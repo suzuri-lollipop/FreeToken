@@ -594,12 +594,13 @@ class Engine:
                         f"(host_memory_ratio={config.host_memory_ratio})"
                     )
                     if est > budget:
-                        raise RuntimeError(
+                        logger.warning_rank0(
                             f"MoE expert banks ({est / 2**30:.2f} GiB/rank, tp={tp}) exceed "
                             f"the host memory budget ({budget / 2**30:.2f} GiB at "
                             f"host_memory_ratio={config.host_memory_ratio}). "
-                            f"Raise --host-memory-ratio, increase --tp, free host RAM, or "
-                            f"use a smaller checkpoint."
+                            f"Proceeding anyway; the OS will use swap if physical RAM is "
+                            f"insufficient. Raise --host-memory-ratio, increase --tp, or "
+                            f"use a smaller checkpoint to avoid swap pressure."
                         )
                     if expert_parallel is None and est > budget * 0.8:
                         logger.info_rank0(

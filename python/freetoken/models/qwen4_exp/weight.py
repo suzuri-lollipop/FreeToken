@@ -180,17 +180,26 @@ def iter_weights(
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
+                # Shard AFTER fusion: fusion parts are full-size, the fused
+                # result is then sharded by shard_tensor via the fused name.
+                fused = _try_fuse(name, tensor, fuse_buf)
+                if fused is not None:
+                    if fused != ():  # () means buffered, not yet complete
+                        fused_name, fused_tensor = fused
+                        if tp_info.size > 1:
+                            fused_tensor = shard_tensor(
+                                fused_name, fused_tensor,
+                                rank=tp_info.rank, world_size=tp_info.size,
+                                num_kv_heads=num_kv_heads,
+                            )
+                        yield fused_name, fused_tensor
+                    continue
                 if tp_info.size > 1:
                     tensor = shard_tensor(
                         name, tensor,
                         rank=tp_info.rank, world_size=tp_info.size,
                         num_kv_heads=num_kv_heads,
                     )
-                fused = _try_fuse(name, tensor, fuse_buf)
-                if fused is not None:
-                    if fused != ():  # () means buffered, not yet complete
-                        yield fused
-                    continue
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
