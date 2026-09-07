@@ -276,6 +276,18 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--host-memory-ratio",
+        type=float,
+        default=ServerArgs.host_memory_ratio,
+        help=(
+            "Fraction of total host RAM (or cgroup limit) the engine may consume for "
+            "MoE expert banks and pinned host tables; the remainder is left for the OS "
+            "and other processes. Lower this when large MoE models push the system "
+            "close to OOM (default 0.9)."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",

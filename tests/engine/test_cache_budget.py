@@ -7,7 +7,7 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import expert_bytes_per_slot, host_memory_budget_bytes, plan_cache_budget, resolve_moe_cache_auto
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -495,8 +495,46 @@ def test_reserved_subtracts_from_the_cap(monkeypatch):
     assert _pin_budget_bytes(reserved=4 * 2**30) == 0
 
 
-def test_uncapped_platform_stays_uncapped(monkeypatch):
+def test_linux_pin_budget_uses_host_memory_ratio(monkeypatch):
     monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
-        pytest.skip("WSL caps pinning")
-    assert _pin_budget_bytes(reserved=2**30) is None
+        pytest.skip("WSL caps pinning differently")
+    # default host_memory_ratio=0.9 -> returns a positive budget, not None
+    budget = _pin_budget_bytes(reserved=0, host_memory_ratio=0.8)
+    assert budget is not None
+    assert budget > 0
+    # host_memory_ratio=1.0 with no reserved -> large budget (total RAM)
+    full = _pin_budget_bytes(reserved=0, host_memory_ratio=1.0)
+    assert full is not None
+    assert full >= budget
+
+
+# ---- host_memory_budget_bytes ----
+
+
+def test_host_memory_budget_basic(monkeypatch):
+    monkeypatch.setattr(os, "sysconf", lambda name: {
+        "SC_PHYS_PAGES": 16 << 10,  # pages
+        "SC_PAGE_SIZE": 1 << 20,    # 1 MiB pages -> 16 GiB total
+    }.get(name, 0))
+    # 80% of 16 GiB = 12.8 GiB
+    assert host_memory_budget_bytes(0.8) == int(0.8 * 16 * 2**30)
+
+
+def test_host_memory_budget_reserved_subtracts(monkeypatch):
+    monkeypatch.setattr(os, "sysconf", lambda name: {
+        "SC_PHYS_PAGES": 16 << 10,
+        "SC_PAGE_SIZE": 1 << 20,
+    }.get(name, 0))
+    reserved = 4 * 2**30  # 4 GiB
+    expected = int(0.9 * 16 * 2**30) - reserved
+    assert host_memory_budget_bytes(0.9, reserved=reserved) == expected
+
+
+def test_host_memory_budget_clamps_at_zero(monkeypatch):
+    monkeypatch.setattr(os, "sysconf", lambda name: {
+        "SC_PHYS_PAGES": 4 << 10,   # 4 GiB total
+        "SC_PAGE_SIZE": 1 << 20,
+    }.get(name, 0))
+    # reserved larger than the ratio-scaled total -> 0
+    assert host_memory_budget_bytes(0.5, reserved=8 * 2**30) == 0
