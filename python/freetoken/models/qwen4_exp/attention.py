@@ -19,9 +19,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
+from freetoken.utils.misc import div_even
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -115,8 +116,10 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int) -> None:
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        from freetoken.distributed import get_tp_info
+        tp_size = get_tp_info().size
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size)
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
@@ -124,7 +127,7 @@ class Qwen4ExpAttention(BaseOP):
         self.qkv_proj = LinearColParallelMerged(
             config.hidden_size, self._qkv_split, has_bias=False
         )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearOProj(self.qo_attn_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config

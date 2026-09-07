@@ -21,13 +21,14 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import download_hf_weight
+from freetoken.utils.hf import cached_load_hf_config
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -157,16 +158,21 @@ def iter_weights(
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
+
+    tp_info = get_tp_info()
+    num_kv_heads = None
+    if tp_info.size > 1:
+        hf_config = cached_load_hf_config(model_path)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        num_kv_heads = getattr(text_config, "num_key_value_heads", text_config.num_attention_heads)
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
+        disable=not tp_info.is_primary(),
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -174,6 +180,12 @@ def iter_weights(
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
+                if tp_info.size > 1:
+                    tensor = shard_tensor(
+                        name, tensor,
+                        rank=tp_info.rank, world_size=tp_info.size,
+                        num_kv_heads=num_kv_heads,
+                    )
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete

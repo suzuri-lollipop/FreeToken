@@ -378,20 +378,24 @@ def dummy_nvfp4_expert_sources(config) -> dict[str, list[torch.Tensor]]:
     random nibbles; block scales are 1.0 and globals small because random e4m3 bytes
     reach 448 (and include NaN encodings), which would blow up the dummy activations.
     """
+    from freetoken.distributed import get_tp_info
+    from freetoken.utils.misc import div_even
+
     num_layers = _num_moe_layers(config)
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
+    I_tp = div_even(I, get_tp_info().size)
     fp8 = torch.float8_e4m3fn
 
     def bank(*shape: int, dtype: torch.dtype) -> list[torch.Tensor]:
         return [alloc_pinned_tensor(*shape, dtype=dtype) for _ in range(num_layers)]
 
     sources = {
-        "gate_up_packed": bank(E, 2 * I, H // 2, dtype=torch.uint8),
-        "gate_up_scale": bank(E, 2 * I, H // 16, dtype=fp8),
-        "gate_up_global": bank(E, 2 * I, dtype=torch.float16),
-        "down_packed": bank(E, H, I // 2, dtype=torch.uint8),
-        "down_scale": bank(E, H, I // 16, dtype=fp8),
+        "gate_up_packed": bank(E, 2 * I_tp, H // 2, dtype=torch.uint8),
+        "gate_up_scale": bank(E, 2 * I_tp, H // 16, dtype=fp8),
+        "gate_up_global": bank(E, 2 * I_tp, dtype=torch.float16),
+        "down_packed": bank(E, H, I_tp // 2, dtype=torch.uint8),
+        "down_scale": bank(E, H, I_tp // 16, dtype=fp8),
         "down_global": bank(E, H, dtype=torch.float16),
     }
     for t in sources["gate_up_packed"] + sources["down_packed"]:

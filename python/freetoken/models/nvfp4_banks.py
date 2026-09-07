@@ -9,7 +9,9 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.distributed import get_tp_info
 from freetoken.utils import download_hf_weight
+from freetoken.utils.misc import div_even
 from tqdm import tqdm
 
 LayerToBank = Callable[[int, object], int | None]
@@ -60,20 +62,24 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
-def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
+def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int, tp_size: int = 1):
     """6 NVFP4 source banks, one ``[E, ...]`` tensor per layer (independent allocations),
     unpinned (pin-after-fill): register only after fill to skip cudaHostAlloc's slow
     commit. Caller fills each layer's ``.tensor`` then pins it (per-layer, via
-    ``PinPipeline``, as its writes complete)."""
+    ``PinPipeline``, as its writes complete).
+
+    When ``tp_size > 1`` the intermediate dimension is sharded: ``I_tp = I // tp_size``.
+    """
     from freetoken.moe.host_banks import alloc_layer_banks
 
+    I_tp = div_even(I, tp_size)
     fp8 = torch.float8_e4m3fn
     return alloc_layer_banks({
-        "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-        "gate_up_scale": ((E, 2 * I, H // 16), fp8),
-        "gate_up_global": ((E, 2 * I), torch.float16),
-        "down_packed": ((E, H, I // 2), torch.uint8),
-        "down_scale": ((E, H, I // 16), fp8),
+        "gate_up_packed": ((E, 2 * I_tp, H // 2), torch.uint8),
+        "gate_up_scale": ((E, 2 * I_tp, H // 16), fp8),
+        "gate_up_global": ((E, 2 * I_tp), torch.float16),
+        "down_packed": ((E, H, I_tp // 2), torch.uint8),
+        "down_scale": ((E, H, I_tp // 16), fp8),
         "down_global": ((E, H), torch.float16),
     }, num_layers)
 
@@ -111,6 +117,10 @@ def load_nvfp4_expert_source_banks(
     H = config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
+    tp_info = get_tp_info()
+    tp_size = tp_info.size
+    I_tp = div_even(I, tp_size)
+    tp_rank = tp_info.rank
 
     for shard in sorted(set(weight_map.values())):
         drop_page_cache(os.path.join(folder, shard))
@@ -149,7 +159,7 @@ def load_nvfp4_expert_source_banks(
                 globals_map[key] = _ingest_global(spec, f.get_tensor(name))
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, tp_size)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -174,23 +184,23 @@ def load_nvfp4_expert_source_banks(
                     tensor = f.get_tensor(name)
                     if kind == "weight":
                         if role == "gate":
-                            gate_up_packed[bank_layer_id][expert, :I] = tensor
+                            gate_up_packed[bank_layer_id][expert, :I_tp] = tensor.chunk(tp_size, dim=0)[tp_rank]
                         elif role == "up":
-                            gate_up_packed[bank_layer_id][expert, I:] = tensor
+                            gate_up_packed[bank_layer_id][expert, I_tp:] = tensor.chunk(tp_size, dim=0)[tp_rank]
                         elif role == "down":
-                            down_packed[bank_layer_id][expert] = tensor
+                            down_packed[bank_layer_id][expert] = tensor.chunk(tp_size, dim=1)[tp_rank]
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     else:
                         global_scale = globals_map[(layer, expert, proj)]
                         if role == "gate":
-                            gate_up_scale[bank_layer_id][expert, :I] = tensor
-                            gate_up_global[bank_layer_id][expert, :I] = global_scale
+                            gate_up_scale[bank_layer_id][expert, :I_tp] = tensor.chunk(tp_size, dim=0)[tp_rank]
+                            gate_up_global[bank_layer_id][expert, :I_tp] = global_scale
                         elif role == "up":
-                            gate_up_scale[bank_layer_id][expert, I:] = tensor
-                            gate_up_global[bank_layer_id][expert, I:] = global_scale
+                            gate_up_scale[bank_layer_id][expert, I_tp:] = tensor.chunk(tp_size, dim=0)[tp_rank]
+                            gate_up_global[bank_layer_id][expert, I_tp:] = global_scale
                         elif role == "down":
-                            down_scale[bank_layer_id][expert] = tensor
+                            down_scale[bank_layer_id][expert] = tensor.chunk(tp_size, dim=1)[tp_rank]
                             down_global[bank_layer_id][expert] = global_scale
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
@@ -242,6 +252,10 @@ def load_nvfp4_expert_source_banks_parallel(
     H = config.hidden_size
     I = config.moe_intermediate_size
     num_layers = _num_moe_layers(config)
+    tp_info = get_tp_info()
+    tp_size = tp_info.size
+    I_tp = div_even(I, tp_size)
+    tp_rank = tp_info.rank
 
     weight_info: dict[str, tuple[re.Match[str], int]] = {}  # name -> (match, bank_layer)
     global_names_by_shard: dict[str, list[str]] = collections.defaultdict(list)
@@ -273,7 +287,7 @@ def load_nvfp4_expert_source_banks_parallel(
                 )
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, tp_size)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -298,21 +312,21 @@ def load_nvfp4_expert_source_banks_parallel(
             kind = _canon_kind(spec, match.group("kind"))
             if kind == "weight":
                 if role == "gate":
-                    gate_up_packed[bank_layer_id][expert, :I] = tensor
+                    gate_up_packed[bank_layer_id][expert, :I_tp] = tensor.chunk(tp_size, dim=0)[tp_rank]
                 elif role == "up":
-                    gate_up_packed[bank_layer_id][expert, I:] = tensor
+                    gate_up_packed[bank_layer_id][expert, I_tp:] = tensor.chunk(tp_size, dim=0)[tp_rank]
                 else:
-                    down_packed[bank_layer_id][expert] = tensor
+                    down_packed[bank_layer_id][expert] = tensor.chunk(tp_size, dim=1)[tp_rank]
             else:
                 g = globals_map[(layer, expert, proj)]
                 if role == "gate":
-                    gate_up_scale[bank_layer_id][expert, :I] = tensor
-                    gate_up_global[bank_layer_id][expert, :I] = g
+                    gate_up_scale[bank_layer_id][expert, :I_tp] = tensor.chunk(tp_size, dim=0)[tp_rank]
+                    gate_up_global[bank_layer_id][expert, :I_tp] = g
                 elif role == "up":
-                    gate_up_scale[bank_layer_id][expert, I:] = tensor
-                    gate_up_global[bank_layer_id][expert, I:] = g
+                    gate_up_scale[bank_layer_id][expert, I_tp:] = tensor.chunk(tp_size, dim=0)[tp_rank]
+                    gate_up_global[bank_layer_id][expert, I_tp:] = g
                 else:
-                    down_scale[bank_layer_id][expert] = tensor
+                    down_scale[bank_layer_id][expert] = tensor.chunk(tp_size, dim=1)[tp_rank]
                     down_global[bank_layer_id][expert] = g
             tracker.note(bank_layer_id)
             placed += 1

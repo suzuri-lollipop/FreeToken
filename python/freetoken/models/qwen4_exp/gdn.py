@@ -4,12 +4,13 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, LinearColParallelMerged
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from freetoken.models.quant_linear import make_replicated_quant
+from freetoken.utils.misc import div_even
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -72,12 +73,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        from freetoken.distributed import get_tp_info
+        tp_size = get_tp_info().size
+        self.num_k_heads = div_even(num_k_heads, tp_size)
+        self.num_v_heads = div_even(num_v_heads, tp_size)
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
@@ -104,15 +107,19 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
-        )
+        # For TP>1 with bf16 out_proj, use LinearRowParallel (row-parallel + all_reduce).
+        if tp_size > 1 and not self._fp8 and expert_quant not in ("nvfp4", "fp8_block"):
+            self.out_proj = LinearRowParallel(self.value_dim, hidden_size, has_bias=False)
+        else:
+            self.out_proj = make_replicated_quant(
+                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
