@@ -48,6 +48,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SCALE_HEADS: tl.constexpr,
     FP8_KV: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
@@ -123,12 +124,21 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             other=0.0,
         )
         if FP8_KV:
+            # One scale per (slot, kv head), laid out like the cache's flat token axis, so a
+            # token is always dequantized with the scale it was written under.
+            slot = safe_page * PAGE_SIZE + page_offset
+            k_scales = tl.load(
+                k_scale_ptr + slot * SCALE_HEADS + kv_head, mask=valid, other=0.0
+            )
+            v_scales = tl.load(
+                v_scale_ptr + slot * SCALE_HEADS + kv_head, mask=valid, other=0.0
+            )
             # Dequantize to the compute dtype (bf16), not float32: float32 dot
             # operands double the shared-memory tile and overflow the SM limit.
             # bf16 holds the dequantized fp8 value with rounding error (~0.4%)
             # far below the fp8 quantization error (~6-12%) already baked in.
-            keys = (keys.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(query.dtype)
-            values = (values.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(query.dtype)
+            keys = (keys.to(tl.float32) * k_scales[None, :]).to(query.dtype)
+            values = (values.to(tl.float32) * v_scales[:, None]).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -234,6 +244,16 @@ def _qsa_merge_splitk_kernel(
     )
 
 
+def _staged_smem_bytes(block_m: int, block_n: int, head_dim: int, num_stages: int,
+                       elem_size: int) -> int:
+    """Shared memory the split-K kernel stages: the Q tile once, K/V over num_stages + 1.
+
+    Reproduces what Triton charges at compile time -- BLOCK_M 16, BLOCK_N 64, HEAD_DIM 256,
+    bf16 and num_stages 2 come to 106496 bytes, over the 101376 a SM120 SM allows.
+    """
+    return (block_m + (num_stages + 1) * block_n) * head_dim * elem_size
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -245,7 +265,11 @@ def qsa_sparse_paged_attention(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged K/V caches (BF16 or FP8 with scales)."""
+    """Run sparse GQA over paged K/V caches (BF16, or FP8 with per-slot scale tables).
+
+    ``k_scale`` / ``v_scale`` are the pool's ``[num_slots, num_kv_heads]`` fp32 tables; each
+    selected token is dequantized with its own row.
+    """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -290,6 +314,22 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+
+    # Those profiles were tuned on GB300 (228 KB smem per SM). A 100 KB SM (SM120) cannot
+    # stage the wide tile at head_dim 256, and Triton fails at compile time with
+    # OutOfResources instead of degrading. Shrink the pipeline first -- that only costs
+    # prefetch depth -- then the tile.
+    num_stages = 2
+    smem_limit = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
+    elem_size = q.element_size()
+    while num_stages > 1 and _staged_smem_bytes(
+        block_m, block_n, head_dim, num_stages, elem_size
+    ) > smem_limit:
+        num_stages -= 1
+    while block_n > 16 and _staged_smem_bytes(
+        block_m, block_n, head_dim, num_stages, elem_size
+    ) > smem_limit:
+        block_n //= 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -352,9 +392,10 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        SCALE_HEADS=k_cache.shape[2],
         FP8_KV=fp8_kv,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
     if num_splits == 1:
         return out
