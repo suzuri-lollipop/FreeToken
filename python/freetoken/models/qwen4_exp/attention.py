@@ -118,12 +118,16 @@ class Qwen4ExpAttention(BaseOP):
         self.layer_id = layer_id
         from freetoken.distributed import get_tp_info
         tp_size = get_tp_info().size
+        # Full dimensions for LinearColParallelMerged (it shards internally).
+        full_qo_dim = config.num_qo_heads * config.head_dim
+        full_kv_dim = config.num_kv_heads * config.head_dim
+        # TP-local dimensions for forward-pass views and LinearOProj.
         self.num_q = div_even(config.num_qo_heads, tp_size)
         self.num_kv = div_even(config.num_kv_heads, tp_size)
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
-        self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        self._qkv_split = [full_qo_dim * 2, full_kv_dim, full_kv_dim]
         self.qkv_proj = LinearColParallelMerged(
             config.hidden_size, self._qkv_split, has_bias=False
         )
