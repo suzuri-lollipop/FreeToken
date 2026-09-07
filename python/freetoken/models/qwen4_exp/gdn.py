@@ -95,7 +95,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
-        self._in_proj_split = [full_conv_dim, full_value_dim, num_v_heads, num_v_heads]
+        self._in_proj_split = [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads]
         if self._fp8:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
@@ -106,7 +106,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            self.in_proj = LinearColParallelMerged(
+                hidden_size, [full_conv_dim, full_value_dim, num_v_heads, num_v_heads],
+                has_bias=False,
+            )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a

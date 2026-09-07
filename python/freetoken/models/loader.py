@@ -12,7 +12,8 @@ from freetoken.utils import div_ceil, download_hf_weight
 
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
                ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
-               ".linear_attn.conv1d", ".dt_bias", ".A_log")
+               ".linear_attn.conv1d", ".dt_bias", ".A_log",
+               ".qkv_proj", ".in_proj", ".gate_up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj", ".out_proj")
 
 

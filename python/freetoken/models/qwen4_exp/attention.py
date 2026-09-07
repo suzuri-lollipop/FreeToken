@@ -127,9 +127,9 @@ class Qwen4ExpAttention(BaseOP):
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
-        self._qkv_split = [full_qo_dim * 2, full_kv_dim, full_kv_dim]
+        self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
+            config.hidden_size, [full_qo_dim * 2, full_kv_dim, full_kv_dim], has_bias=False
         )
         self.o_proj = LinearRowParallel(full_qo_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
