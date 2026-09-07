@@ -391,3 +391,77 @@ def test_fp8_paged_attention_zero_kv_no_nan():
     )
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+@requires_fp8
+def test_qsa_sparse_fp8_kernel_compiles_at_real_dims():
+    """Qwen3.8-Flash-Next QSA dims (24 q / 2 kv / head_dim 256, group 12 -> BLOCK_M 16).
+
+    The float32-dequant version overflowed the 101KB shared-memory limit here
+    (OutOfResources: Required 180224). Dequantizing to bf16 keeps the dot operands
+    at their original size, so the kernel must compile and run.
+    """
+    from freetoken.kernel.triton.qsa.attend import qsa_sparse_paged_attention
+
+    torch.manual_seed(0)
+    num_q_heads, num_kv_heads, head_dim = 24, 2, 256
+    page_size, num_blocks, topk = 64, 2, 64
+    dev = _device()
+
+    q = torch.randn(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=dev)
+    k_cache = torch.randn(num_blocks, page_size, num_kv_heads, head_dim, device=dev).to(
+        torch.float8_e4m3fn
+    )
+    v_cache = torch.randn(num_blocks, page_size, num_kv_heads, head_dim, device=dev).to(
+        torch.float8_e4m3fn
+    )
+    # All selected tokens live in physical page 0 (block_table[0,0]=0).
+    logical_indices = torch.arange(topk, dtype=torch.int32, device=dev).view(1, topk)
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device=dev)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=dev)
+    k_scale = torch.full((1,), 0.01, dtype=torch.float32, device=dev)
+    v_scale = torch.full((1,), 0.01, dtype=torch.float32, device=dev)
+
+    out = qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        k_scale=k_scale, v_scale=v_scale,
+    )
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
+
+@requires_fp8
+def test_fp8_decode_attention_compiles_at_head_dim_256():
+    """The split-K decode kernel (triton backend, FULL attention) must not overflow
+    shared memory with fp8 dequant at head_dim 256 -- the same float32-operand
+    regression that hit the QSA kernel."""
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(0)
+    num_q_heads, num_kv_heads, head_dim, seq_len = 24, 2, 256, 32
+    max_kv_splits = 8
+    dev = _device()
+
+    q = torch.randn(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=dev)
+    k_cache = torch.randn(seq_len, num_kv_heads, head_dim, device=dev).to(torch.float8_e4m3fn)
+    v_cache = torch.randn(seq_len, num_kv_heads, head_dim, device=dev).to(torch.float8_e4m3fn)
+    attn_logits = torch.empty(1, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=dev)
+    attn_lse = torch.empty(1, num_q_heads, max_kv_splits, dtype=torch.float32, device=dev)
+    num_kv_splits = torch.full((1,), max_kv_splits, dtype=torch.int32, device=dev)
+    k_scale = torch.full((1,), 0.01, dtype=torch.float32, device=dev)
+    v_scale = torch.full((1,), 0.01, dtype=torch.float32, device=dev)
+
+    out = decode_paged_attention(
+        q=q, k_cache=k_cache, v_cache=v_cache,
+        indptr=torch.tensor([0, seq_len], dtype=torch.int32, device=dev),
+        indices=torch.arange(seq_len, dtype=torch.int32, device=dev),
+        q_positions=torch.tensor([seq_len - 1], dtype=torch.int64, device=dev),
+        attn_logits=attn_logits, attn_lse=attn_lse,
+        num_kv_splits=num_kv_splits, max_kv_splits=max_kv_splits,
+        sm_scale=head_dim ** -0.5,
+        k_scale=k_scale, v_scale=v_scale,
+    )
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()

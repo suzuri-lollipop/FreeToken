@@ -123,11 +123,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             other=0.0,
         )
         if FP8_KV:
-            keys = keys.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)
-            values = values.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)
-            scores = tl.dot(query.to(tl.float32), keys)
-        else:
-            scores = tl.dot(query, keys)
+            # Dequantize to the compute dtype (bf16), not float32: float32 dot
+            # operands double the shared-memory tile and overflow the SM limit.
+            # bf16 holds the dequantized fp8 value with rounding error (~0.4%)
+            # far below the fp8 quantization error (~6-12%) already baked in.
+            keys = (keys.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(query.dtype)
+            values = (values.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(query.dtype)
+        scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -136,18 +138,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        if FP8_KV:
-            accumulator = tl.dot(
-                probabilities.to(tl.float32),
-                values,
-                acc=accumulator * alpha[:, None],
-            )
-        else:
-            accumulator = tl.dot(
-                probabilities.to(values.dtype),
-                values,
-                acc=accumulator * alpha[:, None],
-            )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            acc=accumulator * alpha[:, None],
+        )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
