@@ -47,6 +47,35 @@ def host_memory_budget_bytes(host_memory_ratio: float, reserved: int = 0) -> int
     return max(0, int(host_memory_ratio * _total_ram_bytes()) - reserved)
 
 
+def host_pin_allowance(mem_available: int, host_memory_ratio: float) -> int:
+    """Machine-wide host bytes the expert banks may hold NON-RECLAIMABLE (pinned or mlocked).
+
+    ``host_memory_ratio`` is a floor on free RAM, not a cap on engine usage. Sizing against
+    ``ratio * total_ram`` alone ignores whatever is already resident, so on a busy desktop
+    the engine can honour the cap and still leave no free RAM. ``mem_available`` is measured
+    once the weights and host tables are resident, so every rank's own footprint is already
+    deducted from it. Anything the banks hold above this allowance must stay pageable so the
+    kernel can push it to swap and keep ``(1 - ratio)`` of RAM free.
+    """
+    total = _total_ram_bytes()
+    # Same int(ratio * total) as host_memory_budget_bytes, so the floor is exactly the
+    # complement of what that budget allows -- (1 - ratio) * total would drift a byte on
+    # ratios float cannot represent.
+    free_floor = total - int(host_memory_ratio * total)
+    return max(0, mem_available - free_floor)
+
+
+def cpu_layer_count(bank_bytes: int, num_layers: int, pin_allowance: int) -> int:
+    """Layers that must leave the pinned set for the banks to fit ``pin_allowance``.
+
+    ``bank_bytes`` is the machine-wide total, not a per-rank shard: at TP>1 every rank pins
+    its own copy, so the aggregate is what has to fit. 0 when everything already fits.
+    """
+    if num_layers <= 0 or bank_bytes <= pin_allowance:
+        return 0
+    return min(num_layers, div_ceil(num_layers * (bank_bytes - pin_allowance), bank_bytes))
+
+
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
 

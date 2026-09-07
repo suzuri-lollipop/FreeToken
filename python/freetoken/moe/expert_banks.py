@@ -15,6 +15,7 @@ three places and nothing else.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
 import threading
@@ -405,6 +406,26 @@ def bank_bytes_estimate(model_config) -> int | None:
     return layers * experts * per_expert(hidden, inter)
 
 
+@contextlib.contextmanager
+def _single_threaded_torch():
+    """Run the enclosed bank build with torch intra-op parallelism off.
+
+    Bank placement writes a few hundred KB at a time, and the gate/up writes land on a
+    STRIDED destination slice (``bank[expert, :I_tp]``), which torch dispatches to its
+    parallel element-wise kernel instead of memcpy. At the default intra-op width the
+    per-copy barrier dwarfs the copy: measured 77 MB/s at 24 threads against 18 GB/s at 1.
+    Contiguous destinations (the down banks) hit memcpy either way and are unaffected. The
+    build is I/O- and memcpy-bound, so one thread is the fast path; the parallel reader's
+    own worker threads are unaffected.
+    """
+    prev = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(prev)
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -441,56 +462,57 @@ def load_expert_banks(
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
-        banks = load_ftw_banks(
-            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency,
-        )
-        if banks is not None:
-            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
-            return banks
+    with _single_threaded_torch():
+        if model_path and is_ftw_checkpoint(model_path) and not dummy:
+            banks = load_ftw_banks(
+                model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                layer_residency=layer_residency,
+            )
+            if banks is not None:
+                logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+                return banks
 
-    if parallel and not _PARALLEL_READER_SUPPORTED:
-        logger.warning_rank0(
-            "expert banks: parallel O_DIRECT reader unsupported on this platform "
-            "(no os.O_DIRECT/preadv) -> serial build"
-        )
-        parallel = False
-
-    auto = parallel is None
-    if auto:
-        from freetoken.models.weight import experts_scattered
-
-        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
-        # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
-        # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
-        # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
-        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
-        # bypass this by forcing ``parallel`` explicitly.)
-        if parallel and not _host_ram_fits_parallel(model_path):
+        if parallel and not _PARALLEL_READER_SUPPORTED:
             logger.warning_rank0(
-                "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
-                "override with --expert-load parallel)"
+                "expert banks: parallel O_DIRECT reader unsupported on this platform "
+                "(no os.O_DIRECT/preadv) -> serial build"
             )
             parallel = False
-    logger.info_rank0(f"expert banks: slow path ({'parallel' if parallel else 'serial'} build)")
-    # parallel's reader resolves hub ids + handles single-file/no-index checkpoints, so it won't
-    # OSError on those (which would leak the banks it pre-allocated, since host banks live for
-    # the process). Only NotImplementedError (quant has no parallel reader; raised before any
-    # allocation) falls back to serial.
-    from freetoken.moe.host_banks import requested_residency
 
-    with requested_residency(layer_residency) as residency_plan:
-        try:
-            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                        decode_target, layer_sink)
-        except NotImplementedError as exc:
-            if not parallel:
-                raise
-            logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
-            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                        decode_target, layer_sink)
-    return _echo_residency(banks, layer_residency, residency_plan)
+        auto = parallel is None
+        if auto:
+            from freetoken.models.weight import experts_scattered
+
+            parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
+            # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
+            # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
+            # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
+            # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
+            # bypass this by forcing ``parallel`` explicitly.)
+            if parallel and not _host_ram_fits_parallel(model_path):
+                logger.warning_rank0(
+                    "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
+                    "override with --expert-load parallel)"
+                )
+                parallel = False
+        logger.info_rank0(f"expert banks: slow path ({'parallel' if parallel else 'serial'} build)")
+        # parallel's reader resolves hub ids + handles single-file/no-index checkpoints, so it won't
+        # OSError on those (which would leak the banks it pre-allocated, since host banks live for
+        # the process). Only NotImplementedError (quant has no parallel reader; raised before any
+        # allocation) falls back to serial.
+        from freetoken.moe.host_banks import requested_residency
+
+        with requested_residency(layer_residency) as residency_plan:
+            try:
+                banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
+                                            decode_target, layer_sink)
+            except NotImplementedError as exc:
+                if not parallel:
+                    raise
+                logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
+                banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
+                                            decode_target, layer_sink)
+        return _echo_residency(banks, layer_residency, residency_plan)
 
 
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:

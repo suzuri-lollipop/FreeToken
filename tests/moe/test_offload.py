@@ -868,3 +868,53 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+# ---- single-threaded bank build ----
+
+
+def test_single_threaded_torch_restores_the_callers_width():
+    """The strided gate/up placement copies are ~240x slower at the default intra-op width:
+    torch sends a non-contiguous destination to its parallel element-wise kernel, and the
+    barrier costs more than a few-hundred-KB copy. So the build pins intra-op to 1 -- and
+    must give the caller's width back, including on the failure path."""
+    from freetoken.moe.expert_banks import _single_threaded_torch
+
+    prev = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        with _single_threaded_torch():
+            assert torch.get_num_threads() == 1
+        assert torch.get_num_threads() == 3
+        with pytest.raises(RuntimeError):
+            with _single_threaded_torch():
+                raise RuntimeError("boom")
+        assert torch.get_num_threads() == 3
+    finally:
+        torch.set_num_threads(prev)
+
+
+def test_load_expert_banks_builds_single_threaded(monkeypatch):
+    """The clamp has to actually reach the provider, not just exist."""
+    from types import SimpleNamespace
+
+    from freetoken.moe import expert_banks as eb
+
+    seen = {}
+
+    def fake_build(*args, **kwargs):
+        seen["threads"] = torch.get_num_threads()
+        return eb.ExpertBanks("bf16", {})
+
+    monkeypatch.setattr(eb, "_build_expert_banks", fake_build)
+    prev = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        eb.load_expert_banks(
+            "", SimpleNamespace(num_moe_layers=1),
+            device=torch.device("cpu"), dtype=torch.bfloat16, parallel=False,
+        )
+    finally:
+        torch.set_num_threads(prev)
+    assert seen["threads"] == 1
+    assert torch.get_num_threads() == prev

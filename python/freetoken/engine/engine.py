@@ -97,6 +97,22 @@ def _resolve_kv_cache_dtype(config, compute_dtype: torch.dtype) -> torch.dtype:
     raise ValueError(f"Unsupported kv_cache_dtype: {kv_dtype!r}. Use 'auto' or 'fp8'.")
 
 
+def _host_mem_available_bytes() -> int | None:
+    """``MemAvailable`` in bytes, or None where /proc/meminfo is unreadable (non-Linux).
+
+    MemAvailable counts reclaimable page cache, so it is the figure the OOM killer and the
+    bank residency split both care about -- MemFree alone would understate it.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
     """Background thread that nudges the kernel to reclaim (swap) host memory.
 
@@ -637,45 +653,55 @@ class Engine:
         # cpu/hybrid both read experts on the CPU, so banks load in the native (CPU-readable)
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
+        # Machine-wide pin allowance, measured before any bank is resident. Collective: every
+        # rank must derive the SAME cpu_layer_ids or the ranks build different models.
+        pin_allowance = self._sync_host_pin_allowance(config)
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        # An auto split exists precisely because the banks do NOT fit the pin allowance, so its
+        # CPU layers must stay swappable. mlocking them would put those bytes straight back
+        # over the allowance and leave the kernel nothing to reclaim -- the free-RAM floor
+        # would be gone again. An explicit --moe-cpu-layers keeps LOCKED (the user asked for
+        # those layers resident, and no allowance drove the choice).
+        cpu_layers_pageable = False
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
-                config, config.model_config.num_moe_layers,
-                reserved=self._host_tables_bytes,
-                host_memory_ratio=config.host_memory_ratio,
+                config, config.model_config.num_moe_layers, pin_allowance
             )
+            cpu_layers_pageable = bool(cpu_layer_ids)
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
+        # split residency: where pinning is quota-capped, pin only the GPU layers' banks and keep the CPU layers' off the pin quota (mlocked, or pageable when an allowance drove the split)
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
-        # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
+        # not applied to plain --moe-backend cpu; all-unpinned under a cap = --moe-backend offload --moe-cpu-layers 1.0
         split_residency = (
             bool(cpu_layer_ids)
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio) is not None
+            and pin_allowance is not None
         )
         if config.moe_backend == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-            budget = _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio)
             bank_bytes = None
-            if budget is not None:
+            if pin_allowance is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
-            if bank_bytes and bank_bytes > budget:
+            if bank_bytes and bank_bytes > pin_allowance:
                 split_residency = True
+                # Over the allowance these banks cannot be resident at all, so leave them
+                # swappable rather than mlocking bytes the kernel can then never reclaim.
+                cpu_layers_pageable = True
                 logger.info_rank0(
                     f"--moe-backend cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-                    f"pin budget; OS-locking all layers instead of pinning"
+                    f"pin allowance {pin_allowance / 2**30:.2f} GiB; leaving all layers "
+                    f"pageable instead of pinning"
                 )
         if split_residency and config.moe_prefill_overlap:
             # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
@@ -691,48 +717,45 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            # Pre-load host-RAM check: refuse to load when the estimated per-rank expert-bank
-            # size exceeds the host memory budget. Without this guard, mmap'd banks consume
-            # physical RAM unconditionally and the system OOMs before the engine can react.
-            # bank_bytes_estimate returns the total (un-sharded) size; divide by tp_size for
-            # the per-rank footprint.
-            if not config.use_dummy_weight:
-                from freetoken.engine.cache_budget import host_memory_budget_bytes
+            # Pre-load host-RAM check, machine-wide on BOTH sides: bank_bytes_estimate is the
+            # un-sharded total and every rank maps its own shard on the same host, so the
+            # aggregate is what has to fit the measured pin allowance. Comparing a per-rank
+            # shard against a machine-wide budget instead lets TP ranks each pass a check the
+            # machine as a whole fails.
+            if not config.use_dummy_weight and pin_allowance is not None:
                 from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
                 est_total = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
                 tp = config.tp_info.size
-                est = est_total // tp if est_total is not None else None
-                budget = host_memory_budget_bytes(config.host_memory_ratio, self._host_tables_bytes)
-                if est is not None:
+                if est_total is not None:
                     logger.info_rank0(
-                        f"host memory: estimated expert banks {est / 2**30:.2f} GiB/rank "
-                        f"(tp={tp}), budget {budget / 2**30:.2f} GiB "
-                        f"(host_memory_ratio={config.host_memory_ratio})"
+                        f"host memory: estimated expert banks {est_total / 2**30:.2f} GiB "
+                        f"machine-wide ({est_total // tp / 2**30:.2f} GiB/rank, tp={tp}), "
+                        f"pin allowance {pin_allowance / 2**30:.2f} GiB"
                     )
-                    if est > budget:
+                    if est_total > pin_allowance:
                         logger.warning_rank0(
-                            f"MoE expert banks ({est / 2**30:.2f} GiB/rank, tp={tp}) exceed "
-                            f"the host memory budget ({budget / 2**30:.2f} GiB at "
-                            f"host_memory_ratio={config.host_memory_ratio}). "
-                            f"Proceeding anyway; the OS will use swap if physical RAM is "
-                            f"insufficient. Raise --host-memory-ratio, increase --tp, or "
-                            f"use a smaller checkpoint to avoid swap pressure."
+                            f"MoE expert banks ({est_total / 2**30:.2f} GiB machine-wide) exceed "
+                            f"the pin allowance ({pin_allowance / 2**30:.2f} GiB at "
+                            f"host_memory_ratio={config.host_memory_ratio}); "
+                            f"{(est_total - pin_allowance) / 2**30:.2f} GiB stays pageable and "
+                            f"swaps. Raise --host-memory-ratio, add RAM, or use a smaller "
+                            f"checkpoint to keep the banks resident."
                         )
-                    if expert_parallel is None and est > budget * 0.8:
-                        logger.info_rank0(
-                            f"expert banks ({est / 2**30:.2f} GiB/rank) approach the host "
-                            f"budget ({budget / 2**30:.2f} GiB); forcing serial load to reduce "
-                            f"peak RAM"
-                        )
-                        expert_parallel = False
+                    # The serial-vs-parallel pick is deliberately NOT made here: the parallel
+                    # reader's cost is a TRANSIENT whole-shard anonymous buffer, and
+                    # load_expert_banks decides that from measured MemAvailable
+                    # (_host_ram_fits_parallel). The pin allowance describes steady-state
+                    # residency, so it is the wrong yardstick and would force serial always.
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
 
+                cpu_residency = (
+                    HostResidency.PAGEABLE if cpu_layers_pageable else HostResidency.LOCKED
+                )
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
-                    else HostResidency.PINNED.value
+                    cpu_residency.value if i in cpu_layer_ids else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
             banks = load_expert_banks(
@@ -887,6 +910,37 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
+
+    def _sync_host_pin_allowance(self, config: EngineConfig) -> int | None:
+        """Machine-wide host bytes the expert banks may hold non-reclaimable.
+
+        ``None`` when the platform does not cap pinning. Measured rather than derived from
+        MemTotal: ``host_memory_ratio`` is a floor on free RAM, so the allowance is what is
+        available NOW -- weights and host tables already resident, every rank's own RSS
+        already deducted from MemAvailable -- minus the ``(1 - ratio)`` that must stay free.
+        Cross-rank MIN so every rank plans the SAME ``cpu_layer_ids``; ranks that disagree
+        would build different models.
+        """
+        cap = _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio)
+        if cap is None:
+            return None
+        avail = _host_mem_available_bytes()
+        if avail is None:  # no /proc/meminfo: the ratio-of-total cap is all we have
+            return cap
+        t = torch.tensor([avail], device="cpu", dtype=torch.int64)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_cpu_group)
+        from freetoken.engine.cache_budget import host_pin_allowance
+
+        allowance = host_pin_allowance(int(t[0].item()), config.host_memory_ratio)
+        logger.info_rank0(
+            f"host memory: MemAvailable {avail / 2**30:.2f} GiB (cross-rank min "
+            f"{int(t[0].item()) / 2**30:.2f} GiB) -> pin allowance "
+            f"{allowance / 2**30:.2f} GiB machine-wide after holding "
+            f"{1.0 - config.host_memory_ratio:.2f} of RAM free"
+        )
+        return allowance
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
         from freetoken.engine.cache_budget import expert_bytes_per_slot
@@ -1334,34 +1388,47 @@ def _pin_budget_bytes(reserved: int = 0, host_memory_ratio: float = 0.9) -> int 
     return max(0, cap - reserved)
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0,
-                     host_memory_ratio: float = 0.9) -> frozenset[int]:
-    """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
+def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int,
+                     pin_allowance: int | None) -> frozenset[int]:
+    """Pick CPU-decode MoE layers automatically when the banks exceed the pin allowance.
 
-    Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
+    ``pin_allowance`` is machine-wide (all ranks' pinned shards together); see
+    :func:`Engine._sync_host_pin_allowance`. Moves just enough head+tail layers off the
+    pinned set: per-layer decode miss rates are U-shaped, so the ends are the cheapest to
+    move off the slot cache. Their banks stay pageable, which is what lets the kernel swap
+    them out and hold the free-RAM floor.
+    """
+    from freetoken.engine.cache_budget import cpu_layer_count
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
-    if not bank_bytes:
+    if not bank_bytes or pin_allowance is None:
         return frozenset()
-    budget = _pin_budget_bytes(reserved, host_memory_ratio)
-    if budget is None or bank_bytes <= budget:
+    n = cpu_layer_count(bank_bytes, num_moe_layers, pin_allowance)
+    if n == 0:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):
         logger.info_rank0(
             f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-            f"pin budget {budget / 2**30:.2f} GiB, but the CPU MoE executor cannot "
+            f"pin allowance {pin_allowance / 2**30:.2f} GiB, but the CPU MoE executor cannot "
             f"serve this model; keeping every layer pinned on the GPU offload path"
         )
         return frozenset()
-    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
     head = (n + 1) // 2
     ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+    pinned = bank_bytes - n * bank_bytes // num_moe_layers
     logger.info_rank0(
-        f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
-        f"({sorted(ids)})"
+        f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin allowance "
+        f"{pin_allowance / 2**30:.2f} GiB; routing {n} head+tail MoE layers to CPU decode "
+        f"({sorted(ids)}), pinning {pinned / 2**30:.2f} GiB and leaving "
+        f"{(bank_bytes - pinned) / 2**30:.2f} GiB pageable for swap"
     )
+    if n == num_moe_layers:
+        logger.warning_rank0(
+            "--moe-cpu-layers auto: the pin allowance fits none of the expert banks, so every "
+            "MoE layer decodes on the CPU from swappable host memory. Decode will be slow; "
+            "raise --host-memory-ratio or free host RAM to keep layers on the GPU path."
+        )
     return ids
 
 
