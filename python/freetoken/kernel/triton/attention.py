@@ -234,7 +234,11 @@ def _decode_grouped_stage1_kernel(
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if not FP8_KV:
+            # bf16 cache: match q to the cache dtype for the dot. For FP8 the cache
+            # dtype is fp8 -- converting q to fp8 would wreck query precision, so q
+            # stays bf16 and k/v are dequantized to bf16 below instead.
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -248,10 +252,11 @@ def _decode_grouped_stage1_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                k = k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)
-                scores = tl.dot(q.to(tl.float32), k) * sm_scale
-            else:
-                scores = tl.dot(q, k) * sm_scale
+                # Dequantize to bf16 (not float32): float32 dot operands double the
+                # shared-memory tile and overflow the SM limit; bf16 rounding error
+                # is far below the fp8 quantization error already in the value.
+                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+            scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
             v = tl.load(
@@ -260,15 +265,12 @@ def _decode_grouped_stage1_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)
+                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
-            if FP8_KV:
-                acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
-            else:
-                acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -585,10 +587,10 @@ def _extend_attention_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                k = k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)
-                scores = tl.dot(q.to(tl.float32), k) * sm_scale
-            else:
-                scores = tl.dot(q.to(k.dtype), k) * sm_scale
+                # Dequantize to bf16 (q.dtype), not float32: float32 dot operands
+                # double the shared-memory tile and can overflow the SM limit.
+                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+            scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -606,10 +608,8 @@ def _extend_attention_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)
-                acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
-            else:
-                acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -723,10 +723,10 @@ def _extend_attention_split_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                k = k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)
-                scores = tl.dot(q.to(tl.float32), k) * sm_scale
-            else:
-                scores = tl.dot(q.to(k.dtype), k) * sm_scale
+                # Dequantize to bf16 (q.dtype), not float32: float32 dot operands
+                # double the shared-memory tile and can overflow the SM limit.
+                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+            scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -744,10 +744,8 @@ def _extend_attention_split_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)
-                acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
-            else:
-                acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
