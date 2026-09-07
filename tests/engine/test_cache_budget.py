@@ -7,7 +7,14 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, host_memory_budget_bytes, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    cpu_layer_count,
+    expert_bytes_per_slot,
+    host_memory_budget_bytes,
+    host_pin_allowance,
+    plan_cache_budget,
+    resolve_moe_cache_auto,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -538,3 +545,58 @@ def test_host_memory_budget_clamps_at_zero(monkeypatch):
     }.get(name, 0))
     # reserved larger than the ratio-scaled total -> 0
     assert host_memory_budget_bytes(0.5, reserved=8 * 2**30) == 0
+
+
+# ---- host_pin_allowance / cpu_layer_count: the free-RAM floor ----
+
+GiB = 2**30
+
+
+def _stub_ram(monkeypatch, total_gib: int):
+    """1 MiB pages, so ``total_gib << 10`` pages is exactly total_gib GiB."""
+    monkeypatch.setattr(os, "sysconf", lambda name: {
+        "SC_PHYS_PAGES": total_gib << 10,
+        "SC_PAGE_SIZE": 1 << 20,
+    }.get(name, 0))
+
+
+def test_pin_allowance_keeps_the_free_floor(monkeypatch):
+    _stub_ram(monkeypatch, 60)
+    # ratio 0.8 -> 12 GiB must stay free; 47 GiB is available now, so 35 GiB may be pinned.
+    assert host_pin_allowance(47 * GiB, 0.8) == 47 * GiB - 12 * GiB
+
+
+def test_pin_allowance_shrinks_on_a_busy_host(monkeypatch):
+    """The regression: a MemTotal-derived budget ignores what is already resident.
+
+    Same ratio, same machine, but the desktop is holding most of the RAM. Sizing against
+    ``ratio * MemTotal`` still hands the banks 48 GiB and leaves nothing free; the measured
+    allowance has to collapse to what is actually available minus the floor.
+    """
+    _stub_ram(monkeypatch, 60)
+    assert host_memory_budget_bytes(0.8) == 48 * GiB  # unchanged, and now wrong
+    assert host_pin_allowance(20 * GiB, 0.8) == 8 * GiB
+
+
+def test_pin_allowance_clamps_at_zero(monkeypatch):
+    _stub_ram(monkeypatch, 60)
+    assert host_pin_allowance(5 * GiB, 0.8) == 0  # already below the 12 GiB floor
+
+
+def test_cpu_layer_count_zero_when_the_banks_fit():
+    assert cpu_layer_count(30 * GiB, 48, 35 * GiB) == 0
+
+
+def test_cpu_layer_count_is_machine_wide_not_per_rank():
+    """TP ranks each pin their own shard on the SAME host, so the total has to fit.
+
+    63 GiB of banks over 2 ranks is 31.5 GiB/rank, which fits a 35 GiB allowance per rank --
+    and 63 GiB machine-wide, which does not. Dividing by tp here would move no layers.
+    """
+    assert cpu_layer_count(63 * GiB, 48, 35 * GiB) == 22  # ceil(48 * 28/63)
+    assert cpu_layer_count(64 * GiB, 48, 32 * GiB) == 24  # exact: half the layers
+
+
+def test_cpu_layer_count_caps_at_every_layer():
+    assert cpu_layer_count(63 * GiB, 48, 0) == 48
+    assert cpu_layer_count(63 * GiB, 0, 35 * GiB) == 0

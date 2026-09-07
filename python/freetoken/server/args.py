@@ -281,10 +281,12 @@ def parse_args(
         type=float,
         default=ServerArgs.host_memory_ratio,
         help=(
-            "Fraction of total host RAM (or cgroup limit) the engine may consume for "
-            "MoE expert banks and pinned host tables; the remainder is left for the OS "
-            "and other processes. Lower this when large MoE models push the system "
-            "close to OOM (default 0.9)."
+            "Fraction of total host RAM (or cgroup limit) the engine may hold "
+            "non-reclaimable for MoE expert banks and pinned host tables, measured against "
+            "what is actually available at startup so (1 - ratio) stays free for the OS even "
+            "when other processes already hold RAM. Bank bytes above that allowance stay "
+            "pageable and swap. Raise it to pin more of the banks at the cost of free RAM; "
+            "lower it when large MoE models push the system close to OOM (default 0.9)."
         ),
     )
 

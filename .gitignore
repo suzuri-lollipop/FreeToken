@@ -227,3 +227,9 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Local serve scripts: environment-dependent launchers (hardcoded GPU/RAM/paths,
+# swap setup, model ids) kept on disk for the developer's own machine. They are
+# NOT portable and must never be committed -- do not `git add -f` them either.
+# Matches root-level serve-*.sh only; install.sh and scripts/*.sh stay tracked.
+/serve-*.sh
