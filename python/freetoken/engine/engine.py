@@ -371,7 +371,7 @@ class Engine:
         available_memory -= state_pool_bytes(config)
         kv_storage_dtype = _resolve_kv_cache_dtype(config, self.dtype)
         if kv_storage_dtype != self.dtype:
-            config.kv_cache_itemsize = kv_storage_dtype.itemsize  # type: ignore[misc]
+            object.__setattr__(config, "kv_cache_itemsize", kv_storage_dtype.itemsize)
             logger.info(f"KV cache stored in {kv_storage_dtype} (compute dtype: {self.dtype})")
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
