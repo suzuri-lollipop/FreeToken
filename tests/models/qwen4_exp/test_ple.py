@@ -418,7 +418,9 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
 
     stopped = torch.zeros_like(slab)
     _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
-    assert torch.equal(got, stopped[live])
+    # Same tolerance as test_prefix_hit_matches_the_uncached_run below: the snapshot and the
+    # truncated prefill reduce differently, so they agree to float32 rounding, not bit for bit.
+    assert torch.allclose(got, stopped[live], rtol=1e-5, atol=1e-6)
 
 
 def test_prefix_hit_matches_the_uncached_run():
