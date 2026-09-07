@@ -100,7 +100,10 @@ def _pick_inner_backend(block_size: int) -> str:
 
     from freetoken.engine.engine import _resolve_auto_attention_backend
 
-    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}), False)
+    # M3's dense leading layers keep bf16 KV, so resolve the inner backend with
+    # fp8 disabled (the default). The stale second positional arg this call used
+    # to pass dated from when the resolver took a `hybrid_linear` flag.
+    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}))
     if not _page_ok(name):
         # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
         # of the SAME tree (same arch gates, same requirement probes) with the
