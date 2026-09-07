@@ -75,6 +75,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         )
         from freetoken.distributed import get_tp_info
         tp_size = get_tp_info().size
+        # Full dimensions for LinearColParallelMerged (it shards internally).
+        full_key_dim = num_k_heads * head_k_dim
+        full_value_dim = num_v_heads * head_v_dim
+        full_conv_dim = 2 * full_key_dim + full_value_dim
+        # TP-local dimensions for forward-pass views and per-head params.
         self.num_k_heads = div_even(num_k_heads, tp_size)
         self.num_v_heads = div_even(num_v_heads, tp_size)
         self.head_k_dim = head_k_dim
@@ -90,11 +95,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        self._in_proj_split = [full_conv_dim, full_value_dim, num_v_heads, num_v_heads]
         if self._fp8:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                hidden_size, [full_conv_dim, full_value_dim], has_bias=False
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
