@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated, LinearRowParallel
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 from freetoken.utils.misc import div_even
@@ -131,7 +131,7 @@ class Qwen4ExpAttention(BaseOP):
         self.qkv_proj = LinearColParallelMerged(
             config.hidden_size, self._qkv_split, has_bias=False
         )
-        self.o_proj = LinearOProj(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearRowParallel(full_qo_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary = config.rotary_config

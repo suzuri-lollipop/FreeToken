@@ -120,7 +120,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
         # For TP>1 with bf16 out_proj, use LinearRowParallel (row-parallel + all_reduce).
         if tp_size > 1 and not self._fp8 and expert_quant not in ("nvfp4", "fp8_block"):
-            self.out_proj = LinearRowParallel(self.value_dim, hidden_size, has_bias=False)
+            self.out_proj = LinearRowParallel(full_value_dim, hidden_size, has_bias=False)
         else:
             self.out_proj = make_replicated_quant(
                 expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
