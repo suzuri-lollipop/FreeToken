@@ -21,6 +21,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -46,6 +48,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FP8_KV: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -119,7 +122,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        scores = tl.dot(query, keys)
+        if FP8_KV:
+            keys = keys.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)
+            values = values.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)
+            scores = tl.dot(query.to(tl.float32), keys)
+        else:
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -128,11 +136,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if FP8_KV:
+            accumulator = tl.dot(
+                probabilities.to(tl.float32),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
@@ -232,8 +247,10 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA over paged K/V caches (BF16 or FP8 with scales)."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +264,9 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    fp8_kv = k_scale is not None and v_scale is not None
+    if not fp8_kv:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -299,6 +318,8 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    k_scale_arg = k_scale if fp8_kv else q
+    v_scale_arg = v_scale if fp8_kv else q
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
@@ -309,6 +330,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        k_scale_arg,
+        v_scale_arg,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -334,6 +357,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        FP8_KV=fp8_kv,
         num_warps=partial_warps,
         num_stages=2,
     )

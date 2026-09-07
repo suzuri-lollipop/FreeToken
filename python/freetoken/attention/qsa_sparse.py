@@ -108,7 +108,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        # Index-tier scratch buffers ride the compute dtype (bf16), not the KV storage
+        # dtype (which may be fp8). The index slab's dtype is the right proxy.
+        self.dtype = getattr(self.kvcache, "_index_dtype", self.kvcache.dtype)
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -282,6 +284,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        fp8 = getattr(self.kvcache, "is_fp8", False)
+        k_s = self.kvcache.k_scale(layer_id) if fp8 else None
+        v_s = self.kvcache.v_scale(layer_id) if fp8 else None
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -290,6 +295,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=k_s,
+            v_scale=v_s,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
