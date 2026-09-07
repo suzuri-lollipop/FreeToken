@@ -31,6 +31,13 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+# Backends that dequantize FP8 KV on read with device-tensor scales (CUDA-graph safe).
+# fa/fi/trtllm are excluded: fa needs descale plumbing not wired here, fi/trtllm take
+# host-float scales whose .item() read breaks graph capture under dynamic per-tensor scales.
+_FP8_CAPABLE_BACKENDS = frozenset({"triton", "qsa_sparse"})
+# Pool families whose store_kv quantizes to FP8 and expose k_scale/v_scale.
+_FP8_CAPABLE_POOLS = frozenset({"MHAKVCache", "QSAKVCache"})
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -204,11 +211,17 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType], fp8: bool = False) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
-    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
+    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
+
+    With ``fp8`` set, only backends that dequantize FP8 KV are considered
+    (``triton`` for FULL/SWA, ``qsa_sparse`` for QSA). fa/fi/trtllm take host-float
+    or no descale factors, which either break CUDA-graph capture or silently
+    mis-dequantize, so they are skipped here and rejected if named explicitly.
+    """
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
@@ -230,11 +243,20 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
+        if fp8 and name not in _FP8_CAPABLE_BACKENDS:
+            continue
         if not _backend_parts_serve(name, required):
             continue
         if not _backend_requirements_met(name):
             continue
         return name
+    if fp8:
+        raise RuntimeError(
+            f"No FP8-capable attention backend can serve attention types "
+            f"{sorted(t.value for t in required)}. FP8 KV cache supports "
+            f"FULL/SWA (triton) and QSA (qsa_sparse) only; drop --kv-cache-dtype fp8 "
+            f"for MLA/DSA/BSA/DSV4 models."
+        )
     raise RuntimeError(
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
@@ -1459,31 +1481,33 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    # FP8 KV cache: validate the pool family BEFORE backend resolution (the resolver
+    # needs to know whether to restrict itself to FP8-capable backends), then resolve.
+    _kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    _fp8_kv = _kv_dtype in ("fp8", "fp8_e4m3")
+    if _fp8_kv:
+        _pool_name = resolve_pool_class(model_config).__name__
+        if _pool_name not in _FP8_CAPABLE_POOLS:
+            raise ValueError(
+                f"--kv-cache-dtype {_kv_dtype} is not supported with pool type "
+                f"'{_pool_name}'. Supported: {', '.join(sorted(_FP8_CAPABLE_POOLS))}."
+            )
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(required_attn_types, fp8=_fp8_kv),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
 
-    # FP8 KV cache validation: only certain backends and pool families support it.
-    _fp8_backends = {"triton", "qsa_sparse"}
-    _kv_dtype = getattr(config, "kv_cache_dtype", "auto")
-    if _kv_dtype in ("fp8", "fp8_e4m3"):
-        if config.attention_backend not in _fp8_backends:
-            raise ValueError(
-                f"--kv-cache-dtype {_kv_dtype} requires --attention-backend "
-                f"{' or '.join(sorted(_fp8_backends))}; got '{config.attention_backend}'. "
-                f"The fa/fi backends do not pass descale factors for FP8 KV."
-            )
-        _fp8_pools = {"MHAKVCache", "QSAKVCache"}
-        _pool_name = resolve_pool_class(model_config).__name__
-        if _pool_name not in _fp8_pools:
-            raise ValueError(
-                f"--kv-cache-dtype {_kv_dtype} is not supported with pool type "
-                f"'{_pool_name}'. Supported: {', '.join(sorted(_fp8_pools))}."
-            )
+    # An explicitly-named backend must itself dequantize FP8 KV; auto already filtered.
+    if _fp8_kv and config.attention_backend not in _FP8_CAPABLE_BACKENDS:
+        raise ValueError(
+            f"--kv-cache-dtype {_kv_dtype} requires --attention-backend "
+            f"{' or '.join(sorted(_FP8_CAPABLE_BACKENDS))}; got '{config.attention_backend}'. "
+            f"fa needs descale plumbing not wired here; fi/trtllm take host-float scales "
+            f"whose .item() read breaks CUDA-graph capture under dynamic per-tensor scales."
+        )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

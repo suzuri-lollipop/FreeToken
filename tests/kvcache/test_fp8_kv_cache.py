@@ -123,6 +123,41 @@ def test_quantize_fp8_roundtrip():
     assert rel_err < 0.1
 
 
+@requires_fp8
+def test_compute_fp8_scale_all_zeros_no_nan():
+    """An all-zero tensor must not produce scale=0 (which would give 0/0=NaN)."""
+    from freetoken.kernel.triton.fp8_kv_cache import (
+        MIN_SCALE,
+        compute_fp8_scale,
+        quantize_fp8,
+    )
+
+    x = torch.zeros(64, 32, dtype=torch.bfloat16, device=_device())
+    scale = torch.zeros(1, dtype=torch.float32, device=_device())
+    compute_fp8_scale(x, scale)
+    # fp32 rounds 1e-6 to 9.999999974752427e-07; assert it floored, not exact.
+    assert scale.item() > 0.0
+    assert scale.item() >= MIN_SCALE * 0.999
+    x_fp8 = quantize_fp8(x, scale)
+    x_dequant = x_fp8.to(torch.float32) * scale
+    assert not torch.isnan(x_dequant).any()
+    assert torch.equal(x_dequant, torch.zeros_like(x_dequant))
+
+
+@requires_fp8
+def test_compute_fp8_scale_tiny_values_finite():
+    """Subnormal-magnitude activations stay finite through the round-trip."""
+    from freetoken.kernel.triton.fp8_kv_cache import compute_fp8_scale, quantize_fp8
+
+    x = (torch.randn(64, 32, dtype=torch.bfloat16, device=_device()) * 1e-5)
+    scale = torch.zeros(1, dtype=torch.float32, device=_device())
+    compute_fp8_scale(x, scale)
+    x_fp8 = quantize_fp8(x, scale)
+    x_dequant = x_fp8.to(torch.float32) * scale
+    assert not torch.isnan(x_dequant).any()
+    assert not torch.isinf(x_dequant).any()
+
+
 # ---- spec_kv_bytes_per_token with FP8 ----
 
 
@@ -196,6 +231,34 @@ def test_resolve_kv_cache_dtype_invalid():
         _resolve_kv_cache_dtype(FakeConfig(), torch.bfloat16)
 
 
+# ---- FP8-aware auto backend resolution ----
+
+
+def test_auto_backend_fp8_prefers_triton_for_full():
+    from freetoken.attention import AttnType
+    from freetoken.engine.engine import _resolve_auto_attention_backend
+
+    # Without fp8, FULL resolves to the hardware-preferred backend (fi/fa/trtllm/triton).
+    # With fp8, only the FP8-capable triton survives the filter.
+    assert _resolve_auto_attention_backend(frozenset({AttnType.FULL}), fp8=True) == "triton"
+
+
+def test_auto_backend_fp8_qsa_picks_qsa_sparse():
+    from freetoken.attention import AttnType
+    from freetoken.engine.engine import _resolve_auto_attention_backend
+
+    assert _resolve_auto_attention_backend(frozenset({AttnType.QSA}), fp8=True) == "qsa_sparse"
+
+
+def test_auto_backend_fp8_rejects_mla():
+    from freetoken.attention import AttnType
+    from freetoken.engine.engine import _resolve_auto_attention_backend
+
+    # MLA/DSA/BSA/DSV4 have no FP8-capable backend; the resolver must say so clearly.
+    with pytest.raises(RuntimeError, match="FP8-capable"):
+        _resolve_auto_attention_backend(frozenset({AttnType.MLA}), fp8=True)
+
+
 # ---- QSA pool FP8 ----
 
 
@@ -216,3 +279,115 @@ def test_qsa_pool_fp8_creation():
     assert pool._index_dtype == torch.bfloat16
     assert pool._cmp_k_buffer.dtype == torch.bfloat16
     assert pool._k_scales.shape == (2,)
+
+
+# ---- End-to-end: FP8 store -> Triton paged attention read ----
+
+
+def _ref_attention(q, k, v, group, sm_scale):
+    """Float32 reference causal-decode attention. q:[1,H,D], k/v:[S,KH,D]."""
+    q = q[0].float()  # [H, D]
+    k = k.float()     # [S, KH, D]
+    v = v.float()     # [S, KH, D]
+    H, D = q.shape
+    S, KH, _ = k.shape
+    out = torch.empty(H, D, dtype=torch.float32, device=q.device)
+    for h in range(H):
+        kvh = h // group
+        scores = (q[h] @ k[:, kvh].T) * sm_scale  # [S]
+        p = torch.softmax(scores, dim=0)
+        out[h] = p @ v[:, kvh]  # [D]
+    return out
+
+
+@requires_fp8
+def test_fp8_paged_attention_matches_bf16_reference():
+    """Full path: store_kv quantizes to fp8, paged_attention dequantizes on read.
+
+    The fp8 output must track the float32 reference within fp8 tolerance.
+    K/V are 2D [tokens, kv_heads*head_dim] as the real model passes them.
+    """
+    _init_tp()
+    from freetoken.kernel.triton.attention import paged_attention
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    torch.manual_seed(0)
+    num_q_heads, num_kv_heads, head_dim, seq_len = 8, 4, 64, 16
+    group = num_q_heads // num_kv_heads
+    kv_dim = num_kv_heads * head_dim
+    sm_scale = head_dim ** -0.5
+    dev = _device()
+
+    q = torch.randn(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=dev)
+    k = torch.randn(seq_len, kv_dim, dtype=torch.bfloat16, device=dev)
+    v = torch.randn(seq_len, kv_dim, dtype=torch.bfloat16, device=dev)
+
+    pool = MHAKVCache(
+        num_kv_heads=num_kv_heads, num_layers=1, head_dim=head_dim,
+        num_pages=seq_len + 1, page_size=1,
+        dtype=torch.float8_e4m3fn, device=dev,
+    )
+    out_loc = torch.arange(seq_len, dtype=torch.int32, device=dev)
+    pool.store_kv(k, v, out_loc, layer_id=0)
+
+    k_cache = pool.k_cache(0).view(-1, num_kv_heads, head_dim)
+    v_cache = pool.v_cache(0).view(-1, num_kv_heads, head_dim)
+    indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=dev)
+    indices = torch.arange(seq_len, dtype=torch.int32, device=dev)
+    q_to_req = torch.zeros(1, dtype=torch.int32, device=dev)
+    q_positions = torch.tensor([seq_len - 1], dtype=torch.int64, device=dev)
+
+    out_fp8 = paged_attention(
+        q=q, k_cache=k_cache, v_cache=v_cache,
+        indptr=indptr, indices=indices,
+        q_to_req=q_to_req, q_positions=q_positions,
+        sm_scale=sm_scale,
+        k_scale=pool.k_scale(0), v_scale=pool.v_scale(0),
+    )
+
+    k3 = k.view(seq_len, num_kv_heads, head_dim)
+    v3 = v.view(seq_len, num_kv_heads, head_dim)
+    ref = _ref_attention(q, k3, v3, group, sm_scale)
+    # fp8-e4m3 has ~2 decimal digits; relative error per element stays modest.
+    rel_err = (out_fp8[0].float() - ref).abs().max().item() / ref.abs().max().item()
+    assert not torch.isnan(out_fp8).any()
+    assert rel_err < 0.15, f"fp8 attention rel_err {rel_err} too high"
+
+
+@requires_fp8
+def test_fp8_paged_attention_zero_kv_no_nan():
+    """All-zero K/V (e.g. padding) must not NaN the attention output."""
+    _init_tp()
+    from freetoken.kernel.triton.attention import paged_attention
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    num_q_heads, num_kv_heads, head_dim, seq_len = 4, 2, 64, 8
+    kv_dim = num_kv_heads * head_dim
+    sm_scale = head_dim ** -0.5
+    dev = _device()
+
+    q = torch.randn(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=dev)
+    k = torch.zeros(seq_len, kv_dim, dtype=torch.bfloat16, device=dev)
+    v = torch.zeros(seq_len, kv_dim, dtype=torch.bfloat16, device=dev)
+
+    pool = MHAKVCache(
+        num_kv_heads=num_kv_heads, num_layers=1, head_dim=head_dim,
+        num_pages=seq_len + 1, page_size=1,
+        dtype=torch.float8_e4m3fn, device=dev,
+    )
+    out_loc = torch.arange(seq_len, dtype=torch.int32, device=dev)
+    pool.store_kv(k, v, out_loc, layer_id=0)
+
+    k_cache = pool.k_cache(0).view(-1, num_kv_heads, head_dim)
+    v_cache = pool.v_cache(0).view(-1, num_kv_heads, head_dim)
+    out = paged_attention(
+        q=q, k_cache=k_cache, v_cache=v_cache,
+        indptr=torch.tensor([0, seq_len], dtype=torch.int32, device=dev),
+        indices=torch.arange(seq_len, dtype=torch.int32, device=dev),
+        q_to_req=torch.zeros(1, dtype=torch.int32, device=dev),
+        q_positions=torch.tensor([seq_len - 1], dtype=torch.int64, device=dev),
+        sm_scale=sm_scale,
+        k_scale=pool.k_scale(0), v_scale=pool.v_scale(0),
+    )
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
