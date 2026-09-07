@@ -574,33 +574,38 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            # Pre-load host-RAM check: refuse to load when the estimated expert-bank size
-            # exceeds the host memory budget. Without this guard, mmap'd banks consume
+            # Pre-load host-RAM check: refuse to load when the estimated per-rank expert-bank
+            # size exceeds the host memory budget. Without this guard, mmap'd banks consume
             # physical RAM unconditionally and the system OOMs before the engine can react.
+            # bank_bytes_estimate returns the total (un-sharded) size; divide by tp_size for
+            # the per-rank footprint.
             if not config.use_dummy_weight:
                 from freetoken.engine.cache_budget import host_memory_budget_bytes
                 from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-                est = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+                est_total = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+                tp = config.tp_info.size
+                est = est_total // tp if est_total is not None else None
                 budget = host_memory_budget_bytes(config.host_memory_ratio, self._host_tables_bytes)
                 if est is not None:
                     logger.info_rank0(
-                        f"host memory: estimated expert banks {est / 2**30:.2f} GiB, "
-                        f"budget {budget / 2**30:.2f} GiB "
+                        f"host memory: estimated expert banks {est / 2**30:.2f} GiB/rank "
+                        f"(tp={tp}), budget {budget / 2**30:.2f} GiB "
                         f"(host_memory_ratio={config.host_memory_ratio})"
                     )
                     if est > budget:
                         raise RuntimeError(
-                            f"MoE expert banks ({est / 2**30:.2f} GiB) exceed the host "
-                            f"memory budget ({budget / 2**30:.2f} GiB at "
+                            f"MoE expert banks ({est / 2**30:.2f} GiB/rank, tp={tp}) exceed "
+                            f"the host memory budget ({budget / 2**30:.2f} GiB at "
                             f"host_memory_ratio={config.host_memory_ratio}). "
-                            f"Raise --host-memory-ratio, free host RAM, or use a smaller "
-                            f"checkpoint."
+                            f"Raise --host-memory-ratio, increase --tp, free host RAM, or "
+                            f"use a smaller checkpoint."
                         )
                     if expert_parallel is None and est > budget * 0.8:
                         logger.info_rank0(
-                            f"expert banks ({est / 2**30:.2f} GiB) approach the host budget "
-                            f"({budget / 2**30:.2f} GiB); forcing serial load to reduce peak RAM"
+                            f"expert banks ({est / 2**30:.2f} GiB/rank) approach the host "
+                            f"budget ({budget / 2**30:.2f} GiB); forcing serial load to reduce "
+                            f"peak RAM"
                         )
                         expert_parallel = False
             requested_residency = None
