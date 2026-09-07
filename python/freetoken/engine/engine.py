@@ -525,10 +525,12 @@ class Engine:
             not cpu_layer_ids
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+            and _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
-                config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
+                config, config.model_config.num_moe_layers,
+                reserved=self._host_tables_bytes,
+                host_memory_ratio=config.host_memory_ratio,
             )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
@@ -542,13 +544,13 @@ class Engine:
         split_residency = (
             bool(cpu_layer_ids)
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+            and _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio) is not None
         )
         if config.moe_backend == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-            budget = _pin_budget_bytes(self._host_tables_bytes)
+            budget = _pin_budget_bytes(self._host_tables_bytes, config.host_memory_ratio)
             bank_bytes = None
             if budget is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
@@ -572,6 +574,26 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+            # Pre-load host-RAM check: estimate expert-bank size against the budget so the
+            # user sees a clear message before the load commits tens of GiB of RAM.
+            if not config.use_dummy_weight:
+                from freetoken.engine.cache_budget import host_memory_budget_bytes
+                from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+                est = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+                budget = host_memory_budget_bytes(config.host_memory_ratio, self._host_tables_bytes)
+                if est is not None:
+                    logger.info_rank0(
+                        f"host memory: estimated expert banks {est / 2**30:.2f} GiB, "
+                        f"budget {budget / 2**30:.2f} GiB "
+                        f"(host_memory_ratio={config.host_memory_ratio})"
+                    )
+                    if est > budget and expert_parallel is None:
+                        logger.warning_rank0(
+                            f"expert banks ({est / 2**30:.2f} GiB) exceed the host budget "
+                            f"({budget / 2**30:.2f} GiB); forcing serial load to reduce peak RAM"
+                        )
+                        expert_parallel = False
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
@@ -1166,20 +1188,22 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
-def _pin_budget_bytes(reserved: int = 0) -> int | None:
-    """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+def _pin_budget_bytes(reserved: int = 0, host_memory_ratio: float = 0.9) -> int | None:
+    """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning.
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. On plain Linux the cap is derived from ``host_memory_ratio`` (fraction of total RAM); pass ``host_memory_ratio=1.0`` to effectively disable the cap. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
     elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
+        from freetoken.engine.cache_budget import host_memory_budget_bytes
+        return host_memory_budget_bytes(host_memory_ratio, reserved)
     else:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
     return max(0, cap - reserved)
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
+def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0,
+                     host_memory_ratio: float = 0.9) -> frozenset[int]:
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
@@ -1188,7 +1212,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
     if not bank_bytes:
         return frozenset()
-    budget = _pin_budget_bytes(reserved)
+    budget = _pin_budget_bytes(reserved, host_memory_ratio)
     if budget is None or bank_bytes <= budget:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):

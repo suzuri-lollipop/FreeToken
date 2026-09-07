@@ -6,12 +6,45 @@ measured quantities, so it is unit-testable without a device.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from freetoken.utils import div_ceil
 
 if TYPE_CHECKING:
     import torch
+
+
+def _cgroup_mem_limit() -> int | None:
+    """Cgroup v2 memory.max, or None when unlimited / unavailable."""
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        if raw == "max":
+            return None
+        return int(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _total_ram_bytes() -> int:
+    """Total physical RAM, falling back to the cgroup limit when it is tighter."""
+    try:
+        total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        total = 8 << 30
+    cg = _cgroup_mem_limit()
+    return min(total, cg) if cg is not None else total
+
+
+def host_memory_budget_bytes(host_memory_ratio: float, reserved: int = 0) -> int:
+    """Total host RAM the engine may consume for expert banks + pinned tables.
+
+    ``host_memory_ratio`` (0, 1] scales total physical RAM (or the cgroup limit,
+    whichever is tighter); ``reserved`` subtracts bytes already committed outside
+    the expert banks (e.g. the Qwen3.8 PLE n-gram table).
+    """
+    return max(0, int(host_memory_ratio * _total_ram_bytes()) - reserved)
 
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
