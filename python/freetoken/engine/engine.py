@@ -124,7 +124,6 @@ def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
         return info
 
     def _watchdog() -> None:
-        import ctypes
         import time
 
         mem = _read_meminfo()
@@ -1467,6 +1466,24 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+
+    # FP8 KV cache validation: only certain backends and pool families support it.
+    _fp8_backends = {"triton", "qsa_sparse"}
+    _kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    if _kv_dtype in ("fp8", "fp8_e4m3"):
+        if config.attention_backend not in _fp8_backends:
+            raise ValueError(
+                f"--kv-cache-dtype {_kv_dtype} requires --attention-backend "
+                f"{' or '.join(sorted(_fp8_backends))}; got '{config.attention_backend}'. "
+                f"The fa/fi backends do not pass descale factors for FP8 KV."
+            )
+        _fp8_pools = {"MHAKVCache", "QSAKVCache"}
+        _pool_name = resolve_pool_class(model_config).__name__
+        if _pool_name not in _fp8_pools:
+            raise ValueError(
+                f"--kv-cache-dtype {_kv_dtype} is not supported with pool type "
+                f"'{_pool_name}'. Supported: {', '.join(sorted(_fp8_pools))}."
+            )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
