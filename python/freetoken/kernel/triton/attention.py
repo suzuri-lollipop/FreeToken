@@ -70,6 +70,7 @@ def _paged_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SCALE_HEADS: tl.constexpr,
     FP8_KV: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
@@ -119,7 +120,12 @@ def _paged_attention_kernel(
                 other=0.0,
             ).to(tl.float32)
             if FP8_KV:
-                k = k * tl.load(k_scale_ptr).to(tl.float32)
+                # One scale per (slot, kv head): a token is dequantized with the scale it was
+                # written under, never with whatever the newest store_kv batch produced.
+                k = k * tl.load(
+                    k_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=offs_n < kv_len, other=0.0,
+                )[:, None]
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -138,7 +144,10 @@ def _paged_attention_kernel(
                 other=0.0,
             ).to(tl.float32)
             if FP8_KV:
-                v = v * tl.load(v_scale_ptr).to(tl.float32)
+                v = v * tl.load(
+                    v_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=offs_n < kv_len, other=0.0,
+                )[:, None]
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -188,6 +197,7 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    SCALE_HEADS: tl.constexpr,
     FP8_KV: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
@@ -252,10 +262,14 @@ def _decode_grouped_stage1_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                # Dequantize to bf16 (not float32): float32 dot operands double the
-                # shared-memory tile and overflow the SM limit; bf16 rounding error
-                # is far below the fp8 quantization error already in the value.
-                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+                # One scale per (slot, kv head): a token is dequantized with the scale it was
+                # written under. To bf16, not float32 -- float32 dot operands double the
+                # shared-memory tile and overflow the SM limit; bf16 rounding error is far
+                # below the fp8 quantization error already in the value.
+                k = (k.to(tl.float32) * tl.load(
+                    k_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[None, :]).to(q.dtype)
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
@@ -265,7 +279,10 @@ def _decode_grouped_stage1_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
+                v = (v.to(tl.float32) * tl.load(
+                    v_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[:, None]).to(q.dtype)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -464,6 +481,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        SCALE_HEADS=num_kv_heads,
         FP8_KV=fp8_kv,
         num_warps=4,
         num_stages=2,
@@ -526,6 +544,7 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SCALE_HEADS: tl.constexpr,
     FP8_KV: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
@@ -587,9 +606,13 @@ def _extend_attention_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                # Dequantize to bf16 (q.dtype), not float32: float32 dot operands
+                # One scale per (slot, kv head): a token is dequantized with the scale it was
+                # written under. To bf16 (q.dtype), not float32 -- float32 dot operands
                 # double the shared-memory tile and can overflow the SM limit.
-                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+                k = (k.to(tl.float32) * tl.load(
+                    k_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[None, :]).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -608,7 +631,10 @@ def _extend_attention_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
+                v = (v.to(tl.float32) * tl.load(
+                    v_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[:, None]).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -660,6 +686,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SCALE_HEADS: tl.constexpr,
     FP8_KV: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
@@ -723,9 +750,13 @@ def _extend_attention_split_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                # Dequantize to bf16 (q.dtype), not float32: float32 dot operands
+                # One scale per (slot, kv head): a token is dequantized with the scale it was
+                # written under. To bf16 (q.dtype), not float32 -- float32 dot operands
                 # double the shared-memory tile and can overflow the SM limit.
-                k = (k.to(tl.float32) * tl.load(k_scale_ptr).to(tl.float32)).to(q.dtype)
+                k = (k.to(tl.float32) * tl.load(
+                    k_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[None, :]).to(q.dtype)
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
@@ -744,7 +775,10 @@ def _extend_attention_split_kernel(
                 other=0.0,
             )
             if FP8_KV:
-                v = (v.to(tl.float32) * tl.load(v_scale_ptr).to(tl.float32)).to(q.dtype)
+                v = (v.to(tl.float32) * tl.load(
+                    v_scale_ptr + slots.to(tl.int64) * SCALE_HEADS + kv_head,
+                    mask=mask_n, other=0.0,
+                )[:, None]).to(q.dtype)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
@@ -895,6 +929,7 @@ def extend_paged_attention(
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
             HAS_SINKS=sinks is not None,
+            SCALE_HEADS=num_kv_heads,
             FP8_KV=fp8_kv,
             num_warps=8,
             num_stages=1,
@@ -930,6 +965,7 @@ def extend_paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        SCALE_HEADS=num_kv_heads,
         FP8_KV=fp8_kv,
         num_warps=8,
         num_stages=1,
@@ -959,8 +995,8 @@ def paged_attention(
     flattened to ``[num_slots, num_kv_heads, head_dim]``. ``indptr`` and
     ``indices`` describe each request's logical KV slots in order.
 
-    Pass ``k_scale`` / ``v_scale`` (fp32 scalar tensors) when the KV cache is
-    stored in FP8 to dequantize on the fly.
+    Pass ``k_scale`` / ``v_scale`` -- the pool's ``[num_slots, num_kv_heads]`` fp32 tables --
+    when the KV cache is stored in FP8 to dequantize each token on the fly.
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
@@ -1012,6 +1048,7 @@ def paged_attention(
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        SCALE_HEADS=num_kv_heads,
         FP8_KV=fp8_kv,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,

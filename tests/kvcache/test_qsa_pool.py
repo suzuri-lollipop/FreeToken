@@ -126,7 +126,10 @@ def test_group_must_not_straddle_a_page():
 
 
 def test_index_slab_needs_a_two_byte_dtype():
-    with pytest.raises(AssertionError, match="2 bytes"):
+    # ValueError, like the page_size/ring_capacity guards above: the slab price the KV cost
+    # model budgets (2 bytes/token) only holds for a 2-byte index dtype. FP8 KV storage is
+    # accepted and maps the slab to bf16 -- see test_qsa_pool_fp8_creation.
+    with pytest.raises(ValueError, match="2-byte dtype"):
         QSAKVCache(
             num_kv_heads=2, num_layers=8, head_dim=64, num_pages=4, page_size=64,
             dtype=torch.float32, device=DEV, index_head_dim=32, num_index_layers=4,

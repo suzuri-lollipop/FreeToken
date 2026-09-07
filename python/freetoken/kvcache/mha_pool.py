@@ -23,9 +23,10 @@ class MHAKVCache(BaseKVCachePool):
     storage slab per KV layer (not per model layer) and remaps the global id to its
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
 
-    When ``dtype`` is an FP8 type the pool stores quantized KV with per-layer
-    dynamic scales (``k_scales`` / ``v_scales``). ``store_kv`` quantizes the
-    bf16 input on the fly; attention backends read the scales back for dequant.
+    When ``dtype`` is an FP8 type the pool stores quantized KV with one scale per
+    ``(token, kv head)`` pair (``k_scale`` / ``v_scale``). ``store_kv`` quantizes the bf16
+    input on the fly and scatters those scales into the slots it wrote; attention backends
+    read a token's own scale back when they dequantize it.
     """
 
     def __init__(
@@ -64,8 +65,20 @@ class MHAKVCache(BaseKVCachePool):
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
         if self._is_fp8:
-            self._k_scales = torch.ones(num_storage_layers, dtype=torch.float32, device=device)
-            self._v_scales = torch.ones(num_storage_layers, dtype=torch.float32, device=device)
+            self._k_scales, self._v_scales = self._alloc_scales(
+                num_storage_layers, num_pages * page_size, local_kv_heads, device
+            )
+
+    @staticmethod
+    def _alloc_scales(num_storage_layers, num_slots, local_kv_heads, device):
+        # Keyed by SLOT, not layer: a layer-wide scale recomputed each forward would
+        # retroactively rescale tokens an earlier forward already wrote. Ones, so an
+        # unwritten slot dequantizes its zeroed KV to zero.
+        shape = (num_storage_layers, num_slots, local_kv_heads)
+        return (
+            torch.ones(shape, dtype=torch.float32, device=device),
+            torch.ones(shape, dtype=torch.float32, device=device),
+        )
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -80,6 +93,9 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
+        if self._is_fp8:
+            self._k_scales = None
+            self._v_scales = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
@@ -91,6 +107,10 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        if self._is_fp8:
+            self._k_scales, self._v_scales = self._alloc_scales(
+                num_storage_layers, num_pages * page_size, local_kv_heads, device
+            )
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
@@ -111,7 +131,12 @@ class MHAKVCache(BaseKVCachePool):
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        per_token = int(buf.numel() * buf.element_size()) // tokens
+        if self._is_fp8:
+            # The scales are allocated with the slab, so the page-count planner has to see
+            # them or it budgets a pool that does not fit. fp32 x 2 (K, V) x heads per token.
+            per_token += int(self._k_scales.numel() * self._k_scales.element_size()) * 2 // tokens
+        return per_token, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -146,16 +171,11 @@ class MHAKVCache(BaseKVCachePool):
                 v=v,
             )
             return
-        from freetoken.kernel.triton.fp8_kv_cache import compute_fp8_scale, quantize_fp8
+        from freetoken.kernel.triton.fp8_kv_cache import quantize_fp8_rows
 
-        k_scale = self._k_scales[dense]
-        v_scale = self._v_scales[dense]
-        k_scale.zero_()
-        v_scale.zero_()
-        compute_fp8_scale(k, k_scale)
-        compute_fp8_scale(v, v_scale)
-        k_fp8 = quantize_fp8(k, k_scale)
-        v_fp8 = quantize_fp8(v, v_scale)
+        head_dim = self._storage_shape[2]
+        k_fp8, k_scales = quantize_fp8_rows(k, head_dim)
+        v_fp8, v_scales = quantize_fp8_rows(v, head_dim)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
@@ -163,6 +183,11 @@ class MHAKVCache(BaseKVCachePool):
             k=k_fp8,
             v=v_fp8,
         )
+        # Scatter each row's scale into the slot it landed in, so a later forward dequantizes
+        # a token with that token's OWN scale instead of the newest batch's.
+        slots = out_loc if out_loc.dtype == torch.int64 else out_loc.to(torch.int64)
+        self._k_scales[dense].index_copy_(0, slots, k_scales)
+        self._v_scales[dense].index_copy_(0, slots, v_scales)
 
     @property
     def device(self) -> torch.device:
@@ -181,9 +206,9 @@ class MHAKVCache(BaseKVCachePool):
         return self._is_fp8
 
     def k_scale(self, layer_id: int) -> torch.Tensor:
-        """Per-tensor FP8 scale for K at the given layer (fp32 scalar)."""
+        """Per-slot FP8 scales for K at the given layer: ``[num_slots, num_kv_heads]`` fp32."""
         return self._k_scales[self._dense(layer_id)]
 
     def v_scale(self, layer_id: int) -> torch.Tensor:
-        """Per-tensor FP8 scale for V at the given layer (fp32 scalar)."""
+        """Per-slot FP8 scales for V at the given layer: ``[num_slots, num_kv_heads]`` fp32."""
         return self._v_scales[self._dense(layer_id)]

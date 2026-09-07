@@ -31,11 +31,11 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
-# Backends that dequantize FP8 KV on read with device-tensor scales (CUDA-graph safe).
-# fa/fi/trtllm are excluded: fa needs descale plumbing not wired here, fi/trtllm take
-# host-float scales whose .item() read breaks graph capture under dynamic per-tensor scales.
+# Backends that dequantize FP8 KV on read from the pool's device-resident per-slot scale
+# tables (CUDA-graph safe). fa/fi/trtllm are excluded: fa needs descale plumbing not wired
+# here, and fi/trtllm take host-float scales -- a per-slot table is not one host float.
 _FP8_CAPABLE_BACKENDS = frozenset({"triton", "qsa_sparse"})
-# Pool families whose store_kv quantizes to FP8 and expose k_scale/v_scale.
+# Pool families whose store_kv quantizes to FP8 and expose per-slot k_scale/v_scale tables.
 _FP8_CAPABLE_POOLS = frozenset({"MHAKVCache", "QSAKVCache"})
 
 
@@ -1572,8 +1572,8 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             f"--kv-cache-dtype {_kv_dtype} requires --attention-backend "
             f"{' or '.join(sorted(_FP8_CAPABLE_BACKENDS))}; got '{config.attention_backend}'. "
-            f"fa needs descale plumbing not wired here; fi/trtllm take host-float scales "
-            f"whose .item() read breaks CUDA-graph capture under dynamic per-tensor scales."
+            f"fa needs descale plumbing not wired here; fi/trtllm take host-float scales, "
+            f"and the pool's per-slot scale tables cannot be reduced to one host float."
         )
 
     if config.moe_cache_rate is not None:
