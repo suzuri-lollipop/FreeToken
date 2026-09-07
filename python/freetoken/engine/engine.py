@@ -574,8 +574,9 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            # Pre-load host-RAM check: estimate expert-bank size against the budget so the
-            # user sees a clear message before the load commits tens of GiB of RAM.
+            # Pre-load host-RAM check: refuse to load when the estimated expert-bank size
+            # exceeds the host memory budget. Without this guard, mmap'd banks consume
+            # physical RAM unconditionally and the system OOMs before the engine can react.
             if not config.use_dummy_weight:
                 from freetoken.engine.cache_budget import host_memory_budget_bytes
                 from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
@@ -588,9 +589,17 @@ class Engine:
                         f"budget {budget / 2**30:.2f} GiB "
                         f"(host_memory_ratio={config.host_memory_ratio})"
                     )
-                    if est > budget and expert_parallel is None:
-                        logger.warning_rank0(
-                            f"expert banks ({est / 2**30:.2f} GiB) exceed the host budget "
+                    if est > budget:
+                        raise RuntimeError(
+                            f"MoE expert banks ({est / 2**30:.2f} GiB) exceed the host "
+                            f"memory budget ({budget / 2**30:.2f} GiB at "
+                            f"host_memory_ratio={config.host_memory_ratio}). "
+                            f"Raise --host-memory-ratio, free host RAM, or use a smaller "
+                            f"checkpoint."
+                        )
+                    if expert_parallel is None and est > budget * 0.8:
+                        logger.info_rank0(
+                            f"expert banks ({est / 2**30:.2f} GiB) approach the host budget "
                             f"({budget / 2**30:.2f} GiB); forcing serial load to reduce peak RAM"
                         )
                         expert_parallel = False
