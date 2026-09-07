@@ -82,6 +82,9 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # KV cache storage dtype override: "auto" uses the compute dtype (typically bf16),
+    # "fp8" / "fp8_e4m3" stores KV in fp8_e4m3 with per-tensor dynamic scales (halves VRAM).
+    kv_cache_dtype: str = "auto"
 
     @cached_property
     def hf_config(self):

@@ -70,6 +70,25 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _resolve_kv_cache_dtype(config, compute_dtype: torch.dtype) -> torch.dtype:
+    """Map the user-facing ``kv_cache_dtype`` string to a torch storage dtype.
+
+    ``"auto"`` (default) keeps the compute dtype. ``"fp8"`` / ``"fp8_e4m3"`` selects
+    fp8-e4m3 (1 byte/elem, halves KV VRAM). Requires SM89+.
+    """
+    kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    if kv_dtype in ("auto", ""):
+        return compute_dtype
+    if kv_dtype in ("fp8", "fp8_e4m3"):
+        if not (torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)):
+            raise RuntimeError(
+                f"FP8 KV cache requires SM89+ (Ada Lovelace), got "
+                f"{torch.cuda.get_device_capability()}"
+            )
+        return torch.float8_e4m3fn
+    raise ValueError(f"Unsupported kv_cache_dtype: {kv_dtype!r}. Use 'auto' or 'fp8'.")
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -350,10 +369,14 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        kv_storage_dtype = _resolve_kv_cache_dtype(config, self.dtype)
+        if kv_storage_dtype != self.dtype:
+            config.kv_cache_itemsize = kv_storage_dtype.itemsize  # type: ignore[misc]
+            logger.info(f"KV cache stored in {kv_storage_dtype} (compute dtype: {self.dtype})")
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=kv_storage_dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================

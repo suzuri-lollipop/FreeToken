@@ -76,18 +76,26 @@ class QSAKVCache(MHAKVCache):
             raise ValueError(
                 f"QSA needs ring_capacity ({ring_capacity}) >= index_ratio ({index_ratio})"
             )
-        # Index keys ride the compute dtype (the model's index_k is engine-dtype). The KV cost
-        # model budgets 2 bytes per token per index layer for the slab
-        # (base.spec_kv_bytes_per_token); keep the two in lockstep.
-        assert dtype.itemsize == _INDEX_DTYPE_BYTES, (
-            f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
-        )
+        # Index keys always ride the compute dtype (2 bytes/elem); the KV cost model budgets
+        # 2 bytes per token per index layer for the slab (base.spec_kv_bytes_per_token).
+        # The K/V paged pool may use a narrower storage dtype (fp8) when configured; the
+        # index slab stays at the compute dtype regardless.
+        _compute_dtypes = (torch.float16, torch.bfloat16)
+        if dtype.itemsize == _INDEX_DTYPE_BYTES:
+            index_dtype = dtype
+        elif dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # FP8 KV storage: the index slab stays bf16; infer the compute dtype from context.
+            index_dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                f"QSA index slab requires 2-byte dtype (bf16/fp16); got {dtype}"
+            )
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         self._index_ratio = index_ratio
         self._num_req_slots = num_req_slots
         self._ring_capacity = ring_capacity
-        self._index_dtype = dtype
+        self._index_dtype = index_dtype
         self._page_size = page_size
         super().__init__(
             num_kv_heads=num_kv_heads,
