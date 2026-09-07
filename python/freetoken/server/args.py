@@ -369,6 +369,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "fp8", "fp8_e4m3"],
+        help="KV cache storage dtype. 'auto' uses the compute dtype (bf16). "
+        "'fp8' stores KV in fp8_e4m3 with per-tensor dynamic scales (halves KV VRAM, requires SM89+).",
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
