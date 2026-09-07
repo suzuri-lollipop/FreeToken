@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import threading
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -87,6 +88,77 @@ def _resolve_kv_cache_dtype(config, compute_dtype: torch.dtype) -> torch.dtype:
             )
         return torch.float8_e4m3fn
     raise ValueError(f"Unsupported kv_cache_dtype: {kv_dtype!r}. Use 'auto' or 'fp8'.")
+
+
+def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
+    """Background thread that nudges the kernel to reclaim (swap) host memory.
+
+    ``host_memory_ratio`` is a software budget the engine uses for sizing, but the
+    kernel doesn't know about it.  When expert banks exceed physical RAM the kernel
+    may wait until memory is critically low before swapping, freezing interactive
+    processes (IME, GUI).  This watchdog monitors ``MemAvailable`` and, when it
+    drops below ``(1 - ratio) * total``, allocates and frees anonymous memory to
+    trigger the kernel's reclaim path (kswapd / direct reclaim), pushing idle
+    pages to swap sooner.
+
+    Returns the daemon thread (already started), or None when no offload backend
+    is active or the watchdog is not needed.
+    """
+    if not is_offload_moe_backend(getattr(config, "moe_backend", "auto")):
+        return None
+    ratio = getattr(config, "host_memory_ratio", 0.8)
+    if ratio >= 1.0:
+        return None
+
+    def _read_meminfo() -> dict[str, int]:
+        info: dict[str, int] = {}
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        key = parts[0].rstrip(":")
+                        info[key] = int(parts[1]) * 1024  # kB -> bytes
+        except OSError:
+            pass
+        return info
+
+    def _watchdog() -> None:
+        import ctypes
+        import time
+
+        mem = _read_meminfo()
+        total = mem.get("MemTotal", 0)
+        if total == 0:
+            return
+        target_avail = int(total * (1.0 - ratio))
+        logger.info_rank0(
+            f"host memory watchdog: total={total / 2**30:.1f}GiB "
+            f"target_avail={target_avail / 2**30:.1f}GiB (ratio={ratio})"
+        )
+        while True:
+            try:
+                time.sleep(2)
+                mem = _read_meminfo()
+                avail = mem.get("MemAvailable", 0)
+                if avail > 0 and avail < target_avail:
+                    # Allocate anonymous memory to trigger kernel reclaim.
+                    # The kernel must find free pages -> swaps out idle pages.
+                    deficit = target_avail - avail
+                    chunk = min(deficit + 256 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
+                    n = max(1, chunk // (4 * 1024 * 1024))
+                    bufs = []
+                    for _ in range(n):
+                        b = bytearray(4 * 1024 * 1024)
+                        b[0] = 1  # touch -> forces physical page allocation
+                        bufs.append(b)
+                    del bufs
+            except Exception:
+                break
+
+    t = threading.Thread(target=_watchdog, daemon=True, name="host-mem-watchdog")
+    t.start()
+    return t
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -358,6 +430,7 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        self._host_mem_watchdog = _maybe_start_host_mem_watchdog(config)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
