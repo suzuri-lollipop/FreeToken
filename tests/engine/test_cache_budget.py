@@ -13,7 +13,9 @@ from freetoken.engine.cache_budget import (
     host_memory_budget_bytes,
     host_pin_allowance,
     plan_cache_budget,
+    plan_pageout,
     resolve_moe_cache_auto,
+    watchdog_nudge_bytes,
 )
 from freetoken.engine.engine import _pin_budget_bytes
 
@@ -583,6 +585,34 @@ def test_pin_allowance_clamps_at_zero(monkeypatch):
     assert host_pin_allowance(5 * GiB, 0.8) == 0  # already below the 12 GiB floor
 
 
+def _engine_with_tables(monkeypatch, avail_gib: int, tables_gib: int):
+    """An Engine shell (no __init__, no GPU) with a stubbed MemAvailable and RAM size."""
+    import freetoken.engine.engine as eng
+    from freetoken.engine.engine import Engine
+
+    _stub_ram(monkeypatch, 60)  # 60 GiB total -> free_floor 12 GiB, ratio budget 48 GiB
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    monkeypatch.setattr(eng, "_host_mem_available_bytes", lambda: avail_gib * GiB)
+    engine = Engine.__new__(Engine)
+    engine._host_tables_bytes = tables_gib * GiB
+    return engine, SimpleNamespace(host_memory_ratio=0.8)
+
+
+def test_pin_allowance_is_clamped_by_the_ratio_of_total_cap(monkeypatch):
+    """Tables pinned OUTSIDE the banks are already out of MemAvailable, so the measured
+    allowance on its own lets tables + banks overshoot ratio * MemTotal."""
+    engine, config = _engine_with_tables(monkeypatch, avail_gib=45, tables_gib=20)
+    # measured: 45 - 12 (free floor) = 33 GiB; cap: 48 - 20 (tables) = 28 GiB
+    assert engine._sync_host_pin_allowance(config) == 28 * GiB
+    assert engine._host_tables_bytes + 28 * GiB == int(0.8 * 60 * GiB)
+
+
+def test_pin_allowance_keeps_the_measured_figure_when_it_is_tighter(monkeypatch):
+    """The clamp must not raise the allowance: on a busy host the measured figure still wins."""
+    engine, config = _engine_with_tables(monkeypatch, avail_gib=20, tables_gib=0)
+    assert engine._sync_host_pin_allowance(config) == 8 * GiB  # 20 - 12, below the 48 GiB cap
+
+
 def test_cpu_layer_count_zero_when_the_banks_fit():
     assert cpu_layer_count(30 * GiB, 48, 35 * GiB) == 0
 
@@ -600,3 +630,61 @@ def test_cpu_layer_count_is_machine_wide_not_per_rank():
 def test_cpu_layer_count_caps_at_every_layer():
     assert cpu_layer_count(63 * GiB, 48, 0) == 48
     assert cpu_layer_count(63 * GiB, 0, 35 * GiB) == 0
+
+
+# ---- watchdog_nudge_bytes / plan_pageout: the runtime reclaim policy ----
+
+MiB = 2**20
+
+
+def test_nudge_is_capped_by_the_ram_that_is_actually_free():
+    """The regression: 1 GiB available with a 10.9 GiB deficit.
+
+    ``min(deficit + 256 MiB, 2 GiB)`` asked for 2 GiB -- more than existed -- so the nudge
+    that exists to relieve pressure became the pressure: direct reclaim in the allocating
+    thread plus 2 GiB of new anonymous pages that themselves need swap.
+    """
+    assert watchdog_nudge_bytes(11 * GiB, 1 * GiB) == GiB // 2
+    assert watchdog_nudge_bytes(100 * MiB, 1 * GiB) == 356 * MiB  # deficit + 256 MiB wins
+    assert watchdog_nudge_bytes(10 * GiB, 100 * GiB) == 2 * GiB   # the ceiling wins
+    assert watchdog_nudge_bytes(10 * GiB, 0) == 0                 # nothing free -> no nudge
+
+
+def test_nudge_never_exceeds_the_ram_it_would_have_to_come_out_of():
+    for avail in (MiB, 64 * MiB, GiB, 8 * GiB):
+        assert watchdog_nudge_bytes(64 * GiB, avail) <= avail
+
+
+def test_plan_pageout_stops_once_the_budget_is_covered():
+    sizes = [10, 20, 30, 40]
+    assert plan_pageout(sizes, 25, 0) == ([0, 1], 2)  # 10 then 10+20 >= 25
+    assert plan_pageout(sizes, 25, 2) == ([2], 3)     # 30 alone covers it
+
+
+def test_plan_pageout_sweeps_from_the_cursor_and_wraps():
+    sizes = [10, 20, 30, 40]
+    assert plan_pageout(sizes, 25, 3) == ([3], 0)     # wraps the cursor to the head
+    assert plan_pageout(sizes, 5, 7) == ([3], 0)      # cursor is normalized mod n
+
+
+def test_plan_pageout_never_advises_one_bank_twice_in_a_sweep():
+    sizes = [5, 5, 5]
+    indices, cursor = plan_pageout(sizes, 1000, 1)    # budget above the total
+    assert sorted(indices) == [0, 1, 2]
+    assert cursor == 1                                # a full sweep returns to the start
+
+
+def test_plan_pageout_rotation_covers_every_bank_over_successive_ticks():
+    """Always restarting at 0 would re-evict the banks the CPU executor just faulted in."""
+    sizes = [10] * 5
+    cursor, seen = 0, []
+    for _ in range(5):
+        indices, cursor = plan_pageout(sizes, 10, cursor)
+        seen.extend(indices)
+    assert seen == [0, 1, 2, 3, 4]
+
+
+def test_plan_pageout_edge_cases():
+    assert plan_pageout([], 100, 5) == ([], 0)   # no banks at all
+    assert plan_pageout([10, 20], 0, 1) == ([], 1)   # no deficit -> advise nothing
+    assert plan_pageout([10, 20], -5, 1) == ([], 1)

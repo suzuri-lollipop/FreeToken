@@ -918,3 +918,87 @@ def test_load_expert_banks_builds_single_threaded(monkeypatch):
         torch.set_num_threads(prev)
     assert seen["threads"] == 1
     assert torch.get_num_threads() == prev
+
+
+# --------------------------------------------------------------------------------------
+# Host-bank eviction: what the host-mem watchdog MADV_PAGEOUTs when MemAvailable sinks
+# --------------------------------------------------------------------------------------
+
+
+def _resident_bytes() -> int:
+    """This process's resident anonymous + shared bytes.
+
+    ``mmap.mmap(-1, n)`` is MAP_SHARED|MAP_ANONYMOUS, so a bank's pages land in RssShmem,
+    not RssAnon -- counting only the latter reads a PAGEOUT that worked as one that did not.
+    """
+    import os
+
+    if not os.path.exists("/proc/self/status"):
+        return -1
+    total = 0
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith(("RssAnon:", "RssShmem:")):
+                total += int(line.split()[1]) * 1024
+    return total
+
+
+def _swap_total_bytes() -> int:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("SwapTotal:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def test_pageout_targets_only_pageable_banks(monkeypatch):
+    """PINNED and LOCKED pages are page-locked: the kernel cannot reclaim them, so advising
+    them would be a silent no-op and the watchdog would think it had relieved the deficit."""
+    import freetoken.moe.host_banks as hb
+
+    live: list = []
+    monkeypatch.setattr(hb, "_LIVE_BANKS", live)
+    pageable = hb.HostBank((4096,), torch.uint8)
+    locked = hb.HostBank((4096,), torch.uint8)
+    pinned = hb.HostBank((4096,), torch.uint8)
+    # Set the flags rather than calling lock()/pin(): lock() mlocks and raises the process
+    # RLIMIT_MEMLOCK, pin() needs a CUDA context, and the filter only reads residency.
+    locked._locked = True
+    pinned._pinned = True
+    assert live == [pageable, locked, pinned]  # every mmap-backed bank registers
+    assert [b.residency for b in live] == [
+        hb.HostResidency.PAGEABLE, hb.HostResidency.LOCKED, hb.HostResidency.PINNED
+    ]
+    assert hb.pageable_bank_ranges() == [(pageable.addr, pageable.nbytes)]
+
+
+def test_pageout_evicts_a_pageable_bank_and_keeps_its_bytes(monkeypatch):
+    """MADV_PAGEOUT, not the MADV_DONTNEED release() uses: the banks are anonymous mmaps, so
+    DONTNEED would zero them. PAGEOUT has to drop the residency AND keep the contents."""
+    import freetoken.moe.host_banks as hb
+
+    if _resident_bytes() < 0:
+        pytest.skip("needs /proc/self/status")
+    if _swap_total_bytes() == 0:
+        pytest.skip("MADV_PAGEOUT cannot evict anonymous pages without swap")
+
+    live: list = []
+    monkeypatch.setattr(hb, "_LIVE_BANKS", live)
+    size = 16 << 20
+    bank = hb.HostBank((size,), torch.uint8)
+    bank.tensor.fill_(0x5A)  # fault every page in
+    before = _resident_bytes()
+
+    advised = hb.pageout_ranges(hb.pageable_bank_ranges())
+    if advised == 0:
+        pytest.skip("madvise(MADV_PAGEOUT) unavailable on this kernel")
+    assert advised == size
+
+    after = _resident_bytes()
+    assert after < before - size // 2, f"PAGEOUT evicted only {before - after} of {size} bytes"
+    # Reading faults the pages back in; the bytes must still be there.
+    assert int(bank.tensor[0]) == 0x5A
+    assert int(bank.tensor[-1]) == 0x5A
