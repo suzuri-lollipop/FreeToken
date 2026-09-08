@@ -120,9 +120,10 @@ def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
     kernel doesn't know about it.  When expert banks exceed physical RAM the kernel
     may wait until memory is critically low before swapping, freezing interactive
     processes (IME, GUI).  This watchdog monitors ``MemAvailable`` and, when it
-    drops below ``(1 - ratio) * total``, allocates and frees anonymous memory to
-    trigger the kernel's reclaim path (kswapd / direct reclaim), pushing idle
-    pages to swap sooner.
+    drops below ``(1 - ratio) * total``, evicts the PAGEABLE expert banks with
+    ``MADV_PAGEOUT`` -- targeted, and adds no pressure of its own.  Only when there
+    is nothing pageable to evict does it fall back to allocating and freeing
+    anonymous memory to force a reclaim pass, sized by what is actually free.
 
     Returns the daemon thread (already started), or None when no offload backend
     is active or the watchdog is not needed.
@@ -149,6 +150,9 @@ def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
     def _watchdog() -> None:
         import time
 
+        from freetoken.engine.cache_budget import plan_pageout, watchdog_nudge_bytes
+        from freetoken.moe.host_banks import pageable_bank_ranges, pageout_ranges
+
         mem = _read_meminfo()
         total = mem.get("MemTotal", 0)
         if total == 0:
@@ -158,23 +162,32 @@ def _maybe_start_host_mem_watchdog(config) -> threading.Thread | None:
             f"host memory watchdog: total={total / 2**30:.1f}GiB "
             f"target_avail={target_avail / 2**30:.1f}GiB (ratio={ratio})"
         )
+        cursor = 0
         while True:
             try:
                 time.sleep(2)
                 mem = _read_meminfo()
                 avail = mem.get("MemAvailable", 0)
-                if avail > 0 and avail < target_avail:
-                    # Allocate anonymous memory to trigger kernel reclaim.
-                    # The kernel must find free pages -> swaps out idle pages.
-                    deficit = target_avail - avail
-                    chunk = min(deficit + 256 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
-                    n = max(1, chunk // (4 * 1024 * 1024))
-                    bufs = []
-                    for _ in range(n):
-                        b = bytearray(4 * 1024 * 1024)
-                        b[0] = 1  # touch -> forces physical page allocation
-                        bufs.append(b)
-                    del bufs
+                if avail <= 0 or avail >= target_avail:
+                    continue
+                deficit = target_avail - avail
+                # Evict first: targeted, and unlike the nudge it adds no pressure of its own.
+                ranges = pageable_bank_ranges()
+                indices, cursor = plan_pageout([n for _, n in ranges], deficit, cursor)
+                if pageout_ranges([ranges[i] for i in indices]):
+                    continue
+                # Nothing pageable to evict (all banks pinned, or no madvise here): force a
+                # reclaim pass instead, sized by the RAM that is actually free.
+                chunk = watchdog_nudge_bytes(deficit, avail)
+                if chunk <= 0:
+                    continue
+                n = max(1, chunk // (4 * 1024 * 1024))
+                bufs = []
+                for _ in range(n):
+                    b = bytearray(4 * 1024 * 1024)
+                    b[0] = 1  # touch -> forces physical page allocation
+                    bufs.append(b)
+                del bufs
             except Exception:
                 break
 
@@ -918,6 +931,9 @@ class Engine:
         MemTotal: ``host_memory_ratio`` is a floor on free RAM, so the allowance is what is
         available NOW -- weights and host tables already resident, every rank's own RSS
         already deducted from MemAvailable -- minus the ``(1 - ratio)`` that must stay free.
+        Clamped by ``cap`` too: the measured figure alone can exceed the ratio-of-total budget
+        once host tables are pinned outside the banks, since those bytes are already out of
+        MemAvailable and the floor is charged only against what remains.
         Cross-rank MIN so every rank plans the SAME ``cpu_layer_ids``; ranks that disagree
         would build different models.
         """
@@ -933,7 +949,7 @@ class Engine:
                                          group=self.tp_cpu_group)
         from freetoken.engine.cache_budget import host_pin_allowance
 
-        allowance = host_pin_allowance(int(t[0].item()), config.host_memory_ratio)
+        allowance = min(cap, host_pin_allowance(int(t[0].item()), config.host_memory_ratio))
         logger.info_rank0(
             f"host memory: MemAvailable {avail / 2**30:.2f} GiB (cross-rank min "
             f"{int(t[0].item()) / 2**30:.2f} GiB) -> pin allowance "

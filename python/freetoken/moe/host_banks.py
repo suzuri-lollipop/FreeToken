@@ -53,6 +53,11 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+# Every mmap-backed bank, so the host-mem watchdog can find the reclaimable ones by residency.
+# The cuda backing is absent by construction: it is born PINNED and can never be reclaimed.
+_LIVE_BANKS: list["HostBank"] = []
+
+
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
     v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
@@ -111,6 +116,8 @@ class HostBank:
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
+        if backing == "mmap":
+            _LIVE_BANKS.append(self)
 
     @property
     def residency(self) -> HostResidency:
@@ -195,6 +202,48 @@ def _os_lock(addr: int, nbytes: int) -> None:
             f"shrink --moe-cpu-layers)",
         )
     _os_locked_total += nbytes
+
+
+_MADV_PAGEOUT = 21  # linux uapi/asm-generic/mman-common.h; Python's mmap exposes no MADV_PAGEOUT
+_madvise_fn = None  # resolved lazily; False once madvise(2) is known to be unavailable
+
+
+def _madvise(addr: int, nbytes: int, advice: int) -> bool:
+    """One ``madvise(2)``; False when libc or the advice is unavailable (non-Linux, old kernel)."""
+    global _madvise_fn
+    if _madvise_fn is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+            libc.madvise.restype = ctypes.c_int
+            _madvise_fn = libc.madvise
+        except (OSError, AttributeError):
+            _madvise_fn = False
+    if not _madvise_fn:
+        return False
+    return _madvise_fn(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes), advice) == 0
+
+
+def pageable_bank_ranges() -> list[tuple[int, int]]:
+    """``(addr, nbytes)`` of every PAGEABLE bank, in allocation order.
+
+    PINNED (cudaHostRegister) and LOCKED (mlock) pages are page-locked: the kernel cannot
+    reclaim them, so advising them would be a silent no-op.
+    """
+    return [
+        (bank.addr, bank.nbytes)
+        for bank in _LIVE_BANKS
+        if bank.residency is HostResidency.PAGEABLE
+    ]
+
+
+def pageout_ranges(ranges: list[tuple[int, int]]) -> int:
+    """``MADV_PAGEOUT`` each range; returns the bytes successfully advised.
+
+    PAGEOUT, not the ``MADV_DONTNEED`` :meth:`HostBank.release` uses: the banks are ANONYMOUS
+    mmaps, so DONTNEED would zero them, while PAGEOUT swaps the pages out and keeps the bytes.
+    """
+    return sum(nbytes for addr, nbytes in ranges if _madvise(addr, nbytes, _MADV_PAGEOUT))
 
 
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:

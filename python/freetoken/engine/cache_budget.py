@@ -7,7 +7,7 @@ measured quantities, so it is unit-testable without a device.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from freetoken.utils import div_ceil
 
@@ -74,6 +74,42 @@ def cpu_layer_count(bank_bytes: int, num_layers: int, pin_allowance: int) -> int
     if num_layers <= 0 or bank_bytes <= pin_allowance:
         return 0
     return min(num_layers, div_ceil(num_layers * (bank_bytes - pin_allowance), bank_bytes))
+
+
+def watchdog_nudge_bytes(deficit: int, mem_available: int, ceiling: int = 2 << 30) -> int:
+    """Anonymous bytes the host-mem watchdog may allocate to force one reclaim pass.
+
+    Bounded by what is actually free: allocating more than ``mem_available`` turns the nudge
+    into the very pressure it exists to relieve -- the allocating thread enters direct reclaim,
+    and the new anonymous pages themselves need swap. Half of free RAM is the ceiling because
+    the nudge is freed immediately after, so it only has to be large enough to be noticed.
+    """
+    return max(0, min(deficit + (256 << 20), ceiling, mem_available // 2))
+
+
+def plan_pageout(sizes: Sequence[int], budget: int, cursor: int) -> tuple[list[int], int]:
+    """Indices to evict this tick, sweeping from ``cursor`` until ``budget`` bytes are covered.
+
+    Rotating rather than always restarting at zero: the pageable banks are the CPU-decode
+    layers' experts, so re-advising the same head of the list every tick evicts exactly the
+    ranges the executor most recently faulted back in. Returns (indices, next_cursor); one
+    sweep never advises an index twice, so a budget above the total covers everything once.
+    """
+    n = len(sizes)
+    if n == 0:
+        return [], 0
+    start = cursor % n
+    if budget <= 0:
+        return [], start
+    chosen: list[int] = []
+    spent = 0
+    for offset in range(n):
+        idx = (start + offset) % n
+        chosen.append(idx)
+        spent += sizes[idx]
+        if spent >= budget:
+            break
+    return chosen, (start + len(chosen)) % n
 
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
