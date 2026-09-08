@@ -263,6 +263,142 @@ def test_shared_expert_gate_up_merge(loaded, checkpoint):
     assert torch.equal(merged[I:], raw[f"{base}.up_proj.weight"])
 
 
+# ======================================================================================
+# TP=2: a fused buffer must hold THIS RANK's slice of every part
+#
+# A fused weight is several checkpoint parts end to end, and LinearColParallelMerged sizes
+# its local weight as sum(div_even(part, tp)) while forward() splits the output by those
+# same local part sizes. Sharding the concatenation as one contiguous chunk keeps the row
+# count right -- so the load succeeds -- but hands rank 0 whole parts and none of others.
+# ======================================================================================
+
+TP = 2
+
+
+def _part_shard(value: torch.Tensor, rank: int) -> torch.Tensor:
+    return value.chunk(TP, dim=0)[rank]
+
+
+def _blocked_gdn_shard(value: torch.Tensor, rank: int) -> torch.Tensor:
+    """The GDN ``[q | k | v]`` shard the op's TP-local ``[key, key, value]`` split expects."""
+    blocks = value.split([KH * HD, KH * HD, VH * HD], dim=0)
+    return torch.cat([_part_shard(b, rank) for b in blocks], dim=0)
+
+
+@pytest.fixture(scope="module")
+def tp2(checkpoint) -> tuple[dict[int, dict[str, torch.Tensor]], dict]:
+    """iter_weights at TP=2 for both ranks, against the toy checkpoint's geometry."""
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.qwen4_exp import weight as weight_mod
+
+    folder, raw = checkpoint
+    text = SimpleNamespace(
+        num_attention_heads=QH,
+        num_key_value_heads=KVH,
+        linear_num_key_heads=KH, linear_key_head_dim=HD,
+        linear_num_value_heads=VH, linear_value_head_dim=HD,
+    )
+    # set_tp_info is write-once and the session fixture already claimed it, so the rank is
+    # injected the way test_gpt_oss / test_qsa_pool do it: patch the module's getter.
+    saved = (weight_mod.cached_load_hf_config, weight_mod.get_tp_info)
+    weight_mod.cached_load_hf_config = lambda _path: SimpleNamespace(text_config=text)
+    per_rank: dict[int, dict[str, torch.Tensor]] = {}
+    try:
+        for rank in range(TP):
+            info = DistributedInfo(rank=rank, size=TP)
+            weight_mod.get_tp_info = lambda: info
+            per_rank[rank] = {
+                name: tensor.clone()
+                for name, tensor in iter_weights(
+                    folder, torch.device("cpu"),
+                    include_moe_experts=True, include_non_moe=True,
+                )
+            }
+    finally:
+        weight_mod.cached_load_hf_config, weight_mod.get_tp_info = saved
+    return per_rank, raw
+
+
+def test_tp2_qkv_fusion_carries_a_slice_of_q_k_and_v(tp2):
+    ranks, raw = tp2
+    attn = "model.language_model.layers.1.self_attn"
+    parts = [raw[f"{attn}.{p}_proj.weight"] for p in ("q", "k", "v")]
+    for rank in range(TP):
+        got = ranks[rank]["model.layers.1.self_attn.qkv_proj.weight"]
+        want = torch.cat([_part_shard(p, rank) for p in parts], dim=0)
+        assert got.shape == want.shape, f"rank {rank}: {got.shape} != {want.shape}"
+        assert torch.equal(got, want), f"rank {rank}"
+        # The k/v slices must actually be there, not more q rows in their place.
+        q_rows = 2 * QH * AHD // TP
+        assert torch.equal(got[q_rows:], torch.cat(
+            [_part_shard(parts[1], rank), _part_shard(parts[2], rank)], dim=0))
+
+
+def test_tp2_gdn_in_proj_shards_the_blocked_qkv_per_block(tp2):
+    ranks, raw = tp2
+    gdn = "model.language_model.layers.0.linear_attn"
+    parts = [raw[f"{gdn}.in_proj_{p}.weight"] for p in ("qkv", "z", "b", "a")]
+    for rank in range(TP):
+        got = ranks[rank]["model.layers.0.linear_attn.in_proj.weight"]
+        want = torch.cat(
+            [_blocked_gdn_shard(parts[0], rank)]
+            + [_part_shard(p, rank) for p in parts[1:]],
+            dim=0,
+        )
+        assert torch.equal(got, want), f"rank {rank}"
+
+
+def test_tp2_gdn_conv1d_follows_the_same_blocked_layout(tp2):
+    ranks, raw = tp2
+    conv = raw["model.language_model.layers.0.linear_attn.conv1d.weight"]
+    for rank in range(TP):
+        assert torch.equal(
+            ranks[rank]["model.layers.0.linear_attn.conv1d.weight"],
+            _blocked_gdn_shard(conv, rank),
+        ), f"rank {rank}"
+
+
+def test_tp2_shared_expert_gate_up_shards_both_halves(tp2):
+    ranks, raw = tp2
+    base = "model.language_model.layers.1.mlp.shared_expert"
+    gate, up = raw[f"{base}.gate_proj.weight"], raw[f"{base}.up_proj.weight"]
+    for rank in range(TP):
+        got = ranks[rank]["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
+        assert torch.equal(
+            got, torch.cat([_part_shard(gate, rank), _part_shard(up, rank)], dim=0)
+        ), f"rank {rank}"
+
+
+def test_tp2_o_proj_input_columns_line_up_with_the_local_q_heads(tp2):
+    """o_proj is row-parallel over the same head range qkv_proj is column-parallel over."""
+    ranks, raw = tp2
+    o = raw["model.language_model.layers.1.self_attn.o_proj.weight"]
+    for rank in range(TP):
+        got = ranks[rank]["model.layers.1.self_attn.o_proj.weight"]
+        assert got.shape == (H, QH * AHD // TP)
+        assert torch.equal(got, o.chunk(TP, dim=1)[rank]), f"rank {rank}"
+
+
+def test_tp2_replicated_weights_match_the_tp1_load(tp2, loaded):
+    """The indexer, the router and the HC mixer are replicated: TP must not touch them."""
+    ranks, _raw = tp2
+    for name in (
+        "model.layers.1.self_attn.indexer.index_qk_proj.weight",
+        "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.0.linear_attn.norm.weight",
+        "model.layers.1.self_attn.q_norm.weight",
+    ):
+        for rank in range(TP):
+            assert torch.equal(ranks[rank][name], loaded[name]), f"{name} rank {rank}"
+
+
+def test_tp2_emits_the_same_key_set_as_tp1(tp2, loaded):
+    ranks, _raw = tp2
+    for rank in range(TP):
+        assert set(ranks[rank]) == set(loaded), f"rank {rank}"
+
+
 ZERO_CENTERED = (
     "model.layers.0.attn_hyper_connection.hc_norm.weight",
     "model.layers.0.mlp_hyper_connection.hc_norm.weight",

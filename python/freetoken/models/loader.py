@@ -10,10 +10,11 @@ from typing import Iterable, Iterator
 import torch
 from freetoken.utils import div_ceil, download_hf_weight
 
+# Checkpoint leaf names only: a FUSED buffer is several of these end to end, so chunking it
+# as one run hands each rank whole parts and none of the others. Shard the parts, then fuse.
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj",
                ".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a",
-               ".linear_attn.conv1d", ".dt_bias", ".A_log",
-               ".qkv_proj", ".in_proj", ".gate_up_proj")
+               ".linear_attn.conv1d", ".dt_bias", ".A_log")
 SPLIT_DIM_1 = (".o_proj", ".down_proj", ".out_proj")
 
 
