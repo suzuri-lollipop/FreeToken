@@ -217,6 +217,9 @@ def iter_weights(
                         yield fused
                     continue
                 yield name, tensor
+        # These bytes are on the device now; left in the page cache they inflate the
+        # MemAvailable reading that sizes the host pin allowance.
+        drop_page_cache(file)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 

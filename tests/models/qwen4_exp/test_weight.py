@@ -6,6 +6,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 
 from __future__ import annotations
 
+import glob
 import random
 from types import SimpleNamespace
 
@@ -207,6 +208,26 @@ def test_mtp_visual_experts_and_table_never_loaded(loaded):
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
+
+
+def test_iter_weights_drops_the_page_cache_of_every_shard(checkpoint, monkeypatch):
+    """Left cached, the dense shards inflate the MemAvailable reading that sizes the host pin
+    allowance, so the engine pins more expert banks than the free-RAM floor actually allows."""
+    import freetoken.models.qwen4_exp.weight as weight_mod
+
+    folder, _raw = checkpoint
+    dropped: list[str] = []
+    monkeypatch.setattr(weight_mod, "drop_page_cache", dropped.append)
+
+    names = {
+        name
+        for name, _ in iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        )
+    }
+
+    assert sorted(dropped) == sorted(glob.glob(f"{folder}/*.safetensors"))  # each once
+    assert names == _expected_names()  # and the drop costs the load nothing
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
