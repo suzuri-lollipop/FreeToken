@@ -173,3 +173,74 @@ def test_output_gate_comes_from_the_config():
     torch.testing.assert_close(out_sig.float(), _ref_out(ref_sig, hidden[0]), rtol=RTOL, atol=ATOL)
 
     assert (out_sig.float() - out_silu.float()).abs().max().item() > 10 * ATOL
+
+
+# --------------------------------------------------------------------------------------
+# TP wiring: which out_proj a checkpoint's quant flags select
+# --------------------------------------------------------------------------------------
+
+
+def _gdn_op(monkeypatch, tp_size: int, expert_quant: str, attn_quant: str):
+    """Build the op on meta under a patched TP size.
+
+    ``get_tp_info`` is patched in both places it resolves: gdn.py imports it inside
+    ``__init__`` (so the ``freetoken.distributed`` attribute is read at call time), while
+    layers/linear.py imported it at module load and holds its own reference.
+    """
+    import freetoken.distributed as dist
+    import freetoken.layers.linear as lin
+    from freetoken.distributed import DistributedInfo
+
+    info = DistributedInfo(rank=0, size=tp_size)
+    monkeypatch.setattr(dist, "get_tp_info", lambda: info)
+    monkeypatch.setattr(lin, "get_tp_info", lambda: info)
+    num_k, num_v = HEADS[3]  # the Qwen3.8-Flash-Next head shape
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        return Qwen4ExpGatedDeltaNet(
+            hidden_size=HIDDEN, num_k_heads=num_k, num_v_heads=num_v, head_k_dim=HEAD_DIM,
+            head_v_dim=HEAD_DIM, conv_kernel_size=CONV_K, rms_norm_eps=EPS, layer_id=0,
+            expert_quant=expert_quant, attn_quant=attn_quant,
+        )
+
+
+def test_tp2_experts_only_nvfp4_keeps_out_proj_row_parallel(monkeypatch):
+    """An experts-only NVFP4 build still needs the all_reduce.
+
+    Such a checkpoint (RadixArk's) sets expert_quant="nvfp4" for the ROUTED experts while
+    attn_quant stays "none", so out_proj is bf16. Its input is the TP-sharded value heads,
+    so TP>1 must reduce -- choosing off expert_quant picked a LinearReplicated and every
+    rank kept only its own value heads' partial sum, diverging from the first GDN layer.
+    """
+    from freetoken.layers import LinearRowParallel
+
+    op = _gdn_op(monkeypatch, 2, expert_quant="nvfp4", attn_quant="none")
+    assert isinstance(op.out_proj, LinearRowParallel)
+    num_v = HEADS[3][1]
+    assert op.out_proj.full_input_size == num_v * HEAD_DIM
+    assert op.out_proj.local_input_size == num_v * HEAD_DIM // 2
+
+
+def test_tp2_plain_bf16_checkpoint_keeps_out_proj_row_parallel(monkeypatch):
+    from freetoken.layers import LinearRowParallel
+
+    op = _gdn_op(monkeypatch, 2, expert_quant="none", attn_quant="none")
+    assert isinstance(op.out_proj, LinearRowParallel)
+
+
+def test_tp2_native_fp4_out_proj_does_not_take_the_row_parallel_branch(monkeypatch):
+    """attn_quant="nvfp4" makes out_proj itself FP4, so it must not get the bf16 row-parallel
+    op. This pins the dispatch only: Nvfp4DenseLinear does not reduce either, so TP>1 with a
+    native-FP4 out_proj still needs a row-parallel FP4 variant before it can serve."""
+    from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
+    from freetoken.layers import LinearRowParallel
+
+    op = _gdn_op(monkeypatch, 2, expert_quant="none", attn_quant="nvfp4")
+    assert not isinstance(op.out_proj, LinearRowParallel)
+    assert isinstance(op.out_proj, Nvfp4DenseLinear)
+
+
+def test_tp1_out_proj_needs_no_reduce(monkeypatch):
+    from freetoken.layers import LinearReplicated
+
+    op = _gdn_op(monkeypatch, 1, expert_quant="nvfp4", attn_quant="none")
+    assert isinstance(op.out_proj, LinearReplicated)

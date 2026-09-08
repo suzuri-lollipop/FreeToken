@@ -99,6 +99,19 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
+# GDN buffers whose rows are BLOCKED [q | k | v] over head groups: the op splits its conv
+# output by TP-local [key_dim, key_dim, value_dim], so shard each block, not the whole run.
+_GDN_QKV_BLOCKED = (".linear_attn.in_proj_qkv.weight", ".linear_attn.conv1d.weight")
+
+
+def _shard_gdn_qkv(
+    value: torch.Tensor, *, rank: int, world_size: int, key_dim: int, value_dim: int
+) -> torch.Tensor:
+    """Shard a blocked ``[q | k | v]`` GDN buffer along dim 0, one block at a time."""
+    q, k, v = value.split([key_dim, key_dim, value_dim], dim=0)
+    return torch.cat([t.chunk(world_size, dim=0)[rank] for t in (q, k, v)], dim=0)
+
+
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
@@ -163,10 +176,26 @@ def iter_weights(
 
     tp_info = get_tp_info()
     num_kv_heads = None
+    gdn_key_dim = gdn_value_dim = 0
     if tp_info.size > 1:
         hf_config = cached_load_hf_config(model_path)
         text_config = getattr(hf_config, "text_config", hf_config)
         num_kv_heads = getattr(text_config, "num_key_value_heads", text_config.num_attention_heads)
+        gdn_key_dim = text_config.linear_num_key_heads * text_config.linear_key_head_dim
+        gdn_value_dim = text_config.linear_num_value_heads * text_config.linear_value_head_dim
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tp_info.size == 1:
+            return tensor
+        if name.endswith(_GDN_QKV_BLOCKED):
+            return _shard_gdn_qkv(
+                tensor, rank=tp_info.rank, world_size=tp_info.size,
+                key_dim=gdn_key_dim, value_dim=gdn_value_dim,
+            )
+        return shard_tensor(
+            name, tensor, rank=tp_info.rank, world_size=tp_info.size,
+            num_kv_heads=num_kv_heads,
+        )
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
@@ -179,27 +208,14 @@ def iter_weights(
                 name = _rename(raw_name)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
-                # Shard AFTER fusion: fusion parts are full-size, the fused
-                # result is then sharded by shard_tensor via the fused name.
+                # Shard each leaf BEFORE fusing: the merged buffer must be this rank's slice
+                # of every part, since forward splits it by those same TP-local part sizes.
+                tensor = shard(name, f.get_tensor(raw_name))
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
-                        fused_name, fused_tensor = fused
-                        if tp_info.size > 1:
-                            fused_tensor = shard_tensor(
-                                fused_name, fused_tensor,
-                                rank=tp_info.rank, world_size=tp_info.size,
-                                num_kv_heads=num_kv_heads,
-                            )
-                        yield fused_name, fused_tensor
+                        yield fused
                     continue
-                if tp_info.size > 1:
-                    tensor = shard_tensor(
-                        name, tensor,
-                        rank=tp_info.rank, world_size=tp_info.size,
-                        num_kv_heads=num_kv_heads,
-                    )
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
