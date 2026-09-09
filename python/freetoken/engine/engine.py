@@ -442,8 +442,13 @@ class Engine:
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        # WSL2 + Blackwell: custom-stream kernel launches may fail with
+        # CUDA_ERROR_UNKNOWN; fall back to the default stream when asked.
+        if os.environ.get("FREETOKEN_DEFAULT_STREAM"):
+            self.stream = torch.cuda.current_stream()
+        else:
+            self.stream = torch.cuda.Stream()
+            torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
