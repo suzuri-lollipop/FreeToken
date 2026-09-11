@@ -144,7 +144,11 @@ def fill_weights(op, seed: int, device: torch.device, scale: float = 0.05) -> No
 
 
 class Fixture:
-    """QSA pool + page table + the sparse backend, with a first-fit page allocator."""
+    """QSA pool + page table + the sparse backend, with a first-fit page allocator.
+
+    ``quant`` builds a quantized pool: the paged K/V is stored in its dtype and descaled on
+    read, while the layers, the index tiers and the scratch keep ``dtype``.
+    """
 
     def __init__(
         self,
@@ -154,6 +158,7 @@ class Fixture:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
+        quant=None,
     ) -> None:
         from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
@@ -170,6 +175,7 @@ class Fixture:
             dtype=dtype,
             device=self.device,
             num_req_slots=self.num_req_slots,
+            quant=quant,
         )
         self.page_table = torch.zeros(
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device

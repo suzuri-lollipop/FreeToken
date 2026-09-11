@@ -2,8 +2,10 @@
 
 Only kernels FreeToken changed or wrote get unit tests: the compression kernel (re-addressed
 pending ring, its own torch check) and the block top-k (original radix select, checked against
-torch.topk and, through the expansion chain, against the vLLM reference semantics). score.py
-and attend.py are vendored from vLLM and are covered by the backend and e2e tests.
+torch.topk and, through the expansion chain, against the vLLM reference semantics). score.py is
+vendored from vLLM and is covered by the backend and e2e tests; attend.py is vendored too but
+carries the FreeToken e4m3 descale, whose read path is checked in
+``tests/kernels/test_kv_quant_attention.py`` and end to end in ``test_qsa_backend.py``.
 ``_qsa_mqa_paged_reference`` / ``_qsa_relative_topk_reference`` / ``_expand_qsa_indices_reference``
 are transcribed from ``vllm/tests/test_qsa_reference.py`` (Apache-2.0).
 """

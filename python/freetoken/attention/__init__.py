@@ -155,6 +155,9 @@ def create_m3_sparse_backend(config: ModelConfig):
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),
+        # The in-tree Triton kernel descales the paged K/V; the index tier, the pending
+        # ring and the scratch rows keep the compute dtype and never see a scale.
+        supports_fp8_kv=True,
     ),
 )
 def create_qsa_sparse_backend(config: ModelConfig):

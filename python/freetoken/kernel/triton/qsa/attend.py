@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from vLLM (vllm/models/qwen4_exp/nvidia/ops/qsa.py)
-"""Sparse paged GQA over the QSA selection."""
+"""Sparse paged GQA over the QSA selection, on a BF16 or an e4m3 KV cache."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    k_scale,
+    v_scale,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -46,6 +48,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -119,9 +122,16 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_FP8:
+            # Every e4m3 code is exact in fp16/bf16, so the cache widens to the query
+            # instead of the query losing its mantissa to e4m3 (see kernel/triton/
+            # attention.py). The descales bring the values back to the stored range.
+            keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        # Scaling scores avoids re-quantizing a scaled query to BF16; the K descale rides
+        # the same multiply.
+        scores *= softmax_scale_log2 * k_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -137,10 +147,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         max_value = next_max
 
     has_values = normalizer > 0
-    normalized_output = tl.where(
-        has_values[:, None],
-        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
-        0.0,
+    # The V descale rides the once-normalized output rather than every tile, and split-K
+    # partials are stored descaled, so the merge kernel stays scale-agnostic.
+    normalized_output = (
+        tl.where(
+            has_values[:, None],
+            accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+            0.0,
+        )
+        * v_scale
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
@@ -232,8 +247,14 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or e4m3 K/V caches.
+
+    ``k_scale``/``v_scale`` descale a quantized ``k_cache``/``v_cache`` (see
+    ``kvcache/kv_quant.py``); they default to 1.0 and are inert for a wide-dtype cache.
+    """
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +268,11 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    assert q.dtype == k_cache.dtype == v_cache.dtype or (
+        # A quantized pool serves fp8 K/V against the compute-dtype query; both caches
+        # share one dtype and one scale pair.
+        k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+    )
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -259,6 +284,7 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
+    kv_fp8 = k_cache.dtype == torch.float8_e4m3fn
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
@@ -309,6 +335,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        k_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -334,6 +362,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_FP8=kv_fp8,
         num_warps=partial_warps,
         num_stages=2,
     )

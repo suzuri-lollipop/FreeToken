@@ -108,7 +108,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        # A quantized pool's .dtype is its storage dtype; the index tiers, the scratch and the
+        # query here ride the compute dtype (attention/fi.py precedent).
+        self.quant = getattr(self.kvcache, "quant", None)
+        self.dtype = self.kvcache.dtype if self.quant is None else self.quant.compute_dtype
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -282,6 +285,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        # A quantized pool descales through its own pair (kvcache/kv_quant.py); reads of a
+        # plain pool are inert at 1.0.
+        k_scale = self.quant.k_scale if self.quant is not None else 1.0
+        v_scale = self.quant.v_scale if self.quant is not None else 1.0
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -290,6 +297,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

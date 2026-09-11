@@ -410,7 +410,9 @@ def test_linear_attention_defaults_to_hybrid_radix():
 # A quantized pool is only readable by a backend that applies its descales: ignoring the
 # scales yields wrong logits, not slow ones, so the combination is refused at config time.
 # fa and trtllm carry the code path but are not hardware-validated yet (see the registry
-# comments), so both report supports_fp8_kv=False until they are.
+# comments), so both report supports_fp8_kv=False until they are. Model families whose KV
+# pool cannot even hold a quantized buffer are refused one step earlier, by the pool check
+# that runs before the backend search.
 
 
 @pytest.mark.parametrize("major", [9, 10])
@@ -465,3 +467,53 @@ def test_only_the_quantized_dtype_gates_the_backends(monkeypatch):
         _adjust_config(config)
         assert config.attention_backend == "fa,fi"
         assert config.kv_quant is None
+
+
+@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
+def test_quantized_cache_is_refused_by_the_pool_before_the_backend(monkeypatch, kind):
+    """Latent/index-key pools cannot descale their own reads, so the POOL is what rejects
+    --kv-cache-dtype for these families. It must say so: the backend search one step later
+    can only report "no backend on this machine", which sends the user hunting for a
+    hardware or package problem instead of dropping the flag."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)  # every package/arch gate satisfied
+    config = _config(kind, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    with pytest.raises(RuntimeError, match=r"is not supported by the \w+ pool"):
+        _adjust_config(config)
+
+
+def test_qsa_accepts_a_quantized_cache(monkeypatch):
+    """QSA is the one index-key family that does descale: its paged K/V goes through the
+    in-tree Triton kernel, which takes the pool's scale pair. Only that slab quantizes, so
+    the family stays on the accepted list even though its index tiers do not."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)
+    config = _config("qsa", attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    _adjust_config(config)
+    assert config.attention_backend == "qsa_sparse"
+    assert config.kv_quant is not None
+
+
+def test_auto_names_the_backends_a_quantized_cache_blocked(monkeypatch):
+    """Control for the test above: when the pool is fine and only the descale capability is
+    missing, the failure names the blocked candidates and the way out, rather than blaming
+    the machine."""
+    from dataclasses import replace
+
+    from freetoken.attention import attention_backend_info
+    from freetoken.engine import engine
+
+    _patch_env(monkeypatch, major=10)
+    monkeypatch.setattr(
+        engine,
+        "attention_backend_info",
+        lambda name: replace(attention_backend_info(name), supports_fp8_kv=False),
+    )
+    config = _config("full", attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    with pytest.raises(RuntimeError) as excinfo:
+        engine._adjust_config(config)
+    msg = str(excinfo.value)
+    assert "triton" in msg and "fi" in msg and "trtllm" in msg
+    assert "drop --kv-cache-dtype" in msg
