@@ -261,7 +261,10 @@ def parse_args(
         "--tp-size",
         type=int,
         default=1,
-        help="The tensor parallelism size.",
+        help=(
+            "Number of GPUs to shard the model across; starts one engine process per rank "
+            "and takes one --gpu entry per rank."
+        ),
     )
 
     parser.add_argument(
@@ -699,7 +702,11 @@ def parse_args(
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+            parser.error(
+                f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is 1; "
+                "TP takes one GPU per rank, so pass --tensor-parallel-size "
+                f"{len(kwargs['gpu'])} to shard across them"
+            )
         parser.error(
             f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
             f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"

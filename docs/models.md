@@ -36,6 +36,8 @@ for them; other checkpoints of the same architectures work too.
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+  FTW stores full-width tensors and its replay is model-agnostic, so an FTW dir
+  serves at `--tp-size 1` only; use the HF directory to shard across GPUs.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the

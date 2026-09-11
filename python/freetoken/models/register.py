@@ -14,6 +14,9 @@ class ModelSpec:
     model_cls: str
     parse_config: str = "parse_config"
     iter_weights: str = "iter_weights"
+    # The reader emits TP-local slices and every shardable Linear is column/row-parallel, so
+    # --tp-size is pre-flightable; families without it fail at startup, not mid weight load.
+    tp_supported: bool = False
     # attribute-path root -> checkpoint root, for quantization_config lookups
     checkpoint_roots: tuple[tuple[str, str], ...] = ()
     # inner attribute path -> checkpoint path (feed_forward.shared_mlp -> mlp)
@@ -65,26 +68,31 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.llama",
         "LlamaForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        tp_supported=True,
     ),
     "Qwen2ForCausalLM": ModelSpec(
         "freetoken.models.qwen2",
         "Qwen2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        tp_supported=True,
     ),
     "Qwen3ForCausalLM": ModelSpec(
         "freetoken.models.qwen3",
         "Qwen3ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        tp_supported=True,
     ),
     "Qwen3MoeForCausalLM": ModelSpec(
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        tp_supported=True,
     ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W123_PACKED,
+        tp_supported=True,
     ),
     # MiniMax-M3 (model_type minimax_m3_vl): multimodal wrapper config (text tower in
     # text_config, weights under language_model.); served text-only. GQA + block-sparse
@@ -127,6 +135,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen4ExpForCausalLM",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        tp_supported=True,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -137,6 +146,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        tp_supported=True,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
@@ -156,6 +166,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.mistral",
         "MistralForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        tp_supported=True,
     ),
     "Mistral3ForConditionalGeneration": ModelSpec(
         "freetoken.models.mistral",
@@ -200,6 +211,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        tp_supported=True,
     ),
     "Glm4MoeForCausalLM": ModelSpec(
         "freetoken.models.glm4_moe",

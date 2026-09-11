@@ -150,6 +150,23 @@ def launch_server(
             f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
         )
 
+    # One clean error here beats N workers each dying on the same unsupported TP config
+    # after they have built a CUDA context.
+    from freetoken.engine.config import tp_preflight_error
+    from freetoken.gpu_select import physical_gpu_count
+
+    if (tp_error := tp_preflight_error(server_args)) is not None:
+        raise SystemExit(f"{prog or 'ft serve'}: error: {tp_error}")
+    # Each rank binds its own card by --gpu entry or CUDA ordinal; a rank with no card
+    # would only notice deep inside the engine, after every worker is up.
+    gpus = physical_gpu_count()
+    if gpus is not None and server_args.tp_info.size > gpus:
+        raise SystemExit(
+            f"{prog or 'ft serve'}: error: --tensor-parallel-size "
+            f"{server_args.tp_info.size} needs {server_args.tp_info.size} GPUs, "
+            f"this machine sees {gpus}"
+        )
+
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp
 

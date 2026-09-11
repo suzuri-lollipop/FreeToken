@@ -40,7 +40,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
-| `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--gpu` | GPU 0 | GPU to run on, one per tensor-parallel rank: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard one model across; see [Multiple GPUs](#multiple-gpus-tensor-parallelism) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -62,6 +63,43 @@ GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-9e8d7c6b-5a49-4f13-8207-c1b0a4e6d3f5)
 ft serve --model ... --gpu 1             # by nvidia-smi index -- the 5090
 ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefix is enough)
 ```
+
+### Multiple GPUs (tensor parallelism)
+
+`--tensor-parallel-size N` (`--tp-size`) shards one model across N GPUs: it starts one
+engine process per rank, entry `i` of `--gpu` is rank `i`, and the ranks exchange partial
+results with NCCL (FreeToken's own PyNCCL path by default; `--disable-pynccl` switches to
+torch's). Attention heads, the KV pool, the MLP widths, the embedding and the LM head split;
+norms, the MoE router and a sparse attention's indexer stay replicated.
+
+```bash
+ft serve --model Qwen/Qwen3.8-27B-FP8 --tp-size 2 --gpu 0,1   # 27 GB of weights over two 24 GB cards
+```
+
+What is TP-sharded today:
+
+* Readers of `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `minimax_m2`, `mistral`, `gpt_oss`, the
+  dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B) and the dense projections of
+  `Qwen4Exp` (Qwen3.8-Flash-Next). Anything else reports `does not shard its checkpoint for
+  tensor parallelism yet` at startup, before any rank is spawned.
+* **bf16 experts only, resident**: `--moe-strategy fused`. The expert offload cache (host banks,
+  the GPU slot cache, the CPU executor) still prices experts at full width, so `offload`, `cpu`,
+  `hybrid` and the `auto` default are refused, as are NVFP4 / MXFP4 / block-FP8 expert banks.
+* `fi` and `qsa_sparse` attention. The other backends read global head counts and are refused
+  (auto selection skips them).
+* An FTW directory cannot be sharded: it stores the tensors already fused at full width, so
+  point `--model` at the HF checkpoint when running `--tp-size > 1`.
+* The runtime cache sliders (`ft ctl cache`) are refused at TP > 1; restart with new sizes.
+
+Sizing has to divide: query heads, KV heads (no replication for the fused QKV projections),
+GatedDeltaNet key/value heads, and `moe_intermediate_size / tp` staying on the expert format's
+scale block. `--tp-size 2` and any power of two up to the head count works for the models above.
+
+Each rank holds its own share of the weights, so the per-GPU memory roughly halves while the
+layers all run on every rank. The price is one or two collectives per layer over the interconnect:
+on two PCIe-attached cards measured at ~8 us each, so a small dense model actually gets slower
+(Qwen3-0.6B: 374 tok/s at TP=1 against 320 at TP=2 on 2x RTX PRO 4000 Blackwell, with byte-identical
+greedy output). Sharding pays where the weights or the expert stream do not fit one card.
 
 ### KV cache & memory
 

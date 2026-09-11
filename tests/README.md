@@ -51,6 +51,9 @@ checkpoint is set:
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
+| `FREETOKEN_TP_TEST_MODEL` | `e2e/test_tp_parity.py` — a TP-capable model dir or hub id; boots a real server at TP=1 and TP=N (falls back to `FREETOKEN_TEST_MODEL`) |
+| `FREETOKEN_TP_SIZE` | `e2e/test_tp_parity.py` — ranks to boot (default 2; skips when fewer GPUs are visible) |
+| `FREETOKEN_TP_BOOT_TIMEOUT` | `e2e/test_tp_parity.py` — seconds to wait for "serving" (default 600) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
@@ -68,6 +71,7 @@ Run these before opening a PR — they are cheap, and a gate nobody trips rots s
 
 ```bash
 FREETOKEN_REBUILD_TEST_MODEL=<small model dir> uv run pytest tests/e2e/test_cache_rebuild.py
+FREETOKEN_TP_TEST_MODEL=<small model dir> uv run pytest tests/e2e/test_tp_parity.py   # needs 2 GPUs
 ```
 
 ## What earns a place here
