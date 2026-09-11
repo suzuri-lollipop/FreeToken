@@ -71,9 +71,9 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--kv-cache-dtype` | auto | `fp8_e4m3` (`fp8`) stores K/V as fp8 e4m3: half the bytes per cached token, so roughly twice the prefix reuse for the same VRAM. Needs sm_89+ and an MHA or SWA-hybrid pool; the latent-MLA, DSA, DSV4, MiniMax-M3 block-sparse and Qwen3.8-Flash-Next (QSA) pools reject it at startup, so drop the flag for those models. `auto` keeps the model dtype |
+| `--kv-cache-dtype` | auto | `fp8_e4m3` (`fp8`) stores K/V as fp8 e4m3: half the bytes per cached token, so roughly twice the prefix reuse for the same VRAM. Needs sm_89+ and an MHA, SWA-hybrid or Qwen3.8-Flash-Next (QSA) pool; on QSA only the paged K/V quantizes, its compressed index keys keep the model dtype. The latent-MLA, DSA, DSV4 and MiniMax-M3 block-sparse pools reject it at startup, so drop the flag for those models. `auto` keeps the model dtype |
 | `--kv-cache-quant-scale` | 1.0 | For a quantized cache: the static scale K and V divide by on store and multiply back on read. Raise it if attention states exceed the e4m3 range (+/- 448 * scale), which would otherwise clamp |
-| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. A `--kv-cache-dtype` cache needs a backend that applies its descales (`triton` or `fi` today; `fa`/`trtllm` are refused with it) |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. A `--kv-cache-dtype` cache needs a backend that applies its descales (`triton`, `fi` and the in-tree `qsa_sparse` today; `fa`/`trtllm` are refused with it) |
 
 ### MoE offload
 

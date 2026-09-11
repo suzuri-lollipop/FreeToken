@@ -41,6 +41,9 @@ class QSAKVCache(MHAKVCache):
     whose K/V slots are ``[r * index_ratio, (r + 1) * index_ratio)``, and the rows from
     ``cmp_scratch_base`` on are the per-request-slot scratch sinks. ``slot`` is the sparse
     layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
+
+    ``quant`` quantizes the inherited paged K/V slab only; every index tier here stays at the
+    compute dtype, which is why ``kv_cost`` keeps budgeting 2 bytes/token for them.
     """
 
     @classmethod
@@ -63,6 +66,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        quant=None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -76,18 +80,20 @@ class QSAKVCache(MHAKVCache):
             raise ValueError(
                 f"QSA needs ring_capacity ({ring_capacity}) >= index_ratio ({index_ratio})"
             )
-        # Index keys ride the compute dtype (the model's index_k is engine-dtype). The KV cost
-        # model budgets 2 bytes per token per index layer for the slab
-        # (base.spec_kv_bytes_per_token); keep the two in lockstep.
-        assert dtype.itemsize == _INDEX_DTYPE_BYTES, (
-            f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
+        # Index keys ride the compute dtype (the model's index_k is engine-dtype) even when
+        # the dtype argument is a quantized pool's storage dtype: only the inherited paged K/V
+        # slab quantizes. The KV cost model budgets 2 bytes per token per index layer for the
+        # slab (base.spec_kv_bytes_per_token); keep the two in lockstep.
+        index_dtype = quant.compute_dtype if quant is not None else dtype
+        assert index_dtype.itemsize == _INDEX_DTYPE_BYTES, (
+            f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {index_dtype}"
         )
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         self._index_ratio = index_ratio
         self._num_req_slots = num_req_slots
         self._ring_capacity = ring_capacity
-        self._index_dtype = dtype
+        self._index_dtype = index_dtype
         self._page_size = page_size
         super().__init__(
             num_kv_heads=num_kv_heads,
@@ -98,6 +104,7 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            quant=quant,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)

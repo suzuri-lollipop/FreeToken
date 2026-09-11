@@ -4,7 +4,8 @@ Pins the three things the QSA kernels and the startup budget both depend on: the
 slab is a 1/index_ratio shadow of the K/V pages with the scratch rows behind it, the ring and
 scratch are fixed (concurrency-sized) and priced apart from the per-token slider, and the K/V
 slabs cover the sparse layers only. The PLE conv history rides the GDN slots, so it must
-follow every slot operation and show up in the state-pool byte account.
+follow every slot operation and show up in the state-pool byte account. A quantized KV pool
+(--kv-cache-dtype) quantizes the inherited paged slab and none of the index tiers.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ def _tp(monkeypatch):
     )
 
 
-def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None):
+def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capacity=None,
+          quant=None):
     return QSAKVCache(
         num_kv_heads=2,
         num_layers=8,
@@ -52,6 +54,7 @@ def _pool(num_pages=4, page_size=64, index_ratio=4, num_req_slots=4, ring_capaci
         num_req_slots=num_req_slots,
         ring_capacity=ring_capacity,
         layer_ids=(1, 3, 5, 7),
+        quant=quant,
     )
 
 
@@ -70,13 +73,14 @@ def _spec(*, index_ratio=4, attn_type=AttnType.QSA, num_kv_heads=2, head_dim=64,
     )
 
 
-def _config(spec, *, page_size=64, max_running_req=3):
+def _config(spec, *, page_size=64, max_running_req=3, kv_quant=None):
     mc = SimpleNamespace(num_layers=8, has_swa_attention=False, has_linear_attention=True)
     mc.kv_cache_group_specs = lambda: (spec,)
     return SimpleNamespace(
         model_config=mc,
         page_size=page_size,
         dtype=torch.bfloat16,
+        kv_quant=kv_quant,
         tp_info=SimpleNamespace(size=1),
         max_running_req=max_running_req,
     )
@@ -216,3 +220,69 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+# ------------------------------------------------------------------------------ fp8 storage
+
+
+def _fp8_quant():
+    from freetoken.kvcache.kv_quant import KVQuant
+
+    # An unequal pair, so a scale that reaches the wrong buffer shows up everywhere below.
+    return KVQuant(dtype=torch.float8_e4m3fn, k_scale=0.5, v_scale=4.0)
+
+
+def test_fp8_pool_quantizes_the_paged_slab_only():
+    pool = _pool(quant=_fp8_quant())
+    assert pool.quant.k_scale == 0.5 and pool.quant.v_scale == 4.0
+    assert pool.dtype is torch.float8_e4m3fn
+    assert pool.k_cache(1).dtype is torch.float8_e4m3fn
+    assert pool.v_cache(1).dtype is torch.float8_e4m3fn
+    # The index tiers ride the compute dtype: their kernels take no descale, so a quantized
+    # row there would be silently misread.
+    assert pool.cmp_k_cache(0).dtype is torch.bfloat16
+    assert pool.pending_ring(0).dtype is torch.bfloat16
+
+
+def test_fp8_pool_rebuild_keeps_both_dtypes():
+    pool = _pool(num_pages=4, quant=_fp8_quant())
+    pool.rebuild(8)
+    assert pool.k_cache(1).dtype is torch.float8_e4m3fn
+    assert pool.k_cache(1).shape == (8, 64, 2, 64)
+    assert pool.cmp_k_cache(0).dtype is torch.bfloat16
+    assert pool.cmp_k_cache(0).shape == (8 * 64 // 4 + 4, 32)
+
+
+def test_factory_passes_the_quant_to_the_qsa_pool():
+    # create_kv_pool hands the factory config.kv_dtype -- the STORAGE dtype -- so the index
+    # tiers must be sized off KVQuant.compute_dtype rather than the dtype argument.
+    from freetoken.kvcache import create_kvcache_pool
+
+    mc = SimpleNamespace(
+        num_layers=8, has_swa_attention=False, has_linear_attention=True, dsv4_args=None
+    )
+    mc.kv_cache_group_specs = lambda: (_spec(),)
+    pool = create_kvcache_pool(
+        mc,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.float8_e4m3fn,
+        device=DEV,
+        num_req_slots=4,
+        quant=_fp8_quant(),
+    )
+    assert isinstance(pool, QSAKVCache)
+    assert pool.k_cache(1).dtype is torch.float8_e4m3fn
+    assert pool.cmp_k_cache(0).dtype is torch.bfloat16
+    assert pool.pending_ring(0).dtype is torch.bfloat16
+
+
+def test_fp8_budget_prices_kv_at_the_storage_dtype_and_index_at_two_bytes():
+    spec, quant = _spec(), _fp8_quant()
+    config = _config(spec, kv_quant=quant)
+    per_page, fixed, _, _ = QSAKVCache.kv_cost(config)
+    # 2 slabs x 64 x 2 heads x 1 byte x 4 sparse layers, index rows still 2 bytes/elem.
+    assert per_page == (2 * 64 * 2 * 1 * 4 + 32 * 4 * 2 // 4) * 64
+    assert fixed == 4 * (32 * 4 * 2) * (QSAKVCache.ring_capacity_for(4) + 1)
+    # The pool's own per-token byte count (what capacity is reported in) has to agree.
+    assert _pool(quant=quant).unit_bytes()[0] == spec_kv_bytes_per_token(spec, config)

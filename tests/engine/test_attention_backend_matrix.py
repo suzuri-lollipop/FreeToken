@@ -469,7 +469,7 @@ def test_only_the_quantized_dtype_gates_the_backends(monkeypatch):
         assert config.kv_quant is None
 
 
-@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa", "qsa"])
+@pytest.mark.parametrize("kind", ["mla", "dsa", "dsv4", "bsa"])
 def test_quantized_cache_is_refused_by_the_pool_before_the_backend(monkeypatch, kind):
     """Latent/index-key pools cannot descale their own reads, so the POOL is what rejects
     --kv-cache-dtype for these families. It must say so: the backend search one step later
@@ -481,6 +481,19 @@ def test_quantized_cache_is_refused_by_the_pool_before_the_backend(monkeypatch, 
     config = _config(kind, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
     with pytest.raises(RuntimeError, match=r"is not supported by the \w+ pool"):
         _adjust_config(config)
+
+
+def test_qsa_accepts_a_quantized_cache(monkeypatch):
+    """QSA is the one index-key family that does descale: its paged K/V goes through the
+    in-tree Triton kernel, which takes the pool's scale pair. Only that slab quantizes, so
+    the family stays on the accepted list even though its index tiers do not."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)
+    config = _config("qsa", attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    _adjust_config(config)
+    assert config.attention_backend == "qsa_sparse"
+    assert config.kv_quant is not None
 
 
 def test_auto_names_the_backends_a_quantized_cache_blocked(monkeypatch):

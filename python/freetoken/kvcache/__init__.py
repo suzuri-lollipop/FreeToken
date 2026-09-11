@@ -78,10 +78,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
 
 
 # Pool families that can hold a quantized KV buffer: they own a plain [slots, heads, dim]
-# K/V slab and route every read through an attention kernel that takes descales. MLA/DSA/
-# BSA/QSA/DSV4 pools carry latent or index-key tiers whose kernels have no scale argument,
-# so an fp8 cache there would be silently misread.
-FP8_KV_POOL_FAMILIES = frozenset({"MHAKVCache", "HybridSWAKVCache"})
+# K/V slab and route every read through an attention kernel that takes descales (QSA's index
+# tiers ride the compute dtype and never see a scale). MLA/DSA/BSA/DSV4 pools carry latent or
+# index-key tiers whose kernels have no scale argument, so an fp8 cache there would be
+# silently misread.
+FP8_KV_POOL_FAMILIES = frozenset({"MHAKVCache", "HybridSWAKVCache", "QSAKVCache"})
 
 
 def check_kv_quant(quant, model_config) -> None:
@@ -231,6 +232,7 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            quant=quant,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

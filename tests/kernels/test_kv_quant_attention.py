@@ -13,6 +13,7 @@ from freetoken.kernel.triton.attention import (
     paged_attention,
 )
 from freetoken.kernel.triton.kv_quant import store_kv_e4m3
+from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -159,3 +160,71 @@ def test_a_missing_descale_is_a_visible_error_not_a_silent_one():
     right = paged_attention(**common, k_scale=K_SCALE, v_scale=V_SCALE)
     wrong = paged_attention(**common)  # scales default to 1.0
     assert (right.float() - wrong.float()).abs().max() > 0.1
+
+
+# ---- QSA sparse attend ------------------------------------------------------------------
+#
+# The QSA kernel reads its K/V through a page table instead of a flat index list, and its
+# split-K partials are stored normalized, so the descale rides the partial rather than every
+# tile. Both the split=1 direct store and the split-K + merge path are checked.
+
+PAGE_SIZE = 16
+PAGES_PER_REQ = 4
+
+
+def _qsa_setup(topk, head_dim=64, num_rows=3, q_heads=6, kv_heads=2, seed=0):
+    """Two requests' worth of pages in fp8 plus the same rows one dtype wider, with a
+    selection that spans several pages of each request. Columns past a row's visible length
+    are -1, the padding the QSA selection emits for tokens not generated yet."""
+    torch.manual_seed(seed)
+    device = "cuda"
+    num_reqs = 2
+    total = num_reqs * PAGES_PER_REQ * PAGE_SIZE
+    k_src = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16) * 3
+    v_src = torch.randn(total, kv_heads, head_dim, device=device, dtype=torch.bfloat16) * 2
+    k8 = torch.zeros(total, kv_heads * head_dim, device=device, dtype=torch.float8_e4m3fn)
+    v8 = torch.zeros(total, kv_heads * head_dim, device=device, dtype=torch.float8_e4m3fn)
+    slots = torch.arange(total, dtype=torch.int32, device=device)
+    store_kv_e4m3(k8, v8, slots, k_src, v_src, K_SCALE, V_SCALE)
+    pages = (num_reqs * PAGES_PER_REQ, PAGE_SIZE, kv_heads, head_dim)
+    k_fp8, v_fp8 = k8.view(*pages), v8.view(*pages)
+    k_wide = (k_fp8.float() * K_SCALE).to(torch.bfloat16)
+    v_wide = (v_fp8.float() * V_SCALE).to(torch.bfloat16)
+    tokens_per_req = PAGES_PER_REQ * PAGE_SIZE
+    block_table = torch.arange(
+        num_reqs * PAGES_PER_REQ, dtype=torch.int32, device=device
+    ).view(num_reqs, PAGES_PER_REQ)
+    indices = torch.full((num_rows, topk), -1, dtype=torch.int32)
+    for row in range(num_rows):
+        visible = max(1, min(topk, 5 + 7 * row))
+        picked = (torch.arange(visible) % tokens_per_req) + (row % num_reqs) * tokens_per_req
+        indices[row, :visible] = picked.to(torch.int32)
+    return dict(
+        k_fp8=k_fp8,
+        v_fp8=v_fp8,
+        k_wide=k_wide,
+        v_wide=v_wide,
+        indices=indices.to(device),
+        block_table=block_table,
+        token_to_req=(torch.arange(num_rows) % num_reqs).to(device=device, dtype=torch.int32),
+        q=torch.randn(num_rows, q_heads, head_dim, device=device, dtype=torch.bfloat16),
+    )
+
+
+@pytest.mark.parametrize(
+    "topk, head_dim",
+    [
+        (16, 64),  # one tile -> the split=1 kernel that stores the output directly
+        (64, 64),  # four tiles -> split-K
+        (96, 64),  # a selection that does not divide into equal splits
+        (64, 256),  # the shipping QSA head_dim
+    ],
+)
+def test_qsa_sparse_attention_reads_e4m3_cache(topk, head_dim):
+    s = _qsa_setup(topk, head_dim=head_dim)
+    selection = (s["indices"], s["block_table"], s["token_to_req"])
+    fp8 = qsa_sparse_paged_attention(
+        s["q"], s["k_fp8"], s["v_fp8"], *selection, k_scale=K_SCALE, v_scale=V_SCALE
+    )
+    wide = qsa_sparse_paged_attention(s["q"], s["k_wide"], s["v_wide"], *selection)
+    _assert_matches(fp8, wide)

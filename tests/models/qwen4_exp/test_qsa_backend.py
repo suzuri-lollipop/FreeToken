@@ -5,7 +5,9 @@
     exactly the causal prefix and the layer output must match ``TorchDenseQSAReference`` (fp32)
     and a flashinfer dense run over the same pool;
 (b) chunked prefill at unaligned cut points equals one-shot prefill (the dual-source compress);
-(c) a captured decode replay equals the eager decode step.
+(c) a captured decode replay equals the eager decode step;
+(d) a quantized (fp8) pool read back through the same backend matches a plain pool parked on
+    exactly what the fp8 buffer recorded.
 """
 
 from __future__ import annotations
@@ -248,3 +250,66 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+@requires_cuda
+def test_fp8_pool_reads_back_through_the_backend():
+    """End of the QSA pipe for a quantized cache: store_kv quantizes on write and the sparse
+    attend kernel descales on read. The reference run is the same scenario over a plain pool
+    parked on exactly what the fp8 buffer recorded, so what is left between the two is the
+    descale plumbing and not the e4m3 error.
+
+    The scenarios run one after the other rather than side by side: a Fixture installs its
+    own global context, and the layer resolves the backend through it, so two live fixtures
+    would both drive the last-built pool."""
+    from freetoken.kvcache.kv_quant import KVQuant
+
+    config = parsed_config()
+    quant = KVQuant(dtype=torch.float8_e4m3fn, k_scale=0.5, v_scale=4.0)
+    length, steps = 300, 3
+    total = length + steps
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    x = (
+        torch.randn(
+            total, config.hidden_size, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        * 0.5
+    )
+
+    def scenario(pool_quant, after_prefill=None):
+        fixture = Fixture(config, num_pages=64, quant=pool_quant)
+        attn = fixture.layer(QSA_LAYER)
+        req = fixture.req(0, 0, length)
+        outs = [attn.forward(x[:length], fixture.batch([req], "prefill")).float().clone()]
+        if after_prefill is not None:
+            after_prefill(fixture)
+        for step in range(steps):
+            fixture.step(req)
+            token = x[length + step : length + step + 1]
+            outs.append(attn.forward(token, fixture.batch([req], "decode")).float().clone())
+        return fixture, outs
+
+    fp8, fp8_outs = scenario(quant)
+    assert fp8.pool.dtype is torch.float8_e4m3fn
+    assert fp8.backend.dtype is torch.bfloat16  # the query and the index tiers stay wide
+    cache_k, cache_v = fp8.pool.k_cache(QSA_LAYER), fp8.pool.v_cache(QSA_LAYER)
+    row = int(cache_k.shape[2]) * int(cache_k.shape[3])  # one token's flattened K
+    stored_k = (cache_k.float() * quant.k_scale).to(torch.bfloat16).view(-1, row)[:total]
+    stored_v = (cache_v.float() * quant.v_scale).to(torch.bfloat16).view(-1, row)[:total]
+    slots = torch.arange(total, dtype=torch.int32, device="cuda")
+
+    def park_dequantized(fixture):
+        raw_k = fixture.pool.k_cache(QSA_LAYER).view(-1, row)[:total].clone()
+        fixture.pool.store_kv(stored_k, stored_v, slots, QSA_LAYER)
+        assert not torch.equal(raw_k, stored_k), "the fp8 store must not be exact at scale 0.5"
+
+    _, wide_outs = scenario(None, park_dequantized)
+
+    for step, (got, reference) in enumerate(zip(fp8_outs[1:], wide_outs[1:]), start=1):
+        # Each step stores its own token through the fp8 path on one side only, which costs
+        # one row out of 300+. A descale that never reached the kernel is off by the scale
+        # itself (4x here), far outside the band.
+        diff = (got - reference).abs().max().item()
+        assert diff < 0.01 * reference.abs().max().item(), (
+            f"fp8 QSA pool diverged from its dequantized twin at decode step {step}: {diff}"
+        )
