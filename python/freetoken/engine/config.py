@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.layers.quantization import set_quant_config
+from freetoken.layers.quantization.scheme import FP8_BLOCK, MX_GROUP, NVFP4_GROUP
 from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+    from freetoken.models.register import ModelSpec
 
 logger = init_logger(__name__)
 
@@ -114,6 +116,10 @@ class EngineConfig:
         return cached_load_hf_config(self.model_path)
 
     @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
@@ -145,9 +151,134 @@ class EngineConfig:
         return self.model_config.rotary_config.max_position
 
     @property
+    def tp_size(self) -> int:
+        return self.tp_info.size
+
+    @property
     def max_forward_len(self) -> int:
         return self.max_seq_len
 
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
+
+
+# The scale-block width each expert format keeps along the sharded intermediate axis: a rank's
+# slice has to stay a whole number of these, or the loaded scales no longer line up.
+_EXPERT_SCALE_GROUP = {
+    "none": 1,
+    "fp8_block": FP8_BLOCK,
+    "nvfp4": NVFP4_GROUP,
+    "mxfp4": MX_GROUP,
+    "mxfp8": MX_GROUP,
+}
+
+
+def _shard_ok(total: int, tp_size: int, *, allow_replicate: bool) -> bool:
+    """Mirror of ``utils.misc.div_even``: whether ``total`` units split over ``tp_size`` ranks."""
+    if total % tp_size == 0:
+        return True
+    return allow_replicate and 0 < total < tp_size and tp_size % total == 0
+
+
+def tp_shard_error(model_config, tp_size: int) -> str | None:
+    """Why this model geometry cannot be sharded across ``tp_size`` ranks, or None.
+
+    Pure so the check is CPU-testable and runs before a CUDA context exists, rather than
+    tripping the sharders' asserts once every rank is half way through building the model.
+    """
+    if tp_size < 2:
+        return None
+    # is_moe is the engine's own key; a family may leave moe_enabled unset and be routed by
+    # its model_type (qwen3_moe), so checking only the flag would miss it.
+    moe = getattr(model_config, "is_moe", False) or getattr(model_config, "moe_enabled", False)
+    problems: list[str] = []
+    if not _shard_ok(model_config.num_qo_heads, tp_size, allow_replicate=False):
+        problems.append(f"{model_config.num_qo_heads} query heads are not divisible by {tp_size}")
+
+    groups = getattr(model_config, "attention_groups", ()) or ()
+    kv_heads = [g.num_kv_heads for g in groups if getattr(g, "num_kv_heads", None) is not None]
+    if not kv_heads:
+        kv_heads = [model_config.num_kv_heads]
+    for kv in kv_heads:
+        if not _shard_ok(kv, tp_size, allow_replicate=True):
+            problems.append(
+                f"{kv} KV heads neither split across nor replicate over {tp_size} ranks"
+            )
+    for group in groups:
+        for attr, what in (("num_key_heads", "key"), ("num_value_heads", "value")):
+            heads = getattr(group, attr, None)
+            if heads is not None and not _shard_ok(heads, tp_size, allow_replicate=True):
+                problems.append(
+                    f"linear group {group.name!r} {what} heads ({heads}) neither split "
+                    f"across nor replicate over {tp_size} ranks"
+                )
+
+    if moe:
+        expert_quant = str(getattr(model_config, "expert_quant", "none"))
+        block = _EXPERT_SCALE_GROUP.get(expert_quant, 1)
+        inter = model_config.moe_intermediate_size
+        if inter and inter % (tp_size * block):
+            problems.append(
+                f"expert intermediate size {inter} cannot be split into {tp_size} ranks "
+                f"on the {block}-column scale group of {expert_quant} experts"
+            )
+        shared = getattr(model_config, "shared_expert_intermediate_size", 0)
+        if shared and shared % tp_size:
+            problems.append(f"shared-expert intermediate size {shared} is not divisible by {tp_size}")
+    elif model_config.intermediate_size % tp_size:
+        problems.append(
+            f"MLP intermediate size {model_config.intermediate_size} is not divisible by {tp_size}"
+        )
+    return "; ".join(problems) or None
+
+
+def tp_preflight_error(config: EngineConfig) -> str | None:
+    """Why this config cannot serve at ``config.tp_info.size``, or None when it can.
+
+    The rank-spawning entry points call this so a family or geometry that has no TP
+    sharder is reported once, before any worker burns a CUDA context and a weight load.
+    """
+    tp_size = getattr(config, "tp_size", 1)  # duck-typed test configs omit it
+    if tp_size < 2:
+        return None
+    model_config = config.model_config
+    # FTW stores the tensors after the reader fused them at full width, and its replay is
+    # model-agnostic, so no rank-local slice exists to hand the sharded buffers.
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    if is_ftw_checkpoint(config.model_path):
+        return (
+            "an FTW checkpoint replays its stored full-width tensors, so it serves at "
+            "--tensor-parallel-size 1; point --model at the HF directory instead"
+        )
+    if not config.model_spec.tp_supported:
+        return (
+            f"{model_config.model_type} does not shard its checkpoint for tensor parallelism "
+            "yet; run with --tensor-parallel-size 1"
+        )
+    geometry = tp_shard_error(model_config, tp_size)
+    if geometry:
+        return f"--tensor-parallel-size {tp_size}: {geometry}"
+    # Auto resolves a MoE model to the offload family, so treat it as the same request here.
+    # The offload banks are TP-sharded for nvfp4 only: the layout declares the rank's slice
+    # and pack cuts the pieces, while the bf16 / mxfp4 / block-fp8 stacks keep their readers at
+    # full width. The CPU executor has no TP path, so cpu and hybrid stay refused.
+    from freetoken.moe import is_offload_moe_strategy
+
+    strategy = config.moe_strategy
+    moe = getattr(model_config, "is_moe", False) or getattr(model_config, "moe_enabled", False)
+    expert_quant = str(getattr(model_config, "expert_quant", "none"))
+    if moe and (is_offload_moe_strategy(strategy) or strategy == "auto"):
+        if expert_quant != "nvfp4":
+            return (
+                f"{expert_quant} experts are not TP-sharded in the offload banks yet; run a bf16 "
+                "MoE with --moe-strategy fused (experts resident on every rank), or a single rank"
+            )
+        if strategy in ("cpu", "hybrid"):
+            return (
+                f"--moe-strategy {strategy} computes experts on the CPU, whose executor has no "
+                f"tensor-parallel path yet; use --moe-strategy offload with --tensor-parallel-size "
+                f"{tp_size}"
+            )
+    return None

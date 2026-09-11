@@ -16,6 +16,7 @@ from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, g
 from freetoken.models.loader import ShardReader, iter_weight_files
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.models.register import ModelSpec, get_model_spec
+from freetoken.models.tp_shard import TpShard, module_leaf, tp_shard
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
@@ -112,8 +113,9 @@ def _dequant(scheme: QuantScheme, part: dict[str, torch.Tensor]) -> torch.Tensor
 class _DenseReader:
     """Routes each Linear tensor to the buffer its module's scheme declares; packed projections are concatenated per role once every part is in."""
 
-    def __init__(self, quant: QuantConfig | None, spec: ModelSpec) -> None:
+    def __init__(self, quant: QuantConfig | None, spec: ModelSpec, shard: TpShard | None = None) -> None:
         self.quant = quant
+        self.shard = shard
         self.groups = {fused: parts for fused, parts in spec.packed_modules_mapping if fused != "experts"}
         self.by_part: dict[str, list[tuple[str, int]]] = {}
         for fused, parts in self.groups.items():
@@ -170,11 +172,21 @@ class _DenseReader:
         del self.pending[target]
         return self._emit(target, [parts[i] for i in range(count)], stored)
 
+    def _leaves(self, target: str) -> list[str]:
+        """The checkpoint leaves that were collected into ``target``, in concat order."""
+        fused = target.rpartition(".")[2]
+        return list(self.groups.get(fused, [fused]))
+
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
         if stored is not None:
             parts = [self._check(target, stored, part) for part in parts]
             if self.scheme(target) is None:
                 parts = [{"weight": _dequant(stored, part)} for part in parts]
+        if self.shard is not None:
+            parts = [
+                self.shard.part(leaf, part)
+                for leaf, part in zip(self._leaves(target), parts, strict=True)
+            ]
         out = []
         for role in parts[0]:
             tensors = [part[role] for part in parts]
@@ -230,19 +242,30 @@ def iter_weights(
 
     Per-expert NVFP4 experts always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading supports TP=1 only")
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
+    if get_tp_info().size > 1 and config.is_moe:
+        raise NotImplementedError(
+            "qwen3_5_moe keeps its routed experts at the full intermediate width, so only "
+            "the dense checkpoints of this family shard for tensor parallelism today"
+        )
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
+    shard = tp_shard(config)
     if include_non_moe or stacked:
-        reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked)
+        reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]), shard) if include_non_moe else None
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, shard=shard)
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool):
+def _iter_shards(
+    model_path: str,
+    device: torch.device,
+    reader: _DenseReader | None,
+    *,
+    stacked: bool,
+    shard: TpShard | None = None,
+):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -262,7 +285,7 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                 elif _is_gemma_norm(name):
                     yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
-                    yield name, tensor
+                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
     if reader is not None and reader.pending:
         raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
 

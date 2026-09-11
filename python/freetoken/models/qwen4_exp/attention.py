@@ -19,9 +19,16 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import (
+    BaseOP,
+    GemmaPlusOneRMSNorm,
+    LinearColParallelMerged,
+    LinearOProj,
+    LinearReplicated,
+)
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -114,22 +121,37 @@ class Qwen4ExpAttention(BaseOP):
     ships ``q_proj``/``k_proj``/``v_proj`` separately, so the loader concatenates along dim 0.
     Other keys keep the checkpoint names: ``o_proj.weight``, ``q_norm.weight``, ``k_norm.weight``
     (both zero-centered, loaded RAW), ``indexer.*``.
+
+    Tensor parallelism: the qkv split and ``o_proj`` are rank-local (``o_proj`` all-reduces),
+    while the indexer and its compressed slab stay REPLICATED so every rank selects the same
+    top-k blocks and only its own KV heads differ.
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
+        head_dim = config.head_dim
+        tp_size = get_tp_info().size
+        if config.num_kv_heads % tp_size:
+            # The fused qkv projection slices rows of the k / v segments, so a rank holds
+            # whole KV heads; replicating one head across ranks needs the separate-kv layout.
+            raise ValueError(
+                f"QSA attention needs the {config.num_kv_heads} KV heads to divide across "
+                f"{tp_size} ranks; pick a TP size that divides them"
+            )
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
-        self.head_dim = config.head_dim
-        self.qo_attn_dim = self.num_q * self.head_dim
-        self.kv_attn_dim = self.num_kv * self.head_dim
+        # Local head counts: the indexer below stays replicated, so every rank scores the
+        # same blocks and reads the same KV pages for its own heads.
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size)
+        self.head_dim = head_dim
+        self.qo_attn_dim = self.num_q * head_dim
+        self.kv_attn_dim = self.num_kv * head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
+            config.hidden_size, [d * tp_size for d in self._qkv_split], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
+        self.o_proj = LinearOProj(
+            config.num_qo_heads * head_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)

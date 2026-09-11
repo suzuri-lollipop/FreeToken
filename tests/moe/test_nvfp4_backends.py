@@ -532,3 +532,93 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+# --------------------------------------------------------------------------- tensor parallelism
+
+
+def _full_nvfp4_pieces(seed: int = 5) -> dict[str, torch.Tensor]:
+    """One layer's routed experts in the checkpoint's own form (per projection + scales)."""
+    g = torch.Generator().manual_seed(seed)
+
+    def packed_bytes(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
+
+    def scales(*shape):
+        return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+
+    return {
+        "gate": packed_bytes(E, I, H // 2),
+        "gate_scale": scales(E, I, H // 16),
+        "gate_global": torch.full((E, 1), 2.0, dtype=torch.float16),
+        "up": packed_bytes(E, I, H // 2),
+        "up_scale": scales(E, I, H // 16),
+        "up_global": torch.full((E, 1), 4.0, dtype=torch.float16),
+        "down": packed_bytes(E, H, I // 2),
+        "down_scale": scales(E, H, I // 16),
+        "down_global": torch.full((E, 1), 0.75, dtype=torch.float16),
+    }
+
+
+def _tp_banks(kernel, pieces, world: int, rank: int, local: int):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+
+    cfg = MoEConfig(
+        num_experts=E, hidden=H, intermediate=I, top_k=TOPK,
+        tp_rank=rank, tp_size=world, strategy="offload",
+    )
+    out = {
+        role: torch.zeros((E, *spec.shape), dtype=spec.dtype)
+        for role, spec in kernel.layout(cfg).items()
+    }
+    kernel.pack({k: v.clone() for k, v in pieces.items()}, cfg, out)
+    return out
+
+
+def test_triton_nvfp4_banks_shard_the_intermediate_per_rank():
+    """Each TP rank banks its own slice: gate | up rows, down's packed columns, scales with them.
+
+    The reader keeps handing over whole experts -- it does not know the layout -- so the cut is
+    the kernel's business. This is what halves the host banks, the GPU slot cache and the PCIe
+    stream per rank; the routed forward's all-reduce sums the two halves back together.
+    """
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    pieces = _full_nvfp4_pieces()
+    local = I // 2
+    kernel = TritonNvfp4MoEKernel()
+    first, second = (_tp_banks(kernel, pieces, 2, r, local) for r in (0, 1))
+
+    assert first["gate_up"].shape == (E, 2 * local, H // 2)
+    assert torch.equal(first["gate_up"][:, :local], pieces["gate"][:, :local])
+    assert torch.equal(first["gate_up"][:, local:], pieces["up"][:, :local])
+    assert torch.equal(second["gate_up"][:, :local], pieces["gate"][:, local:])
+    assert torch.equal(second["gate_up"][:, local:], pieces["up"][:, local:])
+    assert torch.equal(first["gate_up_scale"][:, :local], pieces["gate_scale"][:, :local])
+    assert torch.equal(second["gate_up_scale"][:, local:], pieces["up_scale"][:, local:])
+
+    half, scale_cols = local // 2, local // 16
+    assert first["down"].shape == (E, H, half)
+    assert torch.equal(first["down"], pieces["down"][:, :, :half])
+    assert torch.equal(second["down"], pieces["down"][:, :, half:])
+    assert torch.equal(first["down_scale"], pieces["down_scale"][:, :, :scale_cols])
+    assert torch.equal(second["down_scale"], pieces["down_scale"][:, :, scale_cols:])
+
+    # a per-tensor global is one value per expert, identical for every rank, spread over its rows
+    assert torch.equal(
+        second["gate_up_global"],
+        torch.cat([pieces["gate_global"].expand(E, local), pieces["up_global"].expand(E, local)], dim=1)
+        .half().contiguous(),
+    )
+    assert torch.equal(second["down_global"], pieces["down_global"].expand(E, H).contiguous())
+
+
+def test_triton_nvfp4_single_rank_banks_the_whole_expert():
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    pieces = _full_nvfp4_pieces()
+    banks = _tp_banks(TritonNvfp4MoEKernel(), pieces, 1, 0, I)
+    assert torch.equal(banks["gate_up"], torch.cat([pieces["gate"], pieces["up"]], dim=1))
+    assert torch.equal(banks["down"], pieces["down"])
+    assert banks["down_scale"].shape == (E, H, I // 16)
+

@@ -7,6 +7,7 @@ config; the dense pass has to fill exactly those buffers whatever the checkpoint
 
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -573,3 +574,153 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
     (tmp_path / "config.json").write_text(json.dumps(_config_json(True, quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+# --------------------------------------------------------------------------- tensor parallelism
+
+
+@contextlib.contextmanager
+def _tp_rank(rank: int, world: int):
+    """Run the body as one rank of a TP group, then restore the module's single-rank default."""
+    from freetoken.distributed import DistributedInfo, info
+
+    saved = info._TP_INFO
+    info._TP_INFO = DistributedInfo(rank, world)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
+
+
+@pytest.fixture(scope="module")
+def dense_folder(tmp_path_factory):
+    """The one dense layout: every Linear of a Qwen3.5-style text tower, NVFP4-quantized."""
+    torch.manual_seed(11)
+    moe, quant, raw = _layout("ct_nvfp4_dense")
+    assert not moe
+    return _write(tmp_path_factory.mktemp("dense-tp"), moe, quant, raw)
+
+
+def test_dense_tp_ranks_fill_their_own_buffers(dense_folder):
+    """The sharded reader lands exactly in the buffers a rank's model declares."""
+    for rank in (0, 1):
+        with _tp_rank(rank, 2):
+            loaded, state = _load(dense_folder), _meta_state_dict(dense_folder)
+        assert set(loaded) == set(state)
+        for key, tensor in loaded.items():
+            assert tensor.shape == state[key].shape, (
+                f"rank {rank}: {key} is {tuple(tensor.shape)}, model wants {tuple(state[key].shape)}"
+            )
+
+
+@pytest.fixture(scope="module")
+def dense_raw():
+    """The tensors ``dense_folder`` wrote; the seed and the layout make them identical."""
+    torch.manual_seed(11)
+    return _layout("ct_nvfp4_dense")[2]
+
+
+def test_tp_rank_reads_its_own_rows_and_columns(dense_folder, dense_raw):
+    """Rank 1 of two holds the second half of every sharded buffer, from the raw checkpoint.
+
+    A fused buffer keeps its parts in checkpoint order, so a rank's rows are that rank's
+    slice of EVERY part -- the gate | up halves and the q | k | v runs are not one
+    contiguous block of the fused tensor. Scale tables follow their weight's rows.
+    """
+    # the reader renames model.language_model.* -> model.*, the raw keys keep the prefix
+    attn, gdn, mlp = "model.layers.1.self_attn", "model.layers.0.linear_attn", "model.layers.0.mlp"
+    key, value, heads = KH * HD, VH * HD, VH
+    with _tp_rank(1, 2):
+        got = _load(dense_folder)
+
+    def raw(name: str) -> torch.Tensor:
+        """The raw checkpoint tensor behind an emitted (renamed, role-normalized) key."""
+        stored = f"{LM}.{name[len('model.'):]}" if name.startswith("model.") else name
+        base, _, role = stored.rpartition(".")
+        for candidate in (stored, f"{base}.weight_packed"):
+            if candidate in dense_raw:
+                return dense_raw[candidate]
+        raise KeyError(name)
+
+    def tail(t: torch.Tensor) -> torch.Tensor:
+        return t[t.shape[0] // 2 :]
+
+    def tail_cols(t: torch.Tensor) -> torch.Tensor:
+        """rank 1's half of a column-sharded weight, in its own (possibly packed) units."""
+        return t[:, t.shape[1] // 2 :]
+
+    def runs(t: torch.Tensor) -> torch.Tensor:
+        """rank 1's head from each of the q | k | v row runs of a GDN buffer."""
+        return torch.cat(
+            [
+                t[key // 2 : key],
+                t[key + key // 2 : 2 * key],
+                t[2 * key + value // 2 : 2 * key + value],
+            ],
+            dim=0,
+        )
+
+    qkv = got[f"{attn}.qkv_proj.weight"]
+    nq, nk = QH * AHD, KVH * AHD // 2
+    assert torch.equal(qkv[:nq], tail(raw(f"{attn}.q_proj.weight")))
+    assert torch.equal(qkv[nq : nq + nk], tail(raw(f"{attn}.k_proj.weight")))
+    assert torch.equal(qkv[nq + nk :], tail(raw(f"{attn}.v_proj.weight")))
+    assert torch.equal(got[f"{attn}.o_proj.weight"], tail_cols(raw(f"{attn}.o_proj.weight")))
+
+    gu, gu_scale = got[f"{mlp}.gate_up_proj.weight"], got[f"{mlp}.gate_up_proj.weight_scale"]
+    assert torch.equal(gu[: I // 2], tail(raw(f"{mlp}.gate_proj.weight")))
+    assert torch.equal(gu[I // 2 :], tail(raw(f"{mlp}.up_proj.weight")))
+    assert torch.equal(gu_scale[: I // 2], tail(raw(f"{mlp}.gate_proj.weight_scale")))
+    assert torch.equal(gu_scale[I // 2 :], tail(raw(f"{mlp}.up_proj.weight_scale")))
+    assert torch.equal(got[f"{mlp}.down_proj.weight"], tail_cols(raw(f"{mlp}.down_proj.weight")))
+
+    qkvz = got[f"{gdn}.in_proj_qkvz.weight"]
+    assert torch.equal(qkvz[: key + value // 2], runs(raw(f"{gdn}.in_proj_qkv.weight")))
+    assert torch.equal(qkvz[key + value // 2 :], tail(raw(f"{gdn}.in_proj_z.weight")))
+    assert torch.equal(
+        got[f"{gdn}.in_proj_qkvz.weight_scale"][: key + value // 2], runs(raw(f"{gdn}.in_proj_qkv.weight_scale"))
+    )
+    ba = got[f"{gdn}.in_proj_ba.weight"]
+    assert torch.equal(ba[: heads // 2], tail(raw(f"{gdn}.in_proj_b.weight")))
+    assert torch.equal(ba[heads // 2 :], tail(raw(f"{gdn}.in_proj_a.weight")))
+    assert torch.equal(got[f"{gdn}.conv1d.weight"], runs(raw(f"{gdn}.conv1d.weight")))
+    assert torch.equal(got[f"{gdn}.A_log"], raw(f"{gdn}.A_log")[VH // 2 :])
+    assert torch.equal(got[f"{gdn}.dt_bias"], raw(f"{gdn}.dt_bias")[VH // 2 :])
+    assert torch.equal(got[f"{gdn}.out_proj.weight"], tail_cols(raw(f"{gdn}.out_proj.weight")))
+    assert torch.equal(got["model.embed_tokens.weight"], raw("model.embed_tokens.weight")[V // 2 :])
+    assert torch.equal(got["lm_head.weight"], raw("lm_head.weight")[V // 2 :])
+    # per-head norms stay whole on every rank, with the loader's (1 + weight) bake-in
+    assert torch.equal(got[f"{gdn}.norm.weight"], raw(f"{gdn}.norm.weight"))
+    assert torch.equal(got[f"{attn}.q_norm.weight"], raw(f"{attn}.q_norm.weight") + 1.0)
+
+
+def test_attention_refuses_kv_heads_that_cannot_split(dense_folder):
+    from dataclasses import replace
+
+    from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
+
+    config = replace(parse_config(cached_load_hf_config(dense_folder)), num_kv_heads=3)
+    with _tp_rank(0, 2), pytest.raises(ValueError, match="KV heads to divide"):
+        Qwen3_5Attention(config, 0)
+
+
+def test_gdn_refuses_heads_that_cannot_split(dense_folder):
+    from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+
+    g = parse_config(cached_load_hf_config(dense_folder)).linear_attention_group()
+    with _tp_rank(0, 2), pytest.raises(ValueError, match="value heads to divide"):
+        Qwen3_5GatedDeltaNet(
+            hidden_size=H, num_k_heads=3, num_v_heads=g.num_value_heads,
+            head_k_dim=g.key_head_dim, head_v_dim=g.value_head_dim,
+            conv_kernel_size=g.conv_kernel_dim, rms_norm_eps=1e-6, layer_id=0,
+        )
+
+
+def test_routed_experts_of_this_family_are_still_refused(tmp_path):
+    """The MoE variant of the family keeps its experts at full width, so the reader says no."""
+    torch.manual_seed(3)
+    moe, quant, raw = _layout("bf16")
+    with _tp_rank(0, 1):
+        folder = _write(tmp_path, moe, quant, raw)
+    with _tp_rank(0, 2), pytest.raises(NotImplementedError, match="routed experts"):
+        _load(folder)

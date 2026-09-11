@@ -274,6 +274,12 @@ def format_gpu_uuid(raw) -> str | None:
     return None if raw is None else f"{UUID_PREFIX}{raw}"
 
 
+def physical_gpu_count() -> "int | None":
+    """How many GPUs NVML sees in physical order, or None when NVML is unavailable."""
+    uuids = _nvml_uuids()
+    return None if uuids is None else len(uuids)
+
+
 def gpu_identity(index: int) -> dict:
     """{index, name, uuid, total_bytes} of visible device ``index``."""
     import torch

@@ -9,6 +9,10 @@ experts into a GPU slot cache. Rules every kernel here follows:
 * Every pack keeps the expert dimension outermost with per-expert blocks contiguous
   and byte-identical in size to the native layout, so the banks are repacked *in
   place* and the offload cache's slot gather (``copy_missing``) works unchanged.
+* A TP rank packs and reads only its own slice of the expert intermediate (``cfg.local_intermediate``):
+  the layout declares the local banks, the pack cuts the incoming pieces to match, and the
+  routed forward's all-reduce sums the halves. Marlin and b12x keep their tile geometry and
+  stay TP=1.
 * The per-tensor global scales never enter the offload banks: they are tiny
   ``[L*E]`` vectors kept resident on the GPU and gathered per forward call
   (device-side, CUDA-graph safe).
@@ -34,6 +38,37 @@ MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
 
 
+def tp_piece(piece: torch.Tensor, axis: int, rank: int, total: int, local: int) -> torch.Tensor:
+    """A rank's slice of one expert piece along ``axis``, where the piece tiles ``total`` units.
+
+    A scale grid is thinner than its weight by the quant group, so the cut is taken in the
+    piece's own units; anything that does not tile ``total`` exactly (a per-tensor scale held
+    as one column, or a hidden-sized row vector) is returned whole.
+    """
+    if piece.dim() <= axis:
+        return piece
+    blocks = piece.shape[axis]
+    if not blocks or total % blocks:
+        return piece
+    per = total // blocks
+    if local % per:
+        return piece
+    return piece.narrow(axis, rank * (local // per), local // per)
+
+
+def tp_rows(piece: torch.Tensor, axis: int, rank: int, total: int, local: int) -> torch.Tensor:
+    """``tp_piece`` for an axis that may hold the fused [gate | up] pair: two cuts, not one."""
+    if piece.dim() > axis and piece.shape[axis] == 2 * total:
+        return torch.cat(
+            [
+                piece.narrow(axis, rank * local, local),
+                piece.narrow(axis, total + rank * local, local),
+            ],
+            dim=axis,
+        )
+    return tp_piece(piece, axis, rank, total, local)
+
+
 class TritonNvfp4MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native ModelOpt rows."""
 
@@ -41,14 +76,16 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # banks hold this rank's slice of the expert intermediate; the host RAM, the GPU slot
+        # cache and the PCIe stream all shrink with it, and pack() writes the matching slice
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -59,9 +96,17 @@ class TritonNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
+        total, local, rank = cfg.intermediate, cfg.local_intermediate, cfg.tp_rank
+        if cfg.tp_size > 1:
+            # the reader hands over full experts; this rank banks its own slice of the
+            # intermediate, so the host banks, the slot cache and the PCIe stream halve
+            pieces = {
+                role: tp_rows(t, 2 if role.startswith("down") else 1, rank, total, local)
+                for role, t in pieces.items()
+            }
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, local))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))

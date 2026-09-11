@@ -22,7 +22,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
-from .config import EngineConfig
+from .config import EngineConfig, tp_preflight_error
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
@@ -105,10 +105,17 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
     )
 
 
-def _backend_requirements_met(name: str, fp8_kv: bool = False) -> bool:
+_ATTENTION_BACKEND_NAMES = (
+    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse", "qsa_sparse",
+)
+
+
+def _backend_requirements_met(name: str, fp8_kv: bool = False, tp_size: int = 1) -> bool:
+    infos = [attention_backend_info(part) for part in name.split(",")]
+    if tp_size > 1 and any(not i.supports_tp for i in infos):
+        return False
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
-    infos = [attention_backend_info(part) for part in name.split(",")]
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
         return False
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
@@ -122,11 +129,14 @@ def _backend_requirements_met(name: str, fp8_kv: bool = False) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType], fp8_kv: bool = False) -> str:
+def _resolve_auto_attention_backend(
+    required: frozenset[AttnType], fp8_kv: bool = False, tp_size: int = 1
+) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
-    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
+    sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
+    Tensor parallelism narrows that to the backends that read TP-local heads."""
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
@@ -151,15 +161,20 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType], fp8_kv: bool 
             continue
         if not _backend_parts_serve(name, required):
             continue
-        if not _backend_requirements_met(name, fp8_kv):
+        if not _backend_requirements_met(name, fp8_kv, tp_size):
             # Would it run without the quantized cache? Then the flag, not the hardware or
             # the packages, is what took this candidate out of the list.
-            if fp8_kv and _backend_requirements_met(name):
+            if fp8_kv and _backend_requirements_met(name, tp_size=tp_size):
                 quant_skipped.append(name)
             continue
         return name
     msg = "No attention backend can serve attention types "
     msg += f"{sorted(t.value for t in required)} on this machine"
+    if tp_size > 1:
+        msg += (
+            f"; with tensor parallelism over {tp_size} ranks only backends that shard their "
+            "attention heads qualify"
+        )
     if fp8_kv:
         msg += " with a quantized KV cache (--kv-cache-dtype)"
         if quant_skipped:
@@ -186,6 +201,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     validate_attn_backend(config.attention_backend, allow_auto=False)
 
     model_config = config.model_config
+    tp_size = getattr(config, "tp_size", 1)  # duck-typed test configs omit it
     backend_parts = [p.strip() for p in config.attention_backend.split(",")]
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -193,10 +209,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
         if missing:
             valid = [
                 name
-                for name in (
-                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse",
-                    "qsa_sparse",
-                )
+                for name in _ATTENTION_BACKEND_NAMES
                 if required <= attention_backend_info(name).supported_types
             ]
             missing_names = "/".join(sorted(t.value for t in missing))
@@ -219,6 +232,18 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"--kv-cache-dtype {config.kv_cache_dtype} needs a backend that descales a "
                 f"quantized KV cache; {part!r} does not. Use "
                 f"--attention-backend triton (or fi), or drop --kv-cache-dtype."
+            )
+        if tp_size > 1 and not info.supports_tp:
+            # A non-sharding backend would read global head counts against the TP-local KV
+            # pool and silently attend over the wrong heads.
+            tp_valid = [
+                name for name in _ATTENTION_BACKEND_NAMES
+                if attention_backend_info(name).supports_tp
+            ]
+            raise ValueError(
+                f"backend {part!r} does not shard attention heads, so it cannot run with "
+                f"--tensor-parallel-size {tp_size}; TP supports "
+                f"{', '.join(tp_valid)} (or auto), got {config.attention_backend!r}."
             )
 
     # An explicitly-selected backend may require a package that isn't installed. Auto
@@ -1363,6 +1388,8 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    # Duck-typed test configs omit tp_info; absent means the single-rank view.
+    tp_size = getattr(config, "tp_size", 1)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
@@ -1467,7 +1494,9 @@ def _adjust_config(config: EngineConfig):
         override(
             "attention_backend",
             _resolve_auto_attention_backend(
-                required_attn_types, getattr(config, "kv_quant", None) is not None
+                required_attn_types,
+                getattr(config, "kv_quant", None) is not None,
+                tp_size,
             ),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
@@ -1543,6 +1572,13 @@ def _adjust_config(config: EngineConfig):
                     f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
                     f"extension predates activation {_act!r} (rebuild with "
                     f"`python setup.py build_ext --inplace`); staying on offload"
+                )
+            elif tp_size > 1:
+                # hybrid splits a step's misses between the PCIe fetch and the CPU executor,
+                # and the CPU half has no tensor-parallel path; the offload banks do.
+                logger.info_rank0(
+                    "benchbw profile recommends hybrid, but the CPU MoE executor has no TP path; "
+                    "staying on offload"
                 )
             else:
                 default_backend = "hybrid"
@@ -1648,6 +1684,13 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
         object.__setattr__(model_config, "decode_target", _decode_target(config))
 
+    # TP pre-flight, once the strategy is final: 'auto' on a MoE model means the offload
+    # family, which no rank can price yet. parse_args -> launch_server screens this first for
+    # the CLI; this also covers the programmatic LLM(...) path.
+    tp_error = tp_preflight_error(config)
+    if tp_error is not None:
+        raise ValueError(tp_error)
+
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.
     if config.num_token_override is not None:
@@ -1684,6 +1727,7 @@ def _adjust_config(config: EngineConfig):
         f"attention_backend={config.attention_backend!r}",
         f"cache_type={getattr(config, 'cache_type', 'radix')!r}",
         f"page_size={config.page_size}",
+        f"tp_size={tp_size}",
     ]
     if is_moe:
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")

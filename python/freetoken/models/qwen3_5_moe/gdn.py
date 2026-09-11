@@ -3,8 +3,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
@@ -15,6 +16,25 @@ class _DepthwiseConv1d(BaseOP):
 
     def __init__(self, conv_dim: int, kernel: int):
         self.weight = torch.empty(conv_dim, 1, kernel)
+
+
+def gdn_local_dims(
+    num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int, tp_size: int
+) -> tuple[int, int, int, int, int]:
+    """The rank's ``(k_heads, v_heads, key_dim, value_dim, conv_dim)`` under tensor parallelism.
+
+    Both GatedDeltaNet implementations and ``LinearStatePool._linear_local_dims`` derive the
+    same conv layout from this head split; the fused ``in_proj`` slices whole heads, so this
+    refuses the KV-style replication the pool would otherwise allow.
+    """
+    if num_k_heads % tp_size or num_v_heads % tp_size:
+        raise ValueError(
+            f"GatedDeltaNet needs the {num_k_heads} key / {num_v_heads} value heads to divide "
+            f"across {tp_size} ranks; pick a TP size that divides them"
+        )
+    k_heads, v_heads = num_k_heads // tp_size, num_v_heads // tp_size
+    key_dim, value_dim = k_heads * head_k_dim, v_heads * head_v_dim
+    return k_heads, v_heads, key_dim, value_dim, 2 * key_dim + value_dim
 
 
 class Qwen3_5GatedDeltaNet(BaseOP):
@@ -40,23 +60,26 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        tp_size = get_tp_info().size
+        # The rank's local head/dim set; the state pool splits the same way (gdn_local_dims).
+        (self.num_k_heads, self.num_v_heads, self.key_dim, self.value_dim, self.conv_dim) = (
+            gdn_local_dims(num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size)
+        )
+        self.full_key_dim = num_k_heads * head_k_dim
+        self.full_value_dim = num_v_heads * head_v_dim
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
-        self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        full_conv_dim = 2 * self.full_key_dim + self.full_value_dim
+        self._in_proj_split = [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads]
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                hidden_size, [full_conv_dim, self.full_value_dim], has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
@@ -66,7 +89,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
+                hidden_size, [full_conv_dim, self.full_value_dim, num_v_heads, num_v_heads],
+                has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
@@ -74,11 +98,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
-        self.out_proj = LinearReplicated(
-            self.value_dim, hidden_size, has_bias=False,
+        self.out_proj = LinearRowParallel(
+            self.full_value_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 

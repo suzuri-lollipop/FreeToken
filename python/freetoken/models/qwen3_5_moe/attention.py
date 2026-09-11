@@ -4,9 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GemmaRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -21,15 +22,23 @@ class Qwen3_5Attention(BaseOP):
         attn = paged_attention(q, k, v)
         out = o_proj(attn * sigmoid(gate))
 
-    TP note: uses replicated linears (tp=1 correctness milestone); swap to
-    column/row-parallel for tensor parallelism later.
+    Head counts below are this rank's local ones: qkv_proj splits its output across the
+    ranks and o_proj is row-parallel, so its all-reduce returns the summed hidden states.
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         head_dim = config.head_dim
+        tp_size = get_tp_info().size
+        if config.num_kv_heads % tp_size:
+            # The fused projection slices rows of the k / v segments, so a rank holds whole
+            # KV heads; replicating one head across ranks needs the separate-kv projection.
+            raise ValueError(
+                f"Qwen3.5 attention needs the {config.num_kv_heads} KV heads to divide "
+                f"across {tp_size} ranks; pick a TP size that divides them"
+            )
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size)
         self.head_dim = head_dim
         self.qo_attn_dim = self.num_q * head_dim
         self.kv_attn_dim = self.num_kv * head_dim
@@ -38,7 +47,7 @@ class Qwen3_5Attention(BaseOP):
         # output gate. Split sizes: [num_q*head_dim*2, num_kv*head_dim, num_kv*head_dim].
         self._qkv_split = [self.num_q * head_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
+            config.hidden_size, [d * tp_size for d in self._qkv_split], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
         # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
@@ -56,8 +65,8 @@ class Qwen3_5Attention(BaseOP):
                 else None
             ),
         )
-        self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
+        self.o_proj = LinearOProj(
+            config.num_qo_heads * head_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
 

@@ -27,6 +27,9 @@ class BackendInfo:
     requires_flashinfer: bool = False
     requires_sgl_kernel: bool = False
     requires_sm100: bool = False
+    # Reads local q/KV head counts against the TP-sharded KV pool. Backends without it are
+    # dropped by auto selection and refused by an explicit choice once --tp-size > 1.
+    supports_tp: bool = False
     # Allowed page sizes (None -> any). Config-time resolution coerces to the last
     # entry when the resolved page_size is not in the list.
     page_sizes: tuple[int, ...] | None = None
@@ -68,6 +71,7 @@ def create_trtllm_backend(config: ModelConfig):
         supported_types=frozenset({AttnType.FULL}),
         requires_flashinfer=True,
         supports_fp8_kv=True,
+        supports_tp=True,
     ),
 )
 def create_fi_backend(config: ModelConfig):
@@ -152,6 +156,8 @@ def create_m3_sparse_backend(config: ModelConfig):
     "qsa_sparse",
     BackendInfo(
         supported_types=frozenset({AttnType.QSA}),
+        # the replicated indexer makes every rank pick the same blocks
+        supports_tp=True,
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),
