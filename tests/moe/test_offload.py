@@ -876,3 +876,177 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+# ---- --expert-load auto: the low-RAM veto is sized by the experts, not the whole checkpoint ----
+
+
+def _write_fake_shard(path, tensors: dict[str, int]) -> int:
+    """A safetensors-shaped file (u64 header length + JSON header + zero-filled region)."""
+    import json
+    import struct
+
+    header, end = {}, 0
+    for name, nbytes in tensors.items():
+        header[name] = {"dtype": "U8", "shape": [nbytes], "data_offsets": [end, end + nbytes]}
+        end += nbytes
+    blob = json.dumps(header).encode() + b" " * 8
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        f.write(b"\0" * end)
+    return 8 + len(blob) + end
+
+
+def _fake_checkpoint(tmp_path, *, expert_tensor_bytes: int, experts: int, side_bytes: int) -> dict[str, int]:
+    """Many SMALL expert tensors, a dense shard, and a far bigger side file listed in the index --
+    the Qwen3.8-Flash-Next shape, whose PLE/MTP file the expert reader never opens."""
+    import json
+
+    projs = ("gate", "up", "down")
+    expert_tensors = {
+        f"model.language_model.layers.{i // 3}.mlp.experts.{i}.{projs[i % 3]}_proj.weight": expert_tensor_bytes
+        for i in range(experts)
+    }
+    side_experts = 8
+    shards = {
+        "model-00001-of-00003.safetensors": expert_tensors,
+        "model-00002-of-00003.safetensors": {f"model.language_model.layers.{i}.mlp.gate_proj.weight": 2 << 20 for i in range(2)},
+        # Qwen3.8-Flash-Next shape: a huge side file whose expert tensors belong to the speculative
+        # head the loader drops, so the reader never opens it.
+        "model-00003-of-00003.safetensors": {
+            f"mtp.layers.0.mlp.experts.{i}.gate_proj.weight_scale_inv": side_bytes // side_experts
+            for i in range(side_experts)
+        },
+    }
+    sizes = {shard: _write_fake_shard(tmp_path / shard, tensors) for shard, tensors in shards.items()}
+    weight_map = {name: shard for shard, tensors in shards.items() for name in tensors}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    return sizes
+
+
+def _scattered_checkpoint(tmp_path, **kw) -> dict[str, int]:
+    return _fake_checkpoint(tmp_path, expert_tensor_bytes=64 << 10, experts=96, side_bytes=16 << 20, **kw)
+
+
+def _main_stack_experts():
+    """The predicate a reader uses to keep the served model's experts (qwen4_exp's anchor)."""
+    import re
+
+    return re.compile(r"^model\.language_model\.layers\.\d+\.mlp\.experts\.\d+\.").match
+
+
+def _unknown_banks_config():
+    """A config that leaves ``bank_bytes_estimate()`` unknown, forcing the expert-bytes fallback."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        num_moe_layers=None, expert_quant="none", moe_weight_format=None,
+        num_experts=None, hidden_size=None, moe_intermediate_size=None,
+    )
+
+
+def _serve_expert_matcher(monkeypatch, matcher):
+    """Stand in for the model's own expert key predicate (resolving it needs a registered spec)."""
+    import freetoken.moe.expert_pieces as ep
+
+    monkeypatch.setattr(ep, "expert_key_matcher", lambda path, config, kind: matcher)
+
+
+def test_expert_storage_sizes_experts_not_the_checkpoint(tmp_path):
+    from freetoken.models.weight import expert_storage
+
+    sizes = _scattered_checkpoint(tmp_path)
+    generic = expert_storage(str(tmp_path))
+    assert generic.expert_bytes == 96 * (64 << 10) + (16 << 20)
+    # a reader that only knows ".experts." in the name would buffer the speculative head's shard
+    assert generic.expert_shard_bytes == sizes["model-00003-of-00003.safetensors"]
+
+    served = expert_storage(str(tmp_path), _main_stack_experts())
+    assert served.scattered
+    assert served.expert_bytes == 96 * (64 << 10)
+    # the reader buffers whole shards, but only the shards holding tensors it will place
+    assert served.expert_shard_bytes == sizes["model-00001-of-00003.safetensors"]
+    assert served.expert_shard_bytes < max(sizes.values())
+
+
+def test_expert_key_matcher_is_best_effort():
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.moe.expert_pieces import expert_key_matcher
+
+    assert expert_key_matcher("a/path", SimpleNamespace(architectures=["Qwen4Exp"]), QuantKind.NONE) is None
+    # an unresolvable family must not raise out of a sizing heuristic
+    assert expert_key_matcher("a/path", SimpleNamespace(architectures=["NoSuchArch"]), QuantKind.NVFP4) is None
+
+
+def test_auto_expert_load_sizes_the_experts_the_reader_opens(tmp_path, monkeypatch):
+    import freetoken.moe.expert_banks as eb
+    from freetoken.models.weight import EXPERT_PREFETCH_SHARDS, expert_storage
+
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", True)
+    _serve_expert_matcher(monkeypatch, _main_stack_experts())
+    sizes = _scattered_checkpoint(tmp_path)
+    served = expert_storage(str(tmp_path), _main_stack_experts())
+    need = served.expert_bytes + (EXPERT_PREFETCH_SHARDS + 1) * served.expert_shard_bytes
+    # what the reader opens is smaller than the checkpoint: sizing by every shard plus the largest
+    # file vetoed a box that fits the experts and the buffers it reads
+    assert need < sum(sizes.values()) + max(sizes.values())
+
+    monkeypatch.setattr(eb, "_mem_available_bytes", lambda: need + (1 << 20))
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is True
+
+    monkeypatch.setattr(eb, "_mem_available_bytes", lambda: need - (1 << 20))
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is False
+
+
+def test_auto_expert_load_stays_conservative_without_the_reader_predicate(tmp_path, monkeypatch):
+    import freetoken.moe.expert_banks as eb
+    from freetoken.models.weight import EXPERT_PREFETCH_SHARDS, expert_storage
+
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", True)
+    _serve_expert_matcher(monkeypatch, None)  # a family that reads its experts its own way
+    _scattered_checkpoint(tmp_path)
+    served = expert_storage(str(tmp_path), _main_stack_experts())
+    served_need = served.expert_bytes + (EXPERT_PREFETCH_SHARDS + 1) * served.expert_shard_bytes
+    # the side file's dropped experts are still counted, so the veto stands: sizing never guesses
+    monkeypatch.setattr(eb, "_mem_available_bytes", lambda: served_need + (1 << 20))
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is False
+
+
+def test_auto_expert_load_prefers_the_kernel_bank_size(tmp_path, monkeypatch):
+    import freetoken.moe.expert_banks as eb
+    from freetoken.models.weight import EXPERT_PREFETCH_SHARDS, expert_storage
+
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", True)
+    _serve_expert_matcher(monkeypatch, _main_stack_experts())
+    _scattered_checkpoint(tmp_path)
+    served = expert_storage(str(tmp_path), _main_stack_experts())
+    # RAM exactly enough for the served expert bytes, but not for what the layout needs
+    need = served.expert_bytes + (EXPERT_PREFETCH_SHARDS + 1) * served.expert_shard_bytes
+    monkeypatch.setattr(eb, "_mem_available_bytes", lambda: need + (1 << 20))
+    monkeypatch.setattr(eb, "bank_bytes_estimate", lambda config, method: None)
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is True
+    monkeypatch.setattr(eb, "bank_bytes_estimate", lambda config, method: 8 * served.expert_bytes)
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is False
+
+
+def test_auto_expert_load_keeps_serial_when_parallel_wins_nothing(tmp_path, monkeypatch):
+    import freetoken.moe.expert_banks as eb
+
+    monkeypatch.setattr(eb, "_mem_available_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", True)
+    _serve_expert_matcher(monkeypatch, _main_stack_experts())
+    _scattered_checkpoint(tmp_path)
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, True) is False  # dummy
+
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", False)
+    assert eb._auto_pick_parallel(str(tmp_path), _unknown_banks_config(), None, False) is False
+
+    monkeypatch.setattr(eb, "_PARALLEL_READER_SUPPORTED", True)
+    packed = tmp_path / "packed"
+    packed.mkdir()
+    # experts pre-packed into a few big tensors: serial already saturates the disk
+    _fake_checkpoint(packed, expert_tensor_bytes=64 << 20, experts=3, side_bytes=1 << 20)
+    assert eb._auto_pick_parallel(str(packed), _unknown_banks_config(), None, False) is False
