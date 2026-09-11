@@ -65,6 +65,13 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    # --kv-cache-dtype: "auto" keeps the model dtype; "fp8_e4m3" stores the KV pool in
+    # e4m3 (half the bytes, one static descale pair). See kvcache/kv_quant.py.
+    kv_cache_dtype: str = "auto"
+    # --kv-cache-quant-scale: the static scale both K and V divide by on the way in.
+    # 1.0 fits normalized attention states; raise it (2, 4, ...) when activations have a
+    # wider range than e4m3 can hold, lower it to spend the range you do not need.
+    kv_cache_quant_scale: float = 1.0
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -108,6 +115,23 @@ class EngineConfig:
         set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
         return replace(parse_config(self.hf_config), quant=quant)
+
+    @cached_property
+    def kv_quant(self):
+        """``KVQuant`` for a quantized KV pool, None when the pool keeps ``dtype``.
+
+        Cached: the pool and every attention read must agree on one scale pair for the
+        lifetime of the process (the scales reach kernels as scalars baked into captured
+        graphs), so this is resolved once instead of per call.
+        """
+        from freetoken.kvcache.kv_quant import resolve_kv_quant
+
+        return resolve_kv_quant(self, self.kv_cache_dtype, self.kv_cache_quant_scale)
+
+    @property
+    def kv_dtype(self) -> torch.dtype:
+        """The dtype the KV pool's buffer is allocated in."""
+        return self.dtype if self.kv_quant is None else self.kv_quant.dtype
 
     @property
     def max_seq_len(self) -> int:

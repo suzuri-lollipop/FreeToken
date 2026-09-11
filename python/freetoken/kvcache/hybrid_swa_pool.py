@@ -37,6 +37,7 @@ class HybridSWAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         num_swa_tokens: int | None = None,
+        quant=None,
     ) -> None:
         specs = {group.name: group for group in groups if group.num_layers > 0}
         if set(specs) != {"full", "swa"}:
@@ -44,6 +45,10 @@ class HybridSWAKVCache(BaseKVCachePool):
 
         self._num_layers = num_layers
         self._device = device
+        # A quantized pool stores both tiers in its own dtype and descales on read.
+        self._quant = quant
+        if quant is not None:
+            dtype = quant.dtype
         self._dtype = dtype
         self._full_num_tokens = num_full_pages * page_size
         self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
@@ -207,13 +212,26 @@ class HybridSWAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
-        from freetoken.kernel import store_cache
-
         ref = self.layers_mapping[layer_id]
         storage = self._storages[ref.group]
         indices = out_loc
         if ref.group == "swa":
             indices = self.translate_loc_from_full_to_swa(out_loc)
+        if self._quant is not None:
+            from freetoken.kernel.triton.kv_quant import store_kv_e4m3
+
+            store_kv_e4m3(
+                k_cache=storage.k_buffer[ref.index].view(storage.storage_shape),
+                v_cache=storage.v_buffer[ref.index].view(storage.storage_shape),
+                indices=indices,
+                k=k,
+                v=v,
+                k_scale=self._quant.k_scale,
+                v_scale=self._quant.v_scale,
+            )
+            return
+        from freetoken.kernel import store_cache
+
         store_cache(
             k_cache=storage.k_buffer[ref.index].view(storage.storage_shape),
             v_cache=storage.v_buffer[ref.index].view(storage.storage_shape),
@@ -241,6 +259,10 @@ class HybridSWAKVCache(BaseKVCachePool):
     @property
     def num_layers(self) -> int:
         return self._num_layers
+
+    @property
+    def quant(self):
+        return self._quant
 
     @staticmethod
     def _group_geometry(group: _KVGroupStorage) -> tuple:

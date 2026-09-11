@@ -32,10 +32,15 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        quant=None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
+        # A quantized pool stores in its own dtype and descales on the read side.
+        self._quant = quant
+        if quant is not None:
+            dtype = quant.dtype
         if layer_ids is None:
             num_storage_layers = num_layers
             self._layer_map: list[int] | None = None
@@ -124,9 +129,22 @@ class MHAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        dense = self._dense(layer_id)
+        if self._quant is not None:
+            from freetoken.kernel.triton.kv_quant import store_kv_e4m3
+
+            store_kv_e4m3(
+                k_cache=self._k_buffer[dense].view(self._storage_shape),
+                v_cache=self._v_buffer[dense].view(self._storage_shape),
+                indices=out_loc,
+                k=k,
+                v=v,
+                k_scale=self._quant.k_scale,
+                v_scale=self._quant.v_scale,
+            )
+            return
         from freetoken.kernel import store_cache
 
-        dense = self._dense(layer_id)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
@@ -146,3 +164,7 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def num_layers(self) -> int:
         return self._num_layers
+
+    @property
+    def quant(self):
+        return self._quant
