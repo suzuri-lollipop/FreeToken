@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -307,6 +308,7 @@ class PrefillManager:
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
+        batch.scheduled_at = time.perf_counter()
         batch.prompt_admissions = prompt_admissions
         return batch
 
