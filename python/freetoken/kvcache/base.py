@@ -23,13 +23,19 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
 
+    A quantized pool (``config.kv_quant``, see ``kv_quant.py``) prices its own storage
+    dtype instead of the model dtype -- that byte saving is the whole point of the flag, so
+    the budget solve must see it or it will over-report capacity.
+
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    quant = getattr(config, "kv_quant", None)
+    itemsize = quant.itemsize if quant is not None else config.dtype.itemsize
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
@@ -165,6 +171,12 @@ class BaseKVCachePool(ABC):
     @property
     @abstractmethod
     def num_layers(self) -> int: ...
+
+    @property
+    def quant(self):
+        """``KVQuant`` of a quantized pool (see ``kv_quant.py``), None for a pool that
+        stores in the model dtype. Attention backends descale their reads through it."""
+        return None
 
 
 @dataclass(frozen=True)
