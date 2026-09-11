@@ -27,10 +27,13 @@ from freetoken.models.nvfp4_banks import (
 )
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
+from freetoken.models.tp_shard import TpShard, module_leaf, tp_shard
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+from .config import parse_config
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -112,8 +115,9 @@ class _DenseFuser:
     The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and validates each part against the scheme the model built its buffer from.
     """
 
-    def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+    def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...], shard: TpShard | None = None) -> None:
         self.quant = quant
+        self.shard = shard
         self.groups = {fused: parts for fused, parts in packed if fused != "experts"}  # experts: bank reader
         self.by_part: dict[str, list[tuple[str, int]]] = {}
         for fused, parts in self.groups.items():
@@ -175,6 +179,9 @@ class _DenseFuser:
             return None
         fused, idx = hit
         self.check(fused, name, tensor)
+        if self.shard is not None:
+            # checked against the stored (global) shape, then cut to this rank's slice
+            tensor = self.shard.tensor(leaf, tensor)
         slots = self.buf.setdefault((fused, kind), {})
         slots[idx] = tensor
         parts = self.groups[fused.rpartition(".")[2]]
@@ -203,14 +210,12 @@ def iter_weights(
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
-        return
-
+        return  # the routed experts come from the offload cache's reader, nothing here to yield
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    shard = tp_shard(parse_config(hf_config))
+    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping, shard)
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -225,7 +230,7 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, tensor
+                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
                 else:
                     yield from fused
 

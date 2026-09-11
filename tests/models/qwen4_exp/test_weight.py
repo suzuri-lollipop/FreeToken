@@ -6,6 +6,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 from types import SimpleNamespace
@@ -543,3 +544,102 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+# --------------------------------------------------------------------------- tensor parallelism
+
+
+@contextlib.contextmanager
+def _tp_rank(rank: int, world: int):
+    """Run the body as one rank of a TP group, then restore the session's single-rank default."""
+    from freetoken.distributed import DistributedInfo, info
+
+    saved = info._TP_INFO
+    info._TP_INFO = DistributedInfo(rank, world)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
+
+
+def test_tp_ranks_fill_their_own_buffers(checkpoint):
+    """Each rank's reader output is exactly the buffers the model builds for that rank."""
+    folder = checkpoint[0]
+    with _tp_rank(0, 1):
+        single, whole_state = _load(folder), meta_state_dict(folder)
+    for rank in (0, 1):
+        with _tp_rank(rank, 2):
+            got, state = _load(folder), meta_state_dict(folder)
+        assert set(got) == set(state)
+        for name, tensor in got.items():
+            if single[name].shape != whole_state[name].shape:
+                continue  # the fixture stores 11 embedding rows for a 256-token vocab
+            assert tensor.shape == state[name].shape, (
+                f"rank {rank}: {name} is {tuple(tensor.shape)}, model wants {tuple(state[name].shape)}"
+            )
+
+
+def test_tp_rank_cuts_the_projections_and_keeps_the_mixers(checkpoint, loaded):
+    """The rank's slices come out of the raw tensors; the mixers that must agree do not move.
+
+    The QSA indexer, the hyper-connections and the PLE mixers are replicated on purpose: a
+    rank with its own copy of the index keys would attend to different blocks than its peers.
+    """
+    folder, raw = checkpoint
+    with _tp_rank(1, 2):
+        got = _load(folder)
+
+    replicated = [n for n in loaded if ("indexer" in n or "hyper_connection" in n or ".ple." in n)]
+    assert len(replicated) > 10
+    for name in replicated:
+        assert torch.equal(got[name], loaded[name]), name
+
+    attn, gdn, attn_mlp = "model.layers.1.self_attn", "model.layers.0.linear_attn", "model.layers.0.mlp"
+    qkv = got[f"{attn}.qkv_proj.weight"]
+    q, k, v = (raw[f"{LM}.layers.1.self_attn.{p}_proj.weight"] for p in "qkv")
+    assert torch.equal(qkv[: QH * AHD], q[QH * AHD :])
+    assert torch.equal(qkv[QH * AHD : QH * AHD + KVH * AHD // 2], k[KVH * AHD // 2 :])
+    assert torch.equal(qkv[QH * AHD + KVH * AHD // 2 :], v[KVH * AHD // 2 :])
+    assert torch.equal(got[f"{attn}.o_proj.weight"], raw[f"{LM}.layers.1.self_attn.o_proj.weight"][:, QH * AHD // 2 :])
+
+    key, value = KH * HD, VH * HD
+    g = f"{LM}.layers.0.linear_attn"
+    in_proj = torch.cat(
+        [
+            raw[f"{g}.in_proj_qkv.weight"][key // 2 : key],
+            raw[f"{g}.in_proj_qkv.weight"][key + key // 2 : 2 * key],
+            raw[f"{g}.in_proj_qkv.weight"][2 * key + value // 2 : 2 * key + value],
+            raw[f"{g}.in_proj_z.weight"][value // 2 :],
+            raw[f"{g}.in_proj_b.weight"][VH // 2 :],
+            raw[f"{g}.in_proj_a.weight"][VH // 2 :],
+        ],
+        dim=0,
+    )
+    assert torch.equal(got[f"{gdn}.in_proj.weight"], in_proj)
+    conv = torch.cat(
+        [
+            raw[f"{g}.conv1d.weight"][key // 2 : key],
+            raw[f"{g}.conv1d.weight"][key + key // 2 : 2 * key],
+            raw[f"{g}.conv1d.weight"][2 * key + value // 2 : 2 * key + value],
+        ],
+        dim=0,
+    )
+    assert torch.equal(got[f"{gdn}.conv1d.weight"], conv)
+    assert torch.equal(got[f"{gdn}.A_log"], raw[f"{g}.A_log"][VH // 2 :])
+    assert torch.equal(got[f"{gdn}.out_proj.weight"], raw[f"{g}.out_proj.weight"][:, value // 2 :])
+
+    shared = f"{attn_mlp}.shared_expert"
+    gu = got[f"{shared}.gate_up_proj.weight"]
+    assert torch.equal(gu[: I // 2], raw[f"{LM}.layers.0.mlp.shared_expert.gate_proj.weight"][I // 2 :])
+    assert torch.equal(gu[I // 2 :], raw[f"{LM}.layers.0.mlp.shared_expert.up_proj.weight"][I // 2 :])
+    down = raw[f"{LM}.layers.0.mlp.shared_expert.down_proj.weight"]
+    assert torch.equal(got[f"{shared}.down_proj.weight"], down[:, I // 2 :])
+    # the routers stay whole, as does anything whose rows do not match its config's geometry:
+    # this fixture stores 11 embedding rows for a 256-token vocab, so the slicer refuses to
+    # cut it and the strict load is what reports the mismatch (test_tp_shard covers the cut).
+    assert torch.equal(got[f"{attn_mlp}.gate.weight"], raw[f"{LM}.layers.0.mlp.gate.weight"])
+    assert torch.equal(
+        got[f"{attn_mlp}.shared_expert_gate.weight"], raw[f"{LM}.layers.0.mlp.shared_expert_gate.weight"]
+    )
+    assert torch.equal(got["model.embed_tokens.weight"], raw[f"{LM}.embed_tokens.weight"])
+    assert torch.equal(got[f"{attn}.q_norm.weight"], raw[f"{LM}.layers.1.self_attn.q_norm.weight"])
+
