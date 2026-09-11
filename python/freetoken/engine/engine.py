@@ -1509,6 +1509,13 @@ def _adjust_config(config: EngineConfig):
                     f"extension predates activation {_act!r} (rebuild with "
                     f"`python setup.py build_ext --inplace`); staying on offload"
                 )
+            elif tp_size > 1:
+                # hybrid splits a step's misses between the PCIe fetch and the CPU executor,
+                # and the CPU half has no tensor-parallel path; the offload banks do.
+                logger.info_rank0(
+                    "benchbw profile recommends hybrid, but the CPU MoE executor has no TP path; "
+                    "staying on offload"
+                )
             else:
                 default_backend = "hybrid"
                 logger.info_rank0(

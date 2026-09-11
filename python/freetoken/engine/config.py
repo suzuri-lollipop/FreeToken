@@ -231,21 +231,25 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
     geometry = tp_shard_error(model_config, tp_size)
     if geometry:
         return f"--tensor-parallel-size {tp_size}: {geometry}"
-    # Auto resolves a MoE model to the offload family, so treat it as the same request here:
-    # the host banks / slot cache / CPU executor all price experts at full intermediate size.
+    # Auto resolves a MoE model to the offload family, so treat it as the same request here.
+    # The offload banks are TP-sharded for nvfp4 only: the layout declares the rank's slice
+    # and pack cuts the pieces, while the bf16 / mxfp4 / block-fp8 stacks keep their readers at
+    # full width. The CPU executor has no TP path, so cpu and hybrid stay refused.
     from freetoken.moe import is_offload_moe_strategy
 
     strategy = config.moe_strategy
     moe = getattr(model_config, "is_moe", False) or getattr(model_config, "moe_enabled", False)
-    if moe and str(getattr(model_config, "expert_quant", "none")) != "none":
-        return (
-            f"{getattr(model_config, 'expert_quant', '')} experts are not TP-sharded yet "
-            "(only bf16 expert banks follow the rank's intermediate slice); run with "
-            "--tensor-parallel-size 1"
-        )
+    expert_quant = str(getattr(model_config, "expert_quant", "none"))
     if moe and (is_offload_moe_strategy(strategy) or strategy == "auto"):
-        return (
-            f"the expert offload cache is not tensor-parallel yet, so --tensor-parallel-size "
-            f"{tp_size} needs --moe-strategy fused (experts resident on every rank)"
-        )
+        if expert_quant != "nvfp4":
+            return (
+                f"{expert_quant} experts are not TP-sharded in the offload banks yet; run a bf16 "
+                "MoE with --moe-strategy fused (experts resident on every rank), or a single rank"
+            )
+        if strategy in ("cpu", "hybrid"):
+            return (
+                f"--moe-strategy {strategy} computes experts on the CPU, whose executor has no "
+                f"tensor-parallel path yet; use --moe-strategy offload with --tensor-parallel-size "
+                f"{tp_size}"
+            )
     return None

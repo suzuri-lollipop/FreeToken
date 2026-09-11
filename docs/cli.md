@@ -82,9 +82,13 @@ What is TP-sharded today:
   dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B) and the dense projections of
   `Qwen4Exp` (Qwen3.8-Flash-Next). Anything else reports `does not shard its checkpoint for
   tensor parallelism yet` at startup, before any rank is spawned.
-* **bf16 experts only, resident**: `--moe-strategy fused`. The expert offload cache (host banks,
-  the GPU slot cache, the CPU executor) still prices experts at full width, so `offload`, `cpu`,
-  `hybrid` and the `auto` default are refused, as are NVFP4 / MXFP4 / block-FP8 expert banks.
+* **Experts**: the offload banks shard for NVFP4 experts (`--moe-strategy offload`, which `auto`
+  picks): the Triton kernel declares its banks at the rank's intermediate width and packs the
+  matching slice, so host RAM, the GPU slot cache and the PCIe stream halve per rank (Qwen3.8-Flash-Next's
+  63.5 GiB of expert banks become 31.8 GiB per rank at TP=2). bf16 experts with
+  `--moe-strategy fused` shard the same way. Refused under TP: the CPU and `hybrid` executors
+  (no TP path yet), MXFP4 / block-FP8 expert banks, and the Marlin / b12x packs -- their tiles
+  need a wider slice, so the kernel selector falls back to Triton instead.
 * `fi` and `qsa_sparse` attention. The other backends read global head counts and are refused
   (auto selection skips them).
 * An FTW directory cannot be sharded: it stores the tensors already fused at full width, so

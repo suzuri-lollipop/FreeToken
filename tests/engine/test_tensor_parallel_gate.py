@@ -185,6 +185,32 @@ def test_resident_experts_pass_the_gate():
     assert _preflight(config) is None
 
 
+@pytest.mark.parametrize("strategy", ["auto", "offload"])
+def test_sharded_nvfp4_experts_pass_the_gate(strategy):
+    """The offload banks shard with the kernel that owns their layout, so NVFP4 MoE runs."""
+    config = _config(
+        tp=2,
+        moe_strategy=strategy,
+        model=dict(
+            is_moe=True, moe_enabled=True, moe_intermediate_size=640, expert_quant="nvfp4"
+        ),
+    )
+    assert _preflight(config) is None
+
+
+@pytest.mark.parametrize("strategy", ["cpu", "hybrid"])
+def test_the_cpu_expert_backends_are_refused_under_tp(strategy):
+    config = _config(
+        tp=2,
+        moe_strategy=strategy,
+        model=dict(
+            is_moe=True, moe_enabled=True, moe_intermediate_size=640, expert_quant="nvfp4"
+        ),
+    )
+    error = _preflight(config)
+    assert error is not None and "CPU" in error
+
+
 def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
     from freetoken.engine import engine
 
