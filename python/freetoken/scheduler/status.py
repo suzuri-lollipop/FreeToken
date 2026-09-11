@@ -69,7 +69,9 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         now = self.clock()
-        gap = now - self._last_prefill_time
+        # Measure this batch over its own schedule->completion window: charging the idle
+        # gap since the last report made a lone request after startup read as ~60 token/s.
+        gap = now - (getattr(batch, "scheduled_at", 0.0) or self._last_prefill_time)
         self._last_prefill_time = now
         # Read the schedule-time snapshot: by report time the forward's complete_one() has
         # advanced each req's cached_len to device_len, so reading the reqs here would log

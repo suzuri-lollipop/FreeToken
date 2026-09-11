@@ -140,6 +140,9 @@ class Batch:
     # PrefillManager; 0 on decode batches.
     log_new_tokens: int = field(default=0, init=False)
     log_cached_tokens: int = field(default=0, init=False)
+    # perf_counter() stamp of when the batch was scheduled; the status reporter measures
+    # input throughput over this batch's own schedule->completion window. 0 = unstamped.
+    scheduled_at: float = field(default=0.0, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is

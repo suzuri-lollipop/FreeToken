@@ -53,6 +53,30 @@ def test_prefill_line_reports_tokens_and_throughput():
     assert "input throughput (token/s): 60.00" in line
 
 
+def test_prefill_throughput_uses_the_batch_schedule_window():
+    # A lone request arriving after startup + idle must not pay for the idle gap: the
+    # window is the batch's own schedule->completion span, not the time since the last
+    # prefill report.
+    rep, logs, clock = _reporter()
+    batch = _prefill_batch(new_tokens=1547, cached_tokens=0, n_seqs=1)
+    batch.scheduled_at = 99.4  # scheduled 0.6s before the report, long after startup
+    clock["t"] = 100.0  # startup + idle dominate the wall clock
+    rep.report_batch(
+        batch, running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1,
+    )
+    assert "input throughput (token/s): 2578.33" in logs[-1]  # 1547 / 0.6, not 1547 / 100
+
+
+def test_prefill_throughput_falls_back_without_a_schedule_stamp():
+    rep, logs, clock = _reporter()
+    clock["t"] = 0.25  # unstamped batch: keep the since-last-report window
+    rep.report_batch(
+        _prefill_batch(new_tokens=10, cached_tokens=0, n_seqs=1),
+        running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1,
+    )
+    assert "input throughput (token/s): 40.00" in logs[-1]
+
+
 def test_mamba_slots_reported_only_when_provided():
     rep, logs, clock = _reporter()
     clock["t"] = 1.0
