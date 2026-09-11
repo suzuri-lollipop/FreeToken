@@ -68,6 +68,27 @@ def iter_expert_pieces(
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 
 
+def expert_key_matcher(model_path: str, config, kind: QuantKind) -> Callable[[str], bool] | None:
+    """The index-key predicate the generic expert reader applies, or None when there is no generic
+    reader for this kind. Sizing the reader's buffers needs it: a checkpoint can hold expert tensors
+    the loader never reads (a speculative head's experts live in their own huge shard), and counting
+    those keeps the parallel reader off machines that fit everything it will actually open.
+    """
+    if kind is not QuantKind.NVFP4:
+        return None  # bf16 reads the whole model, other kinds have no generic reader
+    try:
+        spec = get_model_spec(config.architectures[0])
+        family = _model_hook(spec, "iter_expert_pieces")
+        # ask, don't assume: a family hook claims the kinds it reads itself and returns None for the
+        # rest, and only the generic reader's keys are knowable here
+        if family is not None and family(model_path, config, kind, parallel=False) is not None:
+            return None
+        hook = _model_hook(spec, "nvfp4_expert_spec")
+        return hook(model_path, config).key_pattern.match if hook is not None else None
+    except Exception:  # sizing heuristic only -> the caller falls back to the generic rule
+        return None
+
+
 def packed_expert_source_info(key: str) -> tuple[int, str] | None:
     """``model.layers.N....experts.{gate_up_proj,down_proj}`` -> (N, leaf); None otherwise."""
     parts = key.split(".")
@@ -149,6 +170,7 @@ def per_expert_pieces(
 __all__ = [
     "Piece",
     "bank_layer_of",
+    "expert_key_matcher",
     "iter_expert_pieces",
     "num_moe_layers",
     "packed_expert_source_info",

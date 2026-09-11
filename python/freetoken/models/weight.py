@@ -19,6 +19,7 @@ import queue
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Callable, Iterator, Tuple
 
 import torch
@@ -34,6 +35,8 @@ _ST_DTYPE = {
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
 }
 _ODIRECT_BLK = 4096
+# shards the parallel reader keeps in flight at once; peak host RAM is (this + 1) whole shards
+EXPERT_PREFETCH_SHARDS = 2
 
 
 def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mmap:
@@ -72,7 +75,7 @@ def iter_expert_tensors_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     drop_cache: bool = True,
-    prefetch: int = 2,
+    prefetch: int = EXPERT_PREFETCH_SHARDS,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     """Parallel O_DIRECT analog of a model's serial expert ``iter_weights``.
 
@@ -163,20 +166,34 @@ def iter_expert_tensors_parallel(
 _SCATTERED_AVG_BYTES = 16 << 20  # avg expert tensor below this -> "scattered" -> prefer parallel
 
 
-def experts_scattered(model_path: str) -> bool:
-    """Slow-path strategy signal: are the experts stored as many SMALL tensors?
+@dataclass(frozen=True)
+class ExpertStorage:
+    """What one safetensors-header scan says about a checkpoint's routed-expert storage."""
 
-    If yes (per-expert / quantized layouts -> avg expert tensor a few MiB), the serial
-    baseline pays per-tensor overhead on thousands of tiny reads and is slow, so the parallel
-    parallel whole-shard O_DIRECT reader wins. If experts are pre-packed into a few large
-    tensors, the serial read already saturates the disk and parallel only adds read amplification.
-    Measured cheaply from the safetensors headers (no tensor data read). This is a best-
-    effort heuristic: ANY failure (unresolvable path, no safetensors, GGUF, unreadable
-    header) -> False (serial), so the real loader still runs and reports real errors."""
+    scattered: bool  # many SMALL expert tensors, so the serial per-tensor read is the slow one
+    expert_bytes: int  # expert tensor data in the checkpoint (~what the host banks end up holding)
+    expert_shard_bytes: int  # largest WHOLE shard holding expert data: the parallel reader's buffer unit
+
+
+def _generic_expert_name(name: str) -> bool:
+    return ".experts." in name
+
+
+def expert_storage(model_path: str, is_expert: Callable[[str], bool] | None = None) -> ExpertStorage | None:
+    """Size the experts from the shard headers (no tensor data read).
+
+    ``is_expert`` selects the expert tensors by index key; the reader-specific callers pass the
+    predicate their reader will apply, since a checkpoint can store experts the loader drops (the
+    MTP head's ``mtp.layers.N.mlp.experts.*``). Default: any name with ``.experts.`` in it.
+
+    Best-effort: ANY failure (unresolvable path, no safetensors, GGUF, unreadable header) -> None,
+    so callers fall back to their conservative default while the real loader reports real errors.
+    """
+    is_expert = is_expert or _generic_expert_name
     try:
         from freetoken.utils.hf import download_hf_weight
 
-        model_path = download_hf_weight(model_path)  # resolve hub ids -> local (parity w/ serial)
+        model_path = download_hf_weight(model_path)  # resolve hub ids -> local
         index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.exists(index):
             with open(index) as f:
@@ -184,6 +201,7 @@ def experts_scattered(model_path: str) -> bool:
         else:
             shards = sorted(os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors")))
         sizes: list[int] = []
+        shards_with_experts: list[str] = []
         for shard in shards:
             try:
                 with open(os.path.join(model_path, shard), "rb") as fh:
@@ -191,15 +209,37 @@ def experts_scattered(model_path: str) -> bool:
                     hdr = json.loads(fh.read(n))
             except (OSError, ValueError, struct.error):  # unreadable/partial shard -> skip
                 continue
+            hit = False
             for name, meta in hdr.items():
-                if name != "__metadata__" and ".experts." in name:
+                if name != "__metadata__" and is_expert(name):
                     b, e = meta["data_offsets"]
                     sizes.append(e - b)
+                    hit = True
+            if hit:
+                shards_with_experts.append(shard)
         if not sizes:
-            return False
-        return (sum(sizes) / len(sizes)) < _SCATTERED_AVG_BYTES
-    except Exception:  # heuristic only -> default to serial; the real loader reports errors
-        return False
+            return None
+        return ExpertStorage(
+            scattered=(sum(sizes) / len(sizes)) < _SCATTERED_AVG_BYTES,
+            expert_bytes=sum(sizes),
+            # the reader buffers a WHOLE shard, so the transient is the largest shard it opens --
+            # not the largest file in the checkpoint, which it may never read
+            expert_shard_bytes=max(os.path.getsize(os.path.join(model_path, s)) for s in shards_with_experts),
+        )
+    except Exception:  # sizing heuristic only -> the real loader still runs and reports real errors
+        return None
+
+
+def experts_scattered(model_path: str) -> bool:
+    """Slow-path strategy signal: are the experts stored as many SMALL tensors?
+
+    If yes (per-expert / quantized layouts -> avg expert tensor a few MiB), the serial
+    baseline pays per-tensor overhead on thousands of tiny reads and is slow, so the parallel
+    parallel whole-shard O_DIRECT reader wins. If experts are pre-packed into a few large
+    tensors, the serial read already saturates the disk and parallel only adds read amplification.
+    """
+    storage = expert_storage(model_path)
+    return storage is not None and storage.scattered
 
 
 def _spec_for_model_path(model_path: str):
@@ -272,7 +312,11 @@ def load_q4_0_moe_expert_sources(
 
 
 __all__ = [
+    "ExpertStorage",
     "load_weight",
     "load_q4_0_moe_expert_sources",
     "iter_expert_tensors_parallel",
+    "expert_storage",
+    "experts_scattered",
+    "EXPERT_PREFETCH_SHARDS",
 ]

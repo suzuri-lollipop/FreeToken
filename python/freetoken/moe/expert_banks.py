@@ -8,7 +8,6 @@ use their own providers until they get a method.
 
 from __future__ import annotations
 
-import glob
 import math
 import os
 from dataclasses import dataclass, field
@@ -204,32 +203,57 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
 
 
-def _host_ram_fits_parallel(model_path: str) -> bool:
-    """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
-    extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
-    i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
-    avail = None
+def _mem_available_bytes() -> int | None:
+    """MemAvailable -- the OOM-relevant figure, since it counts reclaimable page cache.
+    None when the platform has no /proc/meminfo."""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
-                    avail = int(line.split()[1]) * 1024
-                    break
+                    return int(line.split()[1]) * 1024
     except OSError:
         pass
+    return None
+
+
+def _auto_pick_parallel(model_path: str, model_config, method, dummy: bool) -> bool:
+    """``--expert-load auto``: read scattered experts with the parallel chunked O_DIRECT reader,
+    drop to the serial build when host RAM can't hold the result.
+
+    The parallel reader keeps whole shards in flight as ANONYMOUS (non-reclaimable) buffers on top
+    of the bank-sized resident set, so a memory-tight box OOMs there where the serial path
+    (reclaimable file mmap) survives. Both figures are sized by what the reader will actually open:
+    a checkpoint can hold its experts next to a far bigger side file the loader never reads
+    (Qwen3.8-Flash-Next's 50 GiB PLE/MTP file, whose own experts belong to the dropped speculative
+    head), and sizing by the whole checkpoint then refuses parallel even on boxes with more RAM than
+    the checkpoint has, pinning every one of those models to the slow serial read.
+    """
+    if not _PARALLEL_READER_SUPPORTED or dummy:
+        return False
+    from freetoken.models.weight import EXPERT_PREFETCH_SHARDS, expert_storage
+    from freetoken.moe.expert_pieces import expert_key_matcher
+
+    kind = method.kind if method is not None else None
+    storage = expert_storage(model_path, expert_key_matcher(model_path, model_config, kind))
+    if storage is None or not storage.scattered:
+        return False
+    try:  # the kernel layout is exact; fall back to the checkpoint's expert bytes
+        banks_bytes = bank_bytes_estimate(model_config, method) or storage.expert_bytes
+    except Exception:
+        banks_bytes = storage.expert_bytes
+    transient_bytes = (EXPERT_PREFETCH_SHARDS + 1) * storage.expert_shard_bytes
+    avail = _mem_available_bytes()
     if avail is None:
         return True
-    try:  # resolve a hub id to its local cache dir (no-op for a local path) so glob sees the shards
-        from freetoken.utils.hf import download_hf_weight
-
-        model_path = download_hf_weight(model_path)
-    except Exception:
-        return True
-    sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))]
-    if not sizes:
-        return True
-    return avail > sum(sizes) + max(sizes)
+    if avail <= banks_bytes + transient_bytes:
+        gib = 1 << 30
+        logger.warning_rank0(
+            f"expert banks: {banks_bytes / gib:.1f} GiB banks + {transient_bytes / gib:.1f} GiB "
+            f"reader buffers > {avail / gib:.1f} GiB available RAM -> serial build (avoids "
+            "parallel-reader OOM; override with --expert-load parallel)"
+        )
+        return False
+    return True
 
 
 def ftw_bank_bytes(model_path: str) -> int | None:
@@ -331,20 +355,9 @@ def load_expert_banks(
 
     auto = parallel is None
     if auto:
-        from freetoken.models.weight import experts_scattered
-
-        parallel = _PARALLEL_READER_SUPPORTED and not dummy and experts_scattered(model_path)
-        # Low-RAM fallback: the parallel reader holds whole-shard ANONYMOUS buffers
-        # (non-reclaimable) on top of the ~bank-sized resident set, so on a memory-tight box
-        # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
-        # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
-        # bypass this by forcing ``parallel`` explicitly.)
-        if parallel and not _host_ram_fits_parallel(model_path):
-            logger.warning_rank0(
-                "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
-                "override with --expert-load parallel)"
-            )
-            parallel = False
+        # Low-RAM fallback lives in _auto_pick_parallel; --expert-load serial/parallel bypass it by
+        # forcing ``parallel`` explicitly.
+        parallel = _auto_pick_parallel(model_path, model_config, method, dummy)
     logger.info_rank0(f"expert banks: slow path ({'parallel' if parallel else 'serial'} build)")
     # parallel's reader resolves hub ids + handles single-file/no-index checkpoints, so it won't
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
