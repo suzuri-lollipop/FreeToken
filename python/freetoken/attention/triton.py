@@ -161,6 +161,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
+        # A quantized pool descales through its own pair (kvcache/kv_quant.py); reads of a
+        # plain pool are inert at 1.0.
+        quant = getattr(self.kvcache, "quant", None)
+        k_scale = quant.k_scale if quant is not None else 1.0
+        v_scale = quant.v_scale if quant is not None else 1.0
         if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
@@ -181,6 +186,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if (
             (not metadata.is_decode)
@@ -201,6 +208,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         return paged_attention(
             q=q,
@@ -213,6 +222,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

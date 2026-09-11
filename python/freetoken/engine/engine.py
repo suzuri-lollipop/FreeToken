@@ -104,7 +104,7 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
     )
 
 
-def _backend_requirements_met(name: str) -> bool:
+def _backend_requirements_met(name: str, fp8_kv: bool = False) -> bool:
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
     infos = [attention_backend_info(part) for part in name.split(",")]
@@ -114,10 +114,14 @@ def _backend_requirements_met(name: str) -> bool:
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
+    # A quantized cache is only readable by backends that apply the pool's descales; one
+    # that ignores them would return wrong logits, not slow ones.
+    if fp8_kv and not all(i.supports_fp8_kv for i in infos):
+        return False
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType], fp8_kv: bool = False) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -145,12 +149,13 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
             continue
         if not _backend_parts_serve(name, required):
             continue
-        if not _backend_requirements_met(name):
+        if not _backend_requirements_met(name, fp8_kv):
             continue
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine."
+        f"{sorted(t.value for t in required)} on this machine"
+        + (" with a quantized KV cache (--kv-cache-dtype)." if fp8_kv else ".")
     )
 
 
@@ -193,6 +198,14 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             raise ValueError(
                 f"backend {part!r} does not consume the per-call AttentionSpec that "
                 f"SWA models require, got {config.attention_backend!r}."
+            )
+        if getattr(config, "kv_quant", None) is not None and not info.supports_fp8_kv:
+            # Reading a quantized pool without its descales is silently wrong, so the
+            # combination is refused instead of degrading the numerics.
+            raise RuntimeError(
+                f"--kv-cache-dtype {config.kv_cache_dtype} needs a backend that descales a "
+                f"quantized KV cache; {part!r} does not. Use "
+                f"--attention-backend triton (or fi), or drop --kv-cache-dtype."
             )
 
     # An explicitly-selected backend may require a package that isn't installed. Auto
@@ -358,7 +371,12 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            # A quantized pool stores below the model dtype; it takes its dtype from the
+            # config so the allocation and the reported capacity can never disagree.
+            config,
+            self.num_pages,
+            device=self.device,
+            dtype=getattr(config, "kv_dtype", self.dtype),
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -1407,7 +1425,9 @@ def _adjust_config(config: EngineConfig):
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(
+                required_attn_types, getattr(config, "kv_quant", None) is not None
+            ),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

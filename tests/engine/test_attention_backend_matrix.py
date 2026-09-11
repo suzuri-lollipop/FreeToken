@@ -404,3 +404,64 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
+
+
+# --- --kv-cache-dtype x backend capability -------------------------------------------
+# A quantized pool is only readable by a backend that applies its descales: ignoring the
+# scales yields wrong logits, not slow ones, so the combination is refused at config time.
+# fa and trtllm carry the code path but are not hardware-validated yet (see the registry
+# comments), so both report supports_fp8_kv=False until they are.
+
+
+@pytest.mark.parametrize("major", [9, 10])
+@pytest.mark.parametrize("kind, expected", [("full", "fi"), ("swa", "triton")])
+def test_auto_skips_backends_that_cannot_descale(monkeypatch, major, kind, expected):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=major)
+    config = _config(kind, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    _adjust_config(config)
+    assert config.attention_backend == expected
+
+
+def test_auto_without_quantization_keeps_the_unquantized_winner(monkeypatch):
+    """Control for the test above: the same config without --kv-cache-dtype still
+    resolves to fa,fi on sm90/sm100, so the skip really is caused by the quantized pool."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=9)
+    config = _config("full", attention_backend="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "fa,fi"
+
+
+@pytest.mark.parametrize("backend", ["fa", "trtllm", "fa,fi", "fi,trtllm"])
+def test_explicit_backend_without_descale_support_is_rejected(monkeypatch, backend):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)  # every package/arch gate satisfied
+    config = _config("full", attention_backend=backend, kv_cache_dtype="fp8_e4m3")
+    with pytest.raises(RuntimeError, match="quantized KV cache"):
+        _adjust_config(config)
+
+
+@pytest.mark.parametrize("backend", ["triton", "fi", "fi,triton"])
+def test_descale_capable_backends_accept_a_quantized_cache(monkeypatch, backend):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)
+    config = _config("full", attention_backend=backend, kv_cache_dtype="fp8_e4m3")
+    _adjust_config(config)
+    assert config.attention_backend == backend
+
+
+def test_only_the_quantized_dtype_gates_the_backends(monkeypatch):
+    """--kv-cache-dtype auto/none (i.e. no quantization) resolves like an unset flag."""
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=9)
+    for dtype in ("auto", "none"):
+        config = _config("full", attention_backend="auto", kv_cache_dtype=dtype)
+        _adjust_config(config)
+        assert config.attention_backend == "fa,fi"
+        assert config.kv_quant is None

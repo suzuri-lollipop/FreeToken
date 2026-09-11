@@ -33,6 +33,10 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # Whether the backend descales a quantized KV pool (--kv-cache-dtype; the pool
+    # publishes its KVQuant so reads can). Auto skips these candidates when the cache is
+    # quantized, and an explicit choice is rejected at config time.
+    supports_fp8_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -45,6 +49,11 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
         requires_flashinfer=True,
         requires_sm100=True,
         page_sizes=(16, 32, 64),
+        # trtllm.py passes the pool's scales as bmm1/bmm2_scale. Probed on sm_120: the
+        # fp8-KV decode kernel runs and matches a dequantized cache exactly, the context
+        # kernel aborts with "Unsupported architecture" (its cubins need sm_100a/103a).
+        # Flip once prefill is validated too.
+        supports_fp8_kv=False,
     ),
 )
 def create_trtllm_backend(config: ModelConfig):
@@ -58,6 +67,7 @@ def create_trtllm_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_flashinfer=True,
+        supports_fp8_kv=True,
     ),
 )
 def create_fi_backend(config: ModelConfig):
@@ -71,6 +81,10 @@ def create_fi_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_sgl_kernel=True,
+        # fa.py quantizes the query and passes q/k/v_descale, but sgl_kernel's FA3 ships
+        # sm_90 images only: probed on sm_120 it dies with "no kernel image is available
+        # for execution on the device". Flip once the path is validated on Hopper.
+        supports_fp8_kv=False,
     ),
 )
 def create_fa_backend(config: ModelConfig):
@@ -84,6 +98,7 @@ def create_fa_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         consumes_attn_spec=True,
+        supports_fp8_kv=True,
     ),
 )
 def create_triton_backend(config: ModelConfig):

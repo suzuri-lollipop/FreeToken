@@ -134,6 +134,19 @@ class FlashInferBackend(BaseAttnBackend):
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
+        # A quantized pool stores below the compute dtype, so plan() needs the two
+        # separately plus the pool's static descales (kvcache/kv_quant.py).
+        self.quant = getattr(self.kvcache, "quant", None)
+        self.kv_dtype = self.kvcache.dtype
+        self.q_dtype = self.kv_dtype if self.quant is None else self.quant.compute_dtype
+        # flashinfer takes the descales on run(), not plan(). Empty for a plain pool,
+        # so the bf16 path keeps its exact call and stays compatible with builds that
+        # have no such argument. Constants, hence safe to bake into a captured graph.
+        self.scale_kwargs: dict = (
+            {}
+            if self.quant is None
+            else {"k_scale": self.quant.k_scale, "v_scale": self.quant.v_scale}
+        )
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
@@ -167,7 +180,7 @@ class FlashInferBackend(BaseAttnBackend):
                 seq_lens=metadata.seq_lens_cpu,
                 data_type=metadata.dtype,
                 q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                kv_data_type=self.kv_dtype,
                 non_blocking=True,
             )
         else:
@@ -183,7 +196,7 @@ class FlashInferBackend(BaseAttnBackend):
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
                 q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                kv_data_type=self.kv_dtype,
                 non_blocking=True,
                 causal=True,
             )
@@ -220,7 +233,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache, **self.scale_kwargs)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -255,7 +268,7 @@ class FlashInferBackend(BaseAttnBackend):
             page_size=1,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
-            dtype=self.kvcache.dtype,
+            dtype=self.q_dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 
