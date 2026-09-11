@@ -399,6 +399,30 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=["auto", "fp8", "fp8_e4m3"],
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "Storage dtype of the KV cache. 'auto' (default) keeps the model dtype; "
+            "'fp8_e4m3' ('fp8' for short) stores K/V as fp8 e4m3, halving the bytes per "
+            "cached token (roughly doubling prefix capacity for the same VRAM). Needs an "
+            "sm_89+ GPU and an MHA or SWA-hybrid pool; the attention backend must support it."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-cache-quant-scale",
+        type=float,
+        default=ServerArgs.kv_cache_quant_scale,
+        help=(
+            "Static scale both K and V divide by before the fp8 store (and multiply back "
+            "on read). Default 1.0; raise it if attention states exceed the e4m3 range "
+            "(-448..448), which would otherwise clamp. Ignored without --kv-cache-dtype."
+        ),
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
