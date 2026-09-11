@@ -103,7 +103,13 @@ Each rank holds its own share of the weights, so the per-GPU memory roughly halv
 layers all run on every rank. The price is one or two collectives per layer over the interconnect:
 on two PCIe-attached cards measured at ~8 us each, so a small dense model actually gets slower
 (Qwen3-0.6B: 374 tok/s at TP=1 against 320 at TP=2 on 2x RTX PRO 4000 Blackwell, with byte-identical
-greedy output). Sharding pays where the weights or the expert stream do not fit one card.
+greedy output). Sharding pays where the weights or the expert stream do not fit one card:
+`nvidia/Qwen3.8-27B-NVFP4` (21 GiB of weights) OOMs a single 24 GB card and runs at TP=2.
+
+Note that greedy output is only byte-reproducible on some checkpoints: a quantized dense model
+can shift a near-tie between two runs of the *same* configuration (the prefix-cache path and the
+fp8 / nvfp4 dense GEMMs both reorder accumulation), so compare TP=1 and TP=N on answer quality,
+not on identical text, unless you have verified repeatability at TP=1 first.
 
 ### KV cache & memory
 
