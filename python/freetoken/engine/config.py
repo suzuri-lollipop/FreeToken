@@ -45,6 +45,11 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
+    # Flat residency (--moe-flat-residency): with an offload slot cache big enough to hold
+    # every expert (num_moe_layers * num_experts slots), drop the LRU entirely -- each
+    # expert keeps a permanent GPU slot, so prefill/decode stop streaming expert weights
+    # over PCIe after the one load at startup. Off by default; needs --moe-strategy offload.
+    moe_flat_residency: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.

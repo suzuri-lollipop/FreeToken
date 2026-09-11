@@ -702,6 +702,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-flat-residency",
+        action="store_true",
+        dest="moe_flat_residency",
+        default=ServerArgs.moe_flat_residency,
+        help=(
+            "With --moe-strategy offload and a slot cache covering every expert "
+            "(--moe-cache-size >= num_moe_layers * num_experts), pin each expert to a "
+            "fixed GPU slot instead of cycling an LRU over them: experts are loaded "
+            "once at startup and never cross PCIe again. Refused when the cache is "
+            "too small or experts are computed on the CPU."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

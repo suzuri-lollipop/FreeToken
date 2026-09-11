@@ -685,6 +685,203 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
         bf16.validate_rebuild(3)  # below the num_experts floor
 
 
+# ---------------------------------------------------------------------------
+# Flat residency: slot == layer * num_experts + expert for every expert, so the
+# experts are loaded once and neither prefill nor decode copies them again.
+# ---------------------------------------------------------------------------
+
+
+def _make_flat_cache(num_layers=2, num_experts=4, cache_size=None, **overrides):
+    """A [gate_up, down] cache sized to hold every expert, built with overlap ON to
+    prove flat residency drops it."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    kwargs = dict(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        cache_size=num_layers * num_experts if cache_size is None else cache_size,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+        flat_residency=True,
+    )
+    kwargs.update(overrides)
+    cache = OffloadMoeCache(**kwargs)
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(num_experts, 32, 8) for _ in range(num_layers)],
+        "down": [torch.randn(num_experts, 8, 16) for _ in range(num_layers)],
+    })
+    return cache
+
+
+def _flat_layer(layer_id, cache, monkeypatch, gemm_target, calls):
+    """An offload layer bound to ``cache``, with the expert GEMM stubbed and every
+    movement entry point recording a call."""
+    layer = _bf16_offload_layer(layer_id, cache.num_experts, 2, 8, 16)
+    layer.offload_cache = cache
+
+    def fake_gemm(hidden_states, w1, w2, topk_weights, topk_ids, activation,
+                  apply_router_weight_on_input, act_alpha=1.0, act_limit=float("inf")):
+        calls["w1"], calls["w2"] = w1, w2
+        calls["topk_weights"], calls["topk_ids"] = topk_weights, topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr(gemm_target, fake_gemm)
+    for name in ("materialize_layer", "copy_missing", "ensure_experts", "begin_prefill"):
+        monkeypatch.setattr(cache, name, lambda *a, _n=name: calls.setdefault("movement", _n))
+    return layer
+
+
+def _flat_topk(monkeypatch, topk_weights, topk_ids):
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+
+
+def test_flat_residency_drops_prefill_overlap_and_needs_one_slot_per_expert():
+    cache = _make_flat_cache()
+    assert cache.prefill_overlap is False
+    assert cache.prefill_hit_d2d is False
+    assert cache.prefill_bank_buffers == []
+    with pytest.raises(ValueError, match="one slot per expert"):
+        _make_flat_cache(cache_size=7)
+
+
+def test_flat_residency_rejects_cpu_decode():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    with pytest.raises(ValueError, match="decode_target"):
+        OffloadMoeCache(
+            num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+            decode_target="hybrid", flat_residency=True,
+        )
+
+
+def test_materialize_flat_loads_every_expert_into_its_permanent_slot():
+    cache = _make_flat_cache()
+    moved = cache.materialize_flat()
+
+    gate_up, down = cache.bank_views_flat(1)
+    assert gate_up.shape[0] == cache.num_experts
+    assert torch.equal(gate_up, cache.bank_sources["gate_up"][1])
+    assert torch.equal(down, cache.bank_sources["down"][1])
+    assert cache.slot_for_id.tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert cache.id_of_slot.tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+    expected = sum(
+        t.numel() * t.element_size() for layers in cache.bank_sources.values() for t in layers
+    )
+    assert moved == expected
+
+
+def test_flat_prefill_runs_the_layer_without_staging_or_copying(monkeypatch):
+    cache = _make_flat_cache()
+    cache.materialize_flat()
+    calls = {}
+    layer = _flat_layer(1, cache, monkeypatch, "freetoken.moe.fused.fused_experts_impl", calls)
+    _flat_topk(monkeypatch, torch.tensor([[0.7, 0.3]], dtype=torch.float32),
+               torch.tensor([[2, 1]], dtype=torch.int32))
+
+    hidden_states = torch.randn(1, 8)
+    out = layer.prefill_forward(hidden_states, torch.randn(1, 4))
+
+    assert out is hidden_states  # the stubbed GEMM returns its input
+    assert "movement" not in calls
+    # reads layer 1's own slot block, and raw expert ids index it (position == expert)
+    assert calls["w1"].data_ptr() == cache.bank_caches["gate_up"][4].data_ptr()
+    assert calls["topk_ids"].tolist() == [[2, 1]]
+
+
+def test_flat_decode_maps_routing_ids_onto_permanent_slots(monkeypatch):
+    cache = _make_flat_cache()
+    cache.materialize_flat()
+    calls = {}
+    layer = _flat_layer(1, cache, monkeypatch, "freetoken.moe.fused.fused_experts_decode_impl", calls)
+    _flat_topk(monkeypatch, torch.tensor([[0.7, 0.3]], dtype=torch.float32),
+               torch.tensor([[2, 1]], dtype=torch.int32))
+
+    layer.decode_forward(torch.randn(1, 8), torch.randn(1, 4))
+
+    assert "movement" not in calls
+    assert calls["w1"] is cache.bank_caches["gate_up"]
+    assert calls["topk_ids"].dtype == torch.int32
+    assert calls["topk_ids"].tolist() == [[6, 5]]  # layer 1 base (4) + [2, 1]
+
+
+def test_flat_rebuild_reloads_every_expert_and_rejects_a_shrink():
+    cache = _make_flat_cache()
+    cache.materialize_flat()
+
+    cache.rebuild(12)  # grow: the reallocated slots are empty, so flat residency reloads
+
+    assert cache.cache_size == 12
+    assert torch.equal(cache.bank_caches["gate_up"][4:8], cache.bank_sources["gate_up"][1])
+    assert cache.slot_for_id.flatten().tolist() == list(range(8))
+    assert cache.id_of_slot[:8].tolist() == list(range(8))
+    assert cache.id_of_slot[8:].tolist() == [-1, -1, -1, -1]
+    with pytest.raises(ValueError, match="one slot per expert"):
+        cache.rebuild(7)
+    assert cache.cache_size == 12  # rejected before any teardown
+
+
+def _moe_flat_config(**overrides):
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    kwargs = dict(
+        model_path="/tmp/freetoken-test-model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.float16,
+        attention_backend="fi",
+        moe_strategy="offload",
+        moe_cache_size=80,
+        moe_flat_residency=True,
+    )
+    kwargs.update(overrides)
+    config = EngineConfig(**kwargs)
+    object.__setattr__(
+        config,
+        "model_config",
+        SimpleNamespace(
+            has_swa_attention=False,
+            has_linear_attention=False,
+            is_moe=True,
+            num_layers=10,
+            num_moe_layers=10,
+            num_experts=8,
+            expert_quant="none",
+            moe_strategy="auto",
+        ),
+    )
+    return config
+
+
+@pytest.mark.parametrize("strategy", ["fused", "cpu", "hybrid"])
+def test_adjust_config_rejects_flat_residency_without_the_offload_strategy(strategy):
+    from freetoken.engine.engine import _adjust_config
+
+    with pytest.raises(ValueError, match="requires --moe-strategy offload"):
+        _adjust_config(_moe_flat_config(moe_strategy=strategy))
+
+
+def test_adjust_config_rejects_flat_residency_with_cpu_layers():
+    from freetoken.engine.engine import _adjust_config
+
+    with pytest.raises(ValueError, match="--moe-cpu-layers"):
+        _adjust_config(_moe_flat_config(moe_cpu_layers="4"))
+
+
+def test_adjust_config_keeps_flat_residency_on_offload():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _moe_flat_config()
+    _adjust_config(config)
+    assert config.moe_flat_residency is True
+
+
 def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
