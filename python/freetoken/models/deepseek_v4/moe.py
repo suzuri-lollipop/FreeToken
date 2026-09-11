@@ -102,7 +102,8 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         assert cache is not None
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
         if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
+            cache.flat_residency  # no LRU slots to borrow: the base path reads the layer's own
+            or hidden_states.shape[0] * self.top_k >= self.num_experts
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)

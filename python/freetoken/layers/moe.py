@@ -276,6 +276,20 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if cache.flat_residency:
+            # This layer's experts own permanent slots, so the routing ids only need
+            # shifting into the layer's block: no LRU lookup, no PCIe.
+            topk_ids.add_(cache.flat_slot_base(self.layer_id))
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -350,6 +364,19 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.flat_residency:
+            # The layer's experts already sit in their permanent slots in expert-id order,
+            # so prefill is the plain full-layer GEMM: nothing to stage, nothing to copy.
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views_flat(self.layer_id),
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

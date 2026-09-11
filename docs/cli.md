@@ -88,6 +88,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--moe-flat-residency` | off | With `offload` and a cache covering every expert (`--moe-cache-size >= num_moe_layers * num_experts`): pin each expert to a fixed GPU slot instead of cycling an LRU, so experts are loaded once at startup and prefill/decode copy none. Refused if the cache is smaller or experts decode on CPU |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
 ### API behaviour

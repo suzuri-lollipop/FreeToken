@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -600,6 +601,10 @@ class Engine:
                 )
             layout = method.layout()
             max_slots = method.slot_limit()
+        if config.moe_flat_residency and config.moe_prefill_overlap:
+            # The double buffers borrow the cache's first two expert layers, which flat
+            # residency hands to permanent experts; prefill reads slots directly anyway.
+            object.__setattr__(config, "moe_prefill_overlap", False)
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -610,6 +615,7 @@ class Engine:
             cache_policy=config.moe_cache_policy,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
+            flat_residency=config.moe_flat_residency,
             quant_format=banks.quant_format,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -618,8 +624,26 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
+        if cache.flat_residency and cpu_layer_ids:
+            raise ValueError(
+                f"--moe-flat-residency cannot serve CPU-decoded layers {sorted(cpu_layer_ids)} "
+                "(they read the host banks, not GPU slots); drop --moe-cpu-layers or the "
+                "flat residency flag"
+            )
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if cache.flat_residency:
+            # One pass over PCIe for the whole model, replacing the per-chunk full-layer
+            # copies of the LRU path. Must complete before CUDA graph capture replays a
+            # MoE forward off these slots.
+            started = time.perf_counter()
+            moved = cache.materialize_flat()
+            logger.info_rank0(
+                f"MoE flat residency: {cache.total_experts} experts "
+                f"({moved / 2**30:.2f} GiB) into fixed GPU slots in "
+                f"{time.perf_counter() - started:.2f}s; prefill and decode now move "
+                "no expert weights"
+            )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1243,6 +1267,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_flat_residency": False,
     "expert_load": "auto",
 }
 
@@ -1567,6 +1592,21 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
+
+    if is_moe and getattr(config, "moe_flat_residency", False):
+        # Flat residency is the LRU-free mode: every expert owns a GPU slot, so the
+        # strategies that compute experts on the CPU (or keep no slot cache at all)
+        # cannot serve it. The slot-count floor is checked where the size is final.
+        if config.moe_strategy != "offload":
+            raise ValueError(
+                "--moe-flat-residency requires --moe-strategy offload (got "
+                f"{config.moe_strategy!r}): every expert must own a GPU slot"
+            )
+        if config.moe_cpu_layers:
+            raise ValueError(
+                "--moe-flat-residency cannot be combined with --moe-cpu-layers: "
+                "CPU-decoded layers read the host banks, not GPU slots"
+            )
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)

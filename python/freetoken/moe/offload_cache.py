@@ -114,6 +114,11 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
+    # Flat residency: every expert of every layer owns a permanent slot
+    # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
+    # expert and GPU decode; drops the prefill double buffers, so after the single load in
+    # :meth:`materialize_flat` neither prefill nor decode moves an expert byte.
+    flat_residency: bool = False
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -165,6 +170,16 @@ class OffloadMoeCache:
             "cache, so cache_size must be at least 2 * num_experts "
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
+        if self.flat_residency:
+            # Nothing may borrow slots (the double buffers alias slots < 2 * num_experts,
+            # which are permanent here) and the CPU executor reads host banks, not slots.
+            if self.decode_target != "gpu":
+                raise ValueError(
+                    f"flat residency serves experts from GPU slots; decode_target="
+                    f"{self.decode_target!r} computes them on the CPU executor instead"
+                )
+            self.prefill_overlap = False
+            self.prefill_hit_d2d = False
         self.cache_policy_id = policy_ids[self.cache_policy]
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
@@ -448,6 +463,12 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
+        if self.flat_residency and cache_size < self.total_experts:
+            raise ValueError(
+                f"flat residency needs one slot per expert: cache_size={cache_size} < "
+                f"{self.num_layers} layers * {self.num_experts} experts = {self.total_experts} "
+                "(raise moe_cache_size, or drop --moe-flat-residency to cache experts)"
+            )
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
         if self.max_slots is not None and cache_size > self.max_slots:
@@ -523,7 +544,11 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
-        # 5. Re-evaluate prefill overlap against the new size.
+        # 5. Flat residency is a permanent mapping, not cache state: the reallocated
+        # slots are empty, so reload every expert and restore the identity slot map.
+        if self.flat_residency:
+            self.materialize_flat()
+        # 6. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
             logger.warning(
                 f"Disabling MoE prefill overlap on rebuild: cache_size {cache_size} "
@@ -602,6 +627,46 @@ class OffloadMoeCache:
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
+
+    @property
+    def total_experts(self) -> int:
+        """Slots flat residency needs: one per (layer, expert)."""
+        return self.num_layers * self.num_experts
+
+    def flat_slot_base(self, layer_id: int) -> int:
+        """First slot of ``layer_id``'s permanent block (flat residency). Adding it to a
+        raw expert id yields the slot id the decode kernels index the cache with."""
+        return layer_id * self.num_experts
+
+    def bank_views_flat(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Per-bank views of one layer's permanent slot block, rows in expert-id order
+        (flat residency) -- the same contract the prefill double buffer hands the GEMM,
+        minus the copy."""
+        assert self.banks, "set_bank_sources must register the banks first"
+        lo = self.flat_slot_base(layer_id)
+        return tuple(cache[lo : lo + self.num_experts] for _, cache in self.banks)
+
+    def materialize_flat(self) -> int:
+        """Flat residency setup: stream EVERY expert into its permanent slot.
+
+        Slot ``layer * num_experts + expert`` holds that expert for the life of the
+        process, so ``slot_for_id`` / ``id_of_slot`` become identity maps and the forward
+        paths never reach ``ensure_experts`` / ``copy_missing`` again. Runs once at
+        startup and again after a rebuild; returns the bytes moved.
+        """
+        assert self.flat_residency, "materialize_flat requires flat_residency"
+        assert self.banks, "set_bank_sources must register the banks first"
+        moved = 0
+        for per_layer, cache in self.banks:
+            for layer_id, source in enumerate(per_layer):
+                lo = self.flat_slot_base(layer_id)
+                cache[lo : lo + self.num_experts].copy_(source)
+                moved += source.numel() * source.element_size()
+        identity = torch.arange(self.total_experts, dtype=torch.int32, device=self.device)
+        self.slot_for_id.view(-1).copy_(identity)
+        self.id_of_slot.fill_(-1)
+        self.id_of_slot[: self.total_experts].copy_(identity)
+        return moved
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
