@@ -24,7 +24,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -144,19 +144,31 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType], fp8_kv: bool 
             ("fi", True),
             ("triton", True),
         ]
+    quant_skipped: list[str] = []
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
         if not _backend_parts_serve(name, required):
             continue
         if not _backend_requirements_met(name, fp8_kv):
+            # Would it run without the quantized cache? Then the flag, not the hardware or
+            # the packages, is what took this candidate out of the list.
+            if fp8_kv and _backend_requirements_met(name):
+                quant_skipped.append(name)
             continue
         return name
-    raise RuntimeError(
-        "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine"
-        + (" with a quantized KV cache (--kv-cache-dtype)." if fp8_kv else ".")
-    )
+    msg = "No attention backend can serve attention types "
+    msg += f"{sorted(t.value for t in required)} on this machine"
+    if fp8_kv:
+        msg += " with a quantized KV cache (--kv-cache-dtype)"
+        if quant_skipped:
+            msg += (
+                ": "
+                + ", ".join(sorted(set(quant_skipped)))
+                + " cannot descale a quantized cache -- drop --kv-cache-dtype, or name a"
+                " backend that can"
+            )
+    raise RuntimeError(msg + ".")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -1422,6 +1434,10 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    # The pool family is the earlier constraint than the backend list: a pool that cannot
+    # descale its own reads would mis-serve silently, and its message names the fix (drop
+    # the flag) where the backend search can only report the symptom (nothing left to pick).
+    check_kv_quant(getattr(config, "kv_quant", None), model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
