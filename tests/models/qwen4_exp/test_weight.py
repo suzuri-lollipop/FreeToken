@@ -540,10 +540,10 @@ def test_tp_ranks_fill_their_own_buffers(checkpoint):
     """Each rank's reader output is exactly the buffers the model builds for that rank."""
     folder = checkpoint[0]
     with _tp_rank(0, 1):
-        single, whole_state = _load(folder), meta_state_dict(folder)
+        single, whole_state = _load(folder, vision=False), meta_state_dict(folder)
     for rank in (0, 1):
         with _tp_rank(rank, 2):
-            got, state = _load(folder), meta_state_dict(folder)
+            got, state = _load(folder, vision=False), meta_state_dict(folder)
         assert set(got) == set(state)
         for name, tensor in got.items():
             if single[name].shape != whole_state[name].shape:
@@ -551,6 +551,14 @@ def test_tp_ranks_fill_their_own_buffers(checkpoint):
             assert tensor.shape == state[name].shape, (
                 f"rank {rank}: {name} is {tuple(tensor.shape)}, model wants {tuple(state[name].shape)}"
             )
+
+
+def test_a_sharded_vision_tower_is_refused_before_it_asserts(checkpoint):
+    """The engine builds the tower TP-sharded but no reader slices it; the mismatch must name itself."""
+    folder = checkpoint[0]
+    with _tp_rank(0, 2):
+        with pytest.raises(NotImplementedError, match="vision tower"):
+            _load(folder)
 
 
 def test_tp_rank_cuts_the_projections_and_keeps_the_mixers(checkpoint, loaded):
@@ -561,7 +569,7 @@ def test_tp_rank_cuts_the_projections_and_keeps_the_mixers(checkpoint, loaded):
     """
     folder, raw = checkpoint
     with _tp_rank(1, 2):
-        got = _load(folder)
+        got = _load(folder, vision=False)
 
     replicated = [n for n in loaded if ("indexer" in n or "hyper_connection" in n or ".ple." in n)]
     assert len(replicated) > 10

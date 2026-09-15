@@ -45,6 +45,7 @@ def _config(**kwargs):
 
     tp = kwargs.pop("tp", 1)
     model_path = kwargs.pop("path", "/tmp/freetoken-test-model")
+    encoders = kwargs.pop("encoders", ())
     model_config = _model_config(**kwargs.pop("model", {}))
     model_spec = kwargs.pop("spec", None) or SimpleNamespace(tp_supported=True)
     config = EngineConfig(
@@ -55,6 +56,7 @@ def _config(**kwargs):
     )
     object.__setattr__(config, "model_config", model_config)
     object.__setattr__(config, "model_spec", model_spec)
+    object.__setattr__(config, "active_encoders", encoders)
     return config
 
 
@@ -85,6 +87,15 @@ def test_an_ftw_directory_is_rejected_under_tp(tmp_path):
     error = _preflight(_config(tp=2, path=str(tmp_path)))
     assert error is not None and "FTW checkpoint" in error
     assert _preflight(_config(tp=1, path=str(tmp_path))) is None
+
+
+def test_an_encoder_the_readers_cannot_shard_is_refused_under_tp():
+    # the Qwen VL tower is built rank-sharded but the readers emit full-size weights;
+    # say so before a rank burns a CUDA context and dies on the load_state_dict assert
+    config = _config(tp=2, encoders=(SimpleNamespace(kind="vision"),))
+    error = _preflight(config)
+    assert error is not None and "vision" in error and "--text-model-only" in error
+    assert _preflight(_config(tp=1, encoders=(SimpleNamespace(kind="vision"),))) is None
 
 
 @pytest.mark.parametrize(

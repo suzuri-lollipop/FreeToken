@@ -282,6 +282,13 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
             f"{model_config.model_type} does not shard its checkpoint for tensor parallelism "
             "yet; run with --tensor-parallel-size 1"
         )
+    # The Qwen VL tower is built rank-sharded but no reader slices its weights yet.
+    if config.active_encoders:
+        kinds = ", ".join(e.kind for e in config.active_encoders)
+        return (
+            f"the {kinds} encoder's weights are not tensor-parallel sharded yet; run with "
+            "--text-model-only (or --mm-disable to name the encoders to drop)"
+        )
     geometry = tp_shard_error(model_config, tp_size)
     if geometry:
         return f"--tensor-parallel-size {tp_size}: {geometry}"

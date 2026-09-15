@@ -106,9 +106,16 @@ def test_gdn_in_proj_keeps_one_head_from_every_run():
     assert torch.equal(r1.tensor("in_proj_qkv", qkv), rank_rows(qkv, 1))
     # conv1d carries the same runs on dim 0, with its trailing kernel dims untouched
     conv = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 1, 4)
-    cut = r1.tensor("conv1d", conv)
+    cut = r1.tensor("linear_attn.conv1d", conv)
     assert cut.shape == (rows // 2, 1, 4)
     assert torch.equal(cut, rank_rows(conv, 1))
+
+
+def test_the_ple_conv1d_stays_replicated_under_the_gdn_rule():
+    """qwen4's PLE conv is depthwise over hc*hidden; the row count can equal the GDN conv width."""
+    key, value = KH * GD, VH * GD
+    conv = _index(2 * key + value)
+    assert torch.equal(_shard(1, 2).tensor(module_leaf("model.layers.1.ple.conv1d.weight"), conv), conv)
 
 
 def test_vocab_shard_is_rounded_up_and_zero_padded():
@@ -136,7 +143,8 @@ def test_gdn_heads_must_divide():
 
 def test_module_leaf_names_the_module_of_a_key():
     assert module_leaf("model.embed_tokens.weight") == "embed_tokens"
-    assert module_leaf("model.layers.0.linear_attn.conv1d.weight") == "conv1d"
+    assert module_leaf("model.layers.0.linear_attn.conv1d.weight") == "linear_attn.conv1d"
+    assert module_leaf("model.layers.1.ple.conv1d.weight") == "ple.conv1d"
     assert module_leaf("model.layers.0.linear_attn.A_log") == "A_log"
     assert module_leaf("model.layers.1.self_attn.o_proj.weight") == "o_proj"
     assert module_leaf("model.layers.0.mlp.gate.weight") == "gate"
@@ -144,7 +152,8 @@ def test_module_leaf_names_the_module_of_a_key():
     assert module_leaf("model.layers.0.ple.ple_embedding.ngram_embedding") == "ngram_embedding"
     # leaves outside LEAF_AXIS are replicated, so the slicer must not touch them
     for name in ("model.layers.0.mlp.gate.weight", "model.layers.1.self_attn.indexer.index_qk_proj.weight",
-                 "model.layers.1.attn_hyper_connection.hc_norm.weight", "model.layers.0.ple.key_proj.weight"):
+                 "model.layers.1.attn_hyper_connection.hc_norm.weight", "model.layers.0.ple.key_proj.weight",
+                 "model.layers.1.ple.conv1d.weight"):
         assert module_leaf(name) not in LEAF_AXIS, name
 
 

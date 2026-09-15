@@ -212,6 +212,11 @@ def iter_weights(
     """
     if not include_non_moe:
         return  # the routed experts come from the offload cache's reader, nothing here to yield
+    if get_tp_info().size > 1 and include_vision:
+        raise NotImplementedError(
+            "the Qwen VL vision tower weights are not tensor-parallel sharded; run with "
+            "--text-model-only or --mm-disable vision"
+        )
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     shard = tp_shard(parse_config(hf_config))

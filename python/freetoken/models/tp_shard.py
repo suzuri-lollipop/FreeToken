@@ -24,22 +24,34 @@ LEAF_AXIS = {
     "q_proj": ROWS, "k_proj": ROWS, "v_proj": ROWS,
     "gate_proj": ROWS, "up_proj": ROWS,
     "in_proj_qkv": ROWS, "in_proj_z": ROWS, "in_proj_b": ROWS, "in_proj_a": ROWS,
-    "conv1d": ROWS, "A_log": ROWS, "dt_bias": ROWS,
+    "linear_attn.conv1d": ROWS, "A_log": ROWS, "dt_bias": ROWS,
     "o_proj": COLS, "down_proj": COLS, "out_proj": COLS,
     "lm_head": ROWS, "embed_tokens": ROWS,
 }
 # state-dict roles, i.e. the trailing key component that names a tensor of a module
 ROLE_SUFFIXES = frozenset({"weight", "weight_scale", "weight_scale_inv", "weight_global", "input_scale", "bias"})
+# leaves a replicated module reuses (qwen4's ple.conv1d is a depthwise conv over hc*hidden,
+# not the GDN conv), so they only shard under the owner-qualified leaf
+CONTEXT_LEAVES = frozenset({"conv1d"})
 
 
 def module_leaf(name: str) -> str:
     """The module a state-dict key belongs to: ``...o_proj.weight`` -> ``o_proj``.
 
+    A context leaf carries its owner module too: ``...linear_attn.conv1d.weight`` ->
+    ``linear_attn.conv1d``, ``...ple.conv1d.weight`` -> ``ple.conv1d`` (replicated).
+
     Leaves outside ``LEAF_AXIS`` (routers, indexer projections, the HC and PLE mixers, every
     norm) are replicated, so passing them through the slicer is a no-op by design.
     """
     module, _, last = name.rpartition(".")
-    return module.rpartition(".")[2] if last in ROLE_SUFFIXES else last
+    if last in ROLE_SUFFIXES:
+        parent, _, leaf = module.rpartition(".")
+    else:
+        parent, leaf = module, last
+    if leaf in CONTEXT_LEAVES and parent:
+        leaf = f"{parent.rpartition('.')[2]}.{leaf}"
+    return leaf
 
 
 def _leaf_units(config) -> dict[str, int]:
@@ -66,7 +78,7 @@ def _leaf_units(config) -> dict[str, int]:
         units.update({
             "in_proj_qkv": 2 * key + value, "in_proj_z": value,
             "in_proj_b": group.num_value_heads, "in_proj_a": group.num_value_heads,
-            "conv1d": 2 * key + value, "A_log": group.num_value_heads,
+            "linear_attn.conv1d": 2 * key + value, "A_log": group.num_value_heads,
             "dt_bias": group.num_value_heads, "out_proj": value,
         })
     return units
@@ -80,7 +92,7 @@ def _leaf_runs(config) -> dict[str, list[tuple[int, int]]]:
     key = group.num_key_heads * group.key_head_dim
     value = group.num_value_heads * group.value_head_dim
     runs = [(0, key), (key, key), (2 * key, value)]
-    return {"in_proj_qkv": runs, "conv1d": runs}
+    return {"in_proj_qkv": runs, "linear_attn.conv1d": runs}
 
 
 class TpShard:
