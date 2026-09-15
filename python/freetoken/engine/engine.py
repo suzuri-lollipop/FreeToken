@@ -133,6 +133,30 @@ def _vram_startup_refusal(dense_bytes: int, free_bytes: int, margin_gib: float) 
     )
 
 
+def _slot_cache_oom_note(
+    config: EngineConfig, *, plan_bytes: int, baseline_free: int, cuda_free: int, detail: str
+) -> str:
+    """Explain a refused expert slot cache: which free-memory reading to distrust, and the
+    flags that shrink the plan. Pure so the wording stays CPU-testable.
+
+    The sizing measured ``baseline_free`` before the weights loaded; ``cuda_free`` is what
+    the device still claims at the failed allocation. A refusal with a large ``cuda_free``
+    means the reading is not the physical limit -- true under WSL2, where both the CUDA and
+    NVML views are per-partition and Windows-side clients of the same GPU are invisible.
+    """
+    return (
+        f"MoE expert slot cache of {mem_GB(plan_bytes)} ({config.moe_cache_size} slots) was "
+        f"refused: it was sized from {mem_GB(baseline_free)} free measured before the weights "
+        f"loaded (memory_ratio={config.memory_ratio:g}), and the device still reports "
+        f"{mem_GB(cuda_free)} free, so that number is not what this process may actually "
+        "reserve - under WSL2 both the CUDA and NVML views are per-partition and miss "
+        "clients on the Windows side, and without the CUDA VMM API each bank must come from "
+        "one contiguous allocation. Stop the co-tenant, free VRAM, or shrink the plan with "
+        "--moe-cache-size/--moe-cache-rate (experts), --memory-ratio (whole pool budget) or "
+        f"--num-tokens (KV). Original error: {detail}"
+    )
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -689,25 +713,53 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            resolve_moe_cache_auto,
+            slot_cache_expert_cap,
+        )
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
+        num_moe_layers = config.model_config.num_moe_layers
+        total_experts = num_moe_layers * num_experts
+        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        # A --moe-cpu-layers split leaves the CPU-decoded experts unreachable in the slot
+        # cache; without this cap the greedy fill spends the whole budget on dead slots
+        # instead of KV, and asks the driver for one bank-sized contiguous allocation.
+        slot_cap = slot_cache_expert_cap(
+            num_moe_layers,
+            num_experts,
+            getattr(banks, "layer_residency", None),
+            prefill_overlap=config.moe_prefill_overlap,
+        )
+        max_slots = method.slot_limit() if method is not None else None
+        if slot_cap < total_experts:
+            max_slots = slot_cap if max_slots is None else min(max_slots, slot_cap)
+            logger.info_rank0(
+                f"--moe-cache-auto: only the PINNED layers' experts can hold a GPU slot; "
+                f"capping the slot cache at {slot_cap} of {total_experts} slots "
+                f"({mem_GB((total_experts - slot_cap) * per_expert_bytes)} left for the KV pool)"
+            )
+        kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        if getattr(config, "num_page_override", None) is not None:
+            # solve_num_pages spends the pinned KV geometry whatever the plan says, so the
+            # greedy expert fill must leave room for it, not just for kv_reserve_tokens.
+            kv_reserve_tokens = max(kv_reserve_tokens, config.num_page_override * page_tokens)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
-            max_slots=method.slot_limit() if method is not None else None,
+            max_slots=max_slots,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -833,7 +885,22 @@ class Engine:
                 "(they read the host banks, not GPU slots); drop --moe-cpu-layers or the "
                 "flat residency flag"
             )
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        try:
+            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        except torch.OutOfMemoryError as exc:
+            # The driver refused what the sizing measured as free; say which number to
+            # distrust and which flags shrink the plan, instead of a bare bank size.
+            from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+            raise torch.OutOfMemoryError(
+                _slot_cache_oom_note(
+                    config,
+                    plan_bytes=config.moe_cache_size * expert_bytes_per_slot(banks.sources),
+                    baseline_free=self._baseline_free,
+                    cuda_free=get_free_memory(self.device),
+                    detail=str(exc).splitlines()[0],
+                )
+            ) from exc
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if cache.flat_residency:
             # One pass over PCIe for the whole model, replacing the per-chunk full-layer

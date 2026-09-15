@@ -7,7 +7,12 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    expert_bytes_per_slot,
+    plan_cache_budget,
+    resolve_moe_cache_auto,
+    slot_cache_expert_cap,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -120,6 +125,57 @@ def test_resolve_auto_caps_slots_at_the_kernel_limit():
         kv_reserve_tokens=0, page_size=1, max_slots=992,
     )
     assert size == 992
+
+
+# --------------------------------------------------- residency-aware slot ceiling
+
+def _residency(pinned, num_layers):
+    from freetoken.moe.host_banks import HostResidency
+
+    return [
+        HostResidency.PINNED.value if i in pinned else HostResidency.PAGEABLE.value
+        for i in range(num_layers)
+    ]
+
+
+def test_slot_cache_expert_cap_counts_only_reachable_layers():
+    # 1 of 4 layers keeps a device address: its experts plus the one-window pageable
+    # prefill staging. The other 3 layers' experts can never occupy a GPU slot.
+    assert slot_cache_expert_cap(4, 4, _residency({0}, 4), prefill_overlap=False) == 8
+
+
+def test_slot_cache_expert_cap_adds_the_overlap_double_buffer():
+    assert slot_cache_expert_cap(4, 4, _residency({0}, 4), prefill_overlap=True) == 12
+
+
+def test_slot_cache_expert_cap_of_an_all_cpu_model_is_the_two_layer_buffer():
+    # Every bank non-pinned: the cache is nothing but prefill staging, the geometry
+    # --moe-strategy cpu fixes at 2 * num_experts.
+    assert slot_cache_expert_cap(4, 4, _residency(set(), 4), prefill_overlap=True) == 8
+
+
+def test_slot_cache_expert_cap_allows_full_residency_when_every_layer_is_pinned():
+    assert slot_cache_expert_cap(4, 4, _residency({0, 1, 2, 3}, 4), prefill_overlap=True) == 16
+
+
+@pytest.mark.parametrize("residency", [None, [], ["pinned"] * 3, ["pageable"] * 5])
+def test_slot_cache_expert_cap_trusts_an_unlabeled_loader(residency):
+    # A loader that does not echo per-layer residency (or echoes a partial list) must not
+    # be read as "nothing is reachable": report the whole-model ceiling instead.
+    assert slot_cache_expert_cap(4, 4, residency, prefill_overlap=False) == 16
+
+
+def test_capped_plan_fits_the_floor_and_gives_the_rest_to_kv():
+    # The cap must stay a legal plan_cache_budget argument: 8 slots >= the num_experts
+    # floor, and the freed bytes land in the KV page count.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=8_000_000, per_expert_bytes=480_000, cache_per_page=131_072,
+        num_experts=4, total_experts=16, prefill_overlap=False,
+        kv_reserve_pages=0, max_slots=slot_cache_expert_cap(4, 4, _residency({0}, 4),
+                                                            prefill_overlap=False),
+    )
+    assert size == 8 and overlap is False
+    assert pages == (8_000_000 - 8 * 480_000) // 131_072
 
 
 def _dsv4_adjust_cfg(**over):
@@ -336,6 +392,98 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+
+# ------------------------------------------------- auto plan vs host residency / pinned KV
+#
+# Stub geometry: budget = 0.9 * 10_000_000 - 1_000_000 = 8_000_000 B, one expert slot
+# 320_000 + 160_000 = 480_000 B, one KV page 8192 B/token * 16 = 131_072 B.
+
+
+def _auto_plan_stub(num_layers=4, *, layer_residency="unset", num_page_override=None,
+                    moe_prefill_overlap=False):
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class ModelConfig:
+        has_swa_attention = False
+        num_experts = 4
+        num_moe_layers = num_layers
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=tuple(range(num_layers)), num_kv_heads=8, head_dim=64,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class Config:
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 0.9
+        kv_reserve_tokens = 0
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        model_config = ModelConfig()
+
+        class tp_info:
+            size = 1
+
+    Config.moe_prefill_overlap = moe_prefill_overlap
+    Config.num_page_override = num_page_override
+
+    class Banks:
+        sources = {
+            "gate_up": [torch.zeros(4, 200, 800, dtype=torch.float16)] * num_layers,  # 320_000
+            "down": [torch.zeros(4, 400, 200, dtype=torch.float16)] * num_layers,  # 160_000
+        }
+
+    if layer_residency != "unset":
+        Banks.layer_residency = layer_residency
+
+    engine = Engine.__new__(Engine)  # bypass __init__/GPU
+    engine._baseline_free = 10_000_000
+    engine._weights_bytes = 1_000_000
+    engine._pool_cls = MHAKVCache
+    return engine, Config(), Banks()
+
+
+def test_auto_plan_spends_unreachable_expert_bytes_on_kv():
+    # The WSL2 shape: --moe-cpu-layers leaves 1 of 4 MoE layers with a device address. The
+    # greedy fill must not plan all 16 experts on GPU (7.7 MB of the 8 MB budget, in one
+    # bank-sized contiguous allocation); the unreachable bytes belong to the KV pool.
+    engine, config, banks = _auto_plan_stub(layer_residency=None)
+    uncapped_size, uncapped_pages, _ = engine._resolve_auto_moe_cache_size(config, banks)
+    assert (uncapped_size, uncapped_pages) == (16, 2)  # every expert of every layer planned
+
+    engine, config, banks = _auto_plan_stub(layer_residency=_residency({0}, 4))
+    size, pages, _ = engine._resolve_auto_moe_cache_size(config, banks)
+    assert size == 8  # the pinned layer's experts + the pageable-prefill staging window
+    assert pages == (8_000_000 - size * 480_000) // 131_072 > uncapped_pages
+    assert size * 480_000 + pages * 131_072 <= 8_000_000
+
+
+def test_auto_plan_reserves_a_pinned_kv_geometry():
+    # --num-tokens pins the KV pool; solve_num_pages spends it whatever the plan says, so
+    # the expert fill must leave room for it, not only for kv_reserve_tokens.
+    engine, config, banks = _auto_plan_stub(layer_residency=None, num_page_override=3)
+    size, pages, _ = engine._resolve_auto_moe_cache_size(config, banks)
+    assert size == 15  # one layer shorter than the unpinned plan
+    assert pages >= 3  # the pinned geometry survives the MoE-first split
+
+
+def test_auto_plan_of_the_reported_wsl2_run_caches_one_layer_not_the_model():
+    # RadixArk-Qwen3.8-Flash-Next-NVFP4: 48 MoE layers x 512 experts, 47 of them settled
+    # pageable after the mlock failure, prefill overlap off -> the plan asked for all
+    # 24576 slots (a 37.5 GiB gate_up bank); only one layer + staging can ever be filled.
+    assert slot_cache_expert_cap(
+        48, 512, _residency({24}, 48), prefill_overlap=False
+    ) == 1024
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,37 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
 
 
+def slot_cache_expert_cap(
+    num_layers: int,
+    num_experts: int,
+    layer_residency: "list[str] | None",
+    *,
+    prefill_overlap: bool,
+) -> int:
+    """Slots the GPU expert cache can ever fill, given each host bank layer's residency.
+
+    Only PINNED banks carry a device address, so only their layers take LRU slots. A
+    LOCKED/PAGEABLE layer touches the cache exactly once per prefill chunk -- the
+    whole-layer pageable staging in ``copy_missing`` -- which occupies
+    ``[0, num_experts)`` (two such buffers with prefill overlap). Sizing for their
+    experts buys dead bytes that the KV pool could use, and one huge contiguous bank.
+
+    ``layer_residency is None`` is a loader that settles banks without per-layer labels
+    (see ``moe.expert_banks._echo_residency``): report the whole-model ceiling rather
+    than shrink a residency we cannot see.
+    """
+    from freetoken.moe.host_banks import HostResidency
+
+    total_experts = num_layers * num_experts
+    if not layer_residency or len(layer_residency) != num_layers:
+        return total_experts
+    staging = (2 if prefill_overlap else 1) * num_experts
+    pinned = sum(1 for r in layer_residency if r == HostResidency.PINNED.value)
+    if pinned == num_layers:
+        return total_experts
+    return (pinned * num_experts) + staging
+
+
 def net_cache_budget_bytes(
     memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
 ) -> int:

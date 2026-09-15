@@ -105,3 +105,26 @@ def test_overcommit_falsy(monkeypatch, value):
 def test_overcommit_unset(monkeypatch):
     monkeypatch.delenv(_VRAM_OVERCOMMIT_ENV, raising=False)
     assert not _vram_overcommit_allowed()
+
+
+# --------------------------------------------------- refused slot cache (post-weight OOM)
+
+def test_slot_cache_oom_note_names_the_lying_reading_and_the_knobs():
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import _slot_cache_oom_note
+
+    msg = _slot_cache_oom_note(
+        SimpleNamespace(moe_cache_size=24576, memory_ratio=0.9),
+        plan_bytes=66 * GiB,
+        baseline_free=93 * GiB,
+        cuda_free=84 * GiB,
+        detail="CUDA out of memory. Tried to allocate 37.50 GiB.",
+    )
+    assert "66.00 GiB" in msg and "24576 slots" in msg
+    assert "93.00 GiB" in msg  # what the sizing trusted
+    assert "84.00 GiB" in msg  # what the device still claimed when it refused
+    assert "WSL2" in msg
+    for flag in ("--moe-cache-size", "--moe-cache-rate", "--memory-ratio", "--num-tokens"):
+        assert flag in msg
+    assert "Tried to allocate 37.50 GiB." in msg  # the driver's own words survive
