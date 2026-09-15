@@ -260,7 +260,7 @@ def test_factory_passes_the_quant_to_the_qsa_pool():
     from freetoken.kvcache import create_kvcache_pool
 
     mc = SimpleNamespace(
-        num_layers=8, has_swa_attention=False, has_linear_attention=True, dsv4_args=None
+        num_layers=8, has_swa_attention=False, has_linear_attention=True, dsv4_args=None, model_is_mrope=False
     )
     mc.kv_cache_group_specs = lambda: (_spec(),)
     pool = create_kvcache_pool(

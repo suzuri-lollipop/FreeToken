@@ -626,7 +626,7 @@ def test_dense_tp_ranks_fill_their_own_buffers(dense_folder):
     """The sharded reader lands exactly in the buffers a rank's model declares."""
     for rank in (0, 1):
         with _tp_rank(rank, 2):
-            loaded, state = _load(dense_folder), _meta_state_dict(dense_folder)
+            loaded, state = _load(dense_folder, vision=False), _meta_state_dict(dense_folder)
         assert set(loaded) == set(state)
         for key, tensor in loaded.items():
             assert tensor.shape == state[key].shape, (
