@@ -64,6 +64,12 @@ class Qwen3_5Attention(BaseOP):
                 if config.rotary_config.scaling
                 else None
             ),
+            mrope_section=(
+                tuple(config.rotary_config.mrope_section)
+                if config.rotary_config.mrope_section is not None
+                else None
+            ),
+            mrope_layout=config.rotary_config.mrope_layout,
         )
         self.o_proj = LinearOProj(
             config.num_qo_heads * head_dim, config.hidden_size, has_bias=False,
@@ -73,7 +79,7 @@ class Qwen3_5Attention(BaseOP):
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        positions = get_global_ctx().batch.get_attn_positions()
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
