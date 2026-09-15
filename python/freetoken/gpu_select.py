@@ -280,6 +280,95 @@ def physical_gpu_count() -> "int | None":
     return None if uuids is None else len(uuids)
 
 
+def _nvml_memory() -> "list[tuple[int, int]] | None":
+    """(total_bytes, free_bytes) per physical GPU in NVML order, or None when NVML is unavailable.
+
+    Whole-device view: unlike CUDA's per-process accounting (mem_get_info), NVML counts every
+    client's VRAM. Under WSL2 in particular the CUDA view misses processes outside the
+    namespace (e.g. a docker container on the Windows host), so pool sizing must be clamped
+    against the stricter of the two.
+    """
+    import ctypes
+
+    if os.name == "nt":
+        candidates = [
+            "nvml.dll",
+            os.path.join(os.environ.get("SystemRoot", r"C:\\Windows"), "System32", "nvml.dll"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\\Program Files"), "NVIDIA Corporation", "NVSMI", "nvml.dll"),
+        ]
+    else:
+        candidates = ["libnvidia-ml.so.1"]
+    try:
+        for name in candidates:
+            try:
+                lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        else:
+            return None
+        if lib.nvmlInit() != 0:
+            return None
+        try:
+            count = ctypes.c_int()
+            if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+                return None
+            infos = []
+            for i in range(count.value):
+                handle = ctypes.c_void_p()
+                if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) != 0:
+                    return None
+                mem = (ctypes.c_ulonglong * 3)()  # NVML_MEMORY: total, free, used
+                if lib.nvmlDeviceGetMemoryInfo(handle, mem) != 0:
+                    return None
+                infos.append((int(mem[0]), int(mem[1])))
+            return infos
+        finally:
+            lib.nvmlShutdown()
+    except (OSError, AttributeError):
+        return None
+
+
+def nvml_free_bytes() -> "int | None":
+    """NVML (whole-device) free bytes of this process's assigned GPU, or None when NVML is
+    unavailable or cannot name the card.
+
+    Call after set_assigned_gpu. Clamps the CUDA per-process free-memory view (mem_get_info)
+    when another client holds VRAM this process's CUDA namespace cannot see.
+    """
+    infos = _nvml_memory()
+    if not infos:
+        return None
+    if _assigned_physical is not None:
+        uuids = _nvml_uuids()
+        if uuids is None or len(uuids) != len(infos):
+            return None
+        for i, u in enumerate(uuids):
+            if u.upper().startswith(_assigned_physical.upper()):
+                return infos[i][1]
+        return None
+    visible = _assigned_visible if _assigned_visible is not None else 0
+    preset_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if preset_raw is not None:
+        # freetoken never sets CUDA_VISIBLE_DEVICES itself; a preset one reorders the visible ordinals
+        preset = [e.strip() for e in preset_raw.split(",") if e.strip()]
+        if visible >= len(preset):
+            return None
+        entry = preset[visible]
+        if is_gpu_uuid(entry):
+            uuids = _nvml_uuids()
+            if uuids is None:
+                return None
+            for i, u in enumerate(uuids):
+                if i < len(infos) and (u.upper().startswith(entry.upper()) or entry.upper().startswith(u.upper())):
+                    return infos[i][1]
+            return None
+        if not is_gpu_index(entry):
+            return None
+        visible = int(entry)
+    return infos[visible][1] if visible < len(infos) else None
+
+
 def gpu_identity(index: int) -> dict:
     """{index, name, uuid, total_bytes} of visible device ``index``."""
     import torch

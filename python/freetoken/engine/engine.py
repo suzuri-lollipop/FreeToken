@@ -11,7 +11,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken.gpu_select import gpu_identity
+from freetoken.gpu_select import gpu_identity, nvml_free_bytes
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
@@ -72,6 +72,65 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+
+
+def _effective_free_bytes(cuda_free: int, nvml_free: int | None) -> int:
+    """Whole-device free for pool sizing: NVML wins whenever the CUDA view sees more.
+
+    mem_get_info is per-process-namespace (under WSL2 it misses clients outside the
+    namespace); NVML counts the whole device, so the stricter number is the only one a
+    physical allocation is guaranteed to fit in. Kept pure so the clamp stays CPU-testable.
+    """
+    return cuda_free if nvml_free is None else min(cuda_free, nvml_free)
+
+
+_VRAM_MARGIN_GIB_DEFAULT = 2.0
+_VRAM_MARGIN_ENV = "FREETOKEN_VRAM_START_MARGIN_GIB"
+_VRAM_OVERCOMMIT_ENV = "FREETOKEN_VRAM_ALLOW_OVERCOMMIT"
+
+
+def _dense_weights_bytes(model) -> int:
+    """Exact bytes of every tensor the load path materializes on the device.
+
+    The meta-device state dict is the authoritative footprint: it is TP-sharded exactly
+    the way the weights arrive, and offload models exclude the routed experts from it
+    (they are served from the offload cache, not the dense weights).
+    """
+    return sum(int(p.numel()) * p.element_size() for p in model.state_dict().values())
+
+
+def _vram_margin_gib() -> float:
+    raw = os.environ.get(_VRAM_MARGIN_ENV)
+    if raw is None or not raw.strip():
+        return _VRAM_MARGIN_GIB_DEFAULT
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"{_VRAM_MARGIN_ENV} must be a number (GiB), got {raw!r}") from None
+
+
+def _vram_overcommit_allowed() -> bool:
+    return os.environ.get(_VRAM_OVERCOMMIT_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _vram_startup_refusal(dense_bytes: int, free_bytes: int, margin_gib: float) -> str | None:
+    """Refuse to materialize weights when the shared device is short of dense + margin.
+
+    Pure so the gate stays CPU-testable. Returns the error message, or None when it fits.
+    """
+    need = dense_bytes + int(margin_gib * 1024**3)
+    if free_bytes >= need:
+        return None
+    return (
+        f"refusing to start: the dense weights need {mem_GB(dense_bytes)} plus "
+        f"{margin_gib:g} GiB of margin (CUDA context, graphs, warmup and the minimum "
+        f"pools) = {mem_GB(need)}, but the device reports only {mem_GB(free_bytes)} free - "
+        "another client holds the rest of this physical GPU. Continuing would drive the "
+        "device past its physical limit; on WSL2 that wedges the driver's GPU sync path "
+        "and takes down every client on it (including the co-tenant). Free at least "
+        f"{mem_GB(need - free_bytes)} more, stop the co-tenant, lower {_VRAM_MARGIN_ENV}, "
+        f"or set {_VRAM_OVERCOMMIT_ENV}=1 to start anyway at your own risk."
+    )
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -349,17 +408,19 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
-        _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        # before the first CUDA allocation below: probes the VMM-backed allocator on this device
+        _ensure_expandable_segments(self.device)
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        self._mem_view_warned = False  # one-time rank0 warning when the CUDA/NVML free views diverge
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -377,6 +438,25 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        # Pre-weight gate: refuse before materializing a byte when the physical device
+        # (NVML-clamped, whole-device) is short of dense + margin. On a multi-client GPU
+        # (WSL2) overcommitting the device does not fail only our allocation - it wedges
+        # the driver's GPU sync path and takes down every client on it, co-tenant included.
+        # Refusing here costs one CUDA context; failing later costs the co-tenant.
+        if _vram_overcommit_allowed():
+            logger.warning_rank0(
+                f"{_VRAM_OVERCOMMIT_ENV} is set: skipping the startup VRAM gate - the "
+                "shared device can be driven past its physical limit and every client "
+                "on it can die"
+            )
+        else:
+            free_now, _ = self._sync_get_memory()
+            refusal = _vram_startup_refusal(
+                _dense_weights_bytes(self.model), free_now, _vram_margin_gib()
+            )
+            if refusal:
+                logger.critical_rank0(refusal)
+                raise RuntimeError(refusal)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
         post_weights_free = self._sync_get_memory()[0]
@@ -780,11 +860,25 @@ class Engine:
         self.cpu_moe_executor = executor
 
     def _sync_get_memory(self) -> Tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
+        """Get the min and max free memory across TP ranks, clamped to the whole-device (NVML) free.
+
+        The CUDA allocator view is per-process-namespace: under WSL2 it misses VRAM held by
+        clients outside the namespace (e.g. a docker container on the Windows host), so an
+        unclamped number over-plans the pools and the first real allocation dies with an
+        opaque driver error. NVML sees the whole device, so it wins when the two disagree.
+        """
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-        free_memory = get_free_memory(self.device)
+        cuda_free = get_free_memory(self.device)
+        free_memory = _effective_free_bytes(cuda_free, nvml_free_bytes())
+        if free_memory < cuda_free - (1 << 30) and not self._mem_view_warned:
+            self._mem_view_warned = True
+            logger.warning_rank0(
+                f"CUDA reports {mem_GB(cuda_free)} free but NVML sees {mem_GB(free_memory)}: another "
+                f"client outside this process's CUDA namespace (e.g. a WSL2-external container) "
+                f"holds {mem_GB(cuda_free - free_memory)}; planning pools with the NVML value"
+            )
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -1078,7 +1172,7 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
     return ident["name"], ident["uuid"]
 
 
-def _ensure_expandable_segments() -> None:
+def _ensure_expandable_segments(device: torch.device) -> None:
     """Default the CUDA allocator to expandable segments.
 
     The motivating case is the offload prefill, which repeatedly dequantizes
@@ -1093,6 +1187,12 @@ def _ensure_expandable_segments() -> None:
     setting via the runtime API instead. Must run before the first CUDA allocation (the
     caller guarantees CUDA is not yet initialized). Any user-provided allocator config
     is respected and left untouched.
+
+    The setting is verified with a probe allocation: expandable segments ride on the CUDA
+    VMM API, which some stacks (notably WSL2) do not implement -- without the probe the
+    first real allocation dies with an opaque cudaErrorUnknown deep in model construction.
+    A failed probe leaves the context usable, so re-setting the default allocator is a
+    clean in-process fallback.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
@@ -1100,6 +1200,16 @@ def _ensure_expandable_segments() -> None:
         torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
+        return
+    try:
+        probe = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+        del probe
+    except Exception as exc:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        logger.warning_rank0(
+            f"expandable_segments is unavailable here (probe allocation failed: {exc}); the "
+            f"CUDA VMM API is not implemented by this stack (e.g. WSL2) - using the default allocator"
+        )
         return
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
