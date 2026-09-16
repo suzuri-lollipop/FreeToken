@@ -661,3 +661,31 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+def test_resolve_threads_splits_cores_across_tp_ranks(monkeypatch):
+    """Under TP each rank's executor pins a disjoint stride slice of the physical cores.
+
+    Two rank pools are bandwidth-bound on the SAME RAM; overlapping pinning would collapse
+    the spin barriers against each other, so rank r takes cores[r::size] (no shared core).
+    """
+    from freetoken.distributed import info as tp_info
+    from freetoken.moe import cpu_executor as ce
+
+    all_cores = list(range(16))  # pretend 16 physical cores
+    monkeypatch.setattr(ce, "physical_core_cpus", lambda: all_cores)
+    monkeypatch.setattr(tp_info, "_TP_INFO", None)
+
+    # single rank: whole machine
+    n, cores = ce.resolve_threads_and_affinity(0)
+    assert n == 16 and cores == all_cores
+
+    # tp=2: disjoint stride slices, union == every core, no overlap
+    monkeypatch.setattr(tp_info, "_TP_INFO", tp_info.DistributedInfo(rank=0, size=2))
+    n0, c0 = ce.resolve_threads_and_affinity(0)
+    monkeypatch.setattr(tp_info, "_TP_INFO", tp_info.DistributedInfo(rank=1, size=2))
+    n1, c1 = ce.resolve_threads_and_affinity(0)
+    monkeypatch.setattr(tp_info, "_TP_INFO", None)
+    assert n0 == 8 and n1 == 8
+    assert set(c0).isdisjoint(c1)
+    assert sorted(c0 + c1) == all_cores
