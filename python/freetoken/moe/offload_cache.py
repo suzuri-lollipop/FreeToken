@@ -146,6 +146,12 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # hybrid only: smallest decode batch that routes misses through the CPU executor.
+    # Below it the per-layer submit/sync handshake costs more than the PCIe it saves --
+    # a warm bs=1 step misses only ~1 expert/layer, so the GPU slot cache serves it
+    # faster alone. The engine raises this to 2 under TP (measured: bs=1 hybrid decodes
+    # slower than pure offload there); CUDA graphs bake the branch per captured batch size.
+    hybrid_min_bs: int = 1
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None

@@ -192,3 +192,15 @@ class LinearRowParallel(_LinearTPImpl):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._reduce(self.quant_method.apply(self, x))
+
+    def forward_partial(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's row-parallel GEMM output WITHOUT the cross-rank reduce.
+
+        Lets a caller fold several row-parallel partials into ONE all-reduce (e.g. a
+        shared expert summed with the routed experts before a single collective). Only
+        valid when the layer is bias-free: ``_reduce`` also subtracts the bias that
+        ``apply`` added once per rank, and skipping it would leave that bias counted
+        ``tp_size`` times after the caller's all-reduce.
+        """
+        assert self.bias is None, "forward_partial requires a bias-free row-parallel layer"
+        return self.quant_method.apply(self, x)

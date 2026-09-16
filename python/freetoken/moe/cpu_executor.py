@@ -124,8 +124,18 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spin-barrier degrades badly when oversubscribed). An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
+
+    Under tensor parallelism every rank runs its own executor in its own process, and
+    all pools are bandwidth-bound on the SAME RAM: each rank pins a disjoint stride
+    slice of the physical cores, so the pools split the machine instead of collapsing
+    the spin barriers against each other.
     """
+    from freetoken.distributed.info import try_get_tp_info
+
     reps = physical_core_cpus()
+    tp = try_get_tp_info()
+    if tp is not None and tp.size > 1:
+        reps = reps[tp.rank :: tp.size] or reps
     if requested and requested > 0:
         n = int(requested)
         try:

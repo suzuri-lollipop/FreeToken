@@ -136,13 +136,30 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
+        return self._maybe_all_reduce(self.routed_partial(hidden_states, router_logits))
+
+    def routed_partial(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's expert compute WITHOUT the TP all-reduce.
+
+        Lets a model fold the routed partial together with another row-parallel partial
+        (the shared expert's) before ONE collective -- see Qwen4ExpMoE.forward. Same
+        in-place contract as ``forward``: ``hidden_states`` may be overwritten.
+        """
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        return self._resident_gemm(hidden_states, topk_weights, topk_ids)
+
+    def reduce_partial(self, partial: torch.Tensor) -> torch.Tensor:
+        """The TP all-reduce ``forward`` would have applied to a ``routed_partial``."""
+        return self._maybe_all_reduce(partial)
 
 
 class OffloadMoELayer(MoELayer):
@@ -194,12 +211,22 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
+        return self._maybe_all_reduce(self.routed_partial(hidden_states, router_logits))
+
+    def routed_partial(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's expert compute WITHOUT the TP all-reduce (prefill or decode by phase).
+
+        OffloadMoELayer's ``forward`` all-reduces the phase output; this returns it raw so
+        a model can fold it with another row-parallel partial into one collective.
+        """
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
-            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
-        else:
-            final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+            return self.prefill_forward(hidden_states, router_logits)
+        return self.decode_forward(hidden_states, router_logits)
 
     def routed_forward(
         self,
@@ -280,8 +307,10 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid":
+        if cache.decode_target == "hybrid" and hidden_states.shape[0] >= cache.hybrid_min_bs:
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        # hybrid below hybrid_min_bs falls through to the GPU slot-cache path: a small
+        # batch misses too few experts per layer for the CPU round trip to pay off.
         if cache.flat_residency:
             # This layer's experts own permanent slots, so the routing ids only need
             # shifting into the layer's block: no LRU lookup, no PCIe.

@@ -228,7 +228,10 @@ def test_sharded_nvfp4_experts_pass_the_gate(strategy):
 
 
 @pytest.mark.parametrize("strategy", ["cpu", "hybrid"])
-def test_the_cpu_expert_backends_are_refused_under_tp(strategy):
+def test_the_cpu_expert_backends_run_under_tp_for_sharded_nvfp4(strategy):
+    # nvfp4 is the one offload format whose banks shard with the kernel that owns the
+    # layout, so each rank's CPU executor reads its own intermediate slice and the layer's
+    # all-reduce sums the partials: cpu/hybrid are TP-correct and pass the gate.
     config = _config(
         tp=2,
         moe_strategy=strategy,
@@ -236,8 +239,20 @@ def test_the_cpu_expert_backends_are_refused_under_tp(strategy):
             is_moe=True, moe_enabled=True, moe_intermediate_size=640, expert_quant="nvfp4"
         ),
     )
+    assert _preflight(config) is None
+
+
+@pytest.mark.parametrize("strategy", ["cpu", "hybrid"])
+def test_the_cpu_expert_backends_are_refused_under_tp_without_nvfp4(strategy):
+    # Without nvfp4 the offload banks are not TP-sharded, so the CPU executor would read a
+    # full-width expert against a rank-sharded routing -- refused before any rank loads.
+    config = _config(
+        tp=2,
+        moe_strategy=strategy,
+        model=dict(is_moe=True, moe_enabled=True, moe_intermediate_size=640),
+    )
     error = _preflight(config)
-    assert error is not None and "CPU" in error
+    assert error is not None and "--moe-strategy fused" in error
 
 
 def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):

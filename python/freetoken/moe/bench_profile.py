@@ -158,6 +158,7 @@ def load_hybrid_fetch_fraction(
     gpu_name: str | None = None,
     path: str | None = None,
     gpu_uuid: str | None = None,
+    tp_size: int = 1,
 ) -> float | None:
     """Benched hybrid fetch fraction for ``quant_format``, or ``None``.
 
@@ -169,11 +170,21 @@ def load_hybrid_fetch_fraction(
     under a full-DRAM-contention assumption (cpu keeps cpu - pcie under DMA), which
     reduces to pcie/cpu. Per-dtype entry first, then any per-model entry with this format.
     ``None`` = no usable profile; clamped to [0, 1].
+
+    Under tensor parallelism each rank keeps its OWN PCIe link (the profile is keyed by
+    that rank's GPU uuid) but the CPU MoE pool is one machine-wide RAM bandwidth shared by
+    all ``tp_size`` rank executors. The per-rank CPU slice does not shrink linearly with
+    tp_size: RAM-bound pools on disjoint core slices each keep most of the stream rate
+    (measured on 2 ranks over one dual-channel controller: ~62% each, not 50%), so the
+    shared term scales as tp^0.75. Scaling the CPU term keeps the split bandwidth-matched
+    per rank (a rank fetches a larger share over its private link because its CPU slice is
+    smaller).
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
     prof = _usable_profile(gpu_name, path, gpu_uuid)
     if prof is None:
         return None
+    cpu_share = max(1, int(tp_size or 1)) ** 0.75
     entries = [(prof.get("dtype_kernels") or {}).get(fmt)] + [
         (wl.get("kernels") or {}).get(fmt)
         for wl in (prof.get("workloads") or {}).values()
@@ -184,8 +195,9 @@ def load_hybrid_fetch_fraction(
             continue
         cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
         if cpu_ov and pcie_ov:
-            return min(1.0, pcie_ov / (pcie_ov + cpu_ov))
+            cpu_eff = cpu_ov / cpu_share
+            return min(1.0, pcie_ov / (pcie_ov + cpu_eff))
         cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
         if cpu and pcie:
-            return min(1.0, pcie / cpu)
+            return min(1.0, pcie / (cpu / cpu_share))
     return None

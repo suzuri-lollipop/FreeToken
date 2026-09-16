@@ -66,6 +66,35 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
 
 
+def test_load_hybrid_fetch_fraction_splits_the_cpu_pool_under_tp(tmp_path):
+    """Under TP every rank keeps its private PCIe link but shares ONE RAM pool, so the
+    per-rank CPU term shrinks (sublinearly: disjoint core slices of a RAM-bound pool each
+    keep most of the stream rate -> tp^0.75) and the balanced split fetches MORE over PCIe."""
+    prof = {
+        "gpu": {"name": "FAKE GPU"},
+        "dtype_kernels": {
+            "bf16": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
+            "nvfp4_x": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0,
+                        "cpu_moe_overlap_gbs": 80.0, "pcie_gather_overlap_gbs": 20.0},
+        },
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    # tp=1 keeps the historical single-rank values
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=1) == pytest.approx(0.4)
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=1) == pytest.approx(0.2)
+    # tp=2: standalone -> pcie / (cpu / 2^0.75); overlapped -> pcie_ov / (pcie_ov + cpu_ov / 2^0.75)
+    share = 2 ** 0.75
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=2) == pytest.approx(
+        40.0 / (100.0 / share))
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=2) == pytest.approx(
+        20.0 / (20.0 + 80.0 / share))
+    # ... and always fetches at least as much as tp=1 (the CPU slice only got smaller)
+    for fmt in ("bf16", "nvfp4_x"):
+        assert load_hybrid_fetch_fraction(fmt, path=str(path), tp_size=2) > \
+            load_hybrid_fetch_fraction(fmt, path=str(path), tp_size=1)
+
+
 def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.delenv("FREETOKEN_BENCHBW_PATH", raising=False)
@@ -126,3 +155,52 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hybrid_min_bs_routes_small_batches_to_the_gpu_path():
+    """hybrid_min_bs keeps small decode batches on the GPU slot-cache path.
+
+    A warm bs=1 step misses ~1 expert/layer: the per-layer CPU submit/sync handshake
+    costs more than the PCIe it saves, so the engine raises the floor to 2 under TP and
+    the layer dispatch (captured per batch size into the decode graphs) must honor it.
+    """
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=8, cache_size=16, device=torch.device("cuda"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1, hybrid_min_bs=2,
+    )
+    layer = OffloadMoELayer(
+        layer_id=0, num_experts=8, top_k=2, hidden_size=4, intermediate_size=8,
+        strategy="hybrid", decode_target="hybrid",
+    )
+    layer.offload_cache = cache
+    took = []
+    layer._decode_hybrid = lambda c, h, w, i: took.append("hybrid")
+    cache.ensure_experts = lambda lid, ids: took.append("ensure")
+    cache.copy_missing = lambda: took.append("copy")
+    cache.bank_views = lambda n=None: ()
+    cache.alphas_for_slots = lambda lid: None
+    layer._expert_gemm = lambda *a, **k: took.append("gemm")
+
+    dev = torch.device("cuda")
+    w = torch.zeros(1, 2, device=dev)
+    ids = torch.zeros(1, 2, dtype=torch.int32, device=dev)
+    h1 = torch.zeros(1, 4, device=dev, dtype=torch.bfloat16)
+    layer._decode_routed(h1, w, ids)
+    assert took == ["ensure", "copy", "gemm"]  # bs=1 < hybrid_min_bs -> GPU slot path
+
+    took.clear()
+    cache.hybrid_min_bs = 1  # historical default: hybrid serves every batch size
+    layer._decode_routed(h1, w, ids)
+    assert took == ["hybrid"]
+
+    took.clear()
+    cache.hybrid_min_bs = 2
+    h2 = torch.zeros(2, 4, device=dev, dtype=torch.bfloat16)
+    layer._decode_routed(h2, torch.zeros(2, 2, device=dev),
+                         torch.zeros(2, 2, dtype=torch.int32, device=dev))
+    assert took == ["hybrid"]  # bs=2 >= hybrid_min_bs -> CPU overflow path

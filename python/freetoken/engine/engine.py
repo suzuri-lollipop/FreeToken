@@ -860,6 +860,21 @@ class Engine:
             # The double buffers borrow the cache's first two expert layers, which flat
             # residency hands to permanent experts; prefill reads slots directly anyway.
             object.__setattr__(config, "moe_prefill_overlap", False)
+        if (
+            not config.moe_prefill_hit_d2d
+            and config.moe_prefill_overlap
+            and not config.moe_flat_residency
+            and config.moe_cache_size > 2 * config.model_config.num_experts
+        ):
+            # Auto-enable the prefill hit/miss split whenever it can pay: cache-resident
+            # experts gather device-side into the double buffer and only the misses cross
+            # PCIe. The runtime re-validates per chunk (_hit_d2d_usable) and falls back to
+            # full-layer copies with a warning when the machine lacks the batch memcpy.
+            object.__setattr__(config, "moe_prefill_hit_d2d", True)
+            logger.info_rank0(
+                "MoE prefill hit-D2D auto-enabled (slot cache exceeds the double buffers): "
+                "resident experts gather device-side, only misses stream over PCIe"
+            )
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -916,6 +931,14 @@ class Engine:
             )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+            # Under TP each rank runs its own CPU executor over a shared RAM pool, and the
+            # per-layer submit/sync handshake outweighs the tiny PCIe saving at bs=1 (a warm
+            # single-row step misses ~1 expert/layer). Keep bs=1 on the GPU slot cache and
+            # route bs>=2 through the CPU. Measured: bs=1 hybrid decodes ~25% slower than
+            # offload here, while bs>=2 aggregate is ~1.7x faster. Single-rank keeps the
+            # historical always-hybrid behavior.
+            if config.tp_info.size > 1:
+                cache.hybrid_min_bs = 2
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -942,7 +965,8 @@ class Engine:
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
         fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
+            tp_size=config.tp_info.size,
         )
         if fraction is None:
             cache.hybrid_max_fetch = 1
@@ -1312,6 +1336,37 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
+
+
+def _hybrid_recommended_for_run(bench_fmt: str, tp_size: int) -> bool:
+    """Whether the benchbw profiles recommend hybrid for EVERY GPU the run uses.
+
+    Each TP rank resolves the MoE strategy independently, before any collective
+    exists; ranks that disagree would capture different decode graphs and diverge at
+    the first all-reduce. So the auto pick must be a deterministic function of state
+    every rank sees identically -- the profile files of all GPUs in the run (one
+    machine, same files, same enumeration). One missing or offload-leaning profile
+    keeps the whole run on offload. Ranks bind visible ordinals [0, tp_size) when
+    --gpu is unset; with an explicit --gpu the checked set can differ from the bound
+    set, but it still evaluates identically on every rank, which is what unanimity
+    needs.
+    """
+    from freetoken.moe.bench_profile import load_backend_recommendation
+
+    if tp_size <= 1:
+        gpu_name, gpu_uuid = _profile_gpu()
+        return load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid"
+    try:
+        count = torch.cuda.device_count()
+    except RuntimeError:
+        return False
+    if count < tp_size:
+        return False
+    for index in range(tp_size):
+        gpu_name, gpu_uuid = _profile_gpu(index)
+        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) != "hybrid":
+            return False
+    return True
 
 
 def _ensure_expandable_segments(device: torch.device) -> None:
@@ -1803,10 +1858,7 @@ def _adjust_config(config: EngineConfig):
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-        from freetoken.moe.bench_profile import load_backend_recommendation
-
-        gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+        if _hybrid_recommended_for_run(bench_fmt, tp_size):
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
@@ -1825,17 +1877,11 @@ def _adjust_config(config: EngineConfig):
                     f"extension predates activation {_act!r} (rebuild with "
                     f"`python setup.py build_ext --inplace`); staying on offload"
                 )
-            elif tp_size > 1:
-                # hybrid splits a step's misses between the PCIe fetch and the CPU executor,
-                # and the CPU half has no tensor-parallel path; the offload banks do.
-                logger.info_rank0(
-                    "benchbw profile recommends hybrid, but the CPU MoE executor has no TP path; "
-                    "staying on offload"
-                )
             else:
                 default_backend = "hybrid"
                 logger.info_rank0(
                     f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
+                    + (f" (unanimous across all {tp_size} TP ranks)" if tp_size > 1 else "")
                 )
         override("moe_strategy", default_backend)
         logger.info_rank0(f"Auto-selected MoE strategy: {config.moe_strategy}")

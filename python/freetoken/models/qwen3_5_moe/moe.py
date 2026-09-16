@@ -34,6 +34,14 @@ class _SharedExpert(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
+    def forward_partial(self, x: torch.Tensor) -> torch.Tensor:
+        """The shared expert's rank partial, without the down_proj all-reduce.
+
+        The caller sums it with the routed experts' partial and runs ONE all-reduce
+        (down_proj is bias-free, so the partial folds cleanly). See Qwen4ExpMoE.forward.
+        """
+        return self.down_proj.forward_partial(silu_and_mul(self.gate_up_proj.forward(x)))
+
 
 class Qwen3_5DenseMLP(_SharedExpert):
     """Dense (non-MoE) SwiGLU MLP for dense Qwen3.x checkpoints (e.g. 27B): ``gate_up_proj``
