@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from freetoken.distributed import DistributedInfo, info
-from freetoken.models.tp_shard import LEAF_AXIS, TpShard, module_leaf
+from freetoken.models.tp_shard import LEAF_AXIS, TpShard, module_leaf, tp_shard_for
 
 H = 128  # hidden_size
 QH, KVH, HD = 8, 4, 64  # attention heads (q_proj is 2x wide for its per-head gate) and head dim
@@ -43,7 +43,7 @@ def _config(**overrides):
 
 
 def _shard(rank: int, world: int, **config) -> TpShard:
-    return TpShard(_config(**config), rank, world)
+    return tp_shard_for(_config(**config), rank, world)
 
 
 def _index(rows: int, cols: int = H) -> torch.Tensor:

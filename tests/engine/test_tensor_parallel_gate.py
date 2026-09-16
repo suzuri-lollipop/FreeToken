@@ -66,6 +66,12 @@ def _preflight(config):
     return tp_preflight_error(config)
 
 
+def _encoder(kind="vision", tp_sharded=False):
+    from freetoken.models.register import EncoderSpec
+
+    return EncoderSpec(kind, "vision_config", ("image",), tp_sharded=tp_sharded)
+
+
 def test_tp_one_is_never_gated():
     config = _config(tp=1, spec=SimpleNamespace(tp_supported=False))
     assert _preflight(config) is None
@@ -89,13 +95,25 @@ def test_an_ftw_directory_is_rejected_under_tp(tmp_path):
     assert _preflight(_config(tp=1, path=str(tmp_path))) is None
 
 
-def test_an_encoder_the_readers_cannot_shard_is_refused_under_tp():
+def test_an_encoder_the_reader_cannot_shard_is_refused_under_tp():
     # the Qwen VL tower is built rank-sharded but the readers emit full-size weights;
     # say so before a rank burns a CUDA context and dies on the load_state_dict assert
-    config = _config(tp=2, encoders=(SimpleNamespace(kind="vision"),))
+    config = _config(tp=2, encoders=(_encoder(),))
     error = _preflight(config)
     assert error is not None and "vision" in error and "--text-model-only" in error
-    assert _preflight(_config(tp=1, encoders=(SimpleNamespace(kind="vision"),))) is None
+    assert _preflight(_config(tp=1, encoders=(_encoder(),))) is None
+
+
+def test_an_encoder_whose_reader_cuts_the_tower_passes_the_gate():
+    assert _preflight(_config(tp=2, encoders=(_encoder(tp_sharded=True),))) is None
+
+
+def test_a_tower_whose_widths_do_not_divide_is_refused_under_tp():
+    tower = SimpleNamespace(num_heads=16, hidden_size=1152, intermediate_size=4304, spatial_merge_size=2)
+    encoders = (_encoder(tp_sharded=True),)
+    error = _preflight(_config(tp=5, encoders=encoders, model={"vision_config": tower}))
+    assert error is not None and "vision heads (16)" in error and "vision merged width (4608)" in error
+    assert _preflight(_config(tp=2, encoders=encoders, model={"vision_config": tower})) is None
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,9 @@ class EncoderSpec:
     kind: str  # "vision" | "audio", the name --mm-disable takes
     config_key: str  # the checkpoint config section that builds the tower
     modalities: tuple[str, ...]  # inputs it serves, as implemented
+    # the family's reader cuts this tower to the rank's heads and columns; a tower built
+    # rank-sharded but read at full width fails the load, so --tp-size stays refused
+    tp_sharded: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,8 @@ _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
 )
+# Qwen3.8-Flash-Next is the one Qwen VL release whose reader shards the shared tower today.
+_QWEN4_EXP_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), tp_sharded=True),)
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
@@ -186,7 +191,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen4ExpForConditionalGeneration",
         checkpoint_roots=_QWEN_VL_ROOTS,
         mm_processor=_QWEN_VL_PROCESSOR,
-        encoders=_QWEN_VL_ENCODERS,
+        encoders=_QWEN4_EXP_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
         tp_supported=True,
     ),

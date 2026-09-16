@@ -255,6 +255,18 @@ def tp_shard_error(model_config, tp_size: int) -> str | None:
         problems.append(
             f"MLP intermediate size {model_config.intermediate_size} is not divisible by {tp_size}"
         )
+    # The tower hands each of these widths to div_even, and its reader cuts the same axis.
+    vision = getattr(model_config, "vision_config", None)
+    if vision is not None:
+        merged = vision.hidden_size * vision.spatial_merge_size**2
+        for what, total in (
+            ("heads", vision.num_heads),
+            ("hidden size", vision.hidden_size),
+            ("MLP intermediate size", vision.intermediate_size),
+            ("merged width", merged),
+        ):
+            if total % tp_size:
+                problems.append(f"vision {what} ({total}) does not divide into {tp_size} ranks")
     return "; ".join(problems) or None
 
 
@@ -282,9 +294,10 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
             f"{model_config.model_type} does not shard its checkpoint for tensor parallelism "
             "yet; run with --tensor-parallel-size 1"
         )
-    # The Qwen VL tower is built rank-sharded but no reader slices its weights yet.
-    if config.active_encoders:
-        kinds = ", ".join(e.kind for e in config.active_encoders)
+    # A tower the family's reader still emits at full width would meet rank-sharded buffers at the load.
+    unsharded = [e.kind for e in config.active_encoders if not e.tp_sharded]
+    if unsharded:
+        kinds = ", ".join(unsharded)
         return (
             f"the {kinds} encoder's weights are not tensor-parallel sharded yet; run with "
             "--text-model-only (or --mm-disable to name the encoders to drop)"

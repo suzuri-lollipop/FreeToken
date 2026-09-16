@@ -26,7 +26,15 @@ from freetoken.models.qwen4_exp.weight import (
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+from .common import (
+    LM,
+    RADIXARK_NVFP4,
+    hf_config,
+    install_quant_config,
+    meta_state_dict,
+    mixed_precision_quant,
+    vision_hf_config,
+)
 
 H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
@@ -65,7 +73,38 @@ def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
 
 
-def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
+def _vision_raw(vision) -> dict[str, torch.Tensor]:
+    """Every tensor of the toy tower, at the full width a single-rank checkpoint stores it."""
+    vh, inter = vision.hidden_size, vision.intermediate_size
+    merged = vh * vision.spatial_merge_size**2
+    raw: dict[str, torch.Tensor] = {}
+    for block in range(vision.depth):
+        p = f"model.visual.blocks.{block}"
+        raw[f"{p}.attn.qkv.weight"] = _bf16(3 * vh, vh)
+        raw[f"{p}.attn.qkv.bias"] = _bf16(3 * vh)
+        raw[f"{p}.attn.proj.weight"] = _bf16(vh, vh)
+        raw[f"{p}.attn.proj.bias"] = _bf16(vh)
+        raw[f"{p}.mlp.linear_fc1.weight"] = _bf16(inter, vh)
+        raw[f"{p}.mlp.linear_fc1.bias"] = _bf16(inter)
+        raw[f"{p}.mlp.linear_fc2.weight"] = _bf16(vh, inter)
+        raw[f"{p}.mlp.linear_fc2.bias"] = _bf16(vh)
+        for norm in ("norm1", "norm2"):
+            raw[f"{p}.{norm}.weight"] = _bf16(vh)
+            raw[f"{p}.{norm}.bias"] = _bf16(vh)
+    shape = (vision.in_channels, vision.temporal_patch_size, vision.patch_size, vision.patch_size)
+    raw["model.visual.patch_embed.proj.weight"] = _bf16(vh, *shape)
+    raw["model.visual.patch_embed.proj.bias"] = _bf16(vh)
+    raw["model.visual.pos_embed.weight"] = _bf16(vision.num_position_embeddings, vh)
+    raw["model.visual.merger.norm.weight"] = _bf16(vh)
+    raw["model.visual.merger.norm.bias"] = _bf16(vh)
+    raw["model.visual.merger.linear_fc1.weight"] = _bf16(merged, merged)
+    raw["model.visual.merger.linear_fc1.bias"] = _bf16(merged)
+    raw["model.visual.merger.linear_fc2.weight"] = _bf16(vision.out_hidden_size, merged)
+    raw["model.visual.merger.linear_fc2.bias"] = _bf16(vision.out_hidden_size)
+    return raw
+
+
+def _raw_checkpoint(dense_fp8: bool = False, vision=None) -> dict[str, torch.Tensor]:
     """Layer 0 = GDN + PLE, layer 1 = QSA; plus the mtp / visual / routed-expert noise.
 
     ``dense_fp8`` stores the attention and GDN qkv|z / out projections as 128x128 block-fp8 (e4m3 ``.weight`` + fp32 ``.weight_scale_inv``) like the community NVFP4-FP8 requants.
@@ -141,6 +180,8 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
         "model.visual.merger.norm.weight": _bf16(H),
     })
+    if vision is not None:
+        raw.update(_vision_raw(vision))
     if dense_fp8:
         for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.out_proj",
                        *(f"{attn}.{p}_proj" for p in "qkvo")):
@@ -153,7 +194,7 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
 FP8_DENSE_QUANT = mixed_precision_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
 
 
-def _config_json(quantization_config) -> dict:
+def _config_json(quantization_config, vision=None) -> dict:
     cfg = hf_config(
         num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=2,
         budget=16, hidden=H, max_position=4096, rope_theta=10000.0,
@@ -162,8 +203,12 @@ def _config_json(quantization_config) -> dict:
         linear_key_head_dim=HD, linear_value_head_dim=HD,
         hc_lowrank=LR, ple_layer_ids=[1],
         num_experts=E, moe_intermediate_size=I, shared_expert_intermediate_size=I,
+        vision=vision,
     )
-    return {**vars(cfg), "text_config": vars(cfg.text_config), "quantization_config": quantization_config}
+    out = {**vars(cfg), "text_config": vars(cfg.text_config), "quantization_config": quantization_config}
+    if vision is not None:
+        out["vision_config"] = vars(vision)
+    return out
 
 
 def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -180,7 +225,7 @@ def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     return shards, scale
 
 
-def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config) -> tuple[str, dict[str, torch.Tensor]]:
+def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config, vision=None) -> tuple[str, dict[str, torch.Tensor]]:
     table, _scale = _ngram_table()
     # Spread the dense tensors over two shards so the fusion buffer has to survive a file
     # boundary, and put the n-gram table in its own shards like the real checkpoint does.
@@ -190,7 +235,7 @@ def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config)
     shard_names = sorted(table)
     save_file({n: table[n] for n in shard_names[:2]}, str(folder / "model-plefp8-00000.safetensors"))
     save_file({n: table[n] for n in shard_names[2:]}, str(folder / "model-plefp8-00001.safetensors"))
-    (folder / "config.json").write_text(json.dumps(_config_json(quantization_config)))
+    (folder / "config.json").write_text(json.dumps(_config_json(quantization_config, vision)))
     return str(folder), {**raw, **table}
 
 
@@ -208,6 +253,16 @@ def _load(folder: str, *, vision: bool = True) -> dict[str, torch.Tensor]:
 def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
     return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_ckpt"), _raw_checkpoint(), None)
+
+
+@pytest.fixture(scope="module")
+def checkpoint_vl(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """The same toy model with the vision section and every tensor of the tower it ships."""
+    torch.manual_seed(0)
+    vision = vision_hf_config(H)
+    return _write_checkpoint(
+        tmp_path_factory.mktemp("qwen4_exp_vl_ckpt"), _raw_checkpoint(vision=vision), None, vision=vision
+    )
 
 
 @pytest.fixture(scope="module")
@@ -553,12 +608,38 @@ def test_tp_ranks_fill_their_own_buffers(checkpoint):
             )
 
 
-def test_a_sharded_vision_tower_is_refused_before_it_asserts(checkpoint):
-    """The engine builds the tower TP-sharded but no reader slices it; the mismatch must name itself."""
-    folder = checkpoint[0]
-    with _tp_rank(0, 2):
-        with pytest.raises(NotImplementedError, match="vision tower"):
-            _load(folder)
+def test_tp_ranks_read_their_own_slice_of_the_tower(checkpoint_vl):
+    """The engine builds the tower rank-sharded, so each rank's reader output is exactly its buffers."""
+    folder = checkpoint_vl[0]
+    with _tp_rank(0, 1):
+        whole, whole_state = _load(folder), meta_state_dict(folder, vision=True)
+    assert "visual.blocks.0.attn.qkv.weight" in whole, "the fixture must ship the tower"
+    replicated = (
+        "visual.pos_embed.weight",
+        "visual.patch_embed.proj.weight",
+        "visual.blocks.0.attn.proj.bias",
+        "visual.merger.linear_fc2.bias",
+    )
+    for rank in (0, 1):
+        with _tp_rank(rank, 2):
+            got, state = _load(folder), meta_state_dict(folder, vision=True)
+        assert set(got) == set(state)
+        for name, tensor in state.items():
+            if not name.startswith("visual."):
+                continue  # the text side is the test above this one
+            assert tuple(got[name].shape) == tuple(tensor.shape), (
+                f"rank {rank}: {name} is {tuple(got[name].shape)}, model wants {tuple(tensor.shape)}"
+            )
+        for name in replicated:
+            assert torch.equal(got[name], whole[name]), f"rank {rank} cut {name}, which every rank builds whole"
+        if rank == 1:
+            qkv = whole["visual.blocks.0.attn.qkv.weight"]
+            rows = qkv.shape[0] // 3 // 2
+            cut = got["visual.blocks.0.attn.qkv.weight"]
+            # the fused qkv keeps three runs: rank 1 takes the second half of q, of k and of v, not the tail
+            assert torch.equal(cut[:rows], qkv[rows : 2 * rows])
+            assert torch.equal(cut[rows : 2 * rows], qkv[qkv.shape[0] // 3 + rows : qkv.shape[0] // 3 + 2 * rows])
+            assert torch.equal(cut[2 * rows :], qkv[2 * (qkv.shape[0] // 3) + rows :])
 
 
 def test_tp_rank_cuts_the_projections_and_keeps_the_mixers(checkpoint, loaded):

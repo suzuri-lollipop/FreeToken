@@ -21,6 +21,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.models.qwen3_vl.vision import vision_module_leaf, vision_tp_shard
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
@@ -212,14 +213,19 @@ def iter_weights(
     """
     if not include_non_moe:
         return  # the routed experts come from the offload cache's reader, nothing here to yield
-    if get_tp_info().size > 1 and include_vision:
-        raise NotImplementedError(
-            "the Qwen VL vision tower weights are not tensor-parallel sharded; run with "
-            "--text-model-only or --mm-disable vision"
-        )
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    shard = tp_shard(parse_config(hf_config))
+    model_config = parse_config(hf_config)
+    shard = tp_shard(model_config)
+    # the tower declares its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves
+    vc = model_config.vision_config
+    vision = vision_tp_shard(vc) if include_vision and vc is not None else None
+
+    def slice_dense(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if vision is not None and name.startswith(VISION_KEY_PREFIXES):
+            return vision.tensor(vision_module_leaf(name), tensor)
+        return tensor if shard is None else shard.tensor(module_leaf(name), tensor)
+
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping, shard)
     for file in tqdm(
         iter_weight_files(model_path),
@@ -237,7 +243,7 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
+                    yield name, slice_dense(name, tensor)
                 else:
                     yield from fused
 

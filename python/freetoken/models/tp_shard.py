@@ -96,22 +96,27 @@ def _leaf_runs(config) -> dict[str, list[tuple[int, int]]]:
 
 
 class TpShard:
-    """Cuts one checkpoint tensor to the slice this rank's model buffers hold."""
+    """Cuts one checkpoint tensor to the slice this rank's model buffers hold.
 
-    def __init__(self, config, rank: int, world: int) -> None:
+    A reader builds one instance per weight namespace: ``tp_shard`` for the text tower, and a
+    second one where a tower declares its buffers elsewhere (the Qwen VL vision stack, whose
+    leaf table lives with the tower in ``models/qwen3_vl/vision.py``).
+    """
+
+    def __init__(self, rank: int, world: int, axes, units, runs=None) -> None:
         self.rank, self.world = rank, world
-        self.units = _leaf_units(config)
-        self.runs = _leaf_runs(config)
+        self.axes, self.units = axes, units
+        self.runs = runs or {}
 
     def part(self, leaf: str, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         total = self.units.get(leaf)
-        axis = LEAF_AXIS.get(leaf)
+        axis = self.axes.get(leaf)
         if axis is None or total is None:
             return part
         return {role: self._cut(tensor, axis, total, leaf) for role, tensor in part.items()}
 
     def tensor(self, leaf: str, tensor: torch.Tensor) -> torch.Tensor:
-        axis, total = LEAF_AXIS.get(leaf), self.units.get(leaf)
+        axis, total = self.axes.get(leaf), self.units.get(leaf)
         if axis is None or total is None:
             return tensor
         return self._cut(tensor, axis, total, leaf)
@@ -143,10 +148,15 @@ class TpShard:
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=axis)
 
 
+def tp_shard_for(config, rank: int, world: int) -> TpShard:
+    """The text tower's slicer for an explicit rank, so a test can pin one without a process group."""
+    return TpShard(rank, world, LEAF_AXIS, _leaf_units(config), _leaf_runs(config))
+
+
 def tp_shard(config) -> TpShard | None:
     """This rank's slicer for ``config``'s model, or None when running single-process."""
     tp = get_tp_info()
-    return None if tp.size == 1 else TpShard(config, tp.rank, tp.size)
+    return None if tp.size == 1 else tp_shard_for(config, tp.rank, tp.size)
 
 
-__all__ = ["TpShard", "module_leaf", "tp_shard"]
+__all__ = ["COLS", "ROWS", "ROLE_SUFFIXES", "TpShard", "module_leaf", "tp_shard", "tp_shard_for"]

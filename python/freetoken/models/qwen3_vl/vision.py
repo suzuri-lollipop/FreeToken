@@ -16,6 +16,7 @@ from freetoken.layers import (
     LinearRowParallel,
     OPList,
 )
+from freetoken.models.tp_shard import COLS, ROLE_SUFFIXES, ROWS, TpShard
 from freetoken.utils import div_even
 
 from freetoken.models.weight_stream import BlockWeightStreamer
@@ -372,4 +373,56 @@ class QwenVLVisionMixin:
         return self.visual.forward(item.feature, [item.grid_thw])
 
 
-__all__ = ["Qwen3VLVisionModel", "QwenVLVisionMixin"]
+# The tower's rank split, keyed by the module that owns each leaf: a merger's fc1 cuts by the
+# 2x2-merged width while a block's cuts by the intermediate size, and patch_embed.proj is a Conv3d
+# every rank keeps whole. Kept next to the Linear classes above because it has to agree with them.
+_TP_LEAF_AXIS = {
+    "attn.qkv": ROWS,
+    "attn.proj": COLS,
+    "mlp.linear_fc1": ROWS,
+    "mlp.linear_fc2": COLS,
+    "merger.linear_fc1": ROWS,
+    "merger.linear_fc2": COLS,
+    "deepstack_merger_list.linear_fc1": ROWS,
+    "deepstack_merger_list.linear_fc2": COLS,
+}
+
+
+def vision_module_leaf(name: str) -> str:
+    """``visual.blocks.3.mlp.linear_fc1.weight`` -> ``mlp.linear_fc1``: the owning module and its leaf, block indices dropped."""
+    module, _, last = name.rpartition(".")
+    path = module if last in ROLE_SUFFIXES else name
+    parts = [part for part in path.split(".") if not part.isdigit()]
+    return ".".join(parts[-2:])
+
+
+def _tp_leaf_units(vc: VisionConfig) -> dict[str, int]:
+    """Global units along each sharded leaf's split axis."""
+    hidden, merged = vc.hidden_size, vc.hidden_size * vc.spatial_merge_size**2
+    units = {
+        # q | k | v of num_heads * head_dim rows each, and head_dim is hidden_size / num_heads
+        "attn.qkv": 3 * hidden,
+        "attn.proj": hidden,
+        "mlp.linear_fc1": vc.intermediate_size,
+        "mlp.linear_fc2": vc.intermediate_size,
+    }
+    for owner in ("merger", "deepstack_merger_list"):
+        units[f"{owner}.linear_fc1"] = units[f"{owner}.linear_fc2"] = merged
+    return units
+
+
+def _tp_leaf_runs(vc: VisionConfig) -> dict[str, list[tuple[int, int]]]:
+    """The fused ``qkv`` stores q | k | v back to back, so each rank keeps its heads of all three."""
+    hidden = vc.hidden_size
+    return {"attn.qkv": [(offset, hidden) for offset in (0, hidden, 2 * hidden)]}
+
+
+def vision_tp_shard(vc: VisionConfig) -> TpShard | None:
+    """This rank's slicer for the tower's own keys, or None when running single-process."""
+    tp = get_tp_info()
+    if tp.size == 1:
+        return None
+    return TpShard(tp.rank, tp.size, _TP_LEAF_AXIS, _tp_leaf_units(vc), _tp_leaf_runs(vc))
+
+
+__all__ = ["Qwen3VLVisionModel", "QwenVLVisionMixin", "vision_module_leaf", "vision_tp_shard"]

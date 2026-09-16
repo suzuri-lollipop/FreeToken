@@ -1,18 +1,26 @@
-"""Qwen VL on the CPU side: parse_config, the engine's encoder decision, the registry invariants, the text-side image scatter (no checkpoint)."""
+"""Qwen VL on the CPU side: parse_config, the engine's encoder decision, the registry invariants, the text-side image scatter, the tower's rank shards (no checkpoint)."""
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from freetoken.distributed import DistributedInfo
+from freetoken.distributed import DistributedInfo, info
 from freetoken.engine.config import EngineConfig
 from freetoken.mm import MM_PAD_SHIFT_VALUE
 from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl import deepstack_add, parse_config
+from freetoken.models.qwen3_vl.config import parse_vision_config
+from freetoken.models.qwen3_vl.vision import (
+    Qwen3VLVisionModel,
+    _TP_LEAF_AXIS,
+    vision_module_leaf,
+    vision_tp_shard,
+)
 
 ROPE = {"rope_theta": 5_000_000, "rope_type": "default", "mrope_section": [24, 20, 20], "mrope_interleaved": True}
 
@@ -151,3 +159,91 @@ def test_image_rows_take_the_leading_columns_and_deepstack_adds_the_next_block()
     assert torch.equal(x[1], mm[0, :H]) and torch.equal(x[3], mm[1, :H])
     deepstack_add(x, rows, mm, level=1, hidden_size=H)
     assert torch.equal(x[1], mm[0, :H] + mm[0, 2 * H : 3 * H]) and torch.equal(x[0], table[1])
+
+
+# ------------------------------------------------------------------ tensor-parallel tower load
+@contextlib.contextmanager
+def _tp_rank(rank: int, world: int):
+    """Run the body as one rank of a TP group, then restore the session's single-rank default."""
+    saved = info._TP_INFO
+    info._TP_INFO = DistributedInfo(rank, world)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
+
+
+def _tower():
+    """The parsed vision section of the toy config above, with the full-width tensors to slice.
+
+    The keys carry the reader's ``visual.`` prefix: that is the namespace a family's reader and
+    the wrapper's state dict meet in, while the tower module itself names its buffers below it.
+    """
+    vc = parse_vision_config(_hf_config())
+    with _tp_rank(0, 1):
+        with torch.device("meta"):
+            buffers = Qwen3VLVisionModel(vc).state_dict()
+        full = {
+            "visual." + name: torch.arange(int(tensor.numel()), dtype=torch.float32).reshape(tuple(tensor.shape))
+            for name, tensor in buffers.items()
+        }
+    return vc, list(full), full
+
+
+def test_the_tower_leaf_names_the_module_that_owns_the_cut():
+    assert vision_module_leaf("visual.blocks.3.attn.qkv.weight") == "attn.qkv"
+    assert vision_module_leaf("visual.blocks.3.attn.proj.bias") == "attn.proj"
+    assert vision_module_leaf("visual.blocks.3.mlp.linear_fc1.weight") == "mlp.linear_fc1"
+    # a merger's fc1 splits by the merged width, not by the block's intermediate size
+    assert vision_module_leaf("visual.merger.linear_fc1.weight") == "merger.linear_fc1"
+    assert vision_module_leaf("visual.deepstack_merger_list.1.linear_fc2.weight") == "deepstack_merger_list.linear_fc2"
+    for replicated in ("visual.patch_embed.proj.weight", "visual.pos_embed.weight",
+                       "visual.blocks.3.norm2.weight", "visual.merger.norm.bias"):
+        assert vision_module_leaf(replicated) not in _TP_LEAF_AXIS, replicated
+
+
+def test_each_rank_reads_its_heads_of_every_qkv_run():
+    vc, _, full = _tower()
+    hidden, qkv = vc.hidden_size, full["visual.blocks.0.attn.qkv.weight"]
+    local = hidden // 2
+    with _tp_rank(1, 2):
+        cut = vision_tp_shard(vc).tensor("attn.qkv", qkv)
+    assert torch.equal(cut, torch.cat([qkv[lo + local : lo + 2 * local] for lo in (0, hidden, 2 * hidden)]))
+
+
+def test_slicing_the_tower_fills_the_buffers_the_rank_builds():
+    """Every buffer the model declares for a rank is exactly what the slicer hands it: the loader asserts on this shape."""
+    vc, names, full = _tower()
+    for world in (2, 4):
+        for rank in range(world):
+            with _tp_rank(rank, world):
+                shard = vision_tp_shard(vc)
+                got = {name: shard.tensor(vision_module_leaf(name), full[name]) for name in names}
+                with torch.device("meta"):
+                    want = {"visual." + name: t for name, t in Qwen3VLVisionModel(vc).state_dict().items()}
+            assert set(got) == set(want)
+            for name, tensor in want.items():
+                assert tuple(got[name].shape) == tuple(tensor.shape), f"world {world} rank {rank}: {name}"
+
+
+def test_the_ranks_partition_the_sharded_leaves_without_overlap():
+    """One rank holds each row and column of a sharded buffer, which is what the row-parallel all-reduce adds back."""
+    vc, _, full = _tower()
+    sharded = [n for n, t in full.items() if _TP_LEAF_AXIS.get(vision_module_leaf(n)) is not None]
+    assert "visual.blocks.0.attn.qkv.weight" in sharded and "visual.patch_embed.proj.weight" not in sharded
+    for name in sharded:
+        whole = full[name]
+        axis = _TP_LEAF_AXIS[vision_module_leaf(name)]
+        runs = 3 if name.endswith(("qkv.weight", "qkv.bias")) else 1
+        pieces = []
+        for rank in range(2):
+            with _tp_rank(rank, 2):
+                pieces.append(vision_tp_shard(vc).tensor(vision_module_leaf(name), whole))
+        if whole.dim() <= axis:
+            # a row-parallel layer adds its bias after the all-reduce, so every rank holds it whole
+            assert all(torch.equal(piece, whole) for piece in pieces), name
+            continue
+        for run in range(runs):
+            per_rank, per_run = pieces[0].shape[axis] // runs, whole.shape[axis] // runs
+            rebuilt = torch.cat([p.narrow(axis, run * per_rank, per_rank) for p in pieces], dim=axis)
+            assert torch.equal(rebuilt, whole.narrow(axis, run * per_run, per_run)), f"{name} run {run}"

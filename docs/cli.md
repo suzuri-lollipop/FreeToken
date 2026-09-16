@@ -79,9 +79,13 @@ ft serve --model Qwen/Qwen3.8-27B-FP8 --tp-size 2 --gpu 0,1   # 27 GB of weights
 What is TP-sharded today:
 
 * Readers of `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `minimax_m2`, `mistral`, `gpt_oss`, the
-  dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B) and the dense projections of
-  `Qwen4Exp` (Qwen3.8-Flash-Next). Anything else reports `does not shard its checkpoint for
-  tensor parallelism yet` at startup, before any rank is spawned.
+  dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B), and `Qwen4Exp`
+  (Qwen3.8-Flash-Next) with its dense projections and its vision tower. Anything else reports
+  `does not shard its checkpoint for tensor parallelism yet` at startup, before any rank is spawned.
+* A tower whose reader still emits full-width weights (Qwen3-VL, Qwen3.6 / Qwen3.8-27B) is
+  refused under TP with `the vision encoder's weights are not tensor-parallel sharded yet`: pass
+  `--text-model-only` to serve those checkpoints across ranks, or keep `--tp-size 1` to keep the
+  images.
 * **Experts**: the offload banks shard for NVFP4 experts (`--moe-strategy offload`, which `auto`
   picks): the Triton kernel declares its banks at the rank's intermediate width and packs the
   matching slice, so host RAM, the GPU slot cache and the PCIe stream halve per rank (Qwen3.8-Flash-Next's

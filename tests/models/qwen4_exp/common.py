@@ -33,6 +33,7 @@ def hf_config(
     hidden: int = 256,
     max_position: int = 1 << 16,
     rope_theta: float = 10000000.0,
+    vision: SimpleNamespace | None = None,
     **text_overrides,
 ) -> SimpleNamespace:
     text = SimpleNamespace(
@@ -88,7 +89,26 @@ def hf_config(
         model_type="qwen4_exp",
         architectures=["Qwen4ExpForConditionalGeneration"],
         text_config=text,
+        vision_config=vision,
+        image_token_id=151655,
         quantization_config=None,
+    )
+
+
+def vision_hf_config(hidden: int) -> SimpleNamespace:
+    """A toy Qwen VL tower section: every width divides by two ranks, and out_hidden is the text hidden."""
+    return SimpleNamespace(
+        hidden_size=hidden,
+        depth=2,
+        num_heads=8,
+        intermediate_size=2 * hidden,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=64,
+        out_hidden_size=hidden,
+        in_channels=3,
+        deepstack_visual_indexes=[],
     )
 
 
@@ -356,8 +376,11 @@ def install_quant_config(model_path: str) -> None:
     set_quant_config(checkpoint_quant_config(model_path, hf, get_model_spec(hf.architectures[0])))
 
 
-def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device."""
+def meta_state_dict(model_path: str, vision: bool = False) -> dict[str, torch.Tensor]:
+    """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device.
+
+    ``vision`` keeps the encoder towers enabled, so a caller sees the tower buffers the engine would build.
+    """
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
@@ -367,8 +390,10 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
-                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    config = EngineConfig(
+        model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
+        mm=MultimodalConfig() if vision else MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
+    )
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE
