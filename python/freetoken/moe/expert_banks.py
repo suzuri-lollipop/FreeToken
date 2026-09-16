@@ -8,12 +8,14 @@ use their own providers until they get a method.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from dataclasses import dataclass, field
 
 import torch
 
+from freetoken.distributed import try_get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
@@ -24,6 +26,36 @@ logger = init_logger(__name__)
 
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+
+# most intra-op threads one rank uses while it fills banks; measured as fast as the full pool on
+# the big stacked pieces and faster on the small per-expert ones
+_PACK_THREADS = 4
+
+
+def _pack_thread_limit() -> int:
+    """Intra-op threads to run the bank fill on, for this host and this many ranks on it.
+
+    ``pack`` copies one expert's pieces into its bank rows, a few hundred KiB per call for a
+    per-expert checkpoint -- too small to pay for an OpenMP region, and every rank on the box is
+    running one. Two TP ranks at the default 24-thread width on 32 cores starved each other's
+    barriers and filled Qwen3.8-Flash-Next NVFP4 at 58 MB/s each (15 min); bounded, the same pair
+    loads in 27 s. Dividing the cores also keeps a host with fewer cores than ranks busy."""
+    info = try_get_tp_info()
+    ranks = max(1, info.size) if info is not None else 1
+    return max(1, min(_PACK_THREADS, (os.cpu_count() or 1) // ranks))
+
+
+@contextlib.contextmanager
+def _pack_threads():
+    """Narrow torch's intra-op pool for the bank fill, then give the caller's width back."""
+    want = _pack_thread_limit()
+    had = torch.get_num_threads()
+    if want != had:
+        torch.set_num_threads(want)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(had)
 
 
 @dataclass(frozen=True)
@@ -133,13 +165,14 @@ def build_expert_banks(
         if missing:
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
-    if layer_sink is not None:
-        _fill(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _fill(pins)
-    else:
-        _fill(None)
+    with _pack_threads():
+        if layer_sink is not None:
+            _fill(layer_sink)
+        elif torch.cuda.is_available():
+            with PinPipeline() as pins:
+                _fill(pins)
+        else:
+            _fill(None)
 
     return ExpertBanks(
         legacy_format_for(method.kind, kernel.name), banks,

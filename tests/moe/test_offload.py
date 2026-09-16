@@ -1247,3 +1247,80 @@ def test_auto_expert_load_keeps_serial_when_parallel_wins_nothing(tmp_path, monk
     # experts pre-packed into a few big tensors: serial already saturates the disk
     _fake_checkpoint(packed, expert_tensor_bytes=64 << 20, experts=3, side_bytes=1 << 20)
     assert eb._auto_pick_parallel(str(packed), _unknown_banks_config(), None, False) is False
+
+
+def test_pack_thread_limit_splits_cores_between_ranks(monkeypatch):
+    # every TP rank fills its own banks on this host, so the fill must not assume it owns the cores
+    import os
+
+    import freetoken.moe.expert_banks as eb
+    from freetoken.distributed import DistributedInfo
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    def _limit(ranks: int) -> int:
+        monkeypatch.setattr(eb, "try_get_tp_info", lambda: DistributedInfo(rank=0, size=ranks))
+        return eb._pack_thread_limit()
+
+    assert _limit(1) == eb._PACK_THREADS  # pieces are small enough that a wider pool is pure barrier cost
+    assert _limit(2) == eb._PACK_THREADS
+    assert _limit(16) == 2
+    assert _limit(64) == 1  # more ranks than cores still copies, it just stops splitting
+
+
+def test_expert_bank_fill_runs_on_a_bounded_pool(monkeypatch):
+    # the bound has to cover pack and nothing else: leaving it set would narrow the CPU executor and the vision tower
+    import freetoken.moe.expert_banks as eb
+    from freetoken.moe.expert_banks import build_expert_banks
+
+    _init_tp()
+    E, H, I = 4, 8, 16
+    layer = _bf16_offload_layer(0, E, 2, H, I)
+    method = layer.quant_method
+    monkeypatch.setattr(eb, "_pack_thread_limit", lambda: 1)
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")  # the pool the fill runs on is what's under test, not the page-lock
+
+    def _pieces():
+        yield 0, 0, E, {
+            "gate_up": torch.full((E, 2 * I, H), 0.5, dtype=torch.bfloat16),
+            "down": torch.full((E, H, I), 0.25, dtype=torch.bfloat16),
+        }
+
+    before = torch.get_num_threads()
+    seen = {}
+    real_pack = method.pack
+
+    def _counting(pieces, out):
+        seen["during"] = torch.get_num_threads()
+        return real_pack(pieces, out)
+
+    monkeypatch.setattr(method, "pack", _counting)
+    banks = build_expert_banks(method, 1, _pieces(), device=torch.device("cpu"))
+
+    assert seen["during"] == 1
+    assert torch.get_num_threads() == before  # given back once the banks are filled
+    assert banks.sources["gate_up"][0].shape == (E, 2 * I, H)
+    assert torch.equal(banks.sources["down"][0], torch.full((E, H, I), 0.25, dtype=torch.bfloat16))
+
+
+def test_expert_bank_fill_restores_threads_when_pack_raises(monkeypatch):
+    import freetoken.moe.expert_banks as eb
+    from freetoken.moe.expert_banks import build_expert_banks
+
+    _init_tp()
+    E, H, I = 2, 8, 16
+    layer = _bf16_offload_layer(0, E, 2, H, I)
+    method = layer.quant_method
+    monkeypatch.setattr(eb, "_pack_thread_limit", lambda: 1)
+    before = torch.get_num_threads()
+
+    def _boom(pieces, out):
+        raise RuntimeError("pack failed")
+
+    monkeypatch.setattr(method, "pack", _boom)
+    pieces = [(0, 0, E, {"gate_up": torch.zeros(E, 2 * I, H, dtype=torch.bfloat16),
+                         "down": torch.zeros(E, H, I, dtype=torch.bfloat16)})]
+    with pytest.raises(RuntimeError, match="pack failed"):
+        build_expert_banks(method, 1, iter(pieces), device=torch.device("cpu"))
+
+    assert torch.get_num_threads() == before
