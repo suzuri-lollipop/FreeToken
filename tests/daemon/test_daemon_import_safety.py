@@ -23,6 +23,7 @@ DAEMON_MODULES = [
     "freetoken.daemon.logfmt",
     "freetoken.daemon.logring",
     "freetoken.daemon.osproc",
+    "freetoken.daemon.winproc",
     "freetoken.daemon.pidfile",
     "freetoken.daemon.metrics",
     "freetoken.daemon.proxy",

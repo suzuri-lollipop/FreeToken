@@ -146,10 +146,12 @@ class HostBank:
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
+        Windows has no madvise: the pages stay resident until the buffer is closed."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        if hasattr(self._buf, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
+            self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
@@ -175,6 +177,11 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    if os.name == "nt":
+        # No mlock(2)/RLIMIT on Windows (VirtualLock is capped by a small working-set quota).
+        # Raising OSError keeps the bank PAGEABLE, which lock() already handles as a supported
+        # residency, and the CPU executor is unaffected.
+        raise OSError("mlock is not available on Windows; leaving expert banks pageable")
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below

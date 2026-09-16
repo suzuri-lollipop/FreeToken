@@ -859,8 +859,13 @@ def _install_shell_stop_handlers() -> None:
     outside our process group in shell mode (see launch.py:_detach_process_group), so a closed
     terminal no longer reaches them on its own and this handler is what tears them down.
 
-    SIGINT is deliberately left alone: the shell binds it, per turn, to "cancel this turn"."""
-    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    SIGINT is deliberately left alone: the shell binds it, per turn, to "cancel this turn".
+
+    On Windows SIGHUP does not exist and SIGTERM is never delivered (no SIGTERM signal
+    surface); Ctrl+C arrives as SIGINT and is the shell's own to cancel a turn, so the
+    handler set shrinks accordingly."""
+    stop_sigs = [s for s in (signal.SIGTERM, getattr(signal, "SIGHUP", None)) if s is not None]
+    previous = {sig: signal.getsignal(sig) for sig in stop_sigs}
 
     def _flag_shutdown(signum, frame) -> None:
         _SHUTTING_DOWN.set()

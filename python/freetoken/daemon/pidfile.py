@@ -25,12 +25,10 @@ class SingleInstance:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
-
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock(fd)
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
@@ -38,6 +36,20 @@ class SingleInstance:
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
         self._fd = fd
+
+    @staticmethod
+    def _lock(fd: int) -> None:
+        """flock on POSIX; the CRT byte-range lock on Windows. Both are dropped by close, so a
+        dead daemon never wedges its own restart."""
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl  # POSIX-only
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def release(self) -> None:
         if self._fd is not None:

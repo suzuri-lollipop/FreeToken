@@ -132,9 +132,14 @@ def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
     """Spawn the serve as a session leader with its stdout+stderr going to a real logfile fd (never
     a PIPE): the file survives daemon death, so a re-adopting daemon just resumes tailing it and
     the serve never writes to a dead pipe. ``start_new_session`` makes it a process
-    group leader so signals reach the whole worker tree via the group."""
+    group leader so signals reach the whole worker tree via the group; on Windows it is a
+    no-op flag, so the child gets its own process group (console CTRL events don't leak
+    in/out) and the tree is stopped via ``osproc.signal_group``'s toolhelp walk instead."""
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     logf = open(log_path, "wb", buffering=0)  # truncate: a fresh serve gets a fresh log
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         proc = subprocess.Popen(
             argv,
@@ -143,6 +148,7 @@ def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            **popen_kwargs,
         )
     finally:
         logf.close()  # the child holds its own dup; the parent must not keep this fd

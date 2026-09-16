@@ -42,7 +42,8 @@ def _detach_process_group() -> None:
     of how it stops."""
     try:
         os.setpgrp()
-    except OSError:  # no job control (already a group leader / unusual environment)
+    except (AttributeError, OSError):  # no job control (Windows -- mp.spawn already puts the
+        # child in its own process group -- / already a group leader / unusual environment)
         pass
 
 

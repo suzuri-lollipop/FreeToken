@@ -238,7 +238,31 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
 
 def _mem_available_bytes() -> int | None:
     """MemAvailable -- the OOM-relevant figure, since it counts reclaimable page cache.
-    None when the platform has no /proc/meminfo."""
+    On Windows, GlobalMemoryStatusEx's ullAvailPhys. None when the platform has neither."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:  # noqa: BLE001 -- a best-effort figure; the caller degrades to serial
+            pass
+        return None
     try:
         with open("/proc/meminfo") as f:
             for line in f:
