@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
@@ -42,6 +43,17 @@ def _get_pynccl_wrapper_cls():
     return PyNCCLImpl
 
 
+def configure_pynccl_window() -> bool:
+    """Whether the symmetric-memory window is registered; sets the NCCL knob before comm init.
+
+    NCCL reads this at ``ncclCommInitRank``, so it must run before the wrapper is built. An
+    explicit ``NCCL_WIN_ENABLE`` in the environment always wins.
+    """
+    enabled = ENV.PYNCCL_SYMMETRIC_WINDOW.value
+    os.environ.setdefault("NCCL_WIN_ENABLE", "1" if enabled else "0")
+    return os.environ["NCCL_WIN_ENABLE"] == "1"
+
+
 def init_pynccl(
     *,
     tp_rank: int,
@@ -51,6 +63,7 @@ def init_pynccl(
 ) -> PyNCCLCommunicator:
     import torch
 
+    configure_pynccl_window()
     max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
 
     module = _load_nccl_module()

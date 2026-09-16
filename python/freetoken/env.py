@@ -71,6 +71,10 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
+    # NCCL's symmetric-memory window over the cuMem staging buffer hangs the first collective on
+    # some 2-GPU rigs (measured: 2x RTX PRO 4000 Blackwell, libnccl 2.28.9, driver 595.99.02), so
+    # it stays off; set 1 to register the window and take the symmetric kernels where they work.
+    PYNCCL_SYMMETRIC_WINDOW = EnvBool(False)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
