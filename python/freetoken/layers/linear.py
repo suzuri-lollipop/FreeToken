@@ -17,6 +17,8 @@ class _LinearTPImpl(BaseOP):
     the layer's ``prefix``; without a config the layer is plain bf16."""
 
     quant_layer_kind = LayerKind.LINEAR
+    # a row-parallel layer sums its ranks' partials, so the bias must not ride along with each one
+    bias_after_reduce = False
 
     def __init__(
         self,
@@ -46,6 +48,19 @@ class _LinearTPImpl(BaseOP):
 
     def finalize(self) -> None:
         self.quant_method.finalize(self)
+
+    def _reduce(self, y: torch.Tensor) -> torch.Tensor:
+        """Sum the ranks' partials of a row-parallel GEMM.
+
+        ``quant_method.apply`` adds the bias, and a row-parallel layer's output is full width on
+        every rank, so the reduce has counted the same bias ``tp_size`` times: take the extras back.
+        """
+        if self._tp_size == 1:
+            return y
+        y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y - (self._tp_size - 1) * self.bias.to(y.dtype)
+        return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.quant_method.apply(self, x)
@@ -126,6 +141,8 @@ class LinearQKVMerged(_LinearTPImpl):
 
 
 class LinearOProj(_LinearTPImpl):
+    bias_after_reduce = True
+
     def __init__(
         self,
         input_size: int,
@@ -148,13 +165,12 @@ class LinearOProj(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
-        return y
+        return self._reduce(self.quant_method.apply(self, x))
 
 
 class LinearRowParallel(_LinearTPImpl):
+    bias_after_reduce = True
+
     def __init__(
         self,
         input_size: int,
@@ -175,7 +191,4 @@ class LinearRowParallel(_LinearTPImpl):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
-            y = self._comm.all_reduce(y)
-        return y
+        return self._reduce(self.quant_method.apply(self, x))
