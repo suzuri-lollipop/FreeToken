@@ -81,8 +81,13 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        # Fused combine + MLP norm: eliminates one write+read of the full residual
+        hidden, mlp_rn = self.attn_hyper_connection.combine_norm(
+            hidden, block_output, inject,
+            self.mlp_hyper_connection.hc_norm.weight,
+            self.mlp_hyper_connection.hc_norm.eps,
+        )
+        block_input, inject = self.mlp_hyper_connection.mix_from_normed(mlp_rn)
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
 

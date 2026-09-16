@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_combine_norm,
     hc_gate_mix,
     hc_silu,
 )
@@ -144,11 +145,42 @@ class GatedResidual(BaseOP):
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
         return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
 
+    def mix_from_normed(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Like ``mix`` but skips the norm: ``rn`` is already the normed residual.
+
+        Used by the fused combine+norm path where the previous block's combine
+        produced the normed tensor as a side output.
+        """
+        lora, s = self._down(rn)
+        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        return hc_gate_mix(rn, gate, self.hc_count), s
+
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
         if R.is_cuda:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
+
+    def combine_norm(
+        self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor,
+        next_norm_weight: torch.Tensor, next_norm_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused combine + grouped RMSNorm for the next block's mix.
+
+        Returns ``(R', rn)`` where ``R'`` is the updated residual and ``rn``
+        is the normed version ready for the next block's ``mix_from_normed``.
+        Eliminates one write+read round-trip of the full residual tensor.
+        """
+        if R.is_cuda:
+            return hc_combine_norm(
+                R, y, s, next_norm_weight, next_norm_eps, self.hc_count,
+            )
+        # CPU fallback: sequential combine then norm
+        combined = self._combine_torch(R, y, s)
+        normed = grouped_plus_one_rms_norm(
+            combined, next_norm_weight, next_norm_eps, self.hc_count,
+        )
+        return combined, normed
 
 
 __all__ = ["GatedResidual", "GroupedPlusOneRMSNorm", "grouped_plus_one_rms_norm"]
