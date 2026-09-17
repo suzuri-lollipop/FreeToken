@@ -67,6 +67,26 @@ def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in _TRUE_VALUES
 
 
+def _ensure_ninja_on_path() -> None:
+    """tvm-ffi runs `ninja` as a PATH subprocess; the pip ninja wheel drops it in the
+    environment's script dir, which is not on PATH unless the venv is activated."""
+    import shutil
+
+    if shutil.which("ninja"):
+        return
+    try:
+        import ninja
+    except ImportError:
+        return
+    scripts = pathlib.Path(ninja.BIN_DIR)
+    exe = "ninja" + (".exe" if os.name == "nt" else "")
+    if (scripts / exe).is_file():
+        entry = str(scripts)
+        path = os.environ.get("PATH") or ""
+        if entry not in path.split(os.pathsep):
+            os.environ["PATH"] = entry + os.pathsep + path
+
+
 def _freetoken_version() -> str:
     from freetoken.version import __version__
 
@@ -200,6 +220,8 @@ def load_aot(
     if prebuilt is not None:
         return prebuilt
 
+    _ensure_ninja_on_path()
+
     if cuda_files:
         from freetoken.kernel._toolchain import check_nvcc_matches_torch
 
@@ -245,6 +267,8 @@ def load_jit(
     prebuilt = _load_prebuilt(name)
     if prebuilt is not None:
         return prebuilt
+
+    _ensure_ninja_on_path()
 
     if cuda_files or cuda_wrappers:
         from freetoken.kernel._toolchain import check_nvcc_matches_torch
