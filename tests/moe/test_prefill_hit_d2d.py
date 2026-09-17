@@ -151,3 +151,73 @@ def test_prefill_hit_d2d_noop_without_spare_slots():
     torch.cuda.synchronize()
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
+
+
+# ---------------------------------------------------------------- on-demand
+
+
+@CUDA
+@JIT
+def test_prefill_ondemand_stages_touched_rows_only():
+    """Small banks (no D2D-eligible rows): every touched expert is H2D-gathered
+    from the host banks; untouched buffer rows stay stale and unmapped ids of the
+    staged buffer are invalidated."""
+    cache, sources = _make_cache()
+    # layer 0 stages into buffer 0 (slots [0, E)): seed one true hit region slot,
+    # one stale buffer-slot mapping with poisoned bytes.
+    _seed_resident(cache, sources, layer_id=0, expert_id=1, slot=17)
+    cache.slot_for_id[0, 0] = 2
+    cache.id_of_slot[2] = 0
+    cache.usage[2] = 999
+    for name in sources:
+        cache.bank_caches[name][2].fill_(float("nan"))
+    topk = torch.tensor([[1, 3, 0, 5], [5, 7, 1, 6]], dtype=torch.int32, device="cuda")
+    views = cache.prefetch_prefill_layer_ondemand(0, topk)
+    torch.cuda.synchronize()
+    touched = (0, 1, 3, 5, 6, 7)
+    for view, (name, per_layer) in zip(views, sources.items()):
+        for e in touched:
+            assert torch.equal(view[e].cpu(), per_layer[0][e]), (name, e)
+    # the poisoned slot-2 bytes never surface in the TOUCHED rows (expert 0 was
+    # re-fetched from the host); untouched rows legitimately keep stale bytes
+    for v in views:
+        assert not bool(torch.isnan(v.float()[list(touched)]).any())
+    # hit residency is untouched; the staged buffer's stale mapping is invalidated
+    assert int(cache.slot_for_id[0, 1].item()) == 17
+    assert int(cache.slot_for_id[0, 0].item()) == -1
+    assert int(cache.id_of_slot[2].item()) == -1
+
+
+@CUDA
+@JIT
+def test_prefill_ondemand_hits_gather_from_cache():
+    """Big banks: touched hits are served D2D from their cache slots (NOT the
+    host), touched misses H2D from the host banks."""
+    dev = torch.device("cuda")
+    # rows >= 256 KiB so both banks are D2D-eligible (_SMALL_BANK_FEAT_BYTES)
+    sources = {
+        "gate_up": [torch.randn(E, 128, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+        "down": [torch.randn(E, 64, 128, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=CACHE_SIZE,
+        device=dev, prefill_overlap=True, prefill_hit_d2d=True,
+    )
+    cache.set_bank_sources(sources)
+    assert cache._gather_dst_ptrs is not None
+    # expert 1 resident at slot 17 with CACHE bytes that differ from the host bank
+    distinct = {name: torch.randn_like(per_layer[2][1]) for name, per_layer in sources.items()}
+    cache.slot_for_id[2, 1] = 19
+    cache.id_of_slot[19] = 2 * E + 1
+    for name, rows in distinct.items():
+        cache.bank_caches[name][19].copy_(rows)
+    topk = torch.tensor([[1, 2], [2, 4]], dtype=torch.int32, device=dev)
+    views = cache.prefetch_prefill_layer_ondemand(2, topk)
+    torch.cuda.synchronize()
+    for view, (name, per_layer) in zip(views, sources.items()):
+        # hit row came from the CACHE slot, not the host
+        assert torch.equal(view[1].cpu(), distinct[name].cpu()), name
+        # miss rows came from the host banks
+        for e in (2, 4):
+            assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)
+    assert int(cache.slot_for_id[2, 1].item()) == 19

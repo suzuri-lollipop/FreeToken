@@ -31,8 +31,15 @@ class BaseLLMModel(ABC, BaseOP):
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        """Around one forward dispatch: enter before it is enqueued, exit right after. A backend that feeds the forward from host memory overrides this."""
-        yield
+        """Around one forward dispatch: enter before it is enqueued, exit right after.
+
+        A backend that feeds the forward from host memory overrides this. The yielded
+        value is an optional DEFERRED completion callable: the engine stashes it and
+        the scheduler runs it after the previous batch's drain, so a fill that waits
+        on a device readback does not serialize the host issue loop against the
+        in-flight replay (the device-side flag protocol keeps the ordering correct).
+        """
+        yield None
 
 
 @runtime_checkable

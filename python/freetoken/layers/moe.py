@@ -327,6 +327,11 @@ class OffloadMoELayer(MoELayer):
             )
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        from freetoken.moe import _debug_stats
+
+        dbg = _debug_stats.probe()
+        if dbg is not None:
+            dbg.decode_step(topk_ids, None)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -363,6 +368,11 @@ class OffloadMoELayer(MoELayer):
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+        from freetoken.moe import _debug_stats
+
+        dbg = _debug_stats.probe()
+        if dbg is not None:
+            dbg.decode_step(topk_ids, cpu_ids)
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -412,8 +422,21 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-        if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
+        if (
+            cache.ondemand_prefill
+            and cache.prefill_bank_buffers
+            and hidden_states.shape[0] <= cache.ondemand_max_tokens
+        ):
+            # Short chunk: stage only the experts this chunk's routing touched (the
+            # LRU stays untouched, the GEMM keeps the position == expert id contract).
+            from freetoken.moe import _debug_stats
+
+            dbg = _debug_stats.probe()
+            if dbg is not None:
+                dbg.prefill_layer_begin(self.layer_id)
+            views = cache.prefetch_prefill_layer_ondemand(self.layer_id, topk_ids)
+            if dbg is not None:
+                dbg.prefill_layer_waited(self.layer_id)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -424,6 +447,30 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            if dbg is not None:
+                dbg.prefill_layer_done(self.layer_id, topk_ids)
+            return out
+        if cache.prefill_overlap:
+            from freetoken.moe import _debug_stats
+
+            dbg = _debug_stats.probe()
+            if dbg is not None:
+                dbg.prefill_layer_begin(self.layer_id)
+            views = self._wait_prefill_overlap(cache)
+            if dbg is not None:
+                dbg.prefill_layer_waited(self.layer_id)
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            if dbg is not None:
+                dbg.prefill_layer_done(self.layer_id, topk_ids)
             cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)

@@ -206,10 +206,23 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
+        if _dbg is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter()
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
+        if _dbg is not None:
+            _t1 = _time.perf_counter()
         g.replay()
+        if _dbg is not None:
+            _t2 = _time.perf_counter()
+            _dbg.host_phase("rp.stage", _t1 - _t0)
+            _dbg.host_phase("rp.launch", _t2 - _t1)
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

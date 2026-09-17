@@ -187,12 +187,24 @@ class DiskRowTable:
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
+        log_fills = os.getenv("PLE_FILL_LOG") == "1"
+        if log_fills:
+            self._fill_log_n = getattr(self, "_fill_log_n", 0) + 1
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
             offset += run.numel() - 2
         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+        if log_fills and self._fill_log_n <= 3000:
+            import hashlib
+
+            nbytes = offset * self._token_bytes
+            digest = hashlib.md5(bytes(pinned[:nbytes].numpy().tobytes())).hexdigest()[:12]
+            logger.info(
+                f"[plefill] #{self._fill_log_n} graph={graph} rows={offset} "
+                f"md5={digest} runs={[r.tolist() for r in runs]}"
+            )
 
     def _ple_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.image_token_id is None:
@@ -211,6 +223,12 @@ class DiskRowTable:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
+                # Snapshot the ngram contexts NOW: the engine runs complete_one() on
+                # these reqs later in the same step (and the scheduler appends the
+                # sampled token during the drain), while the deferred fill -- which
+                # the engine runs after that drain -- must see ENTER-time state, the
+                # state the captured lookup's rows are keyed by.
+                ctxs = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
@@ -218,8 +236,8 @@ class DiskRowTable:
                     try:
                         self._readback_event.synchronize()
                         tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        runs = [torch.tensor([*c, t], dtype=torch.int64)
+                                for c, t in zip(ctxs, tokens)]
                         self.fill(runs, graph=True)
                     except BaseException:
                         from freetoken.kernel import _ple_store
@@ -247,12 +265,15 @@ class DiskRowTable:
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
+        """Around one dispatch: stage on enter, hand the deferred fill+signal to the
+        engine (it runs after the previous batch's drain -- see BaseLLMModel). The
+        device-side memop WAIT in ``lookup`` orders the replay against the fill, so
+        deferring costs the GPU only the fill latency instead of serializing the host
+        issue loop behind the whole previous replay (the readback event sits behind it
+        in stream order). A failed launch never binds the deferred callable, so the
+        fill still does not run without its WAIT."""
         deferred = self.host_fill_batch(batch, use_graph)
-        yield
-        # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
-        if deferred is not None:
-            deferred()
+        yield deferred
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 

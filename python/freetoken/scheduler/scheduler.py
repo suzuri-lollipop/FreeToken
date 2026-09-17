@@ -215,6 +215,13 @@ class Scheduler(SchedulerIOMixin):
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
+        if _dbg is not None:
+            import time as _time
+
+            _t = _time.perf_counter()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -223,6 +230,10 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        if _dbg is not None:
+            _n = _time.perf_counter()
+            _dbg.host_phase("recv", _n - _t)
+            _t = _n
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -240,6 +251,10 @@ class Scheduler(SchedulerIOMixin):
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
+        if _dbg is not None:
+            _n = _time.perf_counter()
+            _dbg.host_phase("sched", _n - _t)
+            _t = _n
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -247,8 +262,24 @@ class Scheduler(SchedulerIOMixin):
                 # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
+                if _dbg is not None:
+                    _n0 = _time.perf_counter()
                 self._restore_linear_states(forward_input.batch)
+                if _dbg is not None:
+                    _n1 = _time.perf_counter()
+                    _dbg.host_phase(
+                        ("p." if forward_input.batch.is_prefill else "d.") + "fw.restore",
+                        _n1 - _n0)
                 ongoing_data = (forward_input, self._forward(forward_input))
+                if _dbg is not None:
+                    _n2 = _time.perf_counter()
+                    _dbg.host_phase(
+                        ("p." if forward_input.batch.is_prefill else "d.") + "fw.total",
+                        _n2 - _n1)
+        if _dbg is not None:
+            _n = _time.perf_counter()
+            _dbg.host_phase("fwd_issue", _n - _t)
+            _t = _n
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -256,8 +287,21 @@ class Scheduler(SchedulerIOMixin):
         # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
-        self._process_last_data(last_data)
-        self._flush_abort_acks()
+        try:
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+        finally:
+            # Run the just-issued batch's deferred PLE fill AFTER the drain: its readback
+            # event sits a hair past the drain's copy_done point in stream order (so the
+            # wait is ~0 here), while the replay's captured memop WAIT keeps the ordering.
+            # In a finally so a drain failure can never leave the WAIT unanswered.
+            self.engine.run_pending_host_fill()
+        if _dbg is not None:
+            _n = _time.perf_counter()
+            _dbg.host_phase("drain", _n - _t)
+            # device-syncing stats dump ONLY here: past the deferred fill, so no
+            # un-signaled PLE WAIT can be queued ahead of the sync
+            _dbg.dump("loop")
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -284,6 +328,10 @@ class Scheduler(SchedulerIOMixin):
             self._restore_linear_states(forward_input.batch)
             ongoing_data = (forward_input, self._forward(forward_input))
 
+        # Non-overlap drains the batch it just issued: the deferred PLE fill MUST run
+        # first -- this batch's own replay is WAITing on its flag, so draining before
+        # the fill would deadlock (drain waits replay, replay waits fill, fill waits drain).
+        self.engine.run_pending_host_fill()
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
 
@@ -315,6 +363,12 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        # Signal the in-flight batch's PLE rows at the earliest safe instant: its
+        # readback event is a hair past this copy_done point, and every host us
+        # spent here before the fill is a us the replay idles at its captured WAIT.
+        # (normal_loop drains the batch it just issued and runs the fill BEFORE this
+        # point, so this is a no-op there -- draining first would deadlock.)
+        self.engine.run_pending_host_fill()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -903,12 +957,32 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
+        _pk = "p." if batch.is_prefill else "d."
+        if _dbg is not None:
+            import time as _time
+
+            _q0 = _time.perf_counter()
         batch.input_ids = self.token_pool[input_mapping]
+        if _dbg is not None:
+            _q1 = _time.perf_counter()
+            _dbg.host_phase(_pk + "fw.inputids", _q1 - _q0)
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if _dbg is not None:
+            _qa = _time.perf_counter()
+            _dbg.host_phase(_pk + "fw.anchor", _qa - _q1)
         forward_output = self.engine.forward_batch(batch, sample_args)
+        if _dbg is not None:
+            _q2 = _time.perf_counter()
+            _dbg.host_phase(_pk + "fw.fbcall", _q2 - _qa)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if _dbg is not None:
+            _q3 = _time.perf_counter()
+            _dbg.host_phase(_pk + "fw.tail", _q3 - _q2)
         return forward_output
 
 

@@ -114,6 +114,17 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
+    # Touched-only prefill staging for SHORT chunks: instead of streaming the whole
+    # layer (every non-resident expert row) into the double buffer, gather exactly
+    # the experts the chunk's routing selected -- hits D2D from the slot cache,
+    # misses H2D via the SM gather. Skewed routing means a ~150-token chunk touches
+    # ~30% of a layer, so this cuts the prefill's PCIe bytes ~3x; the LRU is left
+    # untouched. Falls back to the streaming path above ``ondemand_max_tokens``
+    # (where the touched set converges to the whole layer and the double-buffered
+    # overlap pays off again). Requires prefill_overlap buffers + the fused copy
+    # plan + all-pinned layers; set by the engine after construction.
+    ondemand_prefill: bool = False
+    ondemand_max_tokens: int = 256
     # Flat residency: every expert of every layer owns a permanent slot
     # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
     # expert and GPU decode; drops the prefill double buffers, so after the single load in
@@ -307,6 +318,12 @@ class OffloadMoeCache:
         self._prefill_hit_d2d_active = False
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
+        # On-demand (touched-only) prefill staging state: the miss gather plan and the
+        # per-chunk touched mask (the hit plan reuses the _prefill_hit_* tensors).
+        self._prefill_miss_dst: torch.Tensor | None = None
+        self._prefill_miss_src: torch.Tensor | None = None
+        self._prefill_miss_num: torch.Tensor | None = None
+        self._prefill_touched: torch.Tensor | None = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
@@ -690,11 +707,8 @@ class OffloadMoeCache:
             self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_begin_event = torch.cuda.Event()
-        if self.prefill_hit_d2d and self.device.type == "cuda":
-            self._prefill_slot_snapshot = torch.empty(
-                (self.num_layers, self.num_experts), dtype=torch.int32, pin_memory=True
-            )
-            self._prefill_snapshot_np = self._prefill_slot_snapshot.numpy()
+            # Gather-plan tensors for the hit-D2D split AND the on-demand path (the
+            # engine decides which runs after construction; both are tiny).
             self._prefill_hit_dst = torch.empty(
                 (self.num_experts,), dtype=torch.int32, device=self.device
             )
@@ -702,6 +716,21 @@ class OffloadMoeCache:
                 (self.num_experts,), dtype=torch.int32, device=self.device
             )
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            self._prefill_miss_dst = torch.empty(
+                (self.num_experts,), dtype=torch.int32, device=self.device
+            )
+            self._prefill_miss_src = torch.empty(
+                (self.num_experts,), dtype=torch.int32, device=self.device
+            )
+            self._prefill_miss_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            self._prefill_touched = torch.zeros(
+                (self.num_experts,), dtype=torch.int32, device=self.device
+            )
+        if self.prefill_hit_d2d and self.device.type == "cuda":
+            self._prefill_slot_snapshot = torch.empty(
+                (self.num_layers, self.num_experts), dtype=torch.int32, pin_memory=True
+            )
+            self._prefill_snapshot_np = self._prefill_slot_snapshot.numpy()
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
         slot_start = buffer_id * self.num_experts
@@ -885,6 +914,58 @@ class OffloadMoeCache:
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
+
+    def prefetch_prefill_layer_ondemand(
+        self, layer_id: int, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """Touched-only staging of one expert layer for a SHORT prefill chunk.
+
+        Fully device-side on the current stream (no host sync, no copy-stream
+        choreography): mark the chunk's routed experts in ``_prefill_touched``,
+        compact them into hit (D2D slot gather) and miss (H2D pinned gather, the
+        same SM primitive decode's ``copy_missing`` uses -- it runs at DMA rate at
+        these sizes) plans, invalidate this buffer's stale slot mappings, move both
+        row sets into the buffer, and return the full-layer views (position ==
+        expert id, so the caller's GEMM contract is unchanged). The next layer's
+        routing does not exist yet, so there is nothing to prefetch ahead of.
+
+        The LRU slot cache is neither read for eviction nor written: only rows at
+        slots >= 2E are gathered, and the buffer slots' stale ids are invalidated
+        exactly like the streaming path does.
+        """
+        assert self.prefill_overlap and self.prefill_bank_buffers
+        assert self._copy_fused_ok, "on-demand prefill needs the fused copy plan"
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import prefill_ondemand_compact
+
+        buffer_id = layer_id % 2
+        touched = self._prefill_touched
+        touched.zero_()
+        touched.scatter_(0, topk_ids.reshape(-1).long(), 1)
+        prefill_ondemand_compact(self, layer_id, buffer_id, touched)
+        self._invalidate_prefill_buffer(buffer_id)
+        # Hits gather D2D over ALL banks (the SM kernel has no small-row caveat,
+        # unlike the streaming path's batch memcpy, so scales/globals come from
+        # their cache slots too); misses gather H2D from the host banks. D2D
+        # first: the HBM rate is ~40x the PCIe rate.
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_dst_ptrs,
+            self._copy_feat_bytes,
+            self._prefill_hit_dst,
+            self._prefill_hit_src,
+            self._prefill_hit_num,
+            blocks_per_bank=64,
+        )
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_src_ptrs[layer_id],
+            self._copy_feat_bytes,
+            self._prefill_miss_dst,
+            self._prefill_miss_src,
+            self._prefill_miss_num,
+        )
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per

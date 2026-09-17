@@ -82,6 +82,36 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
+def prefill_ondemand_compact(
+    cache, layer_id: int, buffer_id: int, touched: torch.Tensor, threshold: int | None = None
+) -> None:
+    """Touched-only split of one layer's experts for the on-demand prefill path.
+
+    ``touched`` is a [num_experts] 0/1 mask of the experts this chunk's routing
+    actually selected. Emits two fixed-shape gather plans, device-side, no host
+    sync: hits (mask & slot >= 2E) as (buffer row, cache slot) pairs for the D2D
+    gather, and misses (mask & slot < 2E) as (buffer row, host row) pairs -- both
+    indexed position == expert id, so the GEMM keeps the full-layer bank contract.
+    ``threshold`` overrides the hit cut (a huge value routes every touched expert
+    to the miss/H2D plan for caches with no D2D-eligible banks).
+    """
+    num_experts = cache.num_experts
+    _prefill_ondemand_compact_kernel[(1,)](
+        cache.slot_for_id[layer_id],
+        touched,
+        cache._prefill_hit_dst,
+        cache._prefill_hit_src,
+        cache._prefill_hit_num,
+        cache._prefill_miss_dst,
+        cache._prefill_miss_src,
+        cache._prefill_miss_num,
+        buffer_id * num_experts,
+        2 * num_experts if threshold is None else threshold,
+        num_experts,
+        BLOCK=triton.next_power_of_2(num_experts),
+    )
+
+
 def materialize_layer(cache, layer_id: int) -> None:
     _materialize_layer_gpu(cache, layer_id)
 
@@ -429,3 +459,34 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+@triton.jit(do_not_specialize=["buffer_base"])
+def _prefill_ondemand_compact_kernel(
+    slot_ptr,      # [num_experts] int32: this layer's LIVE slot_for_id row
+    touched_ptr,   # [num_experts] int32: 1 for experts this chunk's routing selected
+    hit_dst,       # [num_experts] int32 out: buffer rows of touched hits
+    hit_src,       # [num_experts] int32 out: cache slots of touched hits
+    hit_num,       # [1] int64 out
+    miss_dst,      # [num_experts] int32 out: buffer rows of touched misses (== expert id)
+    miss_src,      # [num_experts] int32 out: host bank rows (== expert id)
+    miss_num,      # [1] int64 out
+    buffer_base,   # buffer_id * num_experts
+    threshold,     # 2 * num_experts
+    num_experts,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    lane = offs < num_experts
+    slots = tl.load(slot_ptr + offs, mask=lane, other=-1)
+    touched = tl.load(touched_ptr + offs, mask=lane, other=0) != 0
+    is_hit = lane & touched & (slots >= threshold)
+    is_miss = lane & touched & (slots < threshold)
+    pos_h = tl.cumsum(is_hit.to(tl.int32)) - 1
+    tl.store(hit_dst + pos_h, (buffer_base + offs).to(tl.int32), mask=is_hit)
+    tl.store(hit_src + pos_h, slots, mask=is_hit)
+    tl.store(hit_num, tl.sum(is_hit.to(tl.int64)))
+    pos_m = tl.cumsum(is_miss.to(tl.int32)) - 1
+    tl.store(miss_dst + pos_m, (buffer_base + offs).to(tl.int32), mask=is_miss)
+    tl.store(miss_src + pos_m, offs.to(tl.int32), mask=is_miss)
+    tl.store(miss_num, tl.sum(is_miss.to(tl.int64)))

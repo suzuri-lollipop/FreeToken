@@ -68,6 +68,7 @@ def _stub_scheduler(*, prefill_runnable: bool, decode_runnable: bool, pending: o
     from freetoken.scheduler.scheduler import Scheduler
 
     sched = Scheduler.__new__(Scheduler)
+    sched.engine = SimpleNamespace(run_pending_host_fill=lambda: None)
     sched.prefill_manager = SimpleNamespace(runnable=prefill_runnable)
     sched.decode_manager = SimpleNamespace(runnable=decode_runnable)
     sched._pending_rebuild = pending
@@ -151,7 +152,8 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     sched.device = torch.device("cpu")
     sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1), max_extend_tokens=100_000)
     sched.engine = SimpleNamespace(
-        rebuild_runtime_cache=lambda **kw: None, num_pages=32, page_table=None
+        rebuild_runtime_cache=lambda **kw: None, num_pages=32, page_table=None,
+        run_pending_host_fill=lambda: None,
     )
     # engine.page_table unchanged across the (stubbed) rebuild -> no token_pool re-point.
     sched.table_manager = SimpleNamespace(page_table=None)

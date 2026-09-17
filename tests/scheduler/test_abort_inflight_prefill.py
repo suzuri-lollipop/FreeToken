@@ -62,6 +62,7 @@ def _setup():
         toolcall_anchor_id=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
+        engine=SimpleNamespace(run_pending_host_fill=lambda: None),
         send_result=sent.extend,
         _kv_usage_pages=cm.page_usage,
         _mamba_slot_usage=lambda: None,

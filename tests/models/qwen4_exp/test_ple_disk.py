@@ -320,9 +320,13 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
             assert _bitwise_equal(out, oracle.lookup(ids)), f"wait-sync token {token}"
             older, newer = newer, token
 
-        # the engine-shaped seam: replay inside the context, deferred fill on exit
-        with disk.forward_host_ctx(_decode_batch([3, 4], 7), use_graph=True):
+        # the engine-shaped seam: replay inside the context, the deferred fill
+        # YIELDED to the caller (the engine runs it after the previous batch's
+        # drain -- see BaseLLMModel.forward_host_ctx / Engine.run_pending_host_fill)
+        with disk.forward_host_ctx(_decode_batch([3, 4], 7), use_graph=True) as deferred:
             graph.replay()
+        assert deferred is not None, "wait-sync mode must yield the deferred fill"
+        deferred()
         torch.cuda.synchronize()
         ids = emb.row_ids(_meta([[7]], [[3, 4]], decode=True)).cuda()
         assert _bitwise_equal(out, oracle.lookup(ids)), "forward_host_ctx deferred"

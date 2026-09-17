@@ -459,6 +459,10 @@ class Engine:
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
+        # Bytes the startup headroom growth (below) added to the MoE slot cache beyond
+        # the memory_ratio plan; runtime-rebuild fit checks credit it back so a rebuild
+        # targeting today's geometry is not rejected by the ratio budget.
+        self._moe_headroom_growth = 0
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -506,6 +510,9 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # Deferred PLE host fill from the last forward_batch; the scheduler runs it
+        # post-drain (run_pending_host_fill), and the next forward flushes any leftover.
+        self._pending_host_fill = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -596,6 +603,9 @@ class Engine:
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+
+        if config.moe_cache_auto:
+            post_free_memory = self._grow_moe_cache_into_headroom(config, post_free_memory)
 
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
@@ -762,6 +772,79 @@ class Engine:
             max_slots=max_slots,
         )
 
+    def _grow_moe_cache_into_headroom(self, config: EngineConfig, post_free_memory: int) -> int:
+        """--moe-cache-auto: grow the expert slot cache into the post-init headroom.
+
+        The startup plan sizes the pools from ``memory_ratio x baseline_free - weights``
+        (all measured BEFORE the model loads), so the ``(1 - ratio)`` remainder is a
+        blind guess at what CUDA-graph capture and the largest prefill chunk's
+        activations will need. Once every pool is resident we know the real free
+        bytes; keep a fixed reserve for those consumers and spend the rest on expert
+        slots -- every extra slot is one less PCIe miss in both prefill and decode.
+        Runs BEFORE the first graph capture, so no re-capture is needed. The target
+        derives from the cross-rank MIN free memory, so every TP rank grows to the
+        same size. Returns the free memory after the growth.
+
+        TP-collective discipline: the go/no-go decision is all-reduced (MIN) AFTER a
+        local probe allocation, and ``_sync_get_memory`` (itself collective) runs only
+        on the unanimous-go path -- so every rank executes the identical collective
+        sequence. A rank-local skip (probe OOM, cap) would desynchronize the gloo
+        group and hang the scheduler's next broadcast.
+        """
+        cache = self.moe_offload_cache
+        if cache is None or cache.flat_residency or self.device.type != "cuda":
+            return post_free_memory
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        per_expert = expert_bytes_per_slot(cache.bank_sources)
+        reserve = int(
+            float(os.getenv("FREETOKEN_MOE_HEADROOM_RESERVE_GIB", "1.5")) * (1 << 30)
+        )
+        go = False
+        target = cache.cache_size
+        extra = (post_free_memory - reserve) // per_expert
+        if extra >= 64:
+            target = cache.cache_size + int(extra)
+            if cache.max_slots is not None:
+                target = min(target, cache.max_slots)
+            try:
+                cache.validate_rebuild(target)
+                extra = target - cache.cache_size
+                go = extra >= 64
+            except ValueError as e:
+                logger.warning_rank0(f"MoE headroom growth skipped: {e}")
+        if go:
+            # Probe-allocate the growth BEFORE rebuild() frees the old cache: an OOM
+            # here is a no-op, while an OOM inside rebuild (free-then-alloc) is fatal.
+            try:
+                probe = torch.empty(extra * per_expert, dtype=torch.uint8, device=self.device)
+                del probe
+            except torch.cuda.OutOfMemoryError:
+                go = False
+                logger.warning_rank0(
+                    "MoE headroom growth skipped: the probe allocation did not fit "
+                    "(fragmentation); keeping the planned cache size"
+                )
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            flag = torch.tensor([1 if go else 0], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            go = bool(flag.item())
+        if not go:
+            return post_free_memory
+        logger.info_rank0(
+            f"--moe-cache-auto: growing expert cache {cache.cache_size} -> {target} "
+            f"slots (+{extra * per_expert / 2**30:.2f} GiB from the post-init headroom, "
+            f"keeping {reserve / 2**30:.2f} GiB reserve for graph capture + activations)"
+        )
+        cache.rebuild(target)
+        object.__setattr__(config, "moe_cache_size", target)
+        self._moe_headroom_growth = extra * per_expert
+        free_min, _ = self._sync_get_memory()
+        logger.info_rank0(f"Free memory after MoE headroom growth: {mem_GB(free_min)}")
+        return free_min
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
@@ -917,6 +1000,30 @@ class Engine:
                 )
             ) from exc
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if (
+            cache.prefill_overlap
+            and not cache.flat_residency
+            and cache._copy_fused_ok
+            and not cache._unpinned_layers
+            and self.device.type == "cuda"
+        ):
+            # Touched-only staging for short prefill chunks: skewed routing means a
+            # ~150-token chunk selects ~30% of a layer's experts, so gathering just
+            # those (hits D2D, misses over PCIe) beats streaming every non-resident
+            # row of the whole layer. Longer chunks converge to the full layer and
+            # keep the double-buffered streaming path.
+            cache.ondemand_prefill = True
+            cache.ondemand_max_tokens = max(
+                0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "256"))
+            )
+            if cache.ondemand_max_tokens == 0:
+                cache.ondemand_prefill = False
+            else:
+                logger.info_rank0(
+                    "MoE on-demand prefill enabled for chunks <= "
+                    f"{cache.ondemand_max_tokens} tokens: only routing-touched experts "
+                    "cross PCIe (whole-layer streaming above that)"
+                )
         if cache.flat_residency:
             # One pass over PCIe for the whole model, replacing the per-chunk full-layer
             # copies of the LRU path. Must complete before CUDA graph capture replays a
@@ -936,12 +1043,17 @@ class Engine:
             # single-row step misses ~1 expert/layer). Keep bs=1 on the GPU slot cache and
             # route bs>=2 through the CPU. Measured: bs=1 hybrid decodes ~25% slower than
             # offload here, while bs>=2 aggregate is ~1.7x faster. Single-rank keeps the
-            # historical always-hybrid behavior.
+            # historical always-hybrid behavior. FREETOKEN_HYBRID_MIN_BS overrides for A/B
+            # on machines where the PCIe link is slower than the CPU slice.
             if config.tp_info.size > 1:
-                cache.hybrid_min_bs = 2
+                cache.hybrid_min_bs = max(1, int(os.getenv("FREETOKEN_HYBRID_MIN_BS", "2")))
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        from freetoken.moe import _debug_stats
+
+        cache.collect_stats = config.moe_collect_stats or _debug_stats.ENABLED
+        if _debug_stats.probe() is not None:
+            _debug_stats.probe().attach(cache)
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -968,6 +1080,19 @@ class Engine:
             cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
             tp_size=config.tp_info.size,
         )
+        # A/B knob: FREETOKEN_HYBRID_FETCH_FRACTION overrides the profiled split,
+        # optionally per rank ("f0,f1"). The cached benchbw overlap pair measures a
+        # single-rank rig; heterogeneous PCIe links (e.g. x16 + x4) want per-rank
+        # splits the profile cannot express.
+        override = os.getenv("FREETOKEN_HYBRID_FETCH_FRACTION", "").strip()
+        if override:
+            parts = [float(x) for x in override.split(",")]
+            picked = parts[min(config.tp_info.rank, len(parts) - 1)]
+            logger.info_rank0(
+                f"FREETOKEN_HYBRID_FETCH_FRACTION: overriding fetch fraction "
+                f"{fraction} -> {picked} (rank {config.tp_info.rank})"
+            )
+            fraction = picked
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -1173,7 +1298,11 @@ class Engine:
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            # credit back the startup headroom growth: those slots legitimately live
+            # in the (1 - memory_ratio) remainder, which this ratio-budget check
+            # otherwise counts against the rebuild target
+            weights_bytes=max(0, self._weights_bytes - self._moe_headroom_growth),
+            current_num_pages=self.num_pages,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
             ),
@@ -1241,13 +1370,92 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
         )
 
+    def run_pending_host_fill(self) -> None:
+        """Run the deferred host fill stashed by the last forward_batch (if any).
+
+        The scheduler calls this right after draining the previous batch: the fill's
+        readback event sits behind that drain's point in stream order, so the wait is
+        ~0 and the GPU only stalls for the fill itself (its captured memop WAIT),
+        instead of the host issue loop serializing behind the whole previous replay.
+        Also flushed at the next forward_batch entry so callers without the scheduler
+        hook (offline loops) can never leave a WAIT unanswered."""
+        fill = self._pending_host_fill
+        if fill is not None:
+            self._pending_host_fill = None
+            from freetoken.moe import _debug_stats
+
+            _dbg = _debug_stats.probe()
+            if _dbg is not None:
+                import time as _time
+
+                _f0 = _time.perf_counter()
+            fill()
+            if _dbg is not None:
+                _dbg.host_phase("ple.fill", _time.perf_counter() - _f0)
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        from freetoken.moe import _debug_stats
+
+        self.run_pending_host_fill()
+        _dbg = _debug_stats.probe()
+        _ek = "p." if batch.is_prefill else "d."
+        if _dbg is not None:
+            import time as _time
+
+            _te0 = _time.perf_counter()
         assert torch.cuda.current_stream() == self.stream
+        if _dbg is not None:
+            _te1 = _time.perf_counter()
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+        # NOTE: whole-forward SYNC instrumentation is only safe with PLE_FILL_AT_EXIT=1:
+        # the captured decode graph parks at the PLE lookup's memop WAIT until the
+        # deferred fill signals it post-drain, so a torch.cuda.synchronize around the
+        # replay would deadlock the scheduler loop unless the fill ran at ctx exit.
+        _profiling = (
+            _dbg is not None
+            and not batch.is_prefill
+            and os.getenv("PLE_FILL_AT_EXIT") == "1"
+            and _dbg.should_profile()
+        )
+        if _profiling:
+            import torch.profiler as _tp
+
+            _prof = _tp.profile(
+                activities=[_tp.ProfilerActivity.CUDA],
+                record_shapes=_debug_stats.PROFILE_SHAPES,
+            )
+            _prof.__enter__()
+        if _dbg is not None:
+            _tc0 = _time.perf_counter()
+            _dbg.host_phase(_ek + "fe.assert", _te1 - _te0)
+            _dbg.host_phase(_ek + "fe.entry", _tc0 - _te1)
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph) as _deferred_fill:
+            if _dbg is not None:
+                _tc1 = _time.perf_counter()
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            if _dbg is not None:
+                _tc2 = _time.perf_counter()
+                _dbg.host_phase(_ek + "fb.ctxenter", _tc1 - _tc0)
+                _dbg.host_phase(_ek + "fb.model", _tc2 - _tc1)
+        # A failed launch skips this (exception unwinds past it): no WAIT is pending
+        # for a replay that never launched, so the fill must not run -- same contract
+        # the ple_disk ctx had when it ran the deferred callable at its own exit.
+        if _deferred_fill is not None:
+            if os.getenv("PLE_FILL_AT_EXIT") == "1":
+                # A/B knob: the historical at-exit execution point (blocks the issue
+                # loop on the readback event until the previous replay completes).
+                _deferred_fill()
+            else:
+                self._pending_host_fill = _deferred_fill
+        if _profiling:
+            # safe only because AT_EXIT mode ran the fill above (see the NOTE)
+            torch.cuda.synchronize(self.device)
+            _prof.__exit__(None, None, None)
+            _dbg.profile_dump(_prof)
+        if _dbg is not None:
+            _tm0 = _time.perf_counter()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1257,10 +1465,17 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        if _dbg is not None:
+            _ts = _time.perf_counter()
+            _dbg.host_phase(_ek + "fb.mid", _ts - _tm0)
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if _dbg is not None:
+            _te = _time.perf_counter()
+            _dbg.host_phase("fb.sample", _te - _ts)
+            _dbg.host_phase(_ek + "fe.ret", _time.perf_counter() - _te)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
