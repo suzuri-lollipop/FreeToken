@@ -41,7 +41,11 @@ def _hf_indexer(seq: int, topk: int):
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
-    ref_topk = idx(x, q_resid, (cos, sin), None, pos[None])  # [1, S, topk]
+    # transformers >= 5.17 dereferences attention_mask unconditionally in the indexer;
+    # GlmMoeDsaAttention always passes a causal mask (attention_mask[:, 0, :, :]), so
+    # replicate that here instead of None.
+    mask = torch.ones(1, seq, seq, dtype=torch.bool, device="cuda").tril()
+    ref_topk = idx(x, q_resid, (cos, sin), mask, pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
 
