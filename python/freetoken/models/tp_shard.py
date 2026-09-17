@@ -145,7 +145,17 @@ class TpShard:
                 pad = torch.zeros(local - take, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
                 piece = pad if piece.numel() == 0 else torch.cat([piece, pad], dim=axis)
             pieces.append(piece)
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=axis)
+        if len(pieces) > 1:
+            return torch.cat(pieces, dim=axis)  # cat already owns its bytes
+        piece = pieces[0]
+        if piece.numel() == tensor.numel():
+            return piece
+        # narrow() leaves the shard aliasing the whole checkpoint tensor, and the loader
+        # adopts yielded tensors by assignment -- so every rank would pin the full
+        # unsharded weight for the life of the process (a 2-rank vocab cut alone strands
+        # ~600 MiB of dead VRAM per weight). Owning the slice lets the reader drop the
+        # source; the extra copy is a device-to-device shard, ~0.1 s for a whole model.
+        return piece.clone()
 
 
 def tp_shard_for(config, rank: int, world: int) -> TpShard:

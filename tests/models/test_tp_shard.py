@@ -183,3 +183,29 @@ def test_tp_shard_is_inert_on_a_single_rank(monkeypatch):
     monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(1, 2))
     assert tp_shard(_config()).world == 2
 
+
+
+def test_a_cut_shard_owns_its_bytes():
+    """The shard must not keep the unsharded checkpoint tensor resident.
+
+    The engine adopts loaded tensors by assignment, so a narrow() view would pin the whole
+    source storage for the process lifetime: on a 2-rank run every weight stranded its
+    other half (~2 GiB of dead VRAM per rank on Qwen3.8-Flash-Next), which the MoE slot
+    cache could otherwise spend on expert residency.
+    """
+    src = _index(QH * HD * 2)
+    out = _shard(0, 2).tensor("q_proj", src)
+    assert torch.equal(out, src[: QH * HD])
+    assert out.untyped_storage().data_ptr() != src.untyped_storage().data_ptr()
+    assert out.untyped_storage().size() == out.numel() * out.element_size()
+
+
+def test_an_uncut_leaf_and_a_padded_vocab_shard_stay_exact():
+    """No copy for a leaf this rank keeps whole, and the rounded-up vocab shard still owns
+    its (padded) bytes."""
+    replicated = _index(64)
+    assert _shard(0, 2).tensor("gate", replicated) is replicated
+    vocab = _index(VOCAB, H)
+    for rank in (0, 1, 2):
+        piece = _shard(rank, 3).tensor("embed_tokens", vocab)
+        assert piece.untyped_storage().size() == piece.numel() * piece.element_size()

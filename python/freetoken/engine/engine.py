@@ -1067,18 +1067,22 @@ class Engine:
 
         Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :
         (cpu_bw - pcie_bw), i.e. fetching a pcie_bw / cpu_bw fraction of each decode
-        step's misses -- both sides then finish together instead of one idling. The
-        achieved bandwidths come from the cached `ft bench bw` profile (the same one the
-        auto backend pick reads); without a usable profile the old fixed cap of 1 applies.
+        step's misses -- both sides then finish together instead of one idling. The CPU
+        side comes from the cached `ft bench bw` profile (the same one the auto backend
+        pick reads); the PCIe side is measured live on THIS rank's link, because two cards
+        in one box routinely sit in different slots and the profile's contended-overlap
+        gather number understates the decode-time rate (see _probe_pcie_h2d_gbs). Without
+        a usable profile the old fixed cap of 1 applies.
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        pcie_gbs = _probe_pcie_h2d_gbs(self.device)
         fraction = load_hybrid_fetch_fraction(
             cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid,
-            tp_size=config.tp_info.size,
+            tp_size=config.tp_info.size, pcie_gbs=pcie_gbs,
         )
         # A/B knob: FREETOKEN_HYBRID_FETCH_FRACTION overrides the profiled split,
         # optionally per rank ("f0,f1"). The cached benchbw overlap pair measures a
@@ -1102,9 +1106,10 @@ class Engine:
             return
         cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction is the cap
         cache.hybrid_fetch_fraction = fraction
-        logger.info_rank0(
+        link = f"measured PCIe {pcie_gbs:.1f} GB/s" if pcie_gbs else "benched PCIe/CPU ratio"
+        logger.info(
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
-            "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
+            f"expert misses over PCIe ({link}), the rest on the CPU"
         )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -1543,6 +1548,37 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _probe_pcie_h2d_gbs(device: torch.device, mib: int = 16, reps: int = 3) -> "float | None":
+    """This rank's pinned-host -> device copy bandwidth in GB/s, or None when unmeasurable.
+
+    The hybrid decode split needs the link THIS rank actually got: two cards in one box
+    routinely sit in different slots (measured on a 2-GPU PCIe rig: gen3 x16 = 12.6 GB/s
+    next to gen4 x4 = 7.1 GB/s), and a cached benchbw profile cannot express that per
+    rank. ~10 ms once at startup; never raises, so any failure keeps the profile split.
+    """
+    if device is None or device.type != "cuda":
+        return None
+    nbytes = mib * 1024 * 1024
+    try:
+        src = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        dst = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            dst.copy_(src, non_blocking=True)  # warm up: first copy pays lazy setup
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(stream)
+            for _ in range(reps):
+                dst.copy_(src, non_blocking=True)
+            end.record(stream)
+        end.synchronize()
+        ms = start.elapsed_time(end)
+        del src, dst
+        return reps * nbytes / (ms * 1e-3) / 1e9 if ms > 0.0 else None
+    except Exception:  # noqa: BLE001 -- a probe must never fail the boot
+        return None
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:

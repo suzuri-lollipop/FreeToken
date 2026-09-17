@@ -204,3 +204,33 @@ def test_hybrid_min_bs_routes_small_batches_to_the_gpu_path():
     layer._decode_routed(h2, torch.zeros(2, 2, device=dev),
                          torch.zeros(2, 2, dtype=torch.int32, device=dev))
     assert took == ["hybrid"]  # bs=2 >= hybrid_min_bs -> CPU overflow path
+
+
+def test_a_measured_link_replaces_the_profiled_pcie_term(tmp_path):
+    """A live per-rank link measurement beats the cached PCIe term.
+
+    The profile's number is one machine-wide sample: it cannot say that rank 0 sits in a
+    gen3 x16 slot and rank 1 in a gen4 x4 one, and its contended-overlap variant measures
+    the gather starved by a 24-thread CPU pool, which understates the decode-time rate.
+    """
+    prof = {
+        "gpu": {"name": "FAKE GPU"},
+        "dtype_kernels": {
+            "nvfp4": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0,
+                      "cpu_moe_overlap_gbs": 90.0, "pcie_gather_overlap_gbs": 30.0},
+        },
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    # no measurement: the contended pair still decides
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) == pytest.approx(0.25)
+    # measured link vs the standalone CPU rate, split per rank by tp_size
+    share = 2 ** 0.75
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
+                                      pcie_gbs=12.5) == pytest.approx(12.5 / (12.5 + 100.0 / share))
+    # a slower link in the other slot fetches less over PCIe, from the same profile
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
+                                      pcie_gbs=7.0) < load_hybrid_fetch_fraction(
+        "nvfp4", path=str(path), tp_size=2, pcie_gbs=12.5)
+    # a non-positive measurement is ignored, not trusted as "no PCIe"
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), pcie_gbs=0.0) == pytest.approx(0.25)

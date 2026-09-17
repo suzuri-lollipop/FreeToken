@@ -159,17 +159,22 @@ def load_hybrid_fetch_fraction(
     path: str | None = None,
     gpu_uuid: str | None = None,
     tp_size: int = 1,
+    pcie_gbs: float | None = None,
 ) -> float | None:
     """Benched hybrid fetch fraction for ``quant_format``, or ``None``.
 
     The hybrid backend's bandwidth-matched fetch split: of a decode step's expert misses,
     fetch this fraction over PCIe and compute the rest on the CPU, so both finish together.
-    Preferred source is the *overlapped* pair (CPU MoE and PCIe gather measured while
-    running concurrently -- the real contention regime): fetched/misses = pcie_ov /
-    (pcie_ov + cpu_ov). Older profiles without it fall back to the standalone bandwidths
-    under a full-DRAM-contention assumption (cpu keeps cpu - pcie under DMA), which
-    reduces to pcie/cpu. Per-dtype entry first, then any per-model entry with this format.
-    ``None`` = no usable profile; clamped to [0, 1].
+    ``pcie_gbs`` -- a live measurement of THIS rank's own link -- replaces the profile's
+    PCIe term when given: the cached one is a machine-wide sample that cannot express two
+    cards sitting in different slots, and its contended-overlap variant understates the
+    decode-time gather rate several-fold. The CPU term always comes from the profile.
+    Without ``pcie_gbs`` the *overlapped* pair is preferred (CPU MoE and PCIe gather
+    measured while running concurrently -- the real contention regime): fetched/misses =
+    pcie_ov / (pcie_ov + cpu_ov). Older profiles without it fall back to the standalone
+    bandwidths under a full-DRAM-contention assumption (cpu keeps cpu - pcie under DMA),
+    which reduces to pcie/cpu. Per-dtype entry first, then any per-model entry with this
+    format. ``None`` = no usable profile; clamped to [0, 1].
 
     Under tensor parallelism each rank keeps its OWN PCIe link (the profile is keyed by
     that rank's GPU uuid) but the CPU MoE pool is one machine-wide RAM bandwidth shared by
@@ -193,6 +198,12 @@ def load_hybrid_fetch_fraction(
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        if pcie_gbs and pcie_gbs > 0:
+            cpu = entry.get("cpu_moe_gbs") or entry.get("cpu_moe_overlap_gbs")
+            if cpu:
+                # standalone CPU rate vs a standalone link measurement: same conditions
+                cpu_eff = cpu / cpu_share
+                return min(1.0, pcie_gbs / (pcie_gbs + cpu_eff))
         cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
         if cpu_ov and pcie_ov:
             cpu_eff = cpu_ov / cpu_share
