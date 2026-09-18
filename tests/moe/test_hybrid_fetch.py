@@ -11,7 +11,12 @@ import os
 import pytest
 import torch
 
-from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
+from freetoken.moe.bench_profile import (
+    _CPU_HIDEABILITY,
+    default_profile_path,
+    load_backend_recommendation,
+    load_hybrid_fetch_fraction,
+)
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
@@ -55,15 +60,38 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     }
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
-    # standalone fallback: full-contention assumption -> pcie / cpu
-    assert load_hybrid_fetch_fraction("bf16", path=str(path)) == pytest.approx(0.4)
-    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov)
-    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path)) == pytest.approx(0.25)
+    hide = _CPU_HIDEABILITY
+    # standalone fallback: full-contention assumption -> pcie / (cpu x hide)
+    assert load_hybrid_fetch_fraction("bf16", path=str(path)) == pytest.approx(40.0 / (100.0 * hide))
+    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov x hide)
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path)) == pytest.approx(
+        30.0 / (30.0 + 90.0 * hide))
     # per-model fallback when there is no per-dtype entry for the format
-    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path)) == pytest.approx(0.625)
+    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path)) == pytest.approx(50.0 / (80.0 * hide))
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) is None
     # a profile from different hardware is ignored
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
+
+
+def test_hideability_weighting_fetches_less_than_a_pure_bandwidth_balance(tmp_path):
+    """Equal measured bandwidths are not equal cost: the gather holds SMs on the critical
+    path while the CPU overflow hides under the GPU's dense work, so the split must lean
+    further onto the CPU than a raw pcie:cpu balance would."""
+    prof = {
+        "gpu": {"name": "FAKE GPU"},
+        "dtype_kernels": {
+            # deliberately equal rates: an unweighted balance would fetch exactly half
+            "nvfp4": {"cpu_moe_gbs": 50.0, "pcie_gather_gbs": 50.0},
+        },
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    frac = load_hybrid_fetch_fraction("nvfp4", path=str(path))
+    # the standalone-fallback branch reduces to pcie / (cpu x hide)
+    assert frac == pytest.approx(50.0 / (50.0 * _CPU_HIDEABILITY))
+    # unweighted, equal rates would fetch everything (pcie / cpu == 1.0)
+    assert frac < 0.5
+    assert _CPU_HIDEABILITY > 1.0
 
 
 def test_load_hybrid_fetch_fraction_splits_the_cpu_pool_under_tp(tmp_path):
@@ -80,15 +108,18 @@ def test_load_hybrid_fetch_fraction_splits_the_cpu_pool_under_tp(tmp_path):
     }
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
-    # tp=1 keeps the historical single-rank values
-    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=1) == pytest.approx(0.4)
-    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=1) == pytest.approx(0.2)
-    # tp=2: standalone -> pcie / (cpu / 2^0.75); overlapped -> pcie_ov / (pcie_ov + cpu_ov / 2^0.75)
+    hide = _CPU_HIDEABILITY
+    # tp=1 keeps the single-rank values
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=1) == pytest.approx(
+        40.0 / (100.0 * hide))
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=1) == pytest.approx(
+        20.0 / (20.0 + 80.0 * hide))
+    # tp=2: standalone -> pcie / (cpu / 2^0.75 x hide); overlapped -> pcie_ov / (pcie_ov + cpu_ov / 2^0.75 x hide)
     share = 2 ** 0.75
     assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=2) == pytest.approx(
-        40.0 / (100.0 / share))
+        40.0 / (100.0 / share * hide))
     assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=2) == pytest.approx(
-        20.0 / (20.0 + 80.0 / share))
+        20.0 / (20.0 + 80.0 / share * hide))
     # ... and always fetches at least as much as tp=1 (the CPU slice only got smaller)
     for fmt in ("bf16", "nvfp4_x"):
         assert load_hybrid_fetch_fraction(fmt, path=str(path), tp_size=2) > \
@@ -222,15 +253,19 @@ def test_a_measured_link_replaces_the_profiled_pcie_term(tmp_path):
     }
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
+    hide = _CPU_HIDEABILITY
     # no measurement: the contended pair still decides
-    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) == pytest.approx(0.25)
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) == pytest.approx(
+        30.0 / (30.0 + 90.0 * hide))
     # measured link vs the standalone CPU rate, split per rank by tp_size
     share = 2 ** 0.75
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
-                                      pcie_gbs=12.5) == pytest.approx(12.5 / (12.5 + 100.0 / share))
+                                      pcie_gbs=12.5) == pytest.approx(
+        12.5 / (12.5 + 100.0 / share * hide))
     # a slower link in the other slot fetches less over PCIe, from the same profile
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
                                       pcie_gbs=7.0) < load_hybrid_fetch_fraction(
         "nvfp4", path=str(path), tp_size=2, pcie_gbs=12.5)
     # a non-positive measurement is ignored, not trusted as "no PCIe"
-    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), pcie_gbs=0.0) == pytest.approx(0.25)
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), pcie_gbs=0.0) == pytest.approx(
+        30.0 / (30.0 + 90.0 * hide))

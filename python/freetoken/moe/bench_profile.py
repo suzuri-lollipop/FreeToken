@@ -153,6 +153,16 @@ def load_backend_recommendation(
     return "hybrid" if all(p == "hybrid" for p in picks) else "offload"
 
 
+# A byte fetched over PCIe costs more than a byte computed on the CPU, even at equal measured
+# bandwidth: the gather runs as an SM kernel on the decode critical path (and under TP the peer
+# rank idles at its all-reduce until the slower link arrives), while the CPU overflow overlaps
+# the GPU's dense GEMMs. Weighting the CPU term by this factor moves the balance point off
+# pcie:cpu onto pcie:(cpu x hide). Measured on a 2-GPU PCIe rig (gen5 x16 beside gen4 x4,
+# nvfp4 512-expert MoE, 4-way decode): the unweighted split lost ~6% conc=8 throughput, and
+# the plateau was flat across rank fractions 0.25-0.45 / 0.10-0.20.
+_CPU_HIDEABILITY = 2.2
+
+
 def load_hybrid_fetch_fraction(
     quant_format: str,
     gpu_name: str | None = None,
@@ -184,6 +194,10 @@ def load_hybrid_fetch_fraction(
     shared term scales as tp^0.75. Scaling the CPU term keeps the split bandwidth-matched
     per rank (a rank fetches a larger share over its private link because its CPU slice is
     smaller).
+
+    The CPU term is then weighted by ``_CPU_HIDEABILITY``: equal measured bandwidths do not
+    mean equal cost, because the PCIe gather holds SMs on the critical path while the CPU
+    overflow hides under the GPU's dense work. Without it the balanced split over-fetches.
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
     prof = _usable_profile(gpu_name, path, gpu_uuid)
@@ -202,13 +216,13 @@ def load_hybrid_fetch_fraction(
             cpu = entry.get("cpu_moe_gbs") or entry.get("cpu_moe_overlap_gbs")
             if cpu:
                 # standalone CPU rate vs a standalone link measurement: same conditions
-                cpu_eff = cpu / cpu_share
+                cpu_eff = cpu / cpu_share * _CPU_HIDEABILITY
                 return min(1.0, pcie_gbs / (pcie_gbs + cpu_eff))
         cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
         if cpu_ov and pcie_ov:
-            cpu_eff = cpu_ov / cpu_share
+            cpu_eff = cpu_ov / cpu_share * _CPU_HIDEABILITY
             return min(1.0, pcie_ov / (pcie_ov + cpu_eff))
         cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
         if cpu and pcie:
-            return min(1.0, pcie / (cpu / cpu_share))
+            return min(1.0, pcie / (cpu / cpu_share * _CPU_HIDEABILITY))
     return None
