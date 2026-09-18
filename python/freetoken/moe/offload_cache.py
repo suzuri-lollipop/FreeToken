@@ -129,6 +129,16 @@ class OffloadMoeCache:
     # fused copy plan + all-pinned layers; set by the engine after construction.
     ondemand_prefill: bool = False
     ondemand_max_tokens: int = 8192
+    # Hybrid prefill: share of each layer's touched-and-missing experts that streams
+    # over PCIe into the double buffer; the rest are computed on the CPU executor
+    # straight from the host banks and their partial is added to the GPU's. 1.0 (the
+    # default) keeps every miss on the PCIe plan, i.e. the pre-split behaviour. Only
+    # the on-demand path splits -- it stages per row, so a CPU-assigned expert simply
+    # leaves the gather plan; the streaming path copies whole layers and cannot.
+    # Worth it when the rank's link is slower than its CPU slice: measured on a gen4
+    # x4 rank (7.1 GB/s) at T=150, 82 missing experts cost 16.0 ms over PCIe and the
+    # balanced split 10.1 ms.
+    prefill_fetch_fraction: float = 1.0
     # Flat residency: every expert of every layer owns a permanent slot
     # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
     # expert and GPU decode; drops the prefill double buffers, so after the single load in
@@ -328,6 +338,7 @@ class OffloadMoeCache:
         self._prefill_miss_src: torch.Tensor | None = None
         self._prefill_miss_num: torch.Tensor | None = None
         self._prefill_touched: torch.Tensor | None = None
+        self._prefill_cpu_mask: torch.Tensor | None = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
 
@@ -706,6 +717,13 @@ class OffloadMoeCache:
             cache[: 2 * self.num_experts].view(2, self.num_experts, *cache.shape[1:])
             for _, cache in self.banks
         ]
+        # Zero the borrowed region once. A row no gather ever staged is read by the
+        # hybrid prefill split, which redirects a CPU-assigned route to row 0 with a
+        # zeroed weight: bank_caches come from torch.empty, and an uninitialized nvfp4
+        # scale byte can encode NaN, which 0 x NaN would propagate into the output.
+        # All-zero bytes dequantize to a zero expert, so the redirect contributes 0.
+        for buffer in self.prefill_bank_buffers:
+            buffer.zero_()
         if self.device.type == "cuda":
             self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
             self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
@@ -728,6 +746,12 @@ class OffloadMoeCache:
             )
             self._prefill_miss_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
             self._prefill_touched = torch.zeros(
+                (self.num_experts,), dtype=torch.int32, device=self.device
+            )
+            # Per-layer verdict of the hybrid prefill split: 1 for a touched miss the
+            # CPU executor computes instead of the H2D plan staging. All zero while
+            # prefill_fetch_fraction is 1.
+            self._prefill_cpu_mask = torch.zeros(
                 (self.num_experts,), dtype=torch.int32, device=self.device
             )
         if self.prefill_hit_d2d and self.device.type == "cuda":
@@ -920,18 +944,34 @@ class OffloadMoeCache:
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def prefetch_prefill_layer_ondemand(
-        self, layer_id: int, topk_ids: torch.Tensor
+        self, layer_id: int, topk_ids: torch.Tensor, pcie_frac_q16: int = 1 << 16
     ) -> tuple[torch.Tensor, ...]:
-        """Touched-only staging of one expert layer for a SHORT prefill chunk.
+        """Plan AND move one layer's touched-only staging; see ``plan_``/``move_`` below.
+
+        Callers that also hand part of the miss set to the CPU executor must use the two
+        halves directly so the submit lands between them.
+        """
+        views = self.plan_prefill_layer_ondemand(layer_id, topk_ids, pcie_frac_q16)
+        self.move_prefill_layer_ondemand(layer_id)
+        return views
+
+    def plan_prefill_layer_ondemand(
+        self, layer_id: int, topk_ids: torch.Tensor, pcie_frac_q16: int = 1 << 16
+    ) -> tuple[torch.Tensor, ...]:
+        """Touched-only staging PLAN for one expert layer of a prefill chunk; moves nothing.
 
         Fully device-side on the current stream (no host sync, no copy-stream
         choreography): mark the chunk's routed experts in ``_prefill_touched``,
         compact them into hit (D2D slot gather) and miss (H2D pinned gather, the
         same SM primitive decode's ``copy_missing`` uses -- it runs at DMA rate at
-        these sizes) plans, invalidate this buffer's stale slot mappings, move both
-        row sets into the buffer, and return the full-layer views (position ==
-        expert id, so the caller's GEMM contract is unchanged). The next layer's
-        routing does not exist yet, so there is nothing to prefetch ahead of.
+        these sizes) plans, invalidate this buffer's stale slot mappings, and return
+        the full-layer views (position == expert id, so the caller's GEMM contract is
+        unchanged). The next layer's routing does not exist yet, so there is nothing
+        to prefetch ahead of.
+
+        ``pcie_frac_q16`` < 1<<16 hands the tail of the miss set to the CPU executor
+        instead of the H2D plan (see ``prefill_cpu_mask``); those rows stay unstaged,
+        so the caller must zero their routing weight before the GEMM.
 
         The LRU slot cache is neither read for eviction nor written: only rows at
         slots >= 2E are gathered, and the buffer slots' stale ids are invalidated
@@ -939,15 +979,26 @@ class OffloadMoeCache:
         """
         assert self.prefill_overlap and self.prefill_bank_buffers
         assert self._copy_fused_ok, "on-demand prefill needs the fused copy plan"
-        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
         from freetoken.moe.offload_kernels import prefill_ondemand_compact
 
         buffer_id = layer_id % 2
         touched = self._prefill_touched
         touched.zero_()
         touched.scatter_(0, topk_ids.reshape(-1).long(), 1)
-        prefill_ondemand_compact(self, layer_id, buffer_id, touched)
+        prefill_ondemand_compact(self, layer_id, buffer_id, touched, pcie_frac_q16=pcie_frac_q16)
         self._invalidate_prefill_buffer(buffer_id)
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
+    def move_prefill_layer_ondemand(self, layer_id: int) -> None:
+        """Issue the gathers planned by :meth:`plan_prefill_layer_ondemand`.
+
+        Split out from the planning step so a caller can submit the CPU executor's partial
+        BETWEEN the two: on one stream the D2H activation copy a submit needs cannot start
+        until everything already enqueued has finished, so issuing the H2D expert gather
+        first serializes the CPU work behind the whole transfer instead of overlapping it.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
         # Hits gather D2D over ALL banks (the SM kernel has no small-row caveat,
         # unlike the streaming path's batch memcpy, so scales/globals come from
         # their cache slots too); misses gather H2D from the host banks. D2D
@@ -969,7 +1020,17 @@ class OffloadMoeCache:
             self._prefill_miss_src,
             self._prefill_miss_num,
         )
-        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
+    @property
+    def prefill_cpu_mask(self) -> "torch.Tensor | None":
+        """[num_experts] int32 verdict of the last ``prefetch_prefill_layer_ondemand``:
+        1 for a touched miss the CPU executor owns instead of the H2D plan. None until
+        the on-demand buffers exist; all zero while ``prefill_fetch_fraction`` is 1."""
+        return self._prefill_cpu_mask
+
+    def prefill_pcie_frac_q16(self) -> int:
+        """Q16 share of a prefill layer's misses to stage over PCIe (see the kernel)."""
+        return min(1 << 16, max(0, round(self.prefill_fetch_fraction * (1 << 16))))
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per

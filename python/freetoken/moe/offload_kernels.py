@@ -83,7 +83,8 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
 
 
 def prefill_ondemand_compact(
-    cache, layer_id: int, buffer_id: int, touched: torch.Tensor, threshold: int | None = None
+    cache, layer_id: int, buffer_id: int, touched: torch.Tensor, threshold: int | None = None,
+    pcie_frac_q16: int = 1 << 16,
 ) -> None:
     """Touched-only split of one layer's experts for the on-demand prefill path.
 
@@ -94,6 +95,11 @@ def prefill_ondemand_compact(
     indexed position == expert id, so the GEMM keeps the full-layer bank contract.
     ``threshold`` overrides the hit cut (a huge value routes every touched expert
     to the miss/H2D plan for caches with no D2D-eligible banks).
+
+    ``pcie_frac_q16`` is the Q16 share of this layer's misses that the H2D plan
+    carries; the remainder are marked in ``cache._prefill_cpu_mask`` for the CPU
+    executor, which reads them straight from the host banks. 1 << 16 (the default)
+    sends every miss over PCIe and leaves the mask all zero.
     """
     num_experts = cache.num_experts
     _prefill_ondemand_compact_kernel[(1,)](
@@ -105,9 +111,11 @@ def prefill_ondemand_compact(
         cache._prefill_miss_dst,
         cache._prefill_miss_src,
         cache._prefill_miss_num,
+        cache._prefill_cpu_mask,
         buffer_id * num_experts,
         2 * num_experts if threshold is None else threshold,
         num_experts,
+        int(pcie_frac_q16),
         BLOCK=triton.next_power_of_2(num_experts),
     )
 
@@ -468,12 +476,14 @@ def _prefill_ondemand_compact_kernel(
     hit_dst,       # [num_experts] int32 out: buffer rows of touched hits
     hit_src,       # [num_experts] int32 out: cache slots of touched hits
     hit_num,       # [1] int64 out
-    miss_dst,      # [num_experts] int32 out: buffer rows of touched misses (== expert id)
+    miss_dst,      # [num_experts] int32 out: buffer rows of the PCIe-assigned misses
     miss_src,      # [num_experts] int32 out: host bank rows (== expert id)
-    miss_num,      # [1] int64 out
+    miss_num,      # [1] int64 out: PCIe-assigned miss count
+    cpu_mask,      # [num_experts] int32 out: 1 for misses assigned to the CPU executor
     buffer_base,   # buffer_id * num_experts
     threshold,     # 2 * num_experts
     num_experts,
+    frac_q16,      # Q16 share of this layer's misses that stream over PCIe
     BLOCK: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK)
@@ -486,7 +496,16 @@ def _prefill_ondemand_compact_kernel(
     tl.store(hit_dst + pos_h, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(hit_src + pos_h, slots, mask=is_hit)
     tl.store(hit_num, tl.sum(is_hit.to(tl.int64)))
+    # Split the misses in expert-id order: the first frac_q16 share streams over PCIe
+    # into the double buffer, the rest are computed on the CPU straight from the host
+    # banks. frac_q16 == 1<<16 puts every miss on the PCIe plan and leaves cpu_mask
+    # all zero, which is the pre-split behaviour bit for bit.
     pos_m = tl.cumsum(is_miss.to(tl.int32)) - 1
-    tl.store(miss_dst + pos_m, (buffer_base + offs).to(tl.int32), mask=is_miss)
-    tl.store(miss_src + pos_m, offs.to(tl.int32), mask=is_miss)
-    tl.store(miss_num, tl.sum(is_miss.to(tl.int64)))
+    n_pcie = (tl.sum(is_miss.to(tl.int32)) * frac_q16) >> 16
+    to_pcie = is_miss & (pos_m < n_pcie)
+    to_cpu = is_miss & (pos_m >= n_pcie)
+    pos_p = tl.cumsum(to_pcie.to(tl.int32)) - 1
+    tl.store(miss_dst + pos_p, (buffer_base + offs).to(tl.int32), mask=to_pcie)
+    tl.store(miss_src + pos_p, offs.to(tl.int32), mask=to_pcie)
+    tl.store(miss_num, tl.sum(to_pcie.to(tl.int64)))
+    tl.store(cpu_mask + offs, to_cpu.to(tl.int32), mask=lane)

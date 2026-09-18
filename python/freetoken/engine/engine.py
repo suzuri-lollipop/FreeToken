@@ -1112,6 +1112,22 @@ class Engine:
                     f"{cache.ondemand_max_tokens} tokens: only routing-touched experts "
                     "cross PCIe (whole-layer streaming above that)"
                 )
+                # Hybrid prefill split, env-gated while its policy is unmeasured. The decode
+                # fraction cannot be reused: that one balances expert BYTES on both sides,
+                # while a chunk's CPU cost scales with ROUTES (~18 per missing expert at
+                # T=150, where the weights stay in L2/L3 across an expert's tokens) and its
+                # PCIe cost with experts -- a different exchange rate. Deriving it properly
+                # needs a prefill-sized CPU MoE number in `ft bench bw`; until then 1.0
+                # keeps every miss on the PCIe plan.
+                frac = os.getenv("FREETOKEN_PREFILL_FETCH_FRACTION", "").strip()
+                if frac:
+                    parts = [float(x) for x in frac.split(",")]
+                    picked = parts[min(config.tp_info.rank, len(parts) - 1)]
+                    cache.prefill_fetch_fraction = min(1.0, max(0.0, picked))
+                    logger.info(
+                        f"MoE hybrid prefill: staging {cache.prefill_fetch_fraction:.1%} of "
+                        "each layer's missing experts over PCIe, the rest on the CPU"
+                    )
         if cache.flat_residency:
             # One pass over PCIe for the whole model, replacing the per-chunk full-layer
             # copies of the LRU path. Must complete before CUDA graph capture replays a
@@ -1220,6 +1236,11 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        if cache.ondemand_prefill and cache.prefill_fetch_fraction < 1.0:
+            # The prefill split feeds whole chunks to the same pool, so its pinned IO
+            # buffers and C++ scratch must cover the largest chunk the on-demand path
+            # accepts. Only paid when the split is actually on.
+            max_tokens = max(max_tokens, cache.ondemand_max_tokens)
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,

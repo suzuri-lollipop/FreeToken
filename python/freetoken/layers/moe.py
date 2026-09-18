@@ -26,6 +26,26 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
 
+def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
+    """(CPU executor, Q16 PCIe share) for one prefill chunk, or (None, 1 << 16) when the
+    chunk stays wholly on the PCIe plan.
+
+    The CPU side reuses the decode executor, whose pinned IO buffers and registered tasks
+    are sized by ``max_tokens``, so a chunk longer than that keeps the old behaviour
+    instead of growing host buffers on the fly. Off unless the engine resolved a
+    ``prefill_fetch_fraction`` below 1 -- see the measurement at that field.
+    """
+    executor = cache.cpu_executor
+    if (
+        executor is None
+        or cache.prefill_fetch_fraction >= 1.0
+        or cache.prefill_cpu_mask is None
+        or num_tokens > executor.max_tokens
+    ):
+        return None, 1 << 16
+    return executor, cache.prefill_pcie_frac_q16()
+
+
 class MoELayer(BaseOP):
     """Resident routed experts.
 
@@ -434,19 +454,54 @@ class OffloadMoELayer(MoELayer):
             dbg = _debug_stats.probe()
             if dbg is not None:
                 dbg.prefill_layer_begin(self.layer_id)
-            views = cache.prefetch_prefill_layer_ondemand(self.layer_id, topk_ids)
+            # Hybrid prefill: hand the tail of this layer's miss set to the CPU executor,
+            # which reads the same rows straight out of the host banks over RAM, and stage
+            # only the PCIe share. The two run concurrently and their partials sum, exactly
+            # like _decode_hybrid -- worth it on a rank whose link is slower than its CPU
+            # slice (a gen4 x4 rank measured 16.0 ms of PCIe against a 10.1 ms balanced
+            # split for 82 missing experts at T=150).
+            executor, frac_q16 = _prefill_cpu_split(cache, hidden_states.shape[0])
+            views = cache.plan_prefill_layer_ondemand(
+                self.layer_id, topk_ids, pcie_frac_q16=frac_q16
+            )
+            pending = None
+            gpu_ids, gpu_weights = topk_ids, topk_weights
+            if executor is not None:
+                on_cpu = cache.prefill_cpu_mask[topk_ids.reshape(-1).long()]
+                on_cpu = on_cpu.view(topk_ids.shape) != 0
+                # A CPU-owned route reads buffer row 0 at weight 0 -- zeroed once at
+                # buffer init, so it contributes exactly nothing and its answer comes
+                # from the partial. The CPU side gets the raw id and -1 for every route
+                # the GPU owns (the kernel skips id < 0), so each route is computed once.
+                gpu_ids = torch.where(on_cpu, topk_ids.new_zeros(()), topk_ids)
+                gpu_weights = torch.where(
+                    on_cpu, topk_weights.new_zeros(()), topk_weights
+                ).contiguous()
+                cpu_ids = torch.where(
+                    on_cpu, topk_ids, topk_ids.new_full((), -1)
+                ).contiguous()
+                # Submit BEFORE the gather is issued: this enqueues the D2H activation
+                # copy the CPU pool needs, so the experts stream over PCIe while the CPU
+                # works instead of after it. Issuing the gather first serializes the two
+                # on this stream and measures ~40-70% SLOWER than not splitting at all.
+                pending = executor.decode_submit(
+                    self.layer_id, hidden_states, topk_weights, cpu_ids
+                )
+            cache.move_prefill_layer_ondemand(self.layer_id)
             if dbg is not None:
                 dbg.prefill_layer_waited(self.layer_id)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
-                topk_weights,
-                topk_ids,
+                gpu_weights,
+                gpu_ids,
                 views=views,
                 n=self.num_experts,
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
+            if pending is not None:
+                out = out + executor.decode_sync(pending)
             if dbg is not None:
                 dbg.prefill_layer_done(self.layer_id, topk_ids)
             return out
