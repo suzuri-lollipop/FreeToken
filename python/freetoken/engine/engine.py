@@ -1077,14 +1077,21 @@ class Engine:
             and not cache._unpinned_layers
             and self.device.type == "cuda"
         ):
-            # Touched-only staging for short prefill chunks: skewed routing means a
-            # ~150-token chunk selects ~30% of a layer's experts, so gathering just
-            # those (hits D2D, misses over PCIe) beats streaming every non-resident
-            # row of the whole layer. Longer chunks converge to the full layer and
-            # keep the double-buffered streaming path.
+            # Touched-only staging for prefill chunks: skewed routing means a ~150-token
+            # chunk selects ~30% of a layer's experts, so gathering just those (hits D2D,
+            # misses over PCIe) beats streaming every non-resident row of the whole layer.
+            # The streaming path also copies each layer's SMALL banks (the nvfp4 scale and
+            # global rows, ~0.16 MB/expert) whole-layer even on a full hit, because a
+            # sub-256KB entry makes cudaMemcpyBatchAsync degrade to a synchronous copy --
+            # ~3.9 GiB per chunk here that touched-only staging never moves. That saving
+            # dwarfs the double-buffered GEMM overlap the streaming path gives up (~0.1 s
+            # measured), so the cap sits well above a batched admission's chunk: measured on
+            # a 2-GPU PCIe rig (gen5 x16 + gen4 x4), a 4-request 600-token batch prefill went
+            # 4.07 s -> 1.52 s and conc=8 throughput +18.7%. Chunks past it (one long prompt)
+            # have a GEMM big enough for the overlap to pay again.
             cache.ondemand_prefill = True
             cache.ondemand_max_tokens = max(
-                0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "256"))
+                0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "2048"))
             )
             if cache.ondemand_max_tokens == 0:
                 cache.ondemand_prefill = False
