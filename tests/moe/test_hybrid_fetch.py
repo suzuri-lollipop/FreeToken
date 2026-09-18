@@ -61,13 +61,21 @@ def test_load_hybrid_fetch_fraction(tmp_path):
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
     hide = _CPU_HIDEABILITY
-    # standalone fallback: full-contention assumption -> pcie / (cpu x hide)
-    assert load_hybrid_fetch_fraction("bf16", path=str(path)) == pytest.approx(40.0 / (100.0 * hide))
-    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov x hide)
-    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path)) == pytest.approx(
-        30.0 / (30.0 + 90.0 * hide))
+    # tp_size=1 keeps the plain bandwidth balance -- the hideability weighting is calibrated
+    # on a 2-rank rig and is deliberately not extrapolated to a single rank.
+    # standalone fallback: full-contention assumption -> pcie / cpu
+    assert load_hybrid_fetch_fraction("bf16", path=str(path)) == pytest.approx(0.4)
+    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov)
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path)) == pytest.approx(0.25)
     # per-model fallback when there is no per-dtype entry for the format
-    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path)) == pytest.approx(50.0 / (80.0 * hide))
+    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path)) == pytest.approx(0.625)
+    # ... and every branch does weight the CPU term once there is a peer rank to wait for
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=2) == pytest.approx(
+        40.0 / (100.0 / 2 ** 0.75 * hide))
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=2) == pytest.approx(
+        30.0 / (30.0 + 90.0 / 2 ** 0.75 * hide))
+    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path), tp_size=2) == pytest.approx(
+        50.0 / (80.0 / 2 ** 0.75 * hide))
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) is None
     # a profile from different hardware is ignored
     assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
@@ -86,12 +94,46 @@ def test_hideability_weighting_fetches_less_than_a_pure_bandwidth_balance(tmp_pa
     }
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
-    frac = load_hybrid_fetch_fraction("nvfp4", path=str(path))
-    # the standalone-fallback branch reduces to pcie / (cpu x hide)
-    assert frac == pytest.approx(50.0 / (50.0 * _CPU_HIDEABILITY))
-    # unweighted, equal rates would fetch everything (pcie / cpu == 1.0)
+    c = 50.0 / 2 ** 0.75
+    # the production path: a live per-rank link measurement, so pcie/(pcie + cpu_eff)
+    frac = load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2, pcie_gbs=50.0)
+    assert frac == pytest.approx(50.0 / (50.0 + c * _CPU_HIDEABILITY))
     assert frac < 0.5
     assert _CPU_HIDEABILITY > 1.0
+    # a single rank is NOT extrapolated to: it keeps the unweighted balance, and its CPU
+    # slice is the whole pool (cpu_share == 1), so equal rates balance at exactly half
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=1,
+                                      pcie_gbs=50.0) == pytest.approx(0.5)
+
+
+def test_the_hideability_shift_is_bounded_relative_to_the_measured_balance(tmp_path):
+    """The factor is calibrated on ONE rig, so it may not drag the split arbitrarily far from
+    what this machine's own measured bandwidths say. The bound is relative on purpose: an
+    absolute floor would clip a slow link's legitimate operating point (a gen4 x4 rank
+    resolves to ~0.14, and a 0.10 floor starts biting once the probe reads 6 GB/s)."""
+    from freetoken.moe.bench_profile import _HIDEABILITY_MAX_SHIFT, _bound_hideability
+
+    assert 0.0 < _HIDEABILITY_MAX_SHIFT < 1.0
+    # a weight of H shifts the split by at most 1/H, so today's 2.2 (-> 0.4545) stays slack
+    assert 1.0 / _CPU_HIDEABILITY > _HIDEABILITY_MAX_SHIFT
+    # slack: the weighted value passes through untouched
+    assert _bound_hideability(0.145, 0.272) == pytest.approx(0.145)
+    # binding: an over-large correction is pinned to the bound
+    assert _bound_hideability(0.05, 0.5) == pytest.approx(_HIDEABILITY_MAX_SHIFT * 0.5)
+    # never above 1, and never raises the fetched share above the unweighted balance
+    assert _bound_hideability(1.4, 1.8) == 1.0
+    assert _bound_hideability(0.3, 0.2) == pytest.approx(0.3)
+
+    # ... and through the public entry point the calibration rig's slow rank stays slack:
+    # cpu_eff/pcie ~ 2.7 is what a gen4 x4 link beside a 32 GB/s CPU pool actually measures.
+    prof = {"gpu": {"name": "FAKE GPU"},
+            "dtype_kernels": {"nvfp4": {"cpu_moe_gbs": 19.02 * 2 ** 0.75,
+                                        "pcie_gather_gbs": 19.02 * 2 ** 0.75}}}
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
+                                      pcie_gbs=7.1) == pytest.approx(
+        7.1 / (7.1 + 19.02 * _CPU_HIDEABILITY))
 
 
 def test_load_hybrid_fetch_fraction_splits_the_cpu_pool_under_tp(tmp_path):
@@ -109,21 +151,21 @@ def test_load_hybrid_fetch_fraction_splits_the_cpu_pool_under_tp(tmp_path):
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
     hide = _CPU_HIDEABILITY
-    # tp=1 keeps the single-rank values
-    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=1) == pytest.approx(
-        40.0 / (100.0 * hide))
-    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=1) == pytest.approx(
-        20.0 / (20.0 + 80.0 * hide))
-    # tp=2: standalone -> pcie / (cpu / 2^0.75 x hide); overlapped -> pcie_ov / (pcie_ov + cpu_ov / 2^0.75 x hide)
     share = 2 ** 0.75
+    # tp=1: no peer rank waits at an all-reduce, so the hideability weighting does not
+    # apply and the split is the plain bandwidth balance.
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=1) == pytest.approx(0.4)
+    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=1) == pytest.approx(0.2)
+    # tp=2: standalone -> pcie / (cpu / 2^0.75 x hide); overlapped -> pcie_ov / (pcie_ov + cpu_ov / 2^0.75 x hide)
     assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=2) == pytest.approx(
         40.0 / (100.0 / share * hide))
     assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path), tp_size=2) == pytest.approx(
         20.0 / (20.0 + 80.0 / share * hide))
-    # ... and always fetches at least as much as tp=1 (the CPU slice only got smaller)
-    for fmt in ("bf16", "nvfp4_x"):
-        assert load_hybrid_fetch_fraction(fmt, path=str(path), tp_size=2) > \
-            load_hybrid_fetch_fraction(fmt, path=str(path), tp_size=1)
+    # The tp^0.75 CPU-slice term still pushes tp=2 toward PCIe on its own: the same
+    # weighting against an UNSHARED pool (tp=1 arithmetic) would fetch less, since each
+    # rank's slice of the one machine-wide RAM pool is smaller.
+    unshared = 40.0 / (100.0 * hide)
+    assert load_hybrid_fetch_fraction("bf16", path=str(path), tp_size=2) > unshared
 
 
 def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
@@ -254,9 +296,8 @@ def test_a_measured_link_replaces_the_profiled_pcie_term(tmp_path):
     path = tmp_path / "benchbw.json"
     path.write_text(json.dumps(prof))
     hide = _CPU_HIDEABILITY
-    # no measurement: the contended pair still decides
-    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) == pytest.approx(
-        30.0 / (30.0 + 90.0 * hide))
+    # no measurement: the contended pair still decides (tp=1, so unweighted)
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) == pytest.approx(0.25)
     # measured link vs the standalone CPU rate, split per rank by tp_size
     share = 2 ** 0.75
     assert load_hybrid_fetch_fraction("nvfp4", path=str(path), tp_size=2,
@@ -267,5 +308,4 @@ def test_a_measured_link_replaces_the_profiled_pcie_term(tmp_path):
                                       pcie_gbs=7.0) < load_hybrid_fetch_fraction(
         "nvfp4", path=str(path), tp_size=2, pcie_gbs=12.5)
     # a non-positive measurement is ignored, not trusted as "no PCIe"
-    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), pcie_gbs=0.0) == pytest.approx(
-        30.0 / (30.0 + 90.0 * hide))
+    assert load_hybrid_fetch_fraction("nvfp4", path=str(path), pcie_gbs=0.0) == pytest.approx(0.25)

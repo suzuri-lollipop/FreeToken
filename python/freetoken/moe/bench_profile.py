@@ -162,6 +162,23 @@ def load_backend_recommendation(
 # the plateau was flat across rank fractions 0.25-0.45 / 0.10-0.20.
 _CPU_HIDEABILITY = 2.2
 
+# The hideability weighting is calibrated on ONE rig, so bound how far it may move the split
+# from what this machine's own measured bandwidths say. Relative, not absolute -- an absolute
+# floor would sit right on a slow link's legitimate operating point (a gen4 x4 rank resolves
+# to ~0.14, and a 0.10 floor starts clipping it once the probe reads 6 GB/s instead of 7).
+# 0.4 is deliberately slack at today's factor: a weight of H can shift the split by at most
+# 1/H, so 2.2 reaches 0.4545 and never trips this. It is a ceiling on a FUTURE recalibration
+# -- nobody may raise _CPU_HIDEABILITY past 2.5 and silently drag an unvalidated machine's
+# split with it.
+_HIDEABILITY_MAX_SHIFT = 0.4
+
+
+def _bound_hideability(weighted: float, unweighted: float) -> float:
+    """Clamp the hideability-weighted split to at most ``_HIDEABILITY_MAX_SHIFT`` of the
+    plain bandwidth balance. ``weighted <= unweighted`` always holds (the factor is >= 1),
+    so the floor is the only side that can bind."""
+    return min(1.0, max(weighted, _HIDEABILITY_MAX_SHIFT * min(1.0, unweighted)))
+
 
 def load_hybrid_fetch_fraction(
     quant_format: str,
@@ -198,12 +215,18 @@ def load_hybrid_fetch_fraction(
     The CPU term is then weighted by ``_CPU_HIDEABILITY``: equal measured bandwidths do not
     mean equal cost, because the PCIe gather holds SMs on the critical path while the CPU
     overflow hides under the GPU's dense work. Without it the balanced split over-fetches.
+    The weighting is applied only at ``tp_size > 1`` -- it is calibrated on a 2-rank rig and
+    a single rank was never measured, so one rank keeps the plain bandwidth balance rather
+    than inheriting an extrapolated correction. The result is clamped off both degenerate
+    ends, where the backend pays one mode's per-layer overhead for the other's work.
     """
     fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
     prof = _usable_profile(gpu_name, path, gpu_uuid)
     if prof is None:
         return None
-    cpu_share = max(1, int(tp_size or 1)) ** 0.75
+    ranks = max(1, int(tp_size or 1))
+    cpu_share = ranks ** 0.75
+    hide = _CPU_HIDEABILITY if ranks > 1 else 1.0
     entries = [(prof.get("dtype_kernels") or {}).get(fmt)] + [
         (wl.get("kernels") or {}).get(fmt)
         for wl in (prof.get("workloads") or {}).values()
@@ -216,13 +239,16 @@ def load_hybrid_fetch_fraction(
             cpu = entry.get("cpu_moe_gbs") or entry.get("cpu_moe_overlap_gbs")
             if cpu:
                 # standalone CPU rate vs a standalone link measurement: same conditions
-                cpu_eff = cpu / cpu_share * _CPU_HIDEABILITY
-                return min(1.0, pcie_gbs / (pcie_gbs + cpu_eff))
+                c = cpu / cpu_share
+                return _bound_hideability(
+                    pcie_gbs / (pcie_gbs + c * hide), pcie_gbs / (pcie_gbs + c)
+                )
         cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
         if cpu_ov and pcie_ov:
-            cpu_eff = cpu_ov / cpu_share * _CPU_HIDEABILITY
-            return min(1.0, pcie_ov / (pcie_ov + cpu_eff))
+            c = cpu_ov / cpu_share
+            return _bound_hideability(pcie_ov / (pcie_ov + c * hide), pcie_ov / (pcie_ov + c))
         cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
         if cpu and pcie:
-            return min(1.0, pcie / (cpu / cpu_share * _CPU_HIDEABILITY))
+            c = cpu / cpu_share
+            return _bound_hideability(pcie / (c * hide), pcie / c)
     return None
