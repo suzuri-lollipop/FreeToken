@@ -382,7 +382,8 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
         extra_fixed_bytes: int = 0, extra_note: str = "",
-        num_swa_pages: int | None = None, **targets,
+        num_swa_pages: int | None = None,
+        device_total: int = 0, nonpool_overhead_bytes: int = 0, **targets,
     ) -> None:
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
@@ -412,7 +413,10 @@ class DSV4PagedKVCache(BaseKVCachePool):
             kv_sizes = self.sizes
         # The rebuilds are free-before-alloc, so the whole budget is available (no fixed
         # cache term); an unfit request must still reject BEFORE the teardown.
-        budget = net_cache_budget_bytes(config.memory_ratio, baseline_free, weights_bytes, 0)
+        budget = net_cache_budget_bytes(
+            config.memory_ratio, baseline_free, weights_bytes, 0,
+            device_total=device_total, nonpool_overhead_bytes=nonpool_overhead_bytes,
+        )
         need = target_moe * per_expert_bytes + dsv4_pool_bytes(
             kv_sizes, dsv4_args, config.max_running_req + 1
         )

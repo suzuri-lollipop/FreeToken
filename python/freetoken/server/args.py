@@ -320,8 +320,9 @@ def parse_args(
         type=float,
         default=ServerArgs.memory_ratio,
         help=(
-            "Fraction of total GPU free memory the engine may use for weights + MoE "
-            "cache + KV cache combined; the remainder is reserved runtime headroom."
+            "Fraction of the GPU's total VRAM the engine's whole per-rank footprint may "
+            "use for weights + MoE cache + KV cache combined; the remainder is reserved "
+            "runtime headroom."
         ),
     )
 

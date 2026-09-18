@@ -59,14 +59,78 @@ def slot_cache_expert_cap(
     return (pinned * num_experts) + staging
 
 
+def has_explicit_cache_sizing(moe_cache_size: int, moe_cache_rate: "float | None") -> bool:
+    """Whether the user pinned the expert slot cache with --moe-cache-size / --moe-cache-rate.
+
+    An explicit size suppresses the --moe-cache-auto fallback, and with it the post-init
+    headroom growth, so --memory-ratio's pool budget then fully determines the footprint.
+
+    Read this BEFORE --moe-cache-auto resolves: the resolution writes its size back into
+    ``config.moe_cache_size``, after which an auto-sized cache is indistinguishable from a
+    user-pinned one. ``headroom_growth_eligible`` takes the latched answer."""
+    return moe_cache_size > 0 or (moe_cache_rate is not None and moe_cache_rate > 0)
+
+
+def headroom_growth_eligible(moe_cache_auto: bool, sizing_explicit: bool) -> bool:
+    """Whether the post-init expert-cache growth may spend the ``(1 - ratio)`` headroom.
+
+    ``sizing_explicit`` is the latched pre-resolution reading of
+    ``has_explicit_cache_sizing``; passing the post-resolution config instead silently
+    disables the growth on every auto-sized run."""
+    return moe_cache_auto and not sizing_explicit
+
+
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float,
+    baseline_free: int,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    *,
+    device_total: int = 0,
+    nonpool_overhead_bytes: int = 0,
 ) -> int:
-    """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    """Net GPU bytes available for the MoE + KV pools under --memory-ratio.
+
+    With a device total (whole-VRAM view at startup), the ratio caps the engine's TOTAL
+    per-rank footprint: pools get ``ratio x device_total`` minus what is already committed
+    outside them (resident weights + the measured CUDA-context/NCCL/allocator overhead).
+    Without one, the historical reading applies: ``ratio`` of the pre-model free baseline
+    minus weights. The ``(1-ratio)`` remainder is the graph/activation headroom. Single
+    source of truth for startup auto-sizing and the runtime-rebuild fit check."""
+    legacy = int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    if device_total <= 0:
+        return legacy
+    capped = (
+        int(memory_ratio * device_total)
+        - weights_bytes
+        - nonpool_overhead_bytes
+        - fixed_cache_size
+    )
+    # A co-tenant already holding VRAM can push the capped figure below the legacy one;
+    # the cap guards against exceeding ratio x device, it must not silently enlarge the plan.
+    return min(legacy, capped)
+
+
+def growth_cap_bytes(
+    memory_ratio: float,
+    device_total: int,
+    current_footprint_bytes: int,
+    reserve_bytes: int,
+) -> int:
+    """Bytes the post-init expert-cache growth may take without breaking --memory-ratio.
+
+    ``memory_ratio x device_total`` is the ceiling on the engine's WHOLE footprint, so the
+    growth may only close the gap between what the startup plan actually allocated and that
+    ceiling. The ``(1 - ratio)`` remainder stays reserved for CUDA-graph capture and the
+    largest prefill chunk's activations -- it is what the ratio promises to leave free, so
+    spending it would make the flag stop being a footprint cap. ``reserve_bytes`` is a
+    second, independent floor for those same consumers; it is what binds when the ratio
+    itself is set near 1. Returns 0 when the plan already sits at or above the ceiling."""
+    room = min(
+        device_total - current_footprint_bytes - reserve_bytes,
+        int(memory_ratio * device_total) - current_footprint_bytes,
+    )
+    return max(0, room)
 
 
 def required_bytes(
@@ -140,16 +204,25 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    device_total: int = 0,
+    nonpool_overhead_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
 
-    Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
-    the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
-    CUDA-graph/activation headroom (not subtracted here).
+    Applies memory_ratio exactly once via net_cache_budget_bytes (the usage-cap reading
+    when a device total is given), then defers the MoE-vs-KV split to plan_cache_budget.
+    The (1-memory_ratio) remainder is the CUDA-graph/activation headroom.
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    budget_bytes = net_cache_budget_bytes(
+        memory_ratio,
+        baseline_free,
+        weights_bytes,
+        fixed_cache_size,
+        device_total=device_total,
+        nonpool_overhead_bytes=nonpool_overhead_bytes,
+    )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(

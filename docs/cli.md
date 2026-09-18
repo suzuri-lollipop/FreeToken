@@ -119,7 +119,7 @@ not on identical text, unless you have verified repeatability at TP=1 first.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--memory-ratio` | 0.9 | Fraction of the GPU's total VRAM the engine's whole per-rank footprint may use (weights + MoE cache + KV + CUDA context); the remainder is runtime headroom for CUDA graphs and activations |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |

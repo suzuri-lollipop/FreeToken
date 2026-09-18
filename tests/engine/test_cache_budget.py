@@ -9,6 +9,7 @@ import os
 
 from freetoken.engine.cache_budget import (
     expert_bytes_per_slot,
+    has_explicit_cache_sizing,
     plan_cache_budget,
     resolve_moe_cache_auto,
     slot_cache_expert_cap,
@@ -368,6 +369,9 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     engine = Engine.__new__(Engine)  # bypass __init__/GPU
     engine._baseline_free = 10_000_000
     engine._weights_bytes = 1_000_000
+    # No device: memory_ratio keeps its historical free-baseline reading.
+    engine._device_total = 0
+    engine._nonpool_overhead_floor = 0
     engine._pool_cls = MHAKVCache  # __init__ skipped -> install the generic pool family
 
     size, pages, overlap = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks())
@@ -449,6 +453,9 @@ def _auto_plan_stub(num_layers=4, *, layer_residency="unset", num_page_override=
     engine = Engine.__new__(Engine)  # bypass __init__/GPU
     engine._baseline_free = 10_000_000
     engine._weights_bytes = 1_000_000
+    # No device: memory_ratio keeps its historical free-baseline reading.
+    engine._device_total = 0
+    engine._nonpool_overhead_floor = 0
     engine._pool_cls = MHAKVCache
     return engine, Config(), Banks()
 
@@ -484,6 +491,161 @@ def test_auto_plan_of_the_reported_wsl2_run_caches_one_layer_not_the_model():
     assert slot_cache_expert_cap(
         48, 512, _residency({24}, 48), prefill_overlap=False
     ) == 1024
+
+
+# ------------------------------------------------- memory_ratio as a total-footprint cap
+
+_GIB = 1 << 30
+
+
+def test_footprint_cap_reads_ratio_off_the_whole_device():
+    # The historical reading scales whatever FREE memory happened to be available before the
+    # weights loaded; with a device total, --memory-ratio instead caps the engine's whole
+    # footprint, so bytes already committed outside the pools are charged against it.
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+
+    # 24 GiB card, 6 GiB of weights, and 3 GiB of CUDA context / NCCL / co-tenant that the
+    # legacy view never accounts for anywhere. Only 8 GiB was free at the baseline, so the
+    # legacy figure is the smaller one and the cap must not enlarge the plan.
+    total, baseline, weights, overhead = 24 * _GIB, 8 * _GIB, 6 * _GIB, 3 * _GIB
+    legacy = net_cache_budget_bytes(0.85, baseline, weights, 0)
+    capped = net_cache_budget_bytes(
+        0.85, baseline, weights, 0, device_total=total, nonpool_overhead_bytes=overhead
+    )
+    assert legacy == int(0.85 * baseline) - weights
+    assert capped == legacy < int(0.85 * total) - weights - overhead
+    # What the engine then ends up resident on the device honors ratio x total.
+    assert capped + weights + overhead <= int(0.85 * total)
+
+
+def test_footprint_cap_holds_when_free_memory_is_not_the_binding_limit():
+    # The case the legacy reading gets wrong: a nearly empty device. ratio x free is then
+    # bigger than ratio x device minus the unaccounted overhead, and only the cap keeps the
+    # footprint inside what --memory-ratio promises.
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+
+    total, weights, overhead = 24 * _GIB, 6 * _GIB, 2 * _GIB
+    legacy = net_cache_budget_bytes(0.85, total, weights, 0)
+    capped = net_cache_budget_bytes(
+        0.85, total, weights, 0, device_total=total, nonpool_overhead_bytes=overhead
+    )
+    assert legacy > capped
+    assert capped + weights + overhead == int(0.85 * total)
+
+
+def test_footprint_cap_never_enlarges_the_plan():
+    # A co-tenant can make ratio x device smaller than the legacy figure. The cap guards
+    # against exceeding it, so it must not silently hand out MORE bytes than before.
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+
+    legacy = net_cache_budget_bytes(0.9, 10_000, 1_000, 0)
+    with_room = net_cache_budget_bytes(0.9, 10_000, 1_000, 0, device_total=100_000)
+    assert with_room == legacy
+    assert net_cache_budget_bytes(0.9, 10_000, 1_000, 0, device_total=0) == legacy
+
+
+def test_nonpool_overhead_is_clamped_by_the_cross_rank_min_free():
+    # Under TP every rank plans off the same cross-rank MIN free figure; a rank whose local
+    # context is bigger must not spend bytes the tightest rank does not have.
+    from freetoken.engine.engine import _nonpool_overhead_bytes
+
+    assert _nonpool_overhead_bytes(24 * _GIB, 20 * _GIB, 20 * _GIB) == 4 * _GIB
+    assert _nonpool_overhead_bytes(24 * _GIB, 20 * _GIB, 1 * _GIB) == 1 * _GIB
+    # No usable device total -> no cap, and the callers fall back to the legacy reading.
+    assert _nonpool_overhead_bytes(0, 20 * _GIB, 20 * _GIB) == 0
+    assert _nonpool_overhead_bytes(24 * _GIB, -1, 20 * _GIB) == 0
+
+
+def test_growth_cap_respects_the_footprint_and_reserve():
+    from freetoken.engine.cache_budget import growth_cap_bytes
+
+    total = 24 * _GIB
+    # ratio x total = 20.4 GiB is the ceiling on the WHOLE footprint, so a 20 GiB footprint
+    # may only grow by the 0.4 GiB still under it -- the cap binds, not the 1.5 GiB reserve.
+    assert growth_cap_bytes(0.85, total, 20 * _GIB, 1536 * 1024 * 1024) == int(0.85 * total) - 20 * _GIB
+    # A ratio near 1 leaves the ceiling loose, so the graph/activation reserve is what binds.
+    assert growth_cap_bytes(0.99, total, 20 * _GIB, 1536 * 1024 * 1024) == total - 20 * _GIB - 1536 * 1024 * 1024
+    # Nothing left below the reserve -> no growth at all, never a negative room.
+    assert growth_cap_bytes(0.85, total, 23 * _GIB, 2 * _GIB) == 0
+
+
+def test_growth_never_spends_the_memory_ratio_remainder():
+    """--memory-ratio is the top-level footprint authority: the (1 - ratio) remainder is what
+    it reserves for graph capture and prefill activations, so the post-init growth may only
+    reclaim rounding slack BELOW the ceiling. Regression for a cap term that bounded the room
+    by ``ratio x total`` instead of ``ratio x total - footprint`` and so never bound: on the
+    measured rig (24467 MiB device, ratio 0.85, 20608 MiB resident) it grew the expert cache
+    by 1.92 GiB and landed the footprint at 92.8% of the device."""
+    from freetoken.engine.cache_budget import growth_cap_bytes
+
+    mib = 1024 * 1024
+    total, footprint, reserve = 24467 * mib, 20608 * mib, 1536 * 1024 * 1024
+    room = growth_cap_bytes(0.85, total, footprint, reserve)
+    assert room == int(0.85 * total) - footprint          # ~189 MiB of rounding slack
+    assert footprint + room <= int(0.85 * total)          # the ceiling holds
+    assert room < 2 * 1024 * mib                          # ... not the 1.92 GiB it used to take
+    # A footprint already at or above the ceiling must not grow at all.
+    assert growth_cap_bytes(0.85, total, int(0.85 * total), reserve) == 0
+    assert growth_cap_bytes(0.85, total, int(0.85 * total) + mib, reserve) == 0
+
+
+def test_explicit_cache_sizing_suppresses_auto_fallback():
+    from freetoken.engine.cache_budget import has_explicit_cache_sizing
+
+    assert has_explicit_cache_sizing(4000, None) is True
+    assert has_explicit_cache_sizing(0, 0.25) is True
+    assert has_explicit_cache_sizing(0, None) is False
+    assert has_explicit_cache_sizing(0, 0) is False
+
+
+def test_pinned_slot_cache_skips_the_headroom_growth():
+    # --moe-cache-size pins the cache; growing it into the (1 - ratio) remainder afterwards
+    # would put bytes outside the pool budget, so --memory-ratio stops being the footprint cap.
+    # The gate itself lives in Engine.__init__, which needs a GPU, so assert on its terms:
+    # an explicit size is detected, and _adjust_config never turns auto back on for it.
+    config = _offload_engine_config(moe_strategy="offload", moe_cache_size=12)
+    assert has_explicit_cache_sizing(config.moe_cache_size, config.moe_cache_rate)
+
+
+def test_headroom_growth_survives_the_auto_size_write_back():
+    """--moe-cache-auto resolves a size and writes it back into config.moe_cache_size, so the
+    growth gate must read the PRE-resolution latch: reading the config at the gate sees the
+    resolved 8969 as user-pinned and silently skips the growth on every auto-sized run."""
+    from freetoken.engine.cache_budget import headroom_growth_eligible
+
+    # the latch, taken before the resolution: auto-sizing was not asked for explicitly
+    latched = has_explicit_cache_sizing(0, None)
+    assert headroom_growth_eligible(moe_cache_auto=True, sizing_explicit=latched) is True
+    # what the same config looks like after _init_offload_moe_cache wrote the size back
+    resolved = has_explicit_cache_sizing(8969, None)
+    assert headroom_growth_eligible(moe_cache_auto=True, sizing_explicit=resolved) is False
+    # a user-pinned cache still declines, whichever reading is used
+    assert headroom_growth_eligible(moe_cache_auto=False, sizing_explicit=True) is False
+
+
+def test_growth_cap_only_tightens_the_reserve():
+    # A rank that skips the growth on its own leaves the others blocked in the go/no-go
+    # all-reduce, so the cap may only ever tighten `reserve` -- room == 0 must fall through
+    # to extra <= 0 (go stays False) instead of returning early.
+    from freetoken.engine.cache_budget import growth_cap_bytes
+
+    total, reserve, post_free = 24 * _GIB, 2 * _GIB, 1 * _GIB
+    room = growth_cap_bytes(0.85, total, total - post_free, reserve)
+    assert room == 0
+    tightened = max(reserve, post_free - room)
+    assert tightened >= post_free  # nothing spendable -> extra == 0 on this rank
+
+
+def test_adjust_config_keeps_an_explicit_slot_cache_pinned():
+    """--moe-cache-size must not be re-widened by the auto fallback it suppresses."""
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe import is_offload_moe_strategy
+
+    config = _offload_engine_config(moe_cache_size=4000)
+    _adjust_config(config)
+    assert is_offload_moe_strategy(config.moe_strategy)
+    assert config.moe_cache_auto is False
+    assert config.moe_cache_size == 4000
 
 
 # ---------------------------------------------------------------------------

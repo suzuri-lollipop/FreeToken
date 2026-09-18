@@ -209,7 +209,14 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
         _baseline = int(engine._baseline_free or 0)
         _weights = int(engine._weights_bytes or 0)
         _mr = float(cfg.memory_ratio) if cfg is not None else 1.0
-        meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
+        # Same memory account the rebuild fit-check prices against, so a slider can never
+        # offer a size the rebuild would reject.
+        _total = int(getattr(engine, "_device_total", 0) or 0)
+        _overhead = int(getattr(engine, "_nonpool_overhead_floor", 0) or 0)
+        meta["cache_budget_bytes"] = max(0, _net_budget(
+            _mr, _baseline, _weights, 0,
+            device_total=_total, nonpool_overhead_bytes=_overhead,
+        )) if _baseline > 0 else 0
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
     return meta

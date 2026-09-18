@@ -24,6 +24,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig, tp_preflight_error
+from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
@@ -67,11 +68,31 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
-def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
+def _startup_kv_budget(
+    memory_ratio: float,
+    init_free_memory: int,
+    new_free_memory: int,
+    *,
+    device_total: int = 0,
+    nonpool_overhead_bytes: int = 0,
+    weights_bytes: int = 0,
+) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
-    what the resident model consumed. Kept as a pure function so the composition with the
-    pool families' ``solve_num_pages`` stays CPU-testable."""
-    return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+    what the resident model consumed. With a device total, --memory-ratio caps the engine's
+    whole footprint instead: pools get ratio x device minus this rank's resident weights and
+    the non-pool CUDA overhead (the floor measured before the first allocation). Kept as a
+    pure function so the composition with the pool families' ``solve_num_pages`` stays
+    CPU-testable.
+
+    ``weights_bytes`` is the cross-rank MIN reading; the legacy term keeps its historical
+    cross-rank MAX delta because that path also has to survive the allocations the other
+    ranks made in between. Under an asymmetric footprint only the cap may use the local view."""
+    legacy = int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+    if device_total <= 0:
+        return legacy
+    capped = int(memory_ratio * device_total) - weights_bytes - nonpool_overhead_bytes
+    # The cap must never enlarge the plan (co-tenant VRAM can make it the smaller figure).
+    return min(legacy, capped)
 
 
 def _effective_free_bytes(cuda_free: int, nvml_free: int | None) -> int:
@@ -82,6 +103,18 @@ def _effective_free_bytes(cuda_free: int, nvml_free: int | None) -> int:
     physical allocation is guaranteed to fit in. Kept pure so the clamp stays CPU-testable.
     """
     return cuda_free if nvml_free is None else min(cuda_free, nvml_free)
+
+
+def _nonpool_overhead_bytes(device_total: int, cuda_free: int, cross_rank_min_free: int) -> int:
+    """Bytes already committed on this device outside every cache pool before the weights
+    load (CUDA context, NCCL buffers, allocator slack); 0 without a usable device total.
+
+    Charged against the --memory-ratio footprint cap like any other resident byte. Clamped
+    by the cross-rank MIN free memory: under TP the local reading of a shared consumer must
+    never let one rank plan more than the tightest rank can hold."""
+    if device_total <= 0 or cuda_free < 0:
+        return 0
+    return max(0, min(device_total - cuda_free, cross_rank_min_free))
 
 
 _VRAM_MARGIN_GIB_DEFAULT = 2.0
@@ -459,10 +492,23 @@ class Engine:
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
-        # Bytes the startup headroom growth (below) added to the MoE slot cache beyond
-        # the memory_ratio plan; runtime-rebuild fit checks credit it back so a rebuild
-        # targeting today's geometry is not rejected by the ratio budget.
-        self._moe_headroom_growth = 0
+        # Whole-device VRAM this process may plan against. --memory-ratio caps the TOTAL
+        # footprint against it (weights + pools + overhead), so the ratio stays meaningful
+        # even though most of the device is already committed. torch's per-device total is
+        # the whole card and follows the bound ordinal, so unlike NVML's physical list it
+        # cannot be misindexed by a preset CUDA_VISIBLE_DEVICES or a UUID assignment.
+        self._device_total = int(torch.cuda.get_device_properties(self.device).total_memory)
+        # Bytes the CUDA context / NCCL / allocator hold outside every pool, measured before
+        # the weights load; charged against the ratio cap like any other resident byte.
+        self._nonpool_overhead_floor = _nonpool_overhead_bytes(
+            self._device_total, torch.cuda.mem_get_info(self.device)[0], free_min
+        )
+        # Latched BEFORE _init_offload_moe_cache resolves --moe-cache-auto, which writes the
+        # resolved size back into config.moe_cache_size; reading the config at the growth gate
+        # instead would see that size as user-pinned and skip the growth on every auto run.
+        self._moe_sizing_explicit = has_explicit_cache_sizing(
+            config.moe_cache_size, config.moe_cache_rate
+        )
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -549,7 +595,14 @@ class Engine:
         new_free = self._sync_get_memory()[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        available_memory = _startup_kv_budget(
+            config.memory_ratio,
+            init_free_memory,
+            new_free,
+            device_total=self._device_total,
+            nonpool_overhead_bytes=self._nonpool_overhead_floor,
+            weights_bytes=self._weights_bytes,
+        )
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
@@ -604,7 +657,7 @@ class Engine:
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
-        if config.moe_cache_auto:
+        if headroom_growth_eligible(config.moe_cache_auto, self._moe_sizing_explicit):
             post_free_memory = self._grow_moe_cache_into_headroom(config, post_free_memory)
 
         # ======================= Graph capture initialization ========================
@@ -770,20 +823,23 @@ class Engine:
             kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=max_slots,
+            device_total=self._device_total,
+            nonpool_overhead_bytes=self._nonpool_overhead_floor,
         )
 
     def _grow_moe_cache_into_headroom(self, config: EngineConfig, post_free_memory: int) -> int:
-        """--moe-cache-auto: grow the expert slot cache into the post-init headroom.
+        """--moe-cache-auto: grow the expert slot cache up to the --memory-ratio ceiling.
 
-        The startup plan sizes the pools from ``memory_ratio x baseline_free - weights``
-        (all measured BEFORE the model loads), so the ``(1 - ratio)`` remainder is a
-        blind guess at what CUDA-graph capture and the largest prefill chunk's
-        activations will need. Once every pool is resident we know the real free
-        bytes; keep a fixed reserve for those consumers and spend the rest on expert
-        slots -- every extra slot is one less PCIe miss in both prefill and decode.
-        Runs BEFORE the first graph capture, so no re-capture is needed. The target
-        derives from the cross-rank MIN free memory, so every TP rank grows to the
-        same size. Returns the free memory after the growth.
+        The startup plan sizes the pools from measurements taken BEFORE the model loads and
+        rounds down to whole slots and pages, so it normally lands a little under
+        ``memory_ratio x device_total``. Once every pool is resident the real footprint is
+        known, and this reclaims that rounding slack for expert slots -- every extra slot is
+        one less PCIe miss in both prefill and decode. The ``(1 - ratio)`` remainder is NOT
+        spendable: it is what the ratio reserves for CUDA-graph capture and the largest
+        prefill chunk's activations, so the growth stops at the ceiling and a plan that
+        already sits on it does not grow at all. Runs BEFORE the first graph capture, so no
+        re-capture is needed. The target derives from the cross-rank MIN free memory, so
+        every TP rank grows to the same size. Returns the free memory after the growth.
 
         TP-collective discipline: the go/no-go decision is all-reduced (MIN) AFTER a
         local probe allocation, and ``_sync_get_memory`` (itself collective) runs only
@@ -794,12 +850,25 @@ class Engine:
         cache = self.moe_offload_cache
         if cache is None or cache.flat_residency or self.device.type != "cuda":
             return post_free_memory
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, growth_cap_bytes
 
         per_expert = expert_bytes_per_slot(cache.bank_sources)
         reserve = int(
             float(os.getenv("FREETOKEN_MOE_HEADROOM_RESERVE_GIB", "1.5")) * (1 << 30)
         )
+        # --memory-ratio caps the WHOLE footprint, so room is what is left below that
+        # ceiling (the reserve only binds for a ratio set near 1).
+        if self._device_total > 0:
+            room = growth_cap_bytes(
+                config.memory_ratio,
+                self._device_total,
+                self._device_total - post_free_memory,
+                reserve,
+            )
+            # Keep at least `reserve` free after growing, so extra <= room. Tightening the
+            # reserve is also how a nearly full device declines to grow (room 0 -> extra 0):
+            # a rank-local early return would desynchronize the all-reduce below.
+            reserve = max(reserve, post_free_memory - room)
         go = False
         target = cache.cache_size
         extra = (post_free_memory - reserve) // per_expert
@@ -833,14 +902,15 @@ class Engine:
             go = bool(flag.item())
         if not go:
             return post_free_memory
+        cap = int(config.memory_ratio * self._device_total) if self._device_total > 0 else 0
         logger.info_rank0(
             f"--moe-cache-auto: growing expert cache {cache.cache_size} -> {target} "
-            f"slots (+{extra * per_expert / 2**30:.2f} GiB from the post-init headroom, "
-            f"keeping {reserve / 2**30:.2f} GiB reserve for graph capture + activations)"
+            f"slots (+{extra * per_expert / 2**30:.2f} GiB of startup rounding slack, "
+            f"--memory-ratio ceiling {cap / 2**30:.2f} GiB of "
+            f"{self._device_total / 2**30:.2f} GiB)"
         )
         cache.rebuild(target)
         object.__setattr__(config, "moe_cache_size", target)
-        self._moe_headroom_growth = extra * per_expert
         free_min, _ = self._sync_get_memory()
         logger.info_rank0(f"Free memory after MoE headroom growth: {mem_GB(free_min)}")
         return free_min
@@ -1303,11 +1373,10 @@ class Engine:
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            # credit back the startup headroom growth: those slots legitimately live
-            # in the (1 - memory_ratio) remainder, which this ratio-budget check
-            # otherwise counts against the rebuild target
-            weights_bytes=max(0, self._weights_bytes - self._moe_headroom_growth),
+            weights_bytes=self._weights_bytes,
             current_num_pages=self.num_pages,
+            device_total=self._device_total,
+            nonpool_overhead_bytes=self._nonpool_overhead_floor,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
             ),
@@ -2140,8 +2209,7 @@ def _adjust_config(config: EngineConfig):
         if (
             is_offload_moe_strategy(config.moe_strategy)
             and config.moe_cache_size <= 0
-            and config.moe_cache_rate is None
-            and not getattr(config, "moe_cache_auto", False)
+            and not config.moe_cache_auto
         ):
             # args.py's "no sizing flag -> default --moe-cache-auto" only fires when the
             # backend is already offload-family at *parse* time. A bare `ft serve <FTW MoE
@@ -2155,6 +2223,14 @@ def _adjust_config(config: EngineConfig):
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected strategy {config.moe_strategy!r}"
             )
+        elif is_offload_moe_strategy(config.moe_strategy) and not config.moe_cache_auto:
+            # An explicit --moe-cache-size / --moe-cache-rate suppresses both the auto fallback
+            # and the post-init headroom growth (below), so the slot cache stays inside the
+            # memory_ratio pool budget and --memory-ratio alone caps the footprint.
+            logger.info_rank0(
+                f"MoE slot cache pinned at moe_cache_size={config.moe_cache_size}: keeping it "
+                f"inside the memory_ratio={config.memory_ratio:g} pool budget (no headroom growth)"
+            )
 
     if is_moe and config.moe_strategy == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
@@ -2165,7 +2241,7 @@ def _adjust_config(config: EngineConfig):
             inert = f"--moe-cache-rate={config.moe_cache_rate}"
         elif config.moe_cache_size:
             inert = f"--moe-cache-size={config.moe_cache_size}"
-        elif getattr(config, "moe_cache_auto", False):
+        elif config.moe_cache_auto:
             inert = "--moe-cache-auto"
         else:
             inert = None
@@ -2184,7 +2260,7 @@ def _adjust_config(config: EngineConfig):
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
         # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
         num_experts = config.model_config.num_experts
-        if getattr(config, "moe_cache_auto", False):
+        if config.moe_cache_auto:
             override("moe_cache_auto", False)
         override("moe_cache_size", 2 * num_experts)
         override("moe_prefill_overlap", True)
