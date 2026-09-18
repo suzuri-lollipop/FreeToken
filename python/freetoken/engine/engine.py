@@ -1084,14 +1084,25 @@ class Engine:
             # global rows, ~0.16 MB/expert) whole-layer even on a full hit, because a
             # sub-256KB entry makes cudaMemcpyBatchAsync degrade to a synchronous copy --
             # ~3.9 GiB per chunk here that touched-only staging never moves. That saving
-            # dwarfs the double-buffered GEMM overlap the streaming path gives up (~0.1 s
-            # measured), so the cap sits well above a batched admission's chunk: measured on
-            # a 2-GPU PCIe rig (gen5 x16 + gen4 x4), a 4-request 600-token batch prefill went
-            # 4.07 s -> 1.52 s and conc=8 throughput +18.7%. Chunks past it (one long prompt)
-            # have a GEMM big enough for the overlap to pay again.
+            # outweighs the double-buffered GEMM overlap the streaming path gives up at
+            # every chunk size this engine can build. Single-request prefills, median of 3,
+            # on a 2-GPU PCIe rig (gen5 x16 beside gen4 x4, so rank1's link is the
+            # straggler both ranks wait for):
+            #
+            #   chunk tokens    256    512   1024   2048   4096   6144   7800
+            #   touched-only   2.27   2.64   3.26   3.94   5.44   6.74   7.61
+            #   streaming      5.60   5.65   5.73   5.88   6.22   6.81   8.25
+            #
+            # No crossover: the two converge as the touched set approaches the whole layer
+            # but touched-only never loses, because the small-bank waste is a constant
+            # ~3.9 GiB while the overlap it trades away is bounded by the GEMM. The default
+            # therefore covers the largest chunk the default --max-extend-length produces;
+            # the streaming path still guards chunk sizes nobody has measured, and
+            # configs that cannot stage per row (no fused copy plan, unpinned banks, no
+            # double buffers) never reach this branch at all.
             cache.ondemand_prefill = True
             cache.ondemand_max_tokens = max(
-                0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "2048"))
+                0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "8192"))
             )
             if cache.ondemand_max_tokens == 0:
                 cache.ondemand_prefill = False

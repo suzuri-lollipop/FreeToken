@@ -121,12 +121,14 @@ class OffloadMoeCache:
     # cuts the prefill's PCIe bytes ~3x; the LRU is left untouched. It also stages the
     # SMALL banks (scales/globals) per row, which the streaming path must copy
     # whole-layer to keep every batch-memcpy entry above the driver's async floor.
-    # Above ``ondemand_max_tokens`` a single long prompt's GEMM is big enough that the
-    # streaming path's double-buffered overlap pays off again. Requires prefill_overlap
-    # buffers + the fused copy plan + all-pinned layers; set by the engine after
-    # construction.
+    # That whole-layer waste is a per-chunk constant, while the double-buffered overlap
+    # touched-only gives up is bounded by the GEMM, so measured over 256..7800-token
+    # chunks touched-only is never slower (2.5x faster at 256, 1.1x at 4096, parity at
+    # 6144 -- table at the engine's default). ``ondemand_max_tokens`` therefore only
+    # guards chunk sizes nobody has measured. Requires prefill_overlap buffers + the
+    # fused copy plan + all-pinned layers; set by the engine after construction.
     ondemand_prefill: bool = False
-    ondemand_max_tokens: int = 2048
+    ondemand_max_tokens: int = 8192
     # Flat residency: every expert of every layer owns a permanent slot
     # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
     # expert and GPU decode; drops the prefill double buffers, so after the single load in
