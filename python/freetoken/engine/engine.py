@@ -1112,13 +1112,11 @@ class Engine:
                     f"{cache.ondemand_max_tokens} tokens: only routing-touched experts "
                     "cross PCIe (whole-layer streaming above that)"
                 )
-                # Hybrid prefill split, env-gated while its policy is unmeasured. The decode
-                # fraction cannot be reused: that one balances expert BYTES on both sides,
-                # while a chunk's CPU cost scales with ROUTES (~18 per missing expert at
-                # T=150, where the weights stay in L2/L3 across an expert's tokens) and its
-                # PCIe cost with experts -- a different exchange rate. Deriving it properly
-                # needs a prefill-sized CPU MoE number in `ft bench bw`; until then 1.0
-                # keeps every miss on the PCIe plan.
+                # Hybrid prefill split; policy-resolved (auto) in _resolve_hybrid_fetch once the
+                # decode split and live link are known. The decode fraction balances expert
+                # BYTES on both sides; a chunk's CPU cost scales with ROUTES (~18 per missing
+                # expert at T=150, where the weights stay in L2/L3 across an expert's tokens)
+                # and its PCIe cost with experts, so the CPU side is relatively cheaper here.
                 frac = os.getenv("FREETOKEN_PREFILL_FETCH_FRACTION", "").strip()
                 if frac:
                     parts = [float(x) for x in frac.split(",")]
@@ -1215,6 +1213,28 @@ class Engine:
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             f"expert misses over PCIe ({link}), the rest on the CPU"
         )
+        # Hybrid prefill split, auto-resolved from the same live link. A chunk's CPU
+        # cost scales with routed expert ROUTES (the weights stay in L2/L3 across an
+        # expert's tokens) while its PCIe cost scales with expert BYTES, so the CPU side
+        # is relatively cheaper than in decode and the split leans harder onto the CPU.
+        # Base it on the decode split (already per-rank, live-PCIe + hideability-weighted)
+        # and halve it: a 128-token chunk on the 2-GPU PCIe rig this path targets
+        # (gen5 x16 ~20 GB/s beside gen4 x4 ~7 GB/s) drops ~10% faster because the slow
+        # rank's ~0.86s PCIe stall collapses to ~0.07s and its now-CPU-bound GEMM hides
+        # under the peer rank's gather. Only under TP: the win is hiding the CPU-bound GEMM
+        # behind the peer rank's PCIe gather, so a single rank keeps the all-PCIe default.
+        # FREETOKEN_PREFILL_FETCH_FRACTION still overrides per rank, and a manual 1.0 keeps
+        # the old all-PCIe behaviour.
+        if (
+            config.tp_info.size > 1
+            and not os.getenv("FREETOKEN_PREFILL_FETCH_FRACTION")
+            and cache.prefill_fetch_fraction >= 1.0
+        ):
+            cache.prefill_fetch_fraction = 0.5 * fraction
+            logger.info(
+                f"MoE hybrid prefill: staging {cache.prefill_fetch_fraction:.1%} of each "
+                "layer's missing experts over PCIe, the rest on the CPU"
+            )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
