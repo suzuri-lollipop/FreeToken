@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import gc
 import math
 import os
@@ -17,6 +19,7 @@ from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quan
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
+from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
@@ -438,6 +441,31 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+class WeightLoadError(RuntimeError):
+    """The checkpoint itself could not be read. Resource and config failures keep their own type."""
+
+
+def _is_resource_failure(exc: Exception) -> bool:
+    if isinstance(exc, (torch.OutOfMemoryError, MemoryError, PinFailed)):
+        return True
+    # an anonymous mmap that does not fit raises ENOMEM, not MemoryError
+    if isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        return True
+    # torch has no type for a failed CPU allocation
+    return isinstance(exc, RuntimeError) and "DefaultCPUAllocator" in str(exc)
+
+
+@contextlib.contextmanager
+def _weight_load_context():
+    """Wrap a checkpoint read so the startup failure reason (log and /health) starts with WeightLoadError."""
+    try:
+        yield
+    except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
+        raise WeightLoadError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -534,8 +562,7 @@ class Engine:
             if refusal:
                 logger.critical_rank0(refusal)
                 raise RuntimeError(refusal)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
-        finalize_quant(self.model)
+        self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -564,7 +591,8 @@ class Engine:
         # planning sees the pin quota the table already spent.
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
-            self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            with _weight_load_context():
+                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -718,6 +746,17 @@ class Engine:
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
+
+    def _load_weights(self, config: EngineConfig) -> None:
+        if config.active_encoders and not config.use_dummy_weight and ftw_lacks_vision(config.model_path):
+            raise ValueError(
+                f"{config.model_path} holds no vision encoder tensors: it was converted by a build before this "
+                "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
+                "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
+            )
+        with _weight_load_context():
+            self.model.load_state_dict(self._load_weight_state_dict(config))
+        finalize_quant(self.model)
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -969,17 +1008,18 @@ class Engine:
                 for i in range(config.model_config.num_moe_layers)
             ]
         try:
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                method=method,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
-            )
+            with _weight_load_context():
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    method=method,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                    layer_residency=requested_residency,
+                )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         if config.moe_cache_auto:
@@ -1748,6 +1788,38 @@ def _hybrid_recommended_for_run(bench_fmt: str, tp_size: int) -> bool:
     return True
 
 
+def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
+    """True when the GPU has no separate device memory (cudaDevAttrIntegrated): host
+    banks and the GPU slot cache are the same DRAM, so the offload family's pinned
+    staging + slot gather are DRAM-to-DRAM copies with no PCIe link to hide behind.
+
+    The attribute is reliable on true-UMA parts (Jetson, GB10/DGX Spark) but not on
+    C2C-linked discrete-HBM parts (GH200 reports integrated=0 despite coherent CPU
+    memory), and it has only been verified on GB10 so far --
+    FREETOKEN_UNIFIED_MEMORY=0/1 overrides the probe where the attribute lies."""
+    env = os.environ.get("FREETOKEN_UNIFIED_MEMORY")
+    if env is not None:
+        return env.strip().lower() not in {"0", "false", "no", "off"}
+    if not torch.cuda.is_available():
+        return False
+    try:
+        dev = torch.cuda.current_device() if index is None else index
+        return bool(torch.cuda.get_device_properties(dev).is_integrated)
+    except Exception:
+        return False
+
+
+def _fused_resident_ok(model_config) -> bool:
+    """Whether the resident ('fused') MoE path can hold this model's experts.
+   
+       FIXME: auto resolves to fused only for bf16 and fp8_block experts; drop this gate once the other quant formats support fused.
+       """
+    expert_quant = getattr(model_config, "expert_quant", "none")
+    if expert_quant not in ("none", "fp8_block"):
+        return False
+    return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
+
+
 def _ensure_expandable_segments(device: torch.device) -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -2020,7 +2092,8 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     from freetoken.checkpoint.ftw import ftw_quant_format
     from freetoken.moe.legacy_format import kind_kernel_for
 
-    fmt = ftw_quant_format(model_path) if model_path else None
+    with _weight_load_context():
+        fmt = ftw_quant_format(model_path) if model_path else None
     if fmt is None:
         return quant_backend
     try:
@@ -2227,6 +2300,21 @@ def _adjust_config(config: EngineConfig):
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
         default_backend = "offload"
+        # Unified memory (GB10/DGX Spark, Jetson): there is no host/device boundary, so
+        # the offload family stages and gathers between two names for the same DRAM (on
+        # GB10 this added a measured ~130 s stall to every request, #369). Resident
+        # experts are the safe default here, not the risky one: the model and its banks
+        # page from the same pool, so the "wrong guess = weight-load OOM" rationale above
+        # does not apply. The benchbw hybrid upgrade is skipped too: CPU execution adds
+        # no bandwidth when both sides share one memory. Only formats the resident path
+        # can actually hold take this branch; the rest stay on offload as before.
+        unified_memory = _is_unified_memory_gpu()
+        if unified_memory and _fused_resident_ok(model_config):
+            default_backend = "fused"
+            logger.info_rank0(
+                "Unified-memory GPU detected; auto-selecting 'fused' MoE strategy "
+                "(resident experts) instead of offload"
+            )
         # Hardware-adaptive config: a cached `ft bench bw` profile can upgrade
         # the offload default to hybrid when this machine's CPU MoE bandwidth clears its PCIe
         # gather bandwidth by the bench threshold (default 2x). hybrid is VRAM-equivalent to
@@ -2237,7 +2325,11 @@ def _adjust_config(config: EngineConfig):
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-        if _hybrid_recommended_for_run(bench_fmt, tp_size):
+        if (
+            default_backend == "offload"
+            and not unified_memory
+            and _hybrid_recommended_for_run(bench_fmt, tp_size)
+        ):
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
@@ -2290,6 +2382,20 @@ def _adjust_config(config: EngineConfig):
                 f"MoE slot cache pinned at moe_cache_size={config.moe_cache_size}: keeping it "
                 f"inside the memory_ratio={config.memory_ratio:g} pool budget (no headroom growth)"
             )
+
+    if (
+        is_moe
+        and config.moe_strategy == "offload"
+        and _is_unified_memory_gpu()
+        and _fused_resident_ok(model_config)
+    ):
+        # An explicit offload pick is honored, but on unified memory the user is paying
+        # for copies between two names for the same DRAM; say so once at config time.
+        logger.warning_rank0(
+            "--moe-strategy offload on a unified-memory GPU: expert 'streaming' copies "
+            "DRAM to DRAM (there is no PCIe link to overlap it with). If the model fits, "
+            "--moe-strategy fused avoids the slot-cache machinery entirely."
+        )
 
     if is_moe and config.moe_strategy == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
