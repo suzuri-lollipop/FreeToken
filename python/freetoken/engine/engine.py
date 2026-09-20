@@ -1673,8 +1673,9 @@ class Engine:
 
         # Cover the shape buckets that Triton FLA kernels specialize on.
         # 64 tokens matches typical chat-template prompts; 256 covers longer
-        # system-prompt conversations; 512 exercises larger chunk boundaries.
-        candidates = [64, 128, 256, 512]
+        # system-prompt conversations. Sampling warmup runs only at the last
+        # length since those kernels are shape-independent.
+        candidates = [64, 128, 256]
         warmup_lens = sorted({min(l, self.max_seq_len) for l in candidates if l <= self.max_seq_len and l >= 2})
         if not warmup_lens:
             warmup_lens = [min(64, self.max_seq_len)]
@@ -1687,6 +1688,7 @@ class Engine:
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
         try:
+            last_logits = None
             for length in warmup_lens:
                 dummy_row[:length] = torch.arange(
                     length, dtype=torch.int32, device=self.device
@@ -1711,24 +1713,24 @@ class Engine:
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
-                    logits = self.model.forward()
-                # Warm the sampling path (softmax + top-k/top-p Triton/flashinfer
-                # kernels) so the first real request skips JIT compilation.
-                if logits is not None and logits.numel() > 0:
-                    sample_logits = logits[:1].float()
-                    temps = torch.tensor([0.7], dtype=torch.float32, device=self.device)
-                    from freetoken.kernel.backend import is_flashinfer_installed
-                    if is_flashinfer_installed():
-                        import flashinfer.sampling as _samp
-                    else:
-                        import freetoken.kernel.triton.sampling as _samp
-                    from freetoken.utils import is_sm90_supported as _sm90
-                    probs = _samp.softmax(sample_logits, temps, enable_pdl=_sm90())
-                    _samp.top_k_top_p_sampling_from_probs(
-                        probs,
-                        torch.tensor([64], dtype=torch.int32, device=self.device),
-                        torch.tensor([0.95], dtype=torch.float32, device=self.device),
-                    )
+                    last_logits = self.model.forward()
+            # Warm the sampling path once (shape-independent) so the first real
+            # request skips JIT compilation of softmax + top-k/top-p kernels.
+            if last_logits is not None and last_logits.numel() > 0:
+                sample_logits = last_logits[:1].float()
+                temps = torch.tensor([0.7], dtype=torch.float32, device=self.device)
+                from freetoken.kernel.backend import is_flashinfer_installed
+                if is_flashinfer_installed():
+                    import flashinfer.sampling as _samp
+                else:
+                    import freetoken.kernel.triton.sampling as _samp
+                from freetoken.utils import is_sm90_supported as _sm90
+                probs = _samp.softmax(sample_logits, temps, enable_pdl=_sm90())
+                _samp.top_k_top_p_sampling_from_probs(
+                    probs,
+                    torch.tensor([64], dtype=torch.int32, device=self.device),
+                    torch.tensor([0.95], dtype=torch.float32, device=self.device),
+                )
         finally:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
