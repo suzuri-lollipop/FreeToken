@@ -716,9 +716,12 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        # Warm the prefill path for all attention backends: Triton kernels
+        # (FLA/GDN, MoE, sampling) need JIT compilation regardless of which
+        # attention backend is selected. The old guard only warmed for the
+        # "triton" backend, leaving qsa_sparse/fi/fa users to pay cold-start
+        # latency on their first real request.
+        self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1659,15 +1662,23 @@ class Engine:
         can still pay Triton/cublas setup costs. Use the dummy request row and
         restore it afterwards so padded decode graph replay keeps using the
         dedicated dummy KV slot.
+
+        Covers multiple sequence lengths to pre-compile Triton kernels across
+        the shape buckets that FLA/GDN autotune keys on, and also warms the
+        sampling path (softmax + top-k/top-p) so the first real request does
+        not pay JIT or autotune latency.
         """
         if self.max_seq_len < 2:
             return
 
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
+        # Cover the shape buckets that Triton FLA kernels specialize on.
+        # 64 tokens matches typical chat-template prompts; 256 covers longer
+        # system-prompt conversations; 512 exercises larger chunk boundaries.
+        candidates = [64, 128, 256, 512]
+        warmup_lens = sorted({min(l, self.max_seq_len) for l in candidates if l <= self.max_seq_len and l >= 2})
         if not warmup_lens:
+            warmup_lens = [min(64, self.max_seq_len)]
+        if not warmup_lens or warmup_lens[0] < 2:
             return
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
@@ -1700,7 +1711,24 @@ class Engine:
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
-                    self.model.forward()
+                    logits = self.model.forward()
+                # Warm the sampling path (softmax + top-k/top-p Triton/flashinfer
+                # kernels) so the first real request skips JIT compilation.
+                if logits is not None and logits.numel() > 0:
+                    sample_logits = logits[:1].float()
+                    temps = torch.tensor([0.7], dtype=torch.float32, device=self.device)
+                    from freetoken.kernel.backend import is_flashinfer_installed
+                    if is_flashinfer_installed():
+                        import flashinfer.sampling as _samp
+                    else:
+                        import freetoken.kernel.triton.sampling as _samp
+                    from freetoken.utils import is_sm90_supported as _sm90
+                    probs = _samp.softmax(sample_logits, temps, enable_pdl=_sm90())
+                    _samp.top_k_top_p_sampling_from_probs(
+                        probs,
+                        torch.tensor([64], dtype=torch.int32, device=self.device),
+                        torch.tensor([0.95], dtype=torch.float32, device=self.device),
+                    )
         finally:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
