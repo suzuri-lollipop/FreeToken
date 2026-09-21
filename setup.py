@@ -74,6 +74,16 @@ setup(
                 extra_compile_args=["-O3", "-std=c++17"],
             )
         ] if sys.platform == "linux" else []),
+        # C++ radix prefix-tree core for the three prefix caches (plain/swa/hybrid);
+        # pure host code (values stay caller-owned torch tensors), so no cudart link.
+        # Missing build falls back to the Python trees (FREETOKEN_RADIX_BACKEND).
+        CppExtension(
+            name="freetoken.kernel._radix_tree",
+            sources=[
+                "python/freetoken/kernel/csrc/radix_tree/radix_tree_ext.cpp",
+            ],
+            extra_compile_args=["-O3", "-std=c++17"],
+        ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

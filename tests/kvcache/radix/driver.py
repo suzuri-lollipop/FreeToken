@@ -42,10 +42,12 @@ class CacheSpec:
     kind: str                     # "plain" | "swa" | "hybrid"
     page_size: int
     window: int = 0               # swa only
+    backend: str = "py"           # "py" (Python tree) | "cpp" (_radix_tree extension)
 
     @property
     def id(self) -> str:
-        return f"{self.kind}-p{self.page_size}" + (f"-w{self.window}" if self.kind == "swa" else "")
+        base = f"{self.kind}-p{self.page_size}" + (f"-w{self.window}" if self.kind == "swa" else "")
+        return base if self.backend == "py" else f"{base}-{self.backend}"
 
     @property
     def unsupported(self) -> Optional[str]:
@@ -54,31 +56,57 @@ class CacheSpec:
         if self.kind == "hybrid" and CHUNK_SIZE % self.page_size:
             return (f"HybridRadixCache requires CHUNK_SIZE({CHUNK_SIZE}) % "
                     f"page_size({self.page_size}) == 0")
+        if self.backend == "cpp":
+            from freetoken.kvcache.cpp_radix_tree import cpp_radix_available
+            if not cpp_radix_available():
+                return "the _radix_tree extension is not built"
         return None
 
     def build(self) -> Tuple[Adapter, RefModel]:
         dev, P = torch.device("cpu"), self.page_size
+        cpp = self.backend == "cpp"
         if self.kind == "plain":
+            if cpp:
+                from freetoken.kvcache.cpp_radix_tree import CppRadixPrefixCache
+                return PlainAdapter(CppRadixPrefixCache(dev, page_size=P), P), RefModel(P)
             from freetoken.kvcache.radix_cache import RadixPrefixCache
             return PlainAdapter(RadixPrefixCache(dev, page_size=P), P), RefModel(P)
         if self.kind == "swa":
-            from freetoken.kvcache.swa_radix_cache import SWARadixCache
             w = self.window or P
+            if cpp:
+                from freetoken.kvcache.cpp_radix_tree import CppSWARadixCache
+                return (SWAAdapter(CppSWARadixCache(dev, P, w), P), SWAModel(P, w))
+            from freetoken.kvcache.swa_radix_cache import SWARadixCache
             return (SWAAdapter(SWARadixCache(dev, page_size=P, sliding_window_size=w), P),
                     SWAModel(P, w))
         if self.kind == "hybrid":
+            if cpp:
+                from freetoken.kvcache.cpp_radix_tree import CppHybridRadixCache
+                return HybridAdapter(CppHybridRadixCache(dev, P), P), HybridModel(P)
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
             return HybridAdapter(HybridRadixCache(dev, page_size=P), P), HybridModel(P)
         raise ValueError(f"unknown cache kind {self.kind!r}")
 
 
-#: The (class x page_size) matrix.  ``hybrid`` at page_size 128 is rejected by the class itself
-#: (snapshots land on CHUNK_SIZE=64 boundaries) and is skipped by the fixtures.
-ALL_SPECS: Tuple[CacheSpec, ...] = (
+#: The (class x page_size x backend) matrix.  ``hybrid`` at page_size 128 is
+#: rejected by the class itself (snapshots land on CHUNK_SIZE=64 boundaries) and
+#: is skipped by the fixtures; ``cpp`` specs are skipped when the extension is
+#: not built.  The python backend stays in the matrix: it is the reference the
+#: C++ tree is ported from, and the harness self-test corrupts through its
+#: object graph.
+def _both_backends(specs):
+    out = []
+    for s in specs:
+        out.append(s)
+        out.append(CacheSpec(s.kind, s.page_size, s.window, backend="cpp"))
+    return tuple(out)
+
+
+ALL_SPECS: Tuple[CacheSpec, ...] = _both_backends((
     CacheSpec("plain", 1), CacheSpec("plain", 4), CacheSpec("plain", 128),
     CacheSpec("swa", 1, window=4), CacheSpec("swa", 4, window=8), CacheSpec("swa", 128, window=128),
     CacheSpec("hybrid", 1), CacheSpec("hybrid", 4), CacheSpec("hybrid", 128),
-)
+))
 
 
 def page_blocks(page_size: int, n_pages: int = 6) -> List[Tuple[int, ...]]:

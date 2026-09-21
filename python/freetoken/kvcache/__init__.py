@@ -298,9 +298,11 @@ def create_naive_cache(device: torch.device, page_size: int | None = None):
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
 def create_radix_cache(device: torch.device, page_size: int | None = None):
-    from .radix_cache import RadixPrefixCache
+    # C++-backed tree when _radix_tree is built; the Python RadixPrefixCache is
+    # the fallback (FREETOKEN_RADIX_BACKEND=auto|cpp|py selects).
+    from .cpp_radix_tree import make_prefix_cache
 
-    return RadixPrefixCache(device=device, page_size=page_size)
+    return make_prefix_cache("radix", device, page_size)
 
 
 # NOTE: "hybrid_radix" is NOT registered as a user-facing --cache-type. It is the internal

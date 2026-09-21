@@ -82,12 +82,11 @@ class CacheManager:
         return total - len(self.free_slots) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
-        if type == "hybrid_radix":
-            from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
-            return HybridRadixCache(device, page_size)
-        if type == "swa_radix":
-            from freetoken.kvcache.swa_radix_cache import SWARadixCache
-            return SWARadixCache(device, page_size, self.sliding_window_size)
+        if type in ("hybrid_radix", "swa_radix"):
+            # C++-backed tree when _radix_tree is built; Python classes are the
+            # fallback (FREETOKEN_RADIX_BACKEND=auto|cpp|py selects).
+            from freetoken.kvcache.cpp_radix_tree import make_prefix_cache
+            return make_prefix_cache(type, device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq) -> MatchResult:

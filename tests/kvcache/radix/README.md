@@ -8,6 +8,18 @@ Three sibling classes — they share `RadixTreeNode` and `split_at`, and nothing
 | `SWARadixCache` | sliding window | `test_swa_radix.py` |
 | `HybridRadixCache` | GDN state snapshot | `test_hybrid_radix.py` |
 
+Every spec runs on BOTH tree backends: the Python classes above and their C++
+twins (`CppRadixPrefixCache` / `CppSWARadixCache` / `CppHybridRadixCache` over
+the `_radix_tree` extension, selected by `CacheSpec.backend`; cpp specs skip
+when the extension is not built). The C++ tree is a statement-level port, so
+the same model, the same battery and the same scenarios arbitrate both — the
+`-cpp` spec ids are the only visible difference. `test_cpp_radix.py` adds what
+belongs to the C++ side alone: node-identity lifecycle (generation-tagged ids,
+stale-id loudness, split identity, registry `is`-stability), production-shape
+inputs (int32 ids, GPU value tensors), a py↔cpp differential fuzz, and the
+counter-mirror tamper tripwire. The harness self-test below corrupts through
+the Python object graph and therefore stays on the python backend.
+
 `test_tree_and_harness.py` holds what belongs to no single class: the shared tree machinery
 (`split_at` identity semantics, `key_fn`, `get_match_len`, `align_down`) covered once, and a
 self-test that wraps a cache in a deliberately broken proxy and requires the battery to fire.
