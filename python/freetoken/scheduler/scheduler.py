@@ -957,6 +957,8 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        # Real work is running: suppress the idle clock-keeper pulse.
+        self.engine.clock_keeper.notify()
         from freetoken.moe import _debug_stats
 
         _dbg = _debug_stats.probe()

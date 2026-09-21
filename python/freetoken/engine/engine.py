@@ -723,6 +723,14 @@ class Engine:
         # latency on their first real request.
         self._warmup_prefill()
 
+        # Optional idle clock keeper (FREETOKEN_IDLE_KEEPALIVE_MS): pulses tiny
+        # matmuls on a side stream so a request after a long idle does not pay
+        # the GPU clock ramp inside its prefill. Per-rank, no collectives.
+        from .clock_keeper import ClockKeeper, keepalive_interval_ms
+
+        self.clock_keeper = ClockKeeper(self.device, keepalive_interval_ms())
+        self.clock_keeper.start()
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
@@ -1667,6 +1675,14 @@ class Engine:
         the shape buckets that FLA/GDN autotune keys on, and also warms the
         sampling path (softmax + top-k/top-p) so the first real request does
         not pay JIT or autotune latency.
+
+        Tokens are seeded-random, NOT zeros: all-zero ids collapse MoE routing
+        onto a degenerate expert set (~66/layer vs ~165 for real text), so the
+        small-per-expert token-count kernel buckets, the CPU-executor dispatch
+        for a realistic miss spread and the PLE n-gram row paths all stayed
+        cold until the first real request. A fixed CPU-seeded generator keeps
+        every TP rank on the identical sequence (routing and collectives must
+        agree) and the run reproducible.
         """
         if self.max_seq_len < 2:
             return
@@ -1682,6 +1698,13 @@ class Engine:
         if not warmup_lens or warmup_lens[0] < 2:
             return
 
+        # One deterministic draw, sliced per length: identical on every rank.
+        vocab_size = self.config.model_config.vocab_size
+        gen = torch.Generator().manual_seed(0x5EED)  # fixed: rank/device independent
+        warm_tokens = torch.randint(
+            0, max(2, vocab_size), (max(warmup_lens),), generator=gen, dtype=torch.int32
+        )
+
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
         started = torch.cuda.Event(enable_timing=True)
@@ -1693,8 +1716,9 @@ class Engine:
                 dummy_row[:length] = torch.arange(
                     length, dtype=torch.int32, device=self.device
                 )
+                req_ids = warm_tokens[:length]
                 warm_req = Req(
-                    input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
+                    input_ids=req_ids,
                     table_idx=self.dummy_req.table_idx,
                     cached_len=0,
                     output_len=1,
@@ -1704,7 +1728,7 @@ class Engine:
                 )
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
+                batch.input_ids = req_ids.to(self.device, non_blocking=True)
                 batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
                 if self.config.model_config.model_is_mrope:
                     batch.mrope_positions = (
@@ -1743,6 +1767,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        keeper = getattr(self, "clock_keeper", None)
+        if keeper is not None:
+            keeper.stop()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
