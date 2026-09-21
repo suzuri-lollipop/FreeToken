@@ -221,3 +221,106 @@ def test_prefill_ondemand_hits_gather_from_cache():
         for e in (2, 4):
             assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)
     assert int(cache.slot_for_id[2, 1].item()) == 19
+
+
+# ---------------------------------------------------------------- promotion
+
+
+def _make_big_cache(promote: float) -> tuple[OffloadMoeCache, dict[str, list[torch.Tensor]]]:
+    """D2D-eligible banks (rows >= 256 KiB) so promoted slots serve as plan hits."""
+    dev = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.randn(E, 128, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+        "down": [torch.randn(E, 64, 128, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=CACHE_SIZE,
+        device=dev, prefill_overlap=True, prefill_hit_d2d=True,
+    )
+    cache.set_bank_sources(sources)
+    cache.prefill_promote_fraction = promote
+    return cache, sources
+
+
+@CUDA
+@JIT
+def test_promote_slots_survive_and_later_staging_hits():
+    """Full promotion: every touched miss gets a cache-region slot and its host
+    bytes; the following on-demand plan finds NO misses (all D2D hits) and the
+    buffer still ends up byte-identical to the host banks."""
+    cache, sources = _make_big_cache(promote=1.0)
+    topk = torch.tensor([[1, 3], [3, 5]], dtype=torch.int32, device="cuda")
+    raw_before = topk.clone()
+
+    cache.promote_prefill_misses(2, topk)
+    torch.cuda.synchronize()
+    # raw ids untouched (promote clones before the in-place slot rewrite)
+    assert torch.equal(topk, raw_before)
+    # every touched expert now sits in the CACHE region (>= 2E), never a buffer slot
+    for e in (1, 3, 5):
+        slot = int(cache.slot_for_id[2, e].item())
+        assert slot >= 2 * E, f"expert {e} promoted into the buffer region ({slot})"
+        assert int(cache.id_of_slot[slot].item()) == 2 * E + e
+
+    views = cache.prefetch_prefill_layer_ondemand(2, topk)
+    torch.cuda.synchronize()
+    assert int(cache._prefill_miss_num.item()) == 0     # nothing streamed from host
+    assert int(cache._prefill_hit_num.item()) == 3      # all touched gathered D2D
+    for view, (name, per_layer) in zip(views, sources.items()):
+        for e in (1, 3, 5):
+            assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)
+
+    # a second staging of the same routing is still all-hits (rows survived)
+    cache.prefetch_prefill_layer_ondemand(2, topk)
+    torch.cuda.synchronize()
+    assert int(cache._prefill_hit_num.item()) == 3
+    assert int(cache._prefill_miss_num.item()) == 0
+
+
+@CUDA
+@JIT
+def test_promote_fraction_caps_the_promoted_set():
+    """fraction 0.5 promotes the bandwidth-balanced half of the miss set; the rest
+    stays missing and streams through the plan as before."""
+    cache, sources = _make_big_cache(promote=0.5)
+    topk = torch.tensor([[1, 3], [5, 7]], dtype=torch.int32, device="cuda")
+    cache.promote_prefill_misses(2, topk)
+    torch.cuda.synchronize()
+    promoted = [e for e in (1, 3, 5, 7) if int(cache.slot_for_id[2, e].item()) >= 2 * E]
+    assert len(promoted) == 2
+    views = cache.prefetch_prefill_layer_ondemand(2, topk)
+    torch.cuda.synchronize()
+    assert int(cache._prefill_hit_num.item()) == 2
+    assert int(cache._prefill_miss_num.item()) == 2
+    for view, (name, per_layer) in zip(views, sources.items()):
+        for e in (1, 3, 5, 7):
+            assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)
+
+
+@CUDA
+@JIT
+def test_promote_zero_fraction_is_a_noop():
+    cache, _ = _make_big_cache(promote=0.0)
+    topk = torch.tensor([[1, 3], [3, 5]], dtype=torch.int32, device="cuda")
+    cache.promote_prefill_misses(2, topk)
+    torch.cuda.synchronize()
+    for e in (1, 3, 5):
+        assert int(cache.slot_for_id[2, e].item()) == -1
+    cache.prefetch_prefill_layer_ondemand(2, topk)
+    torch.cuda.synchronize()
+    assert int(cache._prefill_hit_num.item()) == 0
+    assert int(cache._prefill_miss_num.item()) == 3
+
+
+@CUDA
+@JIT
+def test_promote_guard_keeps_fresh_cache_out_of_buffer_slots():
+    """On a FRESH cache every usage is 0 and the LRU tie-break is the lowest slot
+    index -- without the step+1 guard, promotion would assign exactly the buffer
+    slots [0, 2E) that this chunk is about to trample."""
+    cache, _ = _make_big_cache(promote=1.0)
+    topk = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
+    cache.promote_prefill_misses(0, topk)
+    torch.cuda.synchronize()
+    for e in (0, 1, 2, 3):
+        assert int(cache.slot_for_id[0, e].item()) >= 2 * E

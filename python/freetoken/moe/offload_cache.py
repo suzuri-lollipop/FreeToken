@@ -139,6 +139,18 @@ class OffloadMoeCache:
     # x4 rank (7.1 GB/s) at T=150, 82 missing experts cost 16.0 ms over PCIe and the
     # balanced split 10.1 ms.
     prefill_fetch_fraction: float = 1.0
+    # Hybrid prefill promotion: share of each layer's touched-and-missing experts to
+    # LRU-assign a SLOT to and H2D once (copy_missing) BEFORE the on-demand plan runs,
+    # so the plan classifies them as hits and gathers them D2D into the double buffer.
+    # The promoted rows SURVIVE the chunk: a later prefill/decode routing the same
+    # experts reads them at HBM rate instead of re-streaming from host. Note the
+    # promoted share rides PCIe IN ADDITION to the plan's own fetch share (plan's
+    # pcie_frac then applies to the remaining misses); lower prefill_fetch_fraction
+    # to hold total bytes flat. Only pays off while the routing working set fits the
+    # slot cache -- measured on a 2x24GB rig (8969 slots), a 600-token prompt touches
+    # ~15k experts and thrashes the LRU (no accumulation), and promoting everything
+    # binds to the slower rank's link. Default 0.0 = historical stream-and-discard.
+    prefill_promote_fraction: float = 0.0
     # Flat residency: every expert of every layer owns a permanent slot
     # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
     # expert and GPU decode; drops the prefill double buffers, so after the single load in
@@ -954,6 +966,42 @@ class OffloadMoeCache:
         views = self.plan_prefill_layer_ondemand(layer_id, topk_ids, pcie_frac_q16)
         self.move_prefill_layer_ondemand(layer_id)
         return views
+
+    def promote_prefill_misses(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """LRU-assign slots to ~``prefill_promote_fraction`` of this layer's misses and
+        H2D them ONCE into the slot cache, before ``plan_prefill_layer_ondemand`` runs.
+
+        The plan then classifies the promoted experts as hits (slot >= 2E) and gathers
+        them D2D into the double buffer: same PCIe bytes as streaming into the buffer,
+        but the rows survive the chunk and a later prefill/decode that routes the same
+        experts reads them at HBM rate. Recency-ordered like the decode fetch (recurring
+        misses promote first).
+
+        The double buffer ALIASES slots [0, 2E): a promotion landing there would be
+        trampled by this very chunk's staging and then invalidated, wasting its H2D.
+        Guard the round's victim set by freshening those slots' usage to step+1 (the
+        stamp this round's own assigns will get, device-side max, no sync): the LRU
+        min-(usage, index) pick then prefers every older slot, while later decode steps
+        age the buffer slots back into candidacy as usual.
+        """
+        if self.prefill_promote_fraction <= 0:
+            return
+        if layer_id in self._unpinned_layers:
+            return  # no device alias to slot-map against (see copy_missing's guard)
+        from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+        buffer_slots = 2 * self.num_experts
+        torch.maximum(
+            self.usage[:buffer_slots], self.step + 1, out=self.usage[:buffer_slots]
+        )
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        # clone: ensure rewrites ids to slot ids in place; the caller's plan and the
+        # CPU-executor mask still need the raw expert ids.
+        ensure_experts_hybrid(
+            self, layer_id, topk_ids.clone(), self.num_experts, self.prefill_promote_fraction
+        )
+        self.copy_missing()
 
     def plan_prefill_layer_ondemand(
         self, layer_id: int, topk_ids: torch.Tensor, pcie_frac_q16: int = 1 << 16

@@ -461,6 +461,11 @@ class OffloadMoELayer(MoELayer):
             # slice (a gen4 x4 rank measured 16.0 ms of PCIe against a 10.1 ms balanced
             # split for 82 missing experts at T=150).
             executor, frac_q16 = _prefill_cpu_split(cache, hidden_states.shape[0])
+            if cache.prefill_promote_fraction > 0:
+                # Slot-assign + H2D the recency-top share of this layer's misses BEFORE
+                # the plan, so the plan gathers them D2D as hits and the rows survive
+                # the chunk (repeated content stops re-streaming). See promote_prefill_misses.
+                cache.promote_prefill_misses(self.layer_id, topk_ids)
             views = cache.plan_prefill_layer_ondemand(
                 self.layer_id, topk_ids, pcie_frac_q16=frac_q16
             )

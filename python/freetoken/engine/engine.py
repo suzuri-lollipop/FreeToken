@@ -1177,6 +1177,21 @@ class Engine:
                         f"MoE hybrid prefill: staging {cache.prefill_fetch_fraction:.1%} of "
                         "each layer's missing experts over PCIe, the rest on the CPU"
                     )
+                # Promotion: LRU-assign slots to a share of each layer's misses and H2D
+                # them once BEFORE the on-demand plan, so repeated content stops
+                # re-streaming (the plan gathers promoted rows D2D as hits). Per-rank
+                # like the fetch fraction; 0 (default) keeps stream-and-discard.
+                promote = os.getenv("FREETOKEN_PREFILL_PROMOTE_FRAC", "").strip()
+                if promote:
+                    parts = [float(x) for x in promote.split(",")]
+                    picked = parts[min(config.tp_info.rank, len(parts) - 1)]
+                    cache.prefill_promote_fraction = min(1.0, max(0.0, picked))
+                    if cache.prefill_promote_fraction > 0:
+                        logger.info(
+                            "MoE prefill promotion: slot-caching "
+                            f"{cache.prefill_promote_fraction:.1%} of each layer's missing "
+                            "experts for cross-request reuse"
+                        )
         if cache.flat_residency:
             # One pass over PCIe for the whole model, replacing the per-chunk full-layer
             # copies of the LRU path. Must complete before CUDA graph capture replays a
