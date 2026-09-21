@@ -45,6 +45,48 @@ def test_balanced_fetch_tracks_fraction():
     assert _balanced_fetch(4, round(0.415 * Q)) == 2
 
 
+def test_prefill_cpu_split_off_unless_a_cpu_executor_and_fraction_are_in_play():
+    """The prefill CPU split is the decode executor, so it must stay off when any one
+    ingredient is missing: no executor, a fetch fraction of 1 (pure-PCIe plan), no CPU
+    mask, or a chunk longer than the executor's pinned-buffer ``max_tokens``. A slip that
+    routed such a chunk to the CPU side would silently drop the H2D staging and corrupt
+    the prefill."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.moe import _prefill_cpu_split
+
+    off = SimpleNamespace(
+        cpu_executor=None, prefill_fetch_fraction=0.5, prefill_cpu_mask=object(),
+        prefill_pcie_frac_q16=lambda: 999,  # must never be read when off
+    )
+    assert _prefill_cpu_split(off, 10) == (None, Q)
+    # fraction 1.0 -> the whole prefill stays on the PCIe plan
+    staged = SimpleNamespace(
+        cpu_executor=SimpleNamespace(max_tokens=64), prefill_fetch_fraction=1.0,
+        prefill_cpu_mask=object(), prefill_pcie_frac_q16=lambda: Q,
+    )
+    assert _prefill_cpu_split(staged, 10) == (None, Q)
+    # the CPU mask is only built when the on-demand buffers exist
+    no_mask = SimpleNamespace(
+        cpu_executor=SimpleNamespace(max_tokens=64), prefill_fetch_fraction=0.5,
+        prefill_cpu_mask=None, prefill_pcie_frac_q16=lambda: 999,
+    )
+    assert _prefill_cpu_split(no_mask, 10) == (None, Q)
+    # a chunk longer than the executor buffers keeps the old behaviour, not a resize
+    too_long = SimpleNamespace(
+        cpu_executor=SimpleNamespace(max_tokens=4), prefill_fetch_fraction=0.5,
+        prefill_cpu_mask=object(), prefill_pcie_frac_q16=lambda: 999,
+    )
+    assert _prefill_cpu_split(too_long, 10) == (None, Q)
+    # all present: the chunk rides the CPU executor at the fraction's Q16 share
+    executor = SimpleNamespace(max_tokens=64)
+    on = SimpleNamespace(
+        cpu_executor=executor, prefill_fetch_fraction=0.4, prefill_cpu_mask=object(),
+        prefill_pcie_frac_q16=lambda: round(0.4 * Q),
+    )
+    assert _prefill_cpu_split(on, 10) == (executor, round(0.4 * Q))
+
+
 def test_load_hybrid_fetch_fraction(tmp_path):
     prof = {
         "gpu": {"name": "FAKE GPU"},

@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
-from freetoken.models.qwen4_exp.hc import GatedResidual
+from freetoken.models.qwen4_exp.hc import GatedResidual, grouped_plus_one_rms_norm
 from freetoken.models.qwen4_exp.ple import GpuResidentTable, PLELayer, PLEMetadata
 
 from .common import EOS, hash_constants, requires_cuda, toy_hf_config
@@ -129,6 +129,88 @@ def test_hc_merged_gemm_layout_and_top_level_mixer():
     )
     assert ref_inject is None
     assert torch.allclose(x, ref_x, rtol=1e-5, atol=1e-6)
+
+
+def test_hc_combine_norm_fused_path_matches_combine_then_norm():
+    """The fused combine + next-block norm must return exactly what the sequential chain does:
+    the updated residual ``R'`` and its grouped RMSNorm ``rn`` are the two values production
+    feeds the next block's ``mix_from_normed``, so a drift in either silently rewrites the
+    residual streams against the checkpoint's intent."""
+    torch.manual_seed(0)
+    config = _config()
+    args = config.qwen4_args
+    hc = GatedResidual(config)
+    _fill(hc, torch.Generator().manual_seed(5))
+
+    R = torch.randn(7, args.ple_state_width)
+    y = torch.randn(7, args.hidden_size)
+    # raw inject logits, the post-`2*sigmoid(/hc)` input (any values exercise the chain)
+    s = torch.randn(7, args.hc_count)
+
+    Rc = hc.combine(R, y, s)
+    Rc2, rn = hc.combine_norm(R, y, s, hc.hc_norm.weight, config.rms_norm_eps)
+    ref_rn = grouped_plus_one_rms_norm(
+        Rc2, hc.hc_norm.weight, config.rms_norm_eps, args.hc_count
+    )
+    assert torch.allclose(Rc, Rc2, rtol=1e-5, atol=1e-6)  # fuse did not change the residual
+    assert torch.allclose(rn, ref_rn, rtol=1e-5, atol=1e-6)  # rn really is norm(R')
+    assert rn.shape == Rc2.shape and rn.dtype == Rc2.dtype
+
+
+@requires_cuda
+def test_hc_mix_from_normed_matches_full_mix_on_gpu():
+    """The fused 'skip the norm' mix must equal mixing the raw residual: the previous block's
+    fused combine returns the normed tensor as a side output and production feeds it straight
+    to ``mix_from_normed``, so a drift between the norm-laden and norm-skipping kernels
+    silently rewrites every block's stream mixing against the checkpoint."""
+    from freetoken.utils.torch_utils import torch_dtype
+
+    torch.manual_seed(0)
+    config = _config()
+    args = config.qwen4_args
+    dev = torch.device("cuda")
+    with torch.device(dev), torch_dtype(torch.bfloat16):
+        hc = GatedResidual(config)
+    _fill(hc, torch.Generator(device=dev).manual_seed(11))
+
+    R = torch.randn(7, args.ple_state_width, device=dev, dtype=torch.bfloat16)
+    x_full, s_full = hc.mix(R)  # norms R, then gates the streams
+    rn = grouped_plus_one_rms_norm(
+        R, hc.hc_norm.weight, hc.hc_norm.eps, args.hc_count
+    )
+    x_skip, s_skip = hc.mix_from_normed(rn)
+    assert torch.allclose(x_skip, x_full, rtol=2e-2, atol=2e-2)
+    assert torch.allclose(s_skip, s_full, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda
+def test_hc_combine_norm_gpu_kernel_matches_the_sequential_reference():
+    """The fused Triton ``hc_combine_norm`` kernel against the sequential torch chain (combine
+    then grouped RMSNorm). The CPU fallback is already pinned above on its own; this is the
+    kernel the GPU path actually runs, compared against an independent fp32 reference."""
+    from freetoken.utils.torch_utils import torch_dtype
+
+    torch.manual_seed(0)
+    config = _config()
+    args = config.qwen4_args
+    dev = torch.device("cuda")
+    with torch.device(dev), torch_dtype(torch.bfloat16):
+        hc = GatedResidual(config)
+    _fill(hc, torch.Generator(device=dev).manual_seed(12))
+
+    R = torch.randn(7, args.ple_state_width, device=dev, dtype=torch.bfloat16)
+    y = torch.randn(7, args.hidden_size, device=dev, dtype=torch.bfloat16)
+    s = torch.randn(7, args.hc_count, device=dev, dtype=torch.float32)
+    w = hc.hc_norm.weight
+
+    Rc, rn = hc.combine_norm(R, y, s, w, config.rms_norm_eps)  # triton kernel
+    # independent reference on fp32 CPU: combine then grouped RMSNorm
+    Rc_ref = hc.combine(R.cpu(), y.cpu(), s.cpu())
+    rn_ref = grouped_plus_one_rms_norm(
+        Rc_ref, w.cpu(), config.rms_norm_eps, args.hc_count
+    )
+    assert torch.allclose(Rc.cpu().float(), Rc_ref.float(), rtol=2e-2, atol=2e-2)
+    assert torch.allclose(rn.cpu().float(), rn_ref.float(), rtol=2e-2, atol=2e-2)
 
 
 # --------------------------------------------------------------------------------------

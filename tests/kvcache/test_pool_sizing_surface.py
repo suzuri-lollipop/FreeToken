@@ -121,6 +121,37 @@ def test_startup_kv_budget_composition():
     assert _startup_kv_budget(1.0, 1000, 1000) == 1000
 
 
+def test_startup_kv_budget_footprint_cap_binds_and_charges_resident_bytes():
+    # With a device total, --memory-ratio caps the whole footprint instead: the capped figure
+    # is ratio x device minus the resident weights and the measured non-pool CUDA overhead,
+    # and it wins whenever it is the smaller reading.
+    from freetoken.engine.engine import _startup_kv_budget
+
+    legacy = _startup_kv_budget(0.9, 1000, 995)  # ratio*1000 - (1000 - 995) = 895
+    # int(0.9 * 1000) = 900 - 850 (weights) - 30 (overhead) = 20, far under the legacy 895.
+    assert (
+        _startup_kv_budget(
+            0.9, 1000, 995,
+            device_total=1000, weights_bytes=850, nonpool_overhead_bytes=30,
+        )
+        == 20
+    )
+
+
+def test_startup_kv_budget_cap_never_enlarges_the_plan():
+    # A co-tenant can push the capped figure below the legacy one, but the cap must not
+    # silently spend VRAM the legacy reading did not promise: it only shrinks the plan.
+    from freetoken.engine.engine import _startup_kv_budget
+
+    legacy = _startup_kv_budget(0.9, 1000, 995)  # 895
+    # device_total huge -> capped is enormous -> the legacy figure is returned unchanged.
+    assert (
+        _startup_kv_budget(0.9, 1000, 995, device_total=100_000,
+                           weights_bytes=0, nonpool_overhead_bytes=0)
+        == legacy
+    )
+
+
 def test_generic_validate_rebuild_budget_check():
     from freetoken.kvcache.base import CacheRebuildRejected
     from freetoken.kvcache.mha_pool import MHAKVCache
