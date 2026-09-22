@@ -79,3 +79,25 @@ def test_a_single_rank_row_parallel_layer_is_untouched():
     torch.manual_seed(0)
     layer = _rank_layer(0, 1)
     assert torch.allclose(layer.forward(X), F.linear(X, WHOLE, BIAS), atol=1e-5, rtol=1e-5)
+
+
+def test_fp8_decode_candidate_selects_only_tall_merged_columns():
+    """fp8 decode GEMM opt-in: the measured wins (docs/qwen38_flash_next_optimizations.md)
+    are exactly the tall merged column projections; row/o_proj/replicated shapes lose more to
+    the per-step activation quantization than the GEMM saves, so they must stay bf16 no matter
+    how large they are."""
+    from freetoken.layers import LinearColParallelMerged, LinearOProj, LinearReplicated
+    from freetoken.layers.quantization.linear.unquantized import fp8_decode_candidate
+
+    with _rank(0, 1):
+        col = LinearColParallelMerged(IN, [OUT, OUT], has_bias=False)
+        row = LinearRowParallel(IN, OUT, has_bias=False)
+        oproj = LinearOProj(IN, OUT, has_bias=False)
+        rep = LinearReplicated(IN, OUT, has_bias=False)
+
+    # tiny weights sit under the default size floor for every class
+    assert not fp8_decode_candidate(col)
+    # with the floor lifted, only the opted-in class is a candidate
+    assert fp8_decode_candidate(col, min_elements=1)
+    for layer in (row, oproj, rep):
+        assert not fp8_decode_candidate(layer, min_elements=1)

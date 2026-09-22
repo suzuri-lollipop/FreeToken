@@ -161,8 +161,20 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        # Batched C++ deferred fill (event wait + row build + stage + disk round + flag
+        # signal in one call). Needs the wait-sync protocol and a new-enough extension;
+        # an older prebuilt wheel keeps the Python row builder, which serves the same
+        # protocol at a per-request cost while the replay parks at its WAIT.
+        self._cpp_fill = (
+            self._wait_sync
+            and hasattr(_ple_store.PleStore, "fill_decode_graph")
+            and _ple_store.event_sync_available()
+        )
         sync = "wait-sync" if self._wait_sync else "launch-gating"
-        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
+        logger.info_rank0(
+            f"PLE disk backend: {self._store.io_backend()}, {sync}"
+            + (", cpp fill" if self._cpp_fill else "")
+        )
 
     def _probe_wait_sync(self, mode: str) -> bool:
         from freetoken.kernel import _ple_store
@@ -223,6 +235,40 @@ class DiskRowTable:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
+                if self._cpp_fill and all(r.input_ids.dtype == torch.int32 for r in reqs):
+                    # Same ENTER-time snapshot rule as the Python builder below, but the
+                    # rows are rebuilt in C++ at fill time from these pointers: no
+                    # per-request int()/torch.tensor churn between the drain and the
+                    # replay's memop WAIT (that window is pure GPU idle).
+                    ids_addrs = [r.input_ids.data_ptr() for r in reqs]
+                    positions = [r.device_len - 1 for r in reqs]
+                    # The fill dereferences ids_addrs AFTER the drain; holding the
+                    # buffers in the closure keeps them alive even if every other
+                    # reference to the batch drops before the deferred call runs.
+                    buffers = [r.input_ids for r in reqs]
+                    self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                    self._readback_event.record(torch.cuda.current_stream(self._device))
+                    store = self._store
+                    event = self._readback_event
+                    readback = self._token_readback.data_ptr()
+                    pinned = self._graph_pinned.data_ptr()
+                    flag = self._flag.data_ptr()
+                    image_id = self.image_token_id if self.image_token_id is not None else -1
+
+                    def _complete_cpp(_keepalive=buffers) -> None:
+                        try:
+                            store.fill_decode_graph(
+                                event.cuda_event, ids_addrs, positions, readback, pinned,
+                                image_id, MM_PAD_SHIFT_VALUE, flag,
+                            )
+                        except BaseException:
+                            from freetoken.kernel import _ple_store
+
+                            # unblock the stream before surfacing; the step's output is discarded
+                            _ple_store.signal_flag(flag)
+                            raise
+
+                    return _complete_cpp
                 # Snapshot the ngram contexts NOW: the engine runs complete_one() on
                 # these reqs later in the same step (and the scheduler appends the
                 # sampled token during the drain), while the deferred fill -- which

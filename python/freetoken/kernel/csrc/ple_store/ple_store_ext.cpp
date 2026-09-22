@@ -66,6 +66,21 @@ CuMemOp64Fn g_cu_wait64 = nullptr;
 constexpr unsigned kCuWaitValueGeq = 0x0;
 constexpr unsigned kCuWriteDefault = 0x0;
 
+// Host-side wait for the sampled-token readback (the deferred decode fill).
+using CuEventSyncFn = int (*)(void *event);
+CuEventSyncFn g_cu_event_sync = nullptr;
+
+bool event_sync_available() {
+  static bool ok = [] {
+    void *h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+    if (h != nullptr)
+      g_cu_event_sync = reinterpret_cast<CuEventSyncFn>(dlsym(h, "cuEventSynchronize"));
+    return g_cu_event_sync != nullptr;
+  }();
+  return ok;
+}
+
 bool cumemop_resolve() {
   static bool resolved = [] {
     void *h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
@@ -510,6 +525,50 @@ class PleStore {
     if (signal_addr) signal_flag(signal_addr);
   }
 
+  // Whole deferred decode fill in one call, for the captured-graph flag-sync path:
+  // wait for the sampled-token readback event, build each request's [ctx2, ctx1, token]
+  // run straight from its host int32 token buffer (positions snapshot at dispatch entry)
+  // and the pinned readback, then stage + one disk round + flag signal. This ran as a
+  // per-request Python loop before, between the drain and the replay's memop WAIT --
+  // every microsecond of it was GPU idle.
+  // image_token_id >= 0 remaps context ids >= pad_shift (multimodal placeholders).
+  void fill_decode_graph(uintptr_t event_handle, const std::vector<int64_t> &ids_addrs,
+                         const std::vector<int64_t> &positions, uintptr_t readback_addr,
+                         uintptr_t staging_addr, int64_t image_token_id, int64_t pad_shift,
+                         uintptr_t signal_addr) {
+    const size_t n = ids_addrs.size();
+    if (positions.size() != n)
+      throw std::runtime_error("fill_decode_graph: ids/position count mismatch");
+    if (event_handle != 0) {
+      if (g_cu_event_sync == nullptr && !event_sync_available())
+        throw std::runtime_error("fill_decode_graph: cuEventSynchronize unavailable");
+      if (g_cu_event_sync(reinterpret_cast<void *>(event_handle)) != 0)
+        throw std::runtime_error("fill_decode_graph: readback event synchronize failed");
+    }
+    const int32_t *readback = reinterpret_cast<const int32_t *>(readback_addr);
+    uint8_t *staging = reinterpret_cast<uint8_t *>(staging_addr);
+    const size_t heads = sizes_.size();
+    const int64_t token_bytes = (int64_t)heads * row_bytes_;
+    std::vector<int64_t> rows(heads);
+    for (size_t i = 0; i < n; i++) {
+      const int32_t *ids = reinterpret_cast<const int32_t *>(ids_addrs[i]);
+      const int64_t p = positions[i];
+      int64_t w[3];
+      // mirrors ple_disk._context: eos pads past the start of the sequence
+      w[0] = p >= 2 ? ids[p - 2] : eos_;
+      w[1] = p >= 1 ? ids[p - 1] : eos_;
+      if (image_token_id >= 0) {
+        if (w[0] >= pad_shift) w[0] = image_token_id;
+        if (w[1] >= pad_shift) w[1] = image_token_id;
+      }
+      w[2] = readback[i];
+      hash_rows(w, rows.data());
+      for (size_t h = 0; h < heads; h++)
+        request_row(rows[h], staging + (int64_t)i * token_bytes + (int64_t)h * row_bytes_);
+    }
+    flush(signal_addr);
+  }
+
   std::string io_backend() const {
     size_t direct = 0;
     for (const auto &f : files_) direct += f->direct_io() ? 1 : 0;
@@ -613,7 +672,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
            py::call_guard<py::gil_scoped_release>())
+      .def("fill_decode_graph", &PleStore::fill_decode_graph,
+           py::arg("event_handle"), py::arg("ids_addrs"), py::arg("positions"),
+           py::arg("readback_addr"), py::arg("staging_addr"),
+           py::arg("image_token_id") = -1, py::arg("pad_shift") = 1000000,
+           py::arg("signal_addr") = 0,
+           py::call_guard<py::gil_scoped_release>())
       .def("io_backend", &PleStore::io_backend);
+  m.def("event_sync_available", &event_sync_available);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_reset", &memop_wait_reset, py::arg("stream"), py::arg("flag_addr"));

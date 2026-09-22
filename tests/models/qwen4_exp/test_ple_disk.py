@@ -157,6 +157,42 @@ def test_store_stages_bitwise_rows(tmp_path):
     assert int(flag[0]) == 1, "empty flush must still signal"
 
 
+def test_fill_decode_graph_matches_python_row_build(tmp_path):
+    """The batched C++ deferred fill must stage byte-identical rows to the per-request
+    Python build: same eos padding at sequence start, same image-placeholder remap,
+    same flag signal -- it replaces the Python loop under the replay's memop WAIT."""
+    store, table, args = _make_store(tmp_path)
+    if not hasattr(store, "fill_decode_graph"):
+        pytest.skip("prebuilt _ple_store without fill_decode_graph")
+    from freetoken.models.qwen4_exp.ple_disk import MM_PAD_SHIFT_VALUE, _context
+
+    row = args.num_ngram_heads * args.ngram_head_dim
+    histories = [[3, 4, EOS, 5], [7], []]
+    tokens = [11, 12, EOS]
+    bufs = [torch.tensor(h, dtype=torch.int32) for h in histories]
+    positions = [len(h) for h in histories]  # the ENTER snapshot hands over device_len - 1
+    readback = torch.tensor(tokens, dtype=torch.int32)
+    flag = torch.zeros(1, dtype=torch.int64)
+    staging = torch.zeros(len(tokens) * row, dtype=torch.uint8)
+    store.fill_decode_graph(0, [b.data_ptr() for b in bufs], positions,
+                            readback.data_ptr(), staging.data_ptr(),
+                            -1, MM_PAD_SHIFT_VALUE, flag.data_ptr())
+    want = torch.cat([
+        _fill(store, args, tuple(_context(b, p, EOS)), [t])
+        for b, p, t in zip(bufs, positions, tokens)
+    ])
+    assert torch.equal(staging, want), "batched fill vs per-request python fill"
+    assert int(flag[0]) == 1, "batched fill must signal the flag"
+
+    # image-placeholder contexts remap like _ple_context (ids >= pad_shift -> image id)
+    img_buf = torch.tensor([MM_PAD_SHIFT_VALUE + 123, 5], dtype=torch.int32)
+    rb2 = torch.tensor([9], dtype=torch.int32)
+    st2 = torch.zeros(row, dtype=torch.uint8)
+    store.fill_decode_graph(0, [img_buf.data_ptr()], [2], rb2.data_ptr(), st2.data_ptr(),
+                            77, MM_PAD_SHIFT_VALUE, 0)
+    assert torch.equal(st2, _fill(store, args, (77, 5), [9])), "image context remap"
+
+
 def test_layouts_readers_and_errors(tmp_path):
     # 4 extents in 2 files, out of order, unaligned junk between; the last extent ends at EOF
     sizes, offsets = [500, 400, 300, 800], [0, 500, 900, 1200]
@@ -330,6 +366,16 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
         torch.cuda.synchronize()
         ids = emb.row_ids(_meta([[7]], [[3, 4]], decode=True)).cuda()
         assert _bitwise_equal(out, oracle.lookup(ids)), "forward_host_ctx deferred"
+
+        # the same seam through the Python row builder (the prebuilt-extension
+        # fallback): both paths must serve the identical protocol
+        disk._cpp_fill = False
+        with disk.forward_host_ctx(_decode_batch([3, 4], 7), use_graph=True) as deferred:
+            graph.replay()
+        assert deferred is not None, "python fill must also yield the deferred fill"
+        deferred()
+        torch.cuda.synchronize()
+        assert _bitwise_equal(out, oracle.lookup(ids)), "forward_host_ctx deferred (python fill)"
 
     # gate mode: the hook fills inline and returns no deferred
     monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")

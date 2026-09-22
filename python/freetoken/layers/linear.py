@@ -19,6 +19,10 @@ class _LinearTPImpl(BaseOP):
     quant_layer_kind = LayerKind.LINEAR
     # a row-parallel layer sums its ranks' partials, so the bias must not ride along with each one
     bias_after_reduce = False
+    # Opt-in for the fp8 decode GEMM (FREETOKEN_FP8_DECODE_LINEAR). Only tall merged column
+    # projections measured a win; row/o_proj/replicated shapes lose more to the per-step
+    # activation quantization than the GEMM saves (docs/qwen38_flash_next_optimizations.md).
+    fp8_decode_ok = False
 
     def __init__(
         self,
@@ -93,6 +97,8 @@ class LinearReplicated(_LinearTPImpl):
 
 
 class LinearColParallelMerged(_LinearTPImpl):
+    fp8_decode_ok = True
+
     def __init__(
         self,
         input_size: int,
