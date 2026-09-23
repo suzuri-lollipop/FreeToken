@@ -30,6 +30,8 @@ def _mtp_block(theta=None):
 
 
 def _head(wiring="norm_mix_fc", **text_kw):
+    # norm_mix_fc is the CPU-runnable variant (plain mix); the production default
+    # norm_mixfrom_fc goes through mix_from_normed, whose kernels are CUDA-only.
     from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPHead
 
     config = parsed_config(mtp=_mtp_block(**text_kw) if "mtp" not in text_kw else text_kw.pop("mtp"), **text_kw)
@@ -164,3 +166,12 @@ def test_model_attaches_the_head_only_when_enabled():
     keys = set(model.state_dict())
     assert any(k.startswith("mtp.fc_embedding") for k in keys)
     assert any(k.startswith("mtp.layers.0.mlp.experts.") for k in keys)
+
+
+def test_default_wiring_is_the_probed_winner():
+    # the acceptance probe on real weights settled the front-end order (design doc
+    # section 4): 0.560 for norm_mixfrom_fc vs 0.184 for the double-normed variant.
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPHead
+
+    config = parsed_config(mtp=_mtp_block())
+    assert Qwen4ExpMTPHead(config, layer_id=config.num_layers).wiring == "norm_mixfrom_fc"

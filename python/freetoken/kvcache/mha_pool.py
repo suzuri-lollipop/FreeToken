@@ -46,10 +46,13 @@ class MHAKVCache(BaseKVCachePool):
             self._layer_map: list[int] | None = None
         else:
             num_storage_layers = len(layer_ids)
-            layer_map = [-1] * num_layers
+            # The map is indexed by GLOBAL layer id and the slabs stay dense, so a
+            # synthetic id past the main stack (the MTP head's layer) only grows the
+            # map, never the storage.
+            layer_map = [-1] * max(num_layers, max(layer_ids) + 1)
             for dense, global_id in enumerate(layer_ids):
-                if global_id < 0 or global_id >= num_layers:
-                    raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
+                if global_id < 0:
+                    raise ValueError(f"negative KV layer id {global_id}")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
         self._kv_buffer = torch.empty(

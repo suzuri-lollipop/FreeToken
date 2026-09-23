@@ -21,11 +21,13 @@ probing -- ``wiring`` selects the hypothesis under test):
     R_out                                                            # [T, HC*H]
 
 and the spec step collapses ``R_out`` through the main model's top-level mixer and
-lm_head. "norm_mix_fc" (default) norms R with pre_fc_norm_hidden and then runs the
-mixer's own mix (its hc_norm active -- every checkpoint tensor is used);
-"norm_mixfrom_fc" feeds the pre-normed R via mix_from_normed (the mixer's hc_norm
-stays idle). rope_theta is shared: the released config has mtp.rope_theta equal to
-the main rope_theta (1e7), asserted at build.
+lm_head. The front-end order was settled empirically (the checkpoint ships no HF
+reference): the acceptance-rate probe on real weights (_scratch/mtp_probe.py,
+2026-09-23, 550 teacher-forced positions) measured "norm_mixfrom_fc" -- pre_fc_norm_hidden
+norms R and the mixer consumes it via mix_from_normed, its own hc_norm idle -- at
+0.560 greedy acceptance vs 0.184 for the double-normed "norm_mix_fc" variant.
+rope_theta is shared: the released config has mtp.rope_theta equal to the main
+rope_theta (1e7), asserted at build.
 """
 
 from __future__ import annotations
@@ -86,7 +88,7 @@ class Qwen4ExpMTPHead(BaseOP):
         config: ModelConfig,
         *,
         layer_id: int,
-        wiring: str = "norm_mix_fc",
+        wiring: str = "norm_mixfrom_fc",
         prefix: str = "mtp",
     ) -> None:
         if wiring not in MTP_WIRINGS:

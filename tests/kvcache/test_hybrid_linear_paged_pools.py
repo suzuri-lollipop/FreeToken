@@ -115,3 +115,15 @@ def test_cost_model_kpool_shadow_slab_quarter_cost():
         spec_kv_bytes_per_token(spec1, econf) - spec_kv_bytes_per_token(spec, econf)
         == index_full - index_full // 4
     )
+
+def test_mha_pool_layer_map_covers_synthetic_ids_beyond_the_stack():
+    # An MTP speculative head adds a global layer id equal to num_layers; the dense
+    # slabs must stay len(layer_ids) while only the global->dense map grows.
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    pool = MHAKVCache(
+        num_kv_heads=2, num_layers=4, head_dim=8, num_pages=2, page_size=4,
+        dtype=torch.bfloat16, device=torch.device("cpu"), layer_ids=(1, 3, 4),
+    )
+    assert pool._layer_map == [-1, 0, -1, 1, 2]
+    assert pool._kv_buffer.shape[1] == 3

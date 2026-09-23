@@ -154,7 +154,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             Qwen4ExpMTPHead(
                 config,
                 layer_id=config.num_layers,
-                wiring=os.getenv("FREETOKEN_MTP_WIRING", "norm_mix_fc"),
+                wiring=os.getenv("FREETOKEN_MTP_WIRING", "norm_mixfrom_fc"),
             )
             if config.qwen4_args.mtp_enabled
             else None
