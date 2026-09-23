@@ -246,20 +246,37 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         mixed, residual = self.model.forward_with_residual(batch.input_ids, batch)
         return self.lm_head.forward(mixed), residual
 
-    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        """Greedy MTP draft ids for the rows of ``residual`` (eager spec path, Phase 1).
+    def full_vocab_logits(self, mixed: torch.Tensor) -> torch.Tensor:
+        """Full ``[T, vocab]`` logits from mixed hidden rows.
 
-        Collapses the head output through the shared top mixer and computes the FULL
-        logits with a direct matmul: ParallelLMHead.forward's row selection is ctx-driven
-        (per-request last row) while drafting needs every row. TP1 only for now -- the
-        vocab-parallel gather is Phase 2+ work.
+        The spec path needs EVERY row (ParallelLMHead.forward's row selection is
+        ctx-driven: per-request last row), so this is the direct shard matmul plus the
+        head's own vocab gather (rank-major order, padding trimmed) -- the same contract
+        ParallelLMHead.forward implements for its selected rows.
+        """
+        head = self.lm_head
+        weight = head.tied_embedding.weight if head.tied_embedding is not None else head.weight
+        logits = torch.nn.functional.linear(mixed, weight, head.bias)
+        if head.tp_size == 1:
+            return logits
+        shape = logits.shape
+        gathered = head._comm.all_gather(logits)
+        gathered = gathered.view((head.tp_size,) + shape).permute(1, 0, 2).contiguous()
+        return gathered.reshape(shape[0], head.tp_size * shape[1])[:, : head.num_embeddings]
+
+    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """Greedy MTP draft ids for the rows of ``residual`` (the spec step's head pass).
+
+        Collapses the head output through the shared top mixer and argmaxes the FULL
+        vocab logits (see full_vocab_logits for why the lm_head forward itself is not
+        usable here).
         """
         if self.mtp is None:
             raise AssertionError("draft() needs the MTP head (--speculative mtp)")
         next_embed = self.model.embed_tokens.forward(next_ids)
         head_out = self.mtp.forward(residual, next_embed, batch)
         mixed = self.model.hyper_connection_mixer.mix(head_out)[0]
-        return torch.nn.functional.linear(mixed, self.lm_head.weight).argmax(-1)
+        return self.full_vocab_logits(mixed).argmax(-1)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

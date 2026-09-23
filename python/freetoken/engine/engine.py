@@ -1721,7 +1721,7 @@ class Engine:
             if mode == "prologue_decode":
                 self._run_head_prologue(model, req, batch.spec_prologue)
             mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-            logits = torch.nn.functional.linear(mixed, model.lm_head.weight)
+            logits = model.full_vocab_logits(mixed)
             if mode == "prologue_decode":
                 y = logits[0].argmax(-1)
                 d = model.draft(residual, y.view(1).to(torch.int32), batch)

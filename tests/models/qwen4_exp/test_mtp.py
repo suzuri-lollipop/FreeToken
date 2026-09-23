@@ -216,7 +216,7 @@ def test_draft_runs_the_shared_head_chain_and_argmaxes_full_logits():
 
     embed = model.model.embed_tokens.forward(next_ids)
     mixed = model.model.hyper_connection_mixer.mix(head.fuse_input(residual, embed))[0]
-    want = torch.nn.functional.linear(mixed, model.lm_head.weight).argmax(-1)
+    want = model.full_vocab_logits(mixed).argmax(-1)
     assert got.shape == (3,) and got.dtype == want.dtype
     assert torch.equal(got, want)
 
