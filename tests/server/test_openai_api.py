@@ -687,3 +687,55 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+# ----------------------------------------------------------- stream keepalive
+class _SlowFakeState(FakeState):
+    """FakeState that sleeps before yielding replies so with_keepalive fires."""
+
+    def __init__(self, replies, delay_s: float, **kw) -> None:
+        super().__init__(replies, **kw)
+        self._delay = delay_s
+
+    async def wait_for_ack(self, uid: int):
+        assert uid == 42
+        await asyncio.sleep(self._delay)
+        for reply in self.replies:
+            yield reply
+
+
+def test_stream_chat_completion_emits_keepalive_during_prefill_silence(monkeypatch):
+    """stream_chat_completion_chunks wraps generate_events with with_keepalive so a
+    long prefill (no acks) emits SSE comments, keeping proxies/load balancers from
+    dropping the idle connection -- parity with the Anthropic and Responses adapters.
+
+    Scope limit: a comment is NOT a parsed event, so it does not reset a client whose
+    idle watchdog counts only chunk yields (DSH's pi-ai adapter never calls
+    watchdog.pulse()). Guarding a slow prefill against such a client needs a
+    data-bearing frame, not this."""
+    import freetoken.server.openai_api as openai_mod
+
+    monkeypatch.setattr(openai_mod, "KEEPALIVE_INTERVAL_S", 0.02)
+    state = _SlowFakeState(
+        [UserReply(uid=42, incremental_output="hi", finished=True, prompt_tokens_delta=3, completion_tokens_delta=1)],
+        delay_s=0.08,
+    )
+    req = chat_request(tools=None, stream=True)
+
+    chunks = run(_collect(stream_chat_completion_chunks(42, req, state)))
+
+    # At least one SSE comment must have been emitted during the silence.
+    keepalives = [c for c in chunks if c == b": keepalive\n\n"]
+    assert keepalives, "expected at least one keepalive comment during prefill silence"
+
+    # The real content must still arrive intact after the keepalives.
+    events = parse_sse(chunks)
+    assert events[-1] == "[DONE]"
+    content = "".join(
+        choice["delta"]["content"]
+        for event in events
+        if isinstance(event, dict)
+        for choice in event.get("choices", [])
+        if "content" in choice.get("delta", {}) and choice["delta"]["content"]
+    )
+    assert content == "hi"

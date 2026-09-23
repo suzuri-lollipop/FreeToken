@@ -446,38 +446,61 @@ def _served_model_name() -> str | None:
     return getattr(cfg, "served_model_name", None)
 
 
-@app.middleware("http")
-async def _record_request_middleware(request: Request, call_next):
+class _RequestTimingMiddleware:
     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
     model server, so model = served_model_name; stream is inferred from the response media
-    type. Token counts are P3 (SSE usage arrives after the handler returns) — kept as None."""
-    path = request.url.path
-    if path.startswith(_UNTRACKED_REQUEST_PREFIXES) or not path.startswith(
-        _TRACKED_REQUEST_PREFIXES
-    ):
-        return await call_next(request)
-    import time as _time
+    type. Token counts are P3 (SSE usage arrives after the handler returns) -- kept as None.
 
-    start = _time.monotonic()
-    response = await call_next(request)
-    duration_ms = int((_time.monotonic() - start) * 1000)
-    ctype = response.headers.get("content-type", "")
-    request_ring.record_request(
-        request_ring.RequestRecord(
-            ts=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-            method=request.method,
-            path=path,
-            status=response.status_code,
-            model=_served_model_name(),
-            duration_ms=duration_ms,
-            ttft_ms=None,
-            prompt_tokens=None,
-            completion_tokens=None,
-            stream=ctype.startswith("text/event-stream"),
-            error=None,
-        )
-    )
-    return response
+    Pure ASGI instead of @app.middleware("http"): BaseHTTPMiddleware wraps EVERY request
+    (even /health polls) in a task group + memory stream just to hand us a Response; here
+    untracked requests pass straight through and tracked ones record from the
+    http.response.start message -- the same moment the old call_next returned."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if (
+            scope["type"] != "http"
+            or path.startswith(_UNTRACKED_REQUEST_PREFIXES)
+            or not path.startswith(_TRACKED_REQUEST_PREFIXES)
+        ):
+            await self.app(scope, receive, send)
+            return
+        start = time.monotonic()
+        seen = False
+
+        async def send_wrapper(message):
+            nonlocal seen
+            if message["type"] == "http.response.start" and not seen:
+                seen = True
+                ctype = ""
+                for name, value in message.get("headers", []):
+                    if name == b"content-type":
+                        ctype = value.decode("latin-1")
+                        break
+                request_ring.record_request(
+                    request_ring.RequestRecord(
+                        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        method=scope.get("method", ""),
+                        path=path,
+                        status=message["status"],
+                        model=_served_model_name(),
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                        ttft_ms=None,
+                        prompt_tokens=None,
+                        completion_tokens=None,
+                        stream=ctype.startswith("text/event-stream"),
+                        error=None,
+                    )
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(_RequestTimingMiddleware)
 
 
 class CacheRebuildRequest(BaseModel):

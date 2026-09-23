@@ -627,6 +627,9 @@ class _FakeTokenizeManager:
 
 
 def _count_client(manager=None, maintenance_state="serving"):
+    from freetoken.server import generation
+
+    generation._COUNT_LRU.clear()  # the count cache is process-global; tests reuse prompts
     fake = FakeState([])
     fake.maintenance_state = maintenance_state
     fake._count_manager = manager
@@ -717,6 +720,23 @@ def test_count_tokens_template_render_error_400():
     )
     assert r.status_code == 400, r.text
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_count_tokens_result_is_cached_per_prompt():
+    # count_prompt_tokens memoizes the rendered-prompt count; a repeated identical
+    # request returns the cached count without touching the tokenizer manager.
+    client, fake = _count_client(_FakeTokenizeManager())
+    body = {"model": "claude-x", "messages": [{"role": "user", "content": "hello cache"}]}
+    r1 = client.post("/v1/messages/count_tokens", json=body)
+    assert r1.status_code == 200, r1.text
+    fake._count_manager = _RaisingManager(RuntimeError("tokenizer must not run"))
+    r2 = client.post("/v1/messages/count_tokens", json=body)
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == r1.json()
+
+    body2 = {"model": "claude-x", "messages": [{"role": "user", "content": "hello cache!"}]}
+    r3 = client.post("/v1/messages/count_tokens", json=body2)
+    assert r3.status_code == 500, r3.text  # changed prompt misses the cache and re-counts
 
 
 def test_count_tokens_excluded_from_request_ring():

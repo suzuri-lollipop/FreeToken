@@ -14,8 +14,10 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -288,16 +290,20 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
-async def submit_generation(spec: GenSpec, state: Any) -> int:
+async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = None) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
-    calls this — it takes the neutral spec, not a wire request type."""
+    calls this -- it takes the neutral spec, not a wire request type. ``rendered`` is
+    the already-rendered prompt from ``prerender_prompt``; it rides the str fast path
+    so the worker does not render the same template a second time."""
     refs = collect_image_refs(spec.messages)
+    if rendered is not None and refs:
+        rendered = None
     images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=spec.messages,
+            text=rendered if rendered is not None else spec.messages,
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
@@ -305,6 +311,23 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
         )
     )
     return uid
+
+
+_COUNT_LRU_MAX = 1024
+_COUNT_LRU: OrderedDict[bytes, int] = OrderedDict()
+
+
+def _count_cache_key(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    chat_template_kwargs: dict[str, Any],
+) -> bytes:
+    """sha1 of the canonical-JSON rendering of the (messages, tools, kwargs) triple.
+    Image-bearing prompts are excluded by the caller (their count depends on bytes)."""
+    canonical = json.dumps(
+        [messages, tools, chat_template_kwargs], sort_keys=True, ensure_ascii=False, default=str
+    )
+    return hashlib.sha1(canonical.encode("utf-8", "surrogatepass")).digest()
 
 
 async def count_prompt_tokens(
@@ -326,6 +349,10 @@ async def count_prompt_tokens(
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
     refs = collect_image_refs(messages)
+    key = None if refs else _count_cache_key(messages, tools, chat_template_kwargs)
+    if key is not None and (hit := _COUNT_LRU.get(key)) is not None:
+        _COUNT_LRU.move_to_end(key)
+        return hit
     images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
@@ -340,21 +367,29 @@ async def count_prompt_tokens(
         (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(user_msg.input_ids.numel())
+    count = int(user_msg.input_ids.numel())
+    if key is not None:
+        _COUNT_LRU[key] = count
+        _COUNT_LRU.move_to_end(key)
+        while len(_COUNT_LRU) > _COUNT_LRU_MAX:
+            _COUNT_LRU.popitem(last=False)
+    return count
 
 
-async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
-    """Render ``spec``'s prompt frontend-side, returning the failure a streaming
-    adapter should surface as an HTTP 400 *before* committing an SSE stream —
-    once headers go out, a template rejection can only ride in-stream, where
-    some agents show nothing but "empty response". Render only; the worker
-    still renders and encodes authoritatively. Best-effort: a state without a
+async def prerender_prompt(spec: GenSpec, state: Any) -> tuple[str | None, GenerationError | None]:
+    """Render ``spec``'s prompt frontend-side. Returns ``(rendered, error)``: the
+    failure a streaming adapter should surface as an HTTP 400 *before* committing
+    an SSE stream -- once headers go out, a template rejection can only ride
+    in-stream, where some agents show nothing but "empty response". On success the
+    rendered string is handed to ``submit_generation`` so the worker skips its own
+    render (the str fast path in ``render_prompt``); image prompts keep rendering
+    in the worker, where the fetched bytes exist. Best-effort: a state without a
     frontend tokenizer, or one that fails to *initialize*, skips validation
     rather than blocking the generation path.
     """
     build = getattr(state, "frontend_tokenizer", None)
     if build is None:
-        return None
+        return None, None
     msg = TokenizeMsg(
         uid=0,
         text=spec.messages,
@@ -365,12 +400,14 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     try:
         manager = await asyncio.to_thread(build)
     except Exception:  # noqa: BLE001 -- server fault, not this request's problem
-        return None
+        return None, None
     try:
-        await asyncio.to_thread(manager.render_prompt, msg)
+        rendered = await asyncio.to_thread(manager.render_prompt, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
-        return GenerationError(f"could not encode request: {exc}")
-    return None
+        return None, GenerationError(f"could not encode request: {exc}")
+    if collect_image_refs(spec.messages):
+        return None, None
+    return rendered, None
 
 
 def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
@@ -477,11 +514,14 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
         while True:
             if task is None:
                 task = asyncio.ensure_future(aiter.__anext__())
-            try:
-                ev = await asyncio.wait_for(asyncio.shield(task), interval)
-            except asyncio.TimeoutError:
+            # asyncio.wait keeps the real task pending across timeouts;
+            # wait_for(shield(task)) allocated a shield wrapper on every keepalive.
+            done, _ = await asyncio.wait({task}, timeout=interval)
+            if not done:
                 yield KEEPALIVE
                 continue
+            try:
+                ev = task.result()
             except StopAsyncIteration:
                 return
             task = None

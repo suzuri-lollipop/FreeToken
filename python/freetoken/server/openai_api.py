@@ -24,6 +24,7 @@ from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    KEEPALIVE,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -34,11 +35,14 @@ from .generation import (
     ToolCallStart,
     generate_events,
     generate_full,
-    prerender_error,
+    prerender_prompt,
     render_messages,
     resolve_sampling,
     submit_generation,
+    with_keepalive,
 )
+
+KEEPALIVE_INTERVAL_S = 15.0
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -189,15 +193,17 @@ async def handle_chat_completion(
     except ValueError as exc:
         return create_error_response(str(exc))
 
+    rendered = None
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
-        # through GenerationError; only the stream path needs the pre-check.
-        err = await prerender_error(spec, state)
+        # through GenerationError; only the stream path needs the pre-check, and
+        # its render result rides along so the worker does not re-render.
+        rendered, err = await prerender_prompt(spec, state)
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
     try:
-        uid = await submit_generation(spec, state)
+        uid = await submit_generation(spec, state, rendered=rendered)
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
 
@@ -259,7 +265,10 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions"),
+        KEEPALIVE_INTERVAL_S,
+    )
     while True:
         try:
             ev = await events.__anext__()
@@ -272,6 +281,14 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
             break
+        if ev is KEEPALIVE:
+            # SSE comment: keeps intermediaries (proxies, load balancers) from
+            # dropping an idle connection. NOTE: this does NOT reset a client
+            # whose idle watchdog only counts parsed events -- pi-ai (DSH) wires
+            # its watchdog to chunk yields, not socket bytes, so a comment is
+            # invisible to it. A data-bearing frame would be needed there.
+            yield b": keepalive\n\n"
+            continue
         if isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
