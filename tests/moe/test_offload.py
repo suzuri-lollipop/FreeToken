@@ -270,11 +270,53 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     cache.prefetch_prefill_layer(0)
 
     assert cache.id_of_slot[:num_experts].tolist() == [-1] * num_experts
-    assert cache.usage[:num_experts].tolist() == [0] * num_experts
+    # the borrowed slots are stamped step+1 (not zero) so decode's LRU victim pick
+    # prefers regular slots -- see test_interleaved_decode_keeps_residency below
+    assert cache.usage[:num_experts].tolist() == [int(cache.step) + 1] * num_experts
     for layer_id, expert_id in zip(old_layers.tolist(), old_experts.tolist()):
         assert int(cache.slot_for_id[layer_id, expert_id].item()) == -1
     assert torch.equal(cache.bank_caches["gate_up"][:num_experts], gate_up_source[0])
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
+
+
+def test_interleaved_decode_keeps_residency_across_chunk_invalidation():
+    # Mixed-workload regression: a prefill chunk plan invalidates the borrowed buffer
+    # slots [0, 2E). When invalidation zeroed their usage, every decode fetch picked a
+    # buffer slot as its LRU victim (usage 0 = oldest), so the next chunk wiped the row
+    # and decode hit rate stayed at ~0 -- each interleaved decode step re-fetched in
+    # full over PCIe. With the step+1 stamp, decode lands in regular slots that chunk
+    # plans never touch, and the same expert hits on the next interleaved step.
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=16,
+        device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+
+    def chunk_pass():
+        # one prefill chunk stages every layer through both buffers by parity
+        cache._invalidate_prefill_buffer(0)
+        cache._invalidate_prefill_buffer(1)
+
+    def decode_step(expert: int) -> int:
+        ids = torch.tensor([[expert]], dtype=torch.int32)
+        ensure_experts_hybrid(cache, 0, ids, 4, 0.0)  # CPU reference path
+        return int(cache.num_indices.item())
+
+    chunk_pass()
+    misses = decode_step(0)
+    slot = int(cache.slot_for_id[0, 0].item())
+    assert misses == 1
+    assert slot >= 2 * cache.num_experts, "decode fetch landed in a borrowed buffer slot"
+
+    chunk_pass()  # an interleaved chunk wipes both buffers
+    misses = decode_step(0)
+    assert misses == 0, "decode lost its row to the chunk invalidation"
+    assert int(cache.slot_for_id[0, 0].item()) == slot
 
 
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):

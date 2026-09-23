@@ -778,9 +778,14 @@ class OffloadMoeCache:
         old_ids = self.id_of_slot[slot_start:slot_end]
         self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
         old_ids.fill_(-1)
-        # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
-        # ensure_experts evicts them first.
-        self.usage[slot_start:slot_end].zero_()
+        # Stamp step+1, not zero. Zero made the borrowed slots the first victim of every
+        # decode ensure, so interleaved decode rows landed here and the next chunk's
+        # invalidation wiped them (decode hit rate ~0 under mixed load, every interleaved
+        # step re-fetched in full). step+1 outranks every LRU-touched row, so decode
+        # evicts its own coldest regular slot and keeps residency the chunk plans never
+        # touch; the kernel's usage==step mask still falls back to these when every
+        # regular slot was used this step. Same device-side stamp as the promotion guard.
+        self.usage[slot_start:slot_end] = self.step + 1
 
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
