@@ -87,6 +87,31 @@ def test_prefill_cpu_split_off_unless_a_cpu_executor_and_fraction_are_in_play():
     assert _prefill_cpu_split(on, 10) == (executor, round(0.4 * Q))
 
 
+def test_prefill_cpu_split_gates_big_chunks_off_the_cpu_side(monkeypatch):
+    # The auto fraction is calibrated on decode-step bandwidth; an 8192-token chunk
+    # hands ~82% of its misses to the CPU where each miss carries ~344 routes --
+    # measured ~79 s/chunk vs ~7.3 s pure-PCIe (65k prompt: 630 s vs 58 s). The gate
+    # keeps full-size chunks on the PCIe plan and the measured win for short prefills.
+    from types import SimpleNamespace
+
+    import freetoken.layers.moe as moe_layers
+
+    executor = SimpleNamespace(max_tokens=8192)
+    cache = SimpleNamespace(
+        cpu_executor=executor, prefill_fetch_fraction=0.176, prefill_cpu_mask=object(),
+        prefill_pcie_frac_q16=lambda: round(0.176 * Q),
+    )
+    frac_q16 = round(0.176 * Q)
+    monkeypatch.setattr(moe_layers, "_HYBRID_PREFILL_MAX_TOKENS", 512)
+    assert moe_layers._prefill_cpu_split(cache, 150) == (executor, frac_q16)
+    assert moe_layers._prefill_cpu_split(cache, 512) == (executor, frac_q16)
+    assert moe_layers._prefill_cpu_split(cache, 8192) == (None, Q)
+    monkeypatch.setattr(moe_layers, "_HYBRID_PREFILL_MAX_TOKENS", 0)
+    assert moe_layers._prefill_cpu_split(cache, 1) == (None, Q)
+    monkeypatch.setattr(moe_layers, "_HYBRID_PREFILL_MAX_TOKENS", 1 << 30)
+    assert moe_layers._prefill_cpu_split(cache, 8192) == (executor, frac_q16)
+
+
 def test_load_hybrid_fetch_fraction(tmp_path):
     prof = {
         "gpu": {"name": "FAKE GPU"},

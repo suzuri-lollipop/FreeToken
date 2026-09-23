@@ -25,6 +25,16 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# The CPU side of a prefill chunk pays routes-per-expert (~num_tokens * top_k / touched),
+# while its PCIe side pays a flat per-expert row: the T=150 balance measurement behind
+# prefill_fetch_fraction does NOT extrapolate to full chunks. Measured on a 2x24GB rig
+# (gen5 x16 + gen4 x4, nvfp4, 512 experts top-10): an 8192-token chunk at the auto 17.6%
+# PCIe / 82.4% CPU split ran ~79 s/chunk vs ~7.3 s for the pure-PCIe plan (a 65k-token
+# prompt: 630 s vs 58 s). Chunks above this gate therefore stay wholly on the PCIe plan;
+# small prefills (single short chunks) keep the measured split win. 0 disables the prefill
+# split entirely, a large value restores the ungated behavior for A/B.
+_HYBRID_PREFILL_MAX_TOKENS = int(os.getenv("FREETOKEN_HYBRID_PREFILL_MAX_TOKENS", "512"))
+
 
 def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
     """(CPU executor, Q16 PCIe share) for one prefill chunk, or (None, 1 << 16) when the
@@ -41,6 +51,7 @@ def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
         or cache.prefill_fetch_fraction >= 1.0
         or cache.prefill_cpu_mask is None
         or num_tokens > executor.max_tokens
+        or num_tokens > _HYBRID_PREFILL_MAX_TOKENS
     ):
         return None, 1 << 16
     return executor, cache.prefill_pcie_frac_q16()
