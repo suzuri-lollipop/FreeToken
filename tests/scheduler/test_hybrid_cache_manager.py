@@ -212,3 +212,48 @@ def test_req_spec_fields_default_to_disabled():
     assert req.spec_residual is None
     assert req.spec_draft is None
     assert req.spec_replay is False
+
+
+def test_batch_spec_fields_default_to_regular():
+    from freetoken.core import Batch
+
+    b = Batch(reqs=[], phase="decode")
+    assert b.spec_mode is None
+    assert b.spec_draft_id == -1
+    assert b.spec_pages is None
+    assert b.spec_prologue is None
+
+
+def test_allocate_paged_record_and_release_roundtrip():
+    """Spec-batch page accounting: a recorded charge is exactly reversible (the reject
+    path releases, the replay step re-charges the same position span)."""
+    pool = _pool()
+    page_table = torch.zeros(4, 128, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+
+    # the default (record=False) call stays None-returning and unchanged
+    idle = Req(input_ids=torch.arange(8, dtype=torch.int32), table_idx=1, cached_len=7,
+               output_len=4, uid=1, sampling_params=SamplingParams(), cache_handle=None)
+    idle.device_len = 7  # nothing new to charge
+    assert cm.allocate_paged([idle]) is None
+
+    req = Req(input_ids=torch.arange(65, dtype=torch.int32), table_idx=0, cached_len=64,
+              output_len=10, uid=0, sampling_params=SamplingParams(), cache_handle=None)
+    free_before = len(cm.free_slots)
+
+    # simulate the spec draft bump: two rows at positions [64, 65]; this manager runs
+    # page_size=1, so the span charges exactly two one-slot pages
+    req.device_len = 66
+    info = cm.allocate_paged([req], record=True)
+    assert info == [(0, 64, 66)]
+    assert len(cm.free_slots) == free_before - 2
+    assert page_table[0, 64:66].abs().sum() > 0
+
+    cm.release_paged(info)
+    assert len(cm.free_slots) == free_before
+
+    # the replay step re-charges the same span and gets fresh slots
+    info2 = cm.allocate_paged([req], record=True)
+    assert info2 == info and len(cm.free_slots) == free_before - 2
+    cm.release_paged(info2)
+    assert len(cm.free_slots) == free_before

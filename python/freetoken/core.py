@@ -71,8 +71,9 @@ class Req:
     # conv/recurrent states AND the sibling slot_states, so the PLE n-gram window rolls back
     # with the same call. Allocated at admission (spec mode only), freed at finish.
     spec_slot_idx: int | None = None
-    # Residual row [1, hc*hidden] (device) of the prompt's last position, stashed at the end
-    # of prefill: the head's deferred position T-1 pass consumes it on the first decode step.
+    # Prompt residual stash [T, hc*hidden] (device), accumulated over the prefill chunk(s):
+    # the head's whole-prompt catch-up pass (Batch.spec_prologue) consumes it at the first
+    # decode step and drops it. Spec is gated on prompts whose stash fits the budget.
     spec_residual: torch.Tensor | None = None
     # Pending draft token id (host int) predicted for the position after the current input
     # token; None until the head has produced one (or right after a reject).
@@ -174,6 +175,23 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+
+    # --- MTP speculative decoding (design: _scratch/mtp_design.md, reject-replay loop) ---
+    # None for regular batches. "prologue_decode": the request's first decode step -- the
+    # engine first runs the head over the whole prompt (head KV catch-up from the stashed
+    # residuals), then the normal decode row, then the head at the new position to produce
+    # the first draft. "verify": two rows [last placed token, draft]. "replay": two rows
+    # [x_P, y] rebuilding the state a rejected draft polluted (deterministic accept).
+    spec_mode: str | None = field(default=None, init=False)
+    # "verify" only: the host draft id under test (the engine's accept decision input).
+    spec_draft_id: int = field(default=-1, init=False)
+    # Page range(s) charged by this spec batch's allocate_paged, as (table_idx, first_page,
+    # last_page): a reject releases them because the replay step re-charges the same span
+    # (only non-empty when the span crossed a page boundary).
+    spec_pages: list | None = field(default=None, init=False)
+    # "prologue_decode" only: the scheduler-prepared head-only batch over the prompt rows
+    # (positions 0..T-1, embeds = tokens 1..T-1 plus the first sampled token).
+    spec_prologue: "Batch | None" = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
