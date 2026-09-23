@@ -239,12 +239,13 @@ def _write_checkpoint(folder, raw: dict[str, torch.Tensor], quantization_config,
     return str(folder), {**raw, **table}
 
 
-def _load(folder: str, *, vision: bool = True) -> dict[str, torch.Tensor]:
+def _load(folder: str, *, vision: bool = True, include_mtp: bool = False) -> dict[str, torch.Tensor]:
     install_quant_config(folder)
     return {
         name: tensor.clone()
         for name, tensor in iter_weights(
-            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True, include_vision=vision
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True,
+            include_vision=vision, include_mtp=include_mtp,
         )
     }
 
@@ -320,6 +321,82 @@ def test_fp8_block_scales_scheme_resolves_for_mtp_experts():
     assert main is not None and main.kind is QuantKind.NVFP4
     # dense MTP tensors are not in quantized_layers -> unquantized bf16
     assert cfg.scheme_for_name("mtp.fc_embedding") is None
+
+
+def _mtp_dense_raw() -> dict[str, torch.Tensor]:
+    """The full dense MTP head in toy geometry, mirroring the released checkpoint's names
+    (29 tensors: fc/norm front end, top mixer, one QSA-clone layer with both HC blocks,
+    shared expert + gate). The routed experts stay noise in _raw_checkpoint (stacked
+    shape) and gain one per-expert-shaped key here: both shapes must be skipped."""
+    raw = {
+        "mtp.fc_embedding.weight": _bf16(H, H),
+        "mtp.fc_hidden.weight": _bf16(H, H),
+        "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+        "mtp.pre_fc_norm_hidden.weight": _bf16(HCH),
+        "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        "mtp.layers.0.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.o_proj.weight": _bf16(H, QH * AHD),
+        "mtp.layers.0.self_attn.q_norm.weight": _bf16(AHD),
+        "mtp.layers.0.self_attn.k_norm.weight": _bf16(AHD),
+        "mtp.layers.0.self_attn.indexer.index_qk_proj.weight": _bf16(5 * IHD, H),
+        "mtp.layers.0.self_attn.indexer.q_layernorm.weight": _bf16(IHD),
+        "mtp.layers.0.self_attn.indexer.k_layernorm.weight": _bf16(IHD),
+        "mtp.layers.0.mlp.gate.weight": _bf16(E, H),
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight": _bf16(H, I),
+        "mtp.layers.0.mlp.shared_expert_gate.weight": _bf16(1, H),
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight": _bf16(I, H),  # per-expert noise
+    }
+    raw.update(_hc_weights("mtp.hyper_connection_mixer", inject=False))
+    raw.update(_hc_weights("mtp.layers.0.attn_hyper_connection", inject=True))
+    raw.update(_hc_weights("mtp.layers.0.mlp_hyper_connection", inject=True))
+    return raw
+
+
+@pytest.fixture(scope="module")
+def checkpoint_mtp(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    torch.manual_seed(0)
+    raw = {**_raw_checkpoint(), **_mtp_dense_raw()}
+    return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_mtp_ckpt"), raw, None)
+
+
+def test_mtp_dense_loads_fused_when_requested(checkpoint_mtp):
+    folder, raw = checkpoint_mtp
+    got = _load(folder, include_mtp=True)
+    # replicated pass-throughs (TP1): fc/norm front end keep their bytes
+    assert torch.equal(got["mtp.fc_embedding.weight"], raw["mtp.fc_embedding.weight"])
+    assert torch.equal(got["mtp.pre_fc_norm_hidden.weight"], raw["mtp.pre_fc_norm_hidden.weight"])
+    # the three loader fusions apply under the mtp prefix exactly as in the main model
+    want_qkv = torch.cat(
+        [raw["mtp.layers.0.self_attn.q_proj.weight"],
+         raw["mtp.layers.0.self_attn.k_proj.weight"],
+         raw["mtp.layers.0.self_attn.v_proj.weight"]], 0)
+    assert torch.equal(got["mtp.layers.0.self_attn.qkv_proj.weight"], want_qkv)
+    want_gu = torch.cat(
+        [raw["mtp.layers.0.mlp.shared_expert.gate_proj.weight"],
+         raw["mtp.layers.0.mlp.shared_expert.up_proj.weight"]], 0)
+    assert torch.equal(got["mtp.layers.0.mlp.shared_expert.gate_up_proj.weight"], want_gu)
+    merged = got["mtp.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"]
+    assert merged.shape == (LR + HC + 12, HCH)
+    assert torch.equal(merged[:LR], raw["mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight"])
+    # the top-level mixer never merges inject (it has none)
+    assert "mtp.hyper_connection_mixer.input_mix_weight_down.weight" in got
+    # plain keys survive verbatim
+    assert torch.equal(got["mtp.layers.0.self_attn.o_proj.weight"], raw["mtp.layers.0.self_attn.o_proj.weight"])
+    # routed MTP experts stay out in BOTH export shapes until Phase 2
+    assert not [k for k in got if "mtp.layers.0.mlp.experts" in k]
+    # nothing leaked into the main model's names
+    assert not [k for k in got if k.startswith("mtp.") and "layers.0" not in k
+                and k.split(".", 2)[1] not in ("fc_embedding", "fc_hidden",
+                                               "pre_fc_norm_embedding", "pre_fc_norm_hidden",
+                                               "hyper_connection_mixer")]
+
+
+def test_mtp_still_dropped_by_default(checkpoint_mtp):
+    got = _load(checkpoint_mtp[0])
+    assert not [k for k in got if k.startswith("mtp.")]
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):

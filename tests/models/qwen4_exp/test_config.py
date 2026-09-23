@@ -193,6 +193,8 @@ def test_extend_config_for_mtp_appends_the_synthetic_full_layer():
     # group membership lookups see the synthetic layer as full attention
     assert not ext.is_linear_layer(mtp_id)
     assert ext.attention_group_for_layer(mtp_id).kind == "full"
+    # the extension is what flips the head on for the model and the loader
+    assert ext.qwen4_args.mtp_enabled and not base.qwen4_args.mtp_enabled
     # idempotent
     assert extend_config_for_mtp(ext) is ext
 

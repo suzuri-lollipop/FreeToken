@@ -49,6 +49,10 @@ class Qwen4ExpArgs:
     mtp_num_layers: int = 0
     mtp_rope_theta: float | None = None
     mtp_use_hidden_state_from_layer: int | None = None
+    # Set by extend_config_for_mtp (--speculative mtp): the model attaches the head and
+    # the loader keeps the mtp.* dense weights. Distinct from mtp_num_layers, which just
+    # records the checkpoint.
+    mtp_enabled: bool = False
 
     @property
     def index_topk_blocks(self) -> int:
@@ -323,4 +327,8 @@ def extend_config_for_mtp(config: ModelConfig) -> ModelConfig:
         groups.append(g)
     if not extended:
         raise ValueError("no full-attention group to host the MTP layer")
-    return replace(config, attention_groups=tuple(groups))
+    return replace(
+        config,
+        attention_groups=tuple(groups),
+        qwen4_args=replace(args, mtp_enabled=True),
+    )

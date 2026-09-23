@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
+Dropped: ``mtp.*`` unless ``include_mtp`` (the speculative head's dense weights; its routed experts stay dropped until Phase 2 of _scratch/mtp_design.md); ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -88,10 +88,19 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 
-def _rename(raw_name: str) -> str | None:
+def _rename(raw_name: str, include_mtp: bool = False) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
-        return None
+        if not include_mtp:
+            return None
+        # The head attaches as the model's `mtp` attribute, so its dense keys pass
+        # through verbatim (the fuser/shard rules key off the same leaf names as the
+        # main layers). Routed MTP experts are skipped in BOTH export shapes
+        # (per-expert ".experts.<i>." and stacked ".experts.gate_up_proj") until the
+        # placement decision lands -- Phase 2 of _scratch/mtp_design.md.
+        if ".mlp.experts" in raw_name:
+            return None
+        return raw_name
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -203,6 +212,7 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_vision: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
@@ -234,7 +244,7 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_mtp)
                 if name is None:
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
