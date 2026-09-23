@@ -140,6 +140,10 @@ class DiskRowTable:
             head_offsets=offsets,
             eos_token_id=self.eos_token_id,
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
+            # host row LRU: repeated rows (shared prefixes, decode revisits) skip the
+            # O_DIRECT table; 0 keeps the historical read-every-fill behavior. Default
+            # is deliberately modest: the expert banks already pin ~66 GiB of host RAM.
+            row_cache_mb=int(os.getenv("FREETOKEN_PLE_ROW_CACHE_MB", "512") or "0"),
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self.head_dim

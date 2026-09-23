@@ -33,7 +33,7 @@ def _bitwise_equal(got: torch.Tensor, want: torch.Tensor) -> bool:
     return torch.equal(got.view(torch.int16), want.view(torch.int16))
 
 
-def _make_store(tmp_path, *, write=True, use_io_uring=True):
+def _make_store(tmp_path, *, write=True, use_io_uring=True, **store_kw):
     args = parse_config(toy_hf_config()).qwen4_args
     multipliers, sizes, offsets = hash_constants(args)
     total_rows = int(offsets[-1] + sizes[-1])
@@ -55,6 +55,7 @@ def _make_store(tmp_path, *, write=True, use_io_uring=True):
         head_offsets=offsets.tolist(),
         eos_token_id=EOS,
         use_io_uring=use_io_uring,
+        **store_kw,
     )
     return store, table, args
 
@@ -155,6 +156,60 @@ def test_store_stages_bitwise_rows(tmp_path):
     flag = torch.zeros(1, dtype=torch.int64)
     store.flush(flag.data_ptr())
     assert int(flag[0]) == 1, "empty flush must still signal"
+
+
+def test_row_cache_serves_repeated_rows_from_ram(tmp_path):
+    # The host row LRU must serve a repeated fill entirely from RAM (no new disk reads)
+    # with bitwise-identical staging bytes.
+    store, table, args = _make_store(tmp_path, row_cache_mb=1)
+    emb = _embedding()
+    seq = [3, 4, 5, 6, 7]
+
+    first = _fill(store, args, (EOS, EOS), seq)
+    ids = emb.row_ids(_meta([seq], [[EOS, EOS]]))
+    assert _bitwise_equal(first, table[ids.reshape(-1)].reshape(-1)), "oracle"
+    hits, misses, evicts, slots, _ = store.cache_stats()
+    assert slots > 0
+    assert hits == 0 and misses > 0 and evicts == 0
+
+    second = _fill(store, args, (EOS, EOS), seq)
+    assert _bitwise_equal(second, first)
+    hits2, misses2, evicts2, _, _ = store.cache_stats()
+    assert misses2 == misses, "a cached refill must queue no disk reads"
+    assert hits2 == misses, "every distinct row of the refill must hit"
+    assert evicts2 == 0
+
+
+def test_row_cache_eviction_keeps_bytes_correct(tmp_path):
+    # 8 slots = the two most recent fills (4 head-rows per 1-token fill): older rows
+    # fall back to disk (bitwise correct), and a still-cached recent fill hits.
+    store, _, args = _make_store(tmp_path, row_cache_rows=8)
+    windows = [(EOS, EOS), (EOS, 3), (3, 4), (4, 5)]
+    tokens = [3, 4, 5, 6]
+    fills = [_fill(store, args, w, [t]) for w, t in zip(windows, tokens)]
+
+    _, _, evicts, slots, _ = store.cache_stats()
+    assert slots == 8 and evicts > 0
+
+    again = _fill(store, args, windows[0], [tokens[0]])  # evicted by fills 2-3 -> disk
+    assert _bitwise_equal(again, fills[0])
+
+    before = store.cache_stats()
+    last = _fill(store, args, windows[3], [tokens[3]])  # most recent -> cache hit
+    assert _bitwise_equal(last, fills[3])
+    after = store.cache_stats()
+    assert after[0] > before[0], "recent rows must hit"
+    assert after[1] == before[1], "recent rows must not re-read"
+
+
+def test_row_cache_disabled_reads_every_fill(tmp_path):
+    # Default stays the historical no-cache behavior: identical fills re-read.
+    store, _, args = _make_store(tmp_path)
+    a = _fill(store, args, (EOS, EOS), [3, 4, 5])
+    b = _fill(store, args, (EOS, EOS), [3, 4, 5])
+    assert _bitwise_equal(a, b)
+    hits, misses, _, slots, _ = store.cache_stats()
+    assert slots == 0 and hits == 0 and misses > 0
 
 
 def test_fill_decode_graph_matches_python_row_build(tmp_path):

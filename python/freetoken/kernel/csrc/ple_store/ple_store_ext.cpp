@@ -1,7 +1,11 @@
 // Disk-backed PLE row store: rows read straight from the checkpoint's fp8 shard tensors
 // through an extent table (PleRowSource in ple_ssd.py). Engine-thread only, no locks.
-// Duplicate rows in one fill dedup into ONE batched read round; no RAM cache and no
-// per-sequence state. Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
+// Duplicate rows in one fill dedup into ONE batched read round; no per-sequence state.
+// An optional host row LRU (row_cache_mb / row_cache_rows; env FREETOKEN_PLE_ROW_CACHE_MB
+// resolved in ple_disk.py, default 1024) serves repeated rows from RAM -- shared prefixes
+// across requests and decode revisits stop re-reading the O_DIRECT table, which matters
+// most when the device latency spikes.
+// Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
 // Platform seams: TableFile (O_DIRECT+pread; Win: NO_BUFFERING), BatchReader (io_uring,
 // pread-pool fallback = the portable shape), cumemop_* (dlopen libcuda; Win: nvcuda).
 
@@ -12,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -457,7 +462,8 @@ class PleStore {
   PleStore(std::vector<std::string> paths, std::vector<int64_t> extent_file,
            std::vector<int64_t> extent_base, int64_t rows_per_extent, int64_t row_bytes,
            int64_t row_stride, std::vector<int64_t> multipliers, std::vector<int64_t> head_vocab_sizes,
-           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring)
+           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring,
+           int64_t row_cache_mb, int64_t row_cache_rows)
       : row_bytes_(row_bytes),
         row_stride_(row_stride),
         rows_per_extent_(rows_per_extent),
@@ -484,6 +490,17 @@ class PleStore {
     }
     reader_ = make_batch_reader(use_io_uring);
     bounce_ = page_aligned_alloc((size_t)reader_->capacity() * kSpanMax);
+    // row_cache_rows >= 0 wins over row_cache_mb (exact-slot sizing for tests);
+    // both 0/negative -> cache off. The MB default lives in ple_disk.py (env), not here.
+    if (row_cache_rows >= 0)
+      cache_slots_ = (size_t)row_cache_rows;
+    else if (row_cache_mb > 0)
+      cache_slots_ = (size_t)row_cache_mb * (1024 * 1024) / (size_t)row_bytes_;
+    if (cache_slots_ > 0) {
+      arena_.resize(cache_slots_ * (size_t)row_bytes_);
+      free_slots_.reserve(cache_slots_);
+      for (size_t s = cache_slots_; s-- > 0;) free_slots_.push_back(s);
+    }
   }
 
   // reader first: a still-running read must not land in freed bounce memory
@@ -573,9 +590,22 @@ class PleStore {
     size_t direct = 0;
     for (const auto &f : files_) direct += f->direct_io() ? 1 : 0;
     std::string s = reader_->name();
-    if (direct == files_.size()) return s + ", O_DIRECT";
-    return s + ", buffered " + std::to_string(files_.size() - direct) + "/" +
+    if (direct == files_.size())
+      s += ", O_DIRECT";
+    else
+      s += ", buffered " + std::to_string(files_.size() - direct) + "/" +
            std::to_string(files_.size()) + " files";
+    if (cache_slots_ > 0)
+      s += ", row-cache " + std::to_string((cache_slots_ * (size_t)row_bytes_) / (1024 * 1024)) +
+           " MiB";
+    return s;
+  }
+
+  // (hits, misses, evicts, slots, row_bytes); misses counts rows queued for a disk read,
+  // fan-out duplicates (same row, same fill) are counted as neither.
+  std::vector<uint64_t> cache_stats() const {
+    return {cache_hits_, cache_misses_, cache_evicts_, (uint64_t)cache_slots_,
+            (uint64_t)row_bytes_};
   }
 
  private:
@@ -584,19 +614,30 @@ class PleStore {
     int64_t read_off;
     int64_t read_len;
     int64_t row_off;  // row payload start inside the read buffer
+    int64_t row_id;   // for the row-cache insert on completion
     std::vector<uint8_t *> dsts;
   };
 
-  // Queue dst on this fill's pending batch; duplicate rows fan out from one read.
+  // Queue dst on this fill's pending batch; duplicate rows fan out from one read, and
+  // rows the RAM cache already holds copy straight into dst without joining the batch.
   void request_row(int64_t row_id, uint8_t *dst) {
     auto pit = pending_index_.find(row_id);
     if (pit != pending_index_.end()) {
       pending_[pit->second].dsts.push_back(dst);
       return;
     }
+    auto cit = cache_index_.find(row_id);
+    if (cit != cache_index_.end()) {
+      std::memcpy(dst, arena_.data() + cit->second.first * (size_t)row_bytes_,
+                  (size_t)row_bytes_);
+      lru_.splice(lru_.begin(), lru_, cit->second.second);
+      cache_hits_++;
+      return;
+    }
+    cache_misses_++;
     const Extent &ext = extents_[row_id / rows_per_extent_];
     const int64_t off = ext.base + (row_id % rows_per_extent_) * row_stride_;
-    Pending p{ext.file, off, row_bytes_, 0, {dst}};
+    Pending p{ext.file, off, row_bytes_, 0, row_id, {dst}};
     if (ext.file->direct_io()) {
       // full aligned span even past EOF; truncating would break direct-I/O alignment
       p.read_off = off & ~(kPage - 1);
@@ -635,6 +676,7 @@ class PleStore {
         const Pending &p = pending_[tag_pending[tag]];
         const uint8_t *row = bounce_ + (size_t)tag * kSpanMax + p.row_off;
         for (uint8_t *dst : p.dsts) std::memcpy(dst, row, row_bytes_);
+        cache_insert(p.row_id, row);
         p.file->discard_cache(p.read_off, p.read_len);
         if (next < total) submit_slot(tag);
       }
@@ -642,6 +684,25 @@ class PleStore {
       reader_->drain();
       throw;
     }
+  }
+
+  // LRU insert of a freshly-read row; same engine-thread-only contract as pending_.
+  void cache_insert(int64_t row_id, const uint8_t *row) {
+    if (cache_slots_ == 0 || cache_index_.count(row_id) != 0) return;
+    size_t slot;
+    if (!free_slots_.empty()) {
+      slot = free_slots_.back();
+      free_slots_.pop_back();
+    } else {
+      const int64_t victim = lru_.back();
+      lru_.pop_back();
+      slot = cache_index_.at(victim).first;
+      cache_index_.erase(victim);
+      cache_evicts_++;
+    }
+    std::memcpy(arena_.data() + slot * (size_t)row_bytes_, row, (size_t)row_bytes_);
+    lru_.push_front(row_id);
+    cache_index_.emplace(row_id, std::make_pair(slot, lru_.begin()));
   }
 
   int64_t row_bytes_, row_stride_, rows_per_extent_;
@@ -654,6 +715,15 @@ class PleStore {
 
   std::vector<Pending> pending_;
   std::unordered_map<int64_t, size_t> pending_index_;
+
+  // Optional host row LRU: arena_ owns cache_slots_ rows of row_bytes_; lru_ front is
+  // the most recently used id, cache_index_ maps id -> (slot, lru_ iterator).
+  size_t cache_slots_ = 0;
+  std::vector<uint8_t> arena_;
+  std::list<int64_t> lru_;
+  std::unordered_map<int64_t, std::pair<size_t, std::list<int64_t>::iterator>> cache_index_;
+  std::vector<size_t> free_slots_;
+  uint64_t cache_hits_ = 0, cache_misses_ = 0, cache_evicts_ = 0;
 };
 
 }  // namespace
@@ -662,12 +732,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<PleStore>(m, "PleStore")
       .def(py::init<std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>,
                     int64_t, int64_t, int64_t, std::vector<int64_t>,
-                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool>(),
+                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool, int64_t, int64_t>(),
            py::arg("paths"), py::arg("extent_file"), py::arg("extent_base"),
            py::arg("rows_per_extent"), py::arg("row_bytes"), py::arg("row_stride"),
            py::arg("multipliers"),
            py::arg("head_vocab_sizes"), py::arg("head_offsets"), py::arg("eos_token_id"),
-           py::arg("use_io_uring") = true)
+           py::arg("use_io_uring") = true, py::arg("row_cache_mb") = 0,
+           py::arg("row_cache_rows") = -1)
       .def("stage", &PleStore::stage, py::arg("tokens_addr"), py::arg("n"),
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
@@ -678,7 +749,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("image_token_id") = -1, py::arg("pad_shift") = 1000000,
            py::arg("signal_addr") = 0,
            py::call_guard<py::gil_scoped_release>())
-      .def("io_backend", &PleStore::io_backend);
+      .def("io_backend", &PleStore::io_backend)
+      .def("cache_stats", &PleStore::cache_stats);
   m.def("event_sync_available", &event_sync_available);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));
