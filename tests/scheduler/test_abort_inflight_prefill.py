@@ -95,10 +95,13 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
 
 
 def _as_last_data(batch):
+    # mirrors the ForwardOutput NamedTuple the engine returns (attrs, not positions)
     return (
         SimpleNamespace(batch=batch),
-        (None, torch.tensor([42], dtype=torch.int32),
-         SimpleNamespace(synchronize=lambda: None)),
+        SimpleNamespace(next_tokens_gpu=None,
+                        next_tokens_cpu=torch.tensor([42], dtype=torch.int32),
+                        copy_done_event=SimpleNamespace(synchronize=lambda: None),
+                        spec=None),
     )
 
 

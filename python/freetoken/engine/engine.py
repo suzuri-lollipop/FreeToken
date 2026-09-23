@@ -489,6 +489,10 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # MTP spec payload (None for regular batches): mode-dependent host ints the drain
+    # consumes -- prologue_decode: {y1, draft}; verify: {y1, y2, accept, draft};
+    # replay: {y1, y2, accept, draft, canary}.
+    spec: dict | None = None
 
 
 class Engine:
@@ -1597,6 +1601,10 @@ class Engine:
         from freetoken.moe import _debug_stats
 
         self.run_pending_host_fill()
+        if batch.spec_mode is not None:
+            # MTP spec step: dedicated eager path (no graph, no sampler -- the drain
+            # consumes the dual-argmax payload instead).
+            return self._forward_spec(batch)
         _dbg = _debug_stats.probe()
         _ek = "p." if batch.is_prefill else "d."
         if _dbg is not None:
@@ -1634,7 +1642,15 @@ class Engine:
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph) as _deferred_fill:
             if _dbg is not None:
                 _tc1 = _time.perf_counter()
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            spec_stash = (
+                self.config.speculative == "mtp" and batch.is_prefill and not use_graph
+            )
+            if use_graph:
+                logits = self.graph_runner.replay(batch)
+            elif spec_stash:
+                logits, spec_residual = self.model.forward_with_residual_ctx()
+            else:
+                logits = self.model.forward()
             if _dbg is not None:
                 _tc2 = _time.perf_counter()
                 _dbg.host_phase(_ek + "fb.ctxenter", _tc1 - _tc0)
@@ -1649,6 +1665,8 @@ class Engine:
                 _deferred_fill()
             else:
                 self._pending_host_fill = _deferred_fill
+        if spec_stash:
+            self._stash_spec_residual(batch, spec_residual)
         if _profiling:
             # safe only because AT_EXIT mode ran the fill above (see the NOTE)
             torch.cuda.synchronize(self.device)
@@ -1677,6 +1695,116 @@ class Engine:
             _dbg.host_phase("fb.sample", _te - _ts)
             _dbg.host_phase(_ek + "fe.ret", _time.perf_counter() - _te)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    @torch.inference_mode()
+    def _forward_spec(self, batch: Batch) -> ForwardOutput:
+        """MTP spec step (Phase 1: eager, greedy, single request; _scratch/mtp_design.md).
+
+        All modes run the head unconditionally so the accept decision, both argmaxes and
+        the next draft come back in ONE device->host read (the eager normal_loop
+        serializes here anyway; the reject-side head rows pollute head KV at positions the
+        replay step rewrites, so the wasted work is also harmless).
+        """
+        model = self.model
+        req = batch.reqs[0]
+        assert len(batch.reqs) == 1, "Phase-1 spec steps run a single request"
+        assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
+        mode = batch.spec_mode
+
+        if mode in ("verify", "replay"):
+            # Snapshot BEFORE the forward advances the GDN/PLE state; the reject drain
+            # restores from this scratch slot (copy_from covers the sibling slot_states,
+            # so the PLE n-gram window rolls back with the same call).
+            self.linear_state_pool.copy_from(req.linear_slot_idx, req.spec_slot_idx)
+
+        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
+            if mode == "prologue_decode":
+                self._run_head_prologue(model, req, batch.spec_prologue)
+            mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
+            logits = torch.nn.functional.linear(mixed, model.lm_head.weight)
+            if mode == "prologue_decode":
+                y = logits[0].argmax(-1)
+                d = model.draft(residual, y.view(1).to(torch.int32), batch)
+                vals = torch.stack([y, d[0]]).tolist()
+                next_tokens_gpu = y.view(1).to(torch.int32)
+                payload = {"y1": int(vals[0]), "draft": int(vals[1])}
+            else:
+                y1 = logits[0].argmax(-1)
+                y2 = logits[1].argmax(-1)
+                d = model.draft(residual, torch.stack([y1, y2]).to(torch.int32), batch)
+                rows = [y1, y2, d[1]]
+                if mode == "replay":
+                    rows.append(batch.input_ids[1].to(torch.int64))
+                vals = torch.stack(rows).tolist()
+                if mode == "verify":
+                    accept = int(vals[0]) == batch.spec_draft_id
+                else:
+                    # the replayed row-0 argmax must reproduce the placed token: a
+                    # deterministic-GPU canary (a miss raises in the drain)
+                    accept = int(vals[0]) == int(vals[3])
+                next_tokens_gpu = y2.view(1).to(torch.int32)
+                payload = {
+                    "y1": int(vals[0]), "y2": int(vals[1]),
+                    "accept": accept, "draft": int(vals[2]),
+                }
+        if _deferred_fill is not None:
+            self._pending_host_fill = _deferred_fill
+
+        if mode == "prologue_decode":
+            req.complete_one()  # a regular decode row; the drain only picks up the draft
+        # verify/replay leave the Req lens to the drain: accept completes once and appends
+        # two tokens; reject keeps the pre-step lens so the replay re-reads the span.
+
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
+
+    def _run_head_prologue(self, model, req: Req, prologue: Batch) -> None:
+        """The head's whole-prompt catch-up pass, once per request at its first decode step.
+
+        Rows 0..T-1 with teacher-forced embeds (tokens 1..T-1 plus the first sampled
+        token), building the head layer's KV that the main prefill never ran. The shadow
+        batch sees a fresh prefill of length T (cached_len=0), so the sparse backend
+        initializes its slab/ring for the head layer exactly like a prompt chunk.
+        """
+        residual = req.spec_residual
+        assert residual is not None and prologue is not None, "prologue without the residual stash"
+        next_embed = model.model.embed_tokens.forward(prologue.input_ids)
+        self.attn_backend.prepare_metadata(prologue)
+        model.mtp.forward(residual, next_embed, prologue)
+        req.spec_residual = None  # consumed; the stash storage is released here
+
+    def _stash_spec_residual(self, batch: Batch, residual: torch.Tensor) -> None:
+        """Per-req residual rows of this prefill chunk, for the head's prologue pass.
+
+        Eligibility is decided here (Phase 1): single-chunk cold prompts only -- a prefix
+        hit or a chunked continuation leaves positions whose residuals were never
+        computed, and the catch-up pass needs every row. Non-greedy sampling and
+        over-budget prompts opt out too; all of these flip spec_off and regular decode
+        continues untouched.
+        """
+        from freetoken.scheduler.prefill import ChunkedReq
+
+        budget = int(os.getenv("FREETOKEN_MTP_MAX_STASH_TOKENS", "16384"))
+        multi = len(batch.padded_reqs) > 1
+        off = 0
+        for req in batch.padded_reqs:
+            n = req.extend_len
+            rows, off = residual[off:off + n], off + n
+            if getattr(req, "spec_off", False):
+                continue
+            if (
+                isinstance(req, ChunkedReq)
+                or req.cached_len > 0
+                or getattr(req, "linear_slot_idx", None) is None
+                or not req.sampling_params.is_greedy
+                or req.input_ids.numel() > budget
+            ):
+                req.spec_off = True
+                req.spec_residual = None
+                continue
+            req.spec_residual = rows.clone() if multi else rows
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

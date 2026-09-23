@@ -342,7 +342,9 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        # MTP spec steps need the accept count BEFORE the next batch's host bookkeeping
+        # (positions, pages, pool rows); the overlap loop issues N+1 before draining N.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative != "none":
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -362,7 +364,8 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, fout = last_data[0].batch, last_data[1]
+        next_tokens_cpu, copy_done = fout.next_tokens_cpu, fout.copy_done_event
         copy_done.synchronize()
         # Signal the in-flight batch's PLE rows at the earliest safe instant: its
         # readback event is a hair past this copy_done point, and every host us
@@ -372,8 +375,14 @@ class Scheduler(SchedulerIOMixin):
         self.engine.run_pending_host_fill()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        spec_two_row = getattr(batch, "spec_mode", None) in ("verify", "replay")
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
+            if spec_two_row:
+                # The spec drain owns this batch's bookkeeping (accept: complete_one +
+                # two tokens; reject: rollback + replay flag); the generic per-req loop
+                # below must not also run (its prefill branch would radix-commit).
+                self._drain_spec(batch, fout.spec, reply, new_finished_reqs)
+            for i, req in enumerate(() if spec_two_row else batch.reqs):
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
@@ -451,6 +460,13 @@ class Scheduler(SchedulerIOMixin):
                     # rather than re-read the freed page-table row (and on hybrid, deref the
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
+
+            if getattr(batch, "spec_mode", None) == "prologue_decode" and getattr(fout, "spec", None) is not None:
+                # a regular decode drain ran for this batch; all that remains is handing
+                # the head's first draft to the request for its next (verify) step.
+                for req in batch.reqs:
+                    if req.table_idx != -1 and not req.aborted:
+                        req.spec_draft = fout.spec.get("draft")
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -686,6 +702,14 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # MTP spec resources: the scratch GDN slot comes from the same free-list as the
+        # live/ping-pong slots; the stash/draft references must not outlive the request.
+        if req.spec_slot_idx is not None and self.engine.linear_state_pool is not None:
+            self.engine.linear_state_pool.free(req.spec_slot_idx)
+        req.spec_slot_idx = None
+        req.spec_residual = None
+        req.spec_draft = None
+        req.spec_replay = False
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -861,8 +885,13 @@ class Scheduler(SchedulerIOMixin):
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
-        # slot maps; the generic manager allocates KV pages into the page table.
-        self.cache_manager.allocate_paged(batch.reqs)
+        # slot maps; the generic manager allocates KV pages into the page table. Spec batches
+        # record their charges: a rejected verify releases them (the replay re-charges).
+        recorded = self.cache_manager.allocate_paged(
+            batch.reqs, record=getattr(batch, "spec_mode", None) in ("verify", "replay")
+        )
+        if recorded:
+            batch.spec_pages = recorded
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -932,12 +961,159 @@ class Scheduler(SchedulerIOMixin):
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                batch = self._as_spec_batch(batch) or batch
         if batch is None:
             return None
-        self._prefill_streak = self._prefill_streak + 1 if batch.is_prefill else 0
+        # Spec batches ride phase="prefill" for the extend machinery but ARE decode steps:
+        # they must not feed the prefill-interleave streak.
+        is_spec = getattr(batch, "spec_mode", None) is not None
+        self._prefill_streak = self._prefill_streak + 1 if (batch.is_prefill and not is_spec) else 0
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _as_spec_batch(self, batch: Batch) -> Batch | None:
+        """Upgrade a single-request decode batch into an MTP spec batch, or None to keep it regular.
+
+        Phase-1 gate: exactly one running request, greedy sampling, room for a two-token
+        emit, and a head that has either a draft to verify, a replay to run, or a residual
+        stash to prologue from. verify stages the draft into the token pool at the new
+        position and bumps device_len so the extend machinery emits two rows [last placed
+        token, draft]; replay needs no staging (the reject drain already repaired the pool
+        row). The batch rides phase="prefill" from here: GDN processes the two rows through
+        its chunk branch, the sparse backend and the PLE fill take their extend paths.
+        """
+        if getattr(self.config, "speculative", "none") != "mtp" or len(batch.reqs) != 1:
+            return None
+        req = batch.reqs[0]
+        if req.spec_off or not req.can_decode or not req.sampling_params.is_greedy:
+            return None
+        if req.spec_replay:
+            mode = "replay"
+        elif req.spec_draft is not None:
+            mode = "verify"
+        elif req.spec_residual is not None:
+            mode = "prologue_decode"
+        else:
+            return None
+        if mode in ("verify", "replay") and req.remain_len < 2:
+            return None  # the last token(s) finish on the regular decode path
+        if req.spec_slot_idx is None:
+            pool = self.engine.linear_state_pool
+            if pool is None:
+                req.spec_off = True
+                return None
+            req.spec_slot_idx = pool.alloc(1)[0]
+        batch.spec_mode = mode
+        if mode == "verify":
+            self.token_pool[req.table_idx, req.device_len] = req.spec_draft
+            req.device_len += 1
+            batch.spec_draft_id = req.spec_draft
+            batch.phase = "prefill"
+        elif mode == "replay":
+            batch.phase = "prefill"
+        else:
+            batch.spec_prologue = self._build_spec_prologue(req)
+        return batch
+
+    def _build_spec_prologue(self, req: Req) -> Batch:
+        """The head-only catch-up batch over the prompt rows (see Engine._run_head_prologue).
+
+        A shadow request view makes the sparse backend see a fresh length-T prefill: the
+        head layer's slab/ring start empty and the page slots already exist (the main
+        prefill charged them), so out_loc is just the page-table row slice and the embeds
+        are the pool's tokens 1..T (teacher forcing; pool[T] is the first sampled token).
+        """
+        from types import SimpleNamespace
+
+        t = int(req.cached_len)
+        assert t >= 1 and req.device_len == t + 1, (t, req.device_len)
+        shadow = SimpleNamespace(
+            table_idx=req.table_idx, cached_len=0, device_len=t, extend_len=t,
+            linear_slot_idx=req.linear_slot_idx,
+        )
+        pb = Batch(reqs=[shadow], phase="prefill")
+        pb.positions = torch.arange(t, dtype=torch.int32, device=self.device)
+        pb.input_ids = self.token_pool[req.table_idx, 1:t + 1]
+        pb.out_loc = self.engine.page_table[req.table_idx, 0:t]
+        return pb
+
+    def _drain_spec(self, batch: Batch, spec: dict | None,
+                    reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
+        """Accept/reject bookkeeping of a verify/replay step (single request, Phase 1)."""
+        req = batch.reqs[0]
+        if req.aborted:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            finished_out.add(req)
+            return
+        if spec is None:
+            raise RuntimeError("MTP spec step returned no payload")
+        if req in self.finished_reqs:
+            return
+        if batch.spec_mode == "replay" and not spec["accept"]:
+            raise RuntimeError(
+                "MTP replay canary failed: re-running a placed token diverged "
+                f"(row-0 argmax {spec['y1']}); the greedy determinism assumption "
+                "is broken on this GPU"
+            )
+        if spec["accept"]:
+            req.complete_one()
+            req.spec_replay = False
+            req.spec_draft = spec.get("draft")
+            tokens = (spec["y1"], spec["y2"]) if batch.spec_mode == "verify" else (spec["y2"],)
+        else:
+            # Reject: roll the GDN/PLE state back to the pre-verify snapshot, repair the
+            # draft's pool slot with the true token, and release this step's page charges
+            # (the replay re-charges the span). The Req lens stay pre-step so the replay
+            # rows read exactly [x_P, y1] from the pool.
+            pool = self.engine.linear_state_pool
+            pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+            self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
+            req.spec_draft = None
+            req.spec_replay = True
+            tokens = (spec["y1"],)
+        finished = False
+        for tok in tokens:
+            req.append_host(torch.tensor([tok], dtype=torch.int32))
+            hit_length = not req.can_decode
+            hit_eos = not req.sampling_params.ignore_eos and tok in self.eos_token_ids
+            matched_stop = (
+                self._match_stop_str(req)
+                if not hit_eos and req.sampling_params.stop_strs
+                else None
+            )
+            finished = hit_length or hit_eos or matched_stop is not None
+            finish_reason = (
+                ("stop" if (hit_eos or matched_stop is not None) else "length")
+                if finished
+                else None
+            )
+            if (
+                tok == self.toolcall_anchor_id
+                and req.toolcall_anchor_len is None
+                and not finished
+            ):
+                req.toolcall_anchor_len = req.input_ids.numel()
+            reply.append(
+                DetokenizeMsg(
+                    uid=req.uid,
+                    next_token=tok,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    matched_stop=matched_stop,
+                    stop_strs=req.sampling_params.stop_strs or None,
+                )
+            )
+            if finished:
+                break
+        if finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            finished_out.add(req)
+        elif not spec["accept"] and batch.spec_pages:
+            self.cache_manager.release_paged(batch.spec_pages)
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

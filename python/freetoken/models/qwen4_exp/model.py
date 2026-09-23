@@ -240,6 +240,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
+    def forward_with_residual_ctx(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward()`` over the ctx batch, plus the raw residual (the engine's MTP stash)."""
+        batch = get_global_ctx().batch
+        mixed, residual = self.model.forward_with_residual(batch.input_ids, batch)
+        return self.lm_head.forward(mixed), residual
+
     def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         """Greedy MTP draft ids for the rows of ``residual`` (eager spec path, Phase 1).
 

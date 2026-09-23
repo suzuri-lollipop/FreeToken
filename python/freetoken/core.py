@@ -82,6 +82,11 @@ class Req:
     # state the rejected draft polluted (deterministic accept; the row-0 argmax is checked
     # against the replayed token as a GPU determinism canary).
     spec_replay: bool = False
+    # Permanently disables spec for this request: non-greedy sampling, a prefix-cache hit or
+    # a chunked prompt (the head's catch-up pass needs the WHOLE prompt's residuals, which
+    # only a single-chunk cold prefill produces), or a stash over the budget. Regular decode
+    # continues untouched.
+    spec_off: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
