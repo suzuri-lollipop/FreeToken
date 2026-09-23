@@ -1029,7 +1029,14 @@ class Scheduler(SchedulerIOMixin):
             req.spec_slot_idx = pool.alloc(1)[0]
         batch.spec_mode = mode
         if mode == "verify":
+            # The draft is staged into BOTH stores: the token pool feeds the forward
+            # rows, and the host id buffer feeds the PLE extend fill (which builds this
+            # batch's n-gram rows from req.input_ids[cached:device] -- without the host
+            # copy the draft row would read a stale PLE row). The drain reconciles: an
+            # accept keeps the draft as the placed y1 and appends only y2; a reject
+            # overwrites the slot with the true token.
             self.token_pool[req.table_idx, req.device_len] = req.spec_draft
+            req.append_host(torch.tensor([req.spec_draft], dtype=torch.int32))
             req.device_len += 1
             batch.spec_draft_id = req.spec_draft
             batch.phase = "prefill"
@@ -1100,17 +1107,22 @@ class Scheduler(SchedulerIOMixin):
             req.spec_replay = False
             req.spec_draft = spec.get("draft")
             tokens = (spec["y1"], spec["y2"]) if batch.spec_mode == "verify" else (spec["y2"],)
+            # An accepted verify's y1 IS the draft _as_spec_batch staged onto the host
+            # buffer; a replay's single token (y2) is new and appends.
+            skip_first_append = batch.spec_mode == "verify"
         else:
             # Reject: roll the GDN/PLE state back to the pre-verify snapshot, repair the
-            # draft's pool slot with the true token, and release this step's page charges
+            # draft's slots with the true token, and release this step's page charges
             # (the replay re-charges the span). The Req lens stay pre-step so the replay
             # rows read exactly [x_P, y1] from the pool.
             pool = self.engine.linear_state_pool
             pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
             self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
+            req.input_ids[req.device_len - 1] = spec["y1"]  # the staged draft slot
             req.spec_draft = None
             req.spec_replay = True
             tokens = (spec["y1"],)
+            skip_first_append = True
         if os.getenv("FREETOKEN_MTP_DEBUG"):
             logger.info_rank0(
                 f"[mtp] {batch.spec_mode} accept={spec['accept']} y1={spec['y1']} "
@@ -1118,8 +1130,9 @@ class Scheduler(SchedulerIOMixin):
                 f"lens=({req.cached_len},{req.device_len}) host={req.input_ids.tolist()[-4:]}"
             )
         finished = False
-        for tok in tokens:
-            req.append_host(torch.tensor([tok], dtype=torch.int32))
+        for tok_i, tok in enumerate(tokens):
+            if not (tok_i == 0 and skip_first_append):
+                req.append_host(torch.tensor([tok], dtype=torch.int32))
             hit_length = not req.can_decode
             hit_eos = not req.sampling_params.ignore_eos and tok in self.eos_token_ids
             matched_stop = (

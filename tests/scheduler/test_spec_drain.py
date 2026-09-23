@@ -72,7 +72,9 @@ def _drain(sched, batch, spec):
 
 
 def test_accept_completes_once_and_appends_two_tokens():
-    req = _req()
+    # _as_spec_batch staged the draft onto the host buffer already (slot P+1 = y1)
+    req = _req(host_len=P + 2)
+    req.input_ids[P + 1] = 41
     req.device_len = P + 2  # the verify bump
     sched, batch, calls, pool = _setup(req)
     reply, finished = _drain(sched, batch,
@@ -87,7 +89,8 @@ def test_accept_completes_once_and_appends_two_tokens():
 
 
 def test_reject_restores_repairs_and_keeps_pre_step_lens():
-    req = _req()
+    req = _req(host_len=P + 2)
+    req.input_ids[P + 1] = 999  # the staged draft, to be overwritten with y1
     req.device_len = P + 2
     req.spec_draft = 999
     sched, batch, calls, pool = _setup(req, pages=[(0, 1, 2)])
@@ -97,7 +100,7 @@ def test_reject_restores_repairs_and_keeps_pre_step_lens():
     assert int(pool[0, P + 1]) == 41  # the draft's pool slot repaired with the true token
     assert calls["release"] == [[(0, 1, 2)]]
     assert req.spec_replay and req.spec_draft is None
-    assert req.input_ids.tolist()[-1] == 41 and req.input_ids.numel() == P + 2
+    assert req.input_ids.tolist()[-1] == 41 and req.input_ids.numel() == P + 2  # slot repaired, not appended
     # the pre-step lens: the replay step re-reads rows [P, P+1] = [x_P, y1]
     assert req.cached_len == P and req.device_len == P + 2
     assert [m.next_token for m in reply] == [41] and not finished
@@ -125,7 +128,8 @@ def test_replay_canary_miss_fails_loudly():
 
 
 def test_eos_on_the_first_token_drops_the_bonus_and_finishes():
-    req = _req()
+    req = _req(host_len=P + 2)
+    req.input_ids[P + 1] = 2  # the staged draft == y1 == eos
     req.device_len = P + 2
     sched, batch, calls, _pool = _setup(req)
     reply, finished = _drain(sched, batch,
@@ -137,10 +141,11 @@ def test_eos_on_the_first_token_drops_the_bonus_and_finishes():
 
 
 def test_length_finish_on_the_second_token():
-    req = Req(input_ids=torch.arange(P + 1, dtype=torch.int32), table_idx=0,
-              cached_len=P, output_len=1, uid=7,
+    req = Req(input_ids=torch.arange(P + 2, dtype=torch.int32), table_idx=0,
+              cached_len=P, output_len=0, uid=7,
               sampling_params=SamplingParams(temperature=0.0), cache_handle=None)
-    # max_device_len = P+2: appending y1 exhausts the budget, the bonus token is dropped
+    # max_device_len = P+2: the staged draft already exhausts the budget, so the
+    # accept's complete_one leaves no room and the first emitted token finishes
     req.device_len = P + 2
     sched, batch, _calls, _pool = _setup(req)
     reply, finished = _drain(sched, batch,
@@ -195,6 +200,8 @@ def test_verify_needs_room_for_two_tokens():
     out = Scheduler._as_spec_batch(sched2, batch2)
     assert out is batch2 and batch2.spec_mode == "verify" and batch2.phase == "prefill"
     assert req2.device_len == P + 2 and writes2[(0, P + 1)] == 42
+    # the draft is staged on the HOST buffer too (the PLE extend fill reads it)
+    assert req2.input_ids.numel() == P + 2 and int(req2.input_ids[P + 1]) == 42
 
 
 def test_replay_runs_even_with_one_token_of_room():
