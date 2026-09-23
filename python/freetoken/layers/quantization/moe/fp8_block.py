@@ -21,9 +21,13 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=True, tp_ok=True, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
+        if cfg.intermediate % BLOCK:
+            # the TP shard keeps whole scale blocks (MoEConfig.local_intermediate_range),
+            # which needs the full intermediate to be a multiple of the block
+            return f"fp8 block MoE needs the intermediate ({cfg.intermediate}) to be a multiple of {BLOCK}"
         reason = gated_epilogue_reason(cfg)
         if reason:
             return f"fp8 block MoE kernel: {reason}"
@@ -32,7 +36,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h, b = cfg.intermediate, cfg.hidden, BLOCK
+        i, h, b = cfg.local_intermediate, cfg.hidden, BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
             "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),
@@ -67,7 +71,9 @@ class Fp8BlockMoEMethod(MoEMethod):
 
     def create_weights(self, layer) -> None:
         g = self.cfg
-        e, i, h, b = g.num_experts, g.intermediate, g.hidden, BLOCK
+        # local (this rank's block-aligned shard) since TP support: the fused gate_up is
+        # [gate rows lo:hi; up rows lo:hi] and the scales are the whole blocks in between
+        e, i, h, b = g.num_experts, g.local_intermediate, g.hidden, BLOCK
         layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=FP8)
         layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
         layer.down_proj = torch.empty(e, h, i, dtype=FP8)

@@ -9,7 +9,19 @@ from typing import Any, ClassVar
 import torch
 
 from ..method import QuantMethod
-from ..scheme import QuantScheme
+from ..scheme import FP8_BLOCK as FP8_BLOCK_SIZE
+from ..scheme import QuantKind, QuantScheme
+
+
+def block_aligned_range(total: int, block: int, rank: int, size: int) -> tuple[int, int]:
+    """The [lo, hi) row range of ``total`` rows owned by ``rank`` of ``size`` when a shard
+    must keep whole ``block``-row groups together (fp8 128x128 block scales: a scale block
+    can never straddle two ranks). Remainder blocks go to the trailing ranks; when the
+    block count divides evenly this is the ordinary uniform split.
+    """
+    blocks, rem = divmod(total, block)
+    assert rem == 0, f"total {total} is not a multiple of the scale block {block}"
+    return blocks * rank // size * block, blocks * (rank + 1) // size * block
 
 
 @dataclass(frozen=True)
@@ -56,7 +68,22 @@ class MoEConfig:
 
     @property
     def local_intermediate(self) -> int:
-        return self.intermediate // self.tp_size
+        lo, hi = self.local_intermediate_range
+        return hi - lo
+
+    @property
+    def local_intermediate_range(self) -> tuple[int, int]:
+        """This rank's [lo, hi) rows of the full intermediate dim.
+
+        FP8 block scales shard by whole 128-row blocks (possibly uneven across ranks:
+        640 rows = 5 blocks gives 256/384 over TP2); every other kind splits evenly.
+        """
+        if self.scheme is not None and self.scheme.kind == QuantKind.FP8_BLOCK:
+            return block_aligned_range(
+                self.intermediate, FP8_BLOCK_SIZE, self.tp_rank, self.tp_size
+            )
+        per = self.intermediate // self.tp_size
+        return per * self.tp_rank, per * (self.tp_rank + 1)
 
     @property
     def plain_silu(self) -> bool:

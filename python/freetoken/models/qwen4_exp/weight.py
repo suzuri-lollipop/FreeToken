@@ -54,6 +54,35 @@ _MTP_EXPERT_PIECE_RE = re.compile(
     r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale_inv)$"
 )
+# The stacked MTP expert export: buffer-named tensors that pass through _rename and are
+# sharded here under TP (same block-aligned ranges as _fuse_mtp_experts).
+_MTP_STACKED_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.\d+\.mlp\.experts\."
+    r"(gate_up_proj|gate_up_scale_inv|down_proj|down_scale_inv)$"
+)
+
+
+def _shard_stacked_mtp(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    m = _MTP_STACKED_EXPERT_RE.match(name)
+    tp = get_tp_info()
+    if m is None or tp.size <= 1:
+        return tensor
+    from freetoken.layers.quantization.moe.base import block_aligned_range
+
+    kind = m.group(1)
+    if kind == "gate_up_proj":
+        i_full = tensor.shape[1] // 2
+        lo, hi = block_aligned_range(i_full, 128, tp.rank, tp.size)
+        return torch.cat((tensor[:, lo:hi], tensor[:, i_full + lo:i_full + hi]), dim=1)
+    if kind == "down_proj":
+        lo, hi = block_aligned_range(tensor.shape[2], 128, tp.rank, tp.size)
+        return tensor[:, :, lo:hi].contiguous()
+    blocks = tensor.shape[1] if kind == "gate_up_scale_inv" else tensor.shape[2]
+    b_full = blocks // 2 if kind == "gate_up_scale_inv" else blocks
+    lb, hb = b_full * tp.rank // tp.size, b_full * (tp.rank + 1) // tp.size
+    if kind == "gate_up_scale_inv":
+        return torch.cat((tensor[:, lb:hb], tensor[:, b_full + lb:b_full + hb]), dim=1)
+    return tensor[:, :, lb:hb].contiguous()
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -211,18 +240,22 @@ class _DenseFuser:
 
 def _fuse_mtp_experts(
     pieces: dict[tuple[int, int, str, str], torch.Tensor],
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Stack the per-expert MTP pieces into the resident buffers create_weights declares.
 
-    gate|up fuse along the intermediate dim exactly like the bank layout does, and this
-    checkpoint's 128-row scale blocks align at the fused boundary (gate and up scales
-    are [I/128, H/128] each and simply stack to [2I/128, H/128]), so no repack is
-    needed -- unlike a TP-sharded layout, which is Phase 2 of _scratch/mtp_design.md.
+    gate|up fuse along the intermediate dim exactly like the bank layout does. Under TP
+    the shard keeps whole 128-row scale blocks (MoEConfig.local_intermediate_range and
+    this packer must agree -- 640 rows over TP2 gives 256 on rank 0 and 384 on rank 1,
+    so the fused boundary stays block-aligned even though a uniform split would not).
     Pieces arrive on CPU (the fused peak stays off the GPU); the emitted names match the
     state dict of the resident fp8-block method: ``experts.{gate_up_proj,
     gate_up_scale_inv, down_proj, down_scale_inv}`` (scales only when the checkpoint
     carries them -- unquantized exports have plain bf16 weights and no scale_inv).
     """
+    from freetoken.layers.quantization.moe.base import block_aligned_range
+
     for layer in sorted({k[0] for k in pieces}):
         experts = sorted({k[1] for k in pieces if k[0] == layer})
         if experts != list(range(len(experts))):
@@ -233,28 +266,43 @@ def _fuse_mtp_experts(
         def has(proj: str, kind: str) -> bool:
             return all((layer, e, proj, kind) in pieces for e in experts)
 
-        def stack(proj: str, kind: str) -> torch.Tensor:
-            return torch.stack([pieces[(layer, e, proj, kind)] for e in experts])
-
-        def stack_gu(kind: str) -> torch.Tensor:
-            return torch.stack([
-                torch.cat((pieces[(layer, e, "gate_proj", kind)],
-                           pieces[(layer, e, "up_proj", kind)]), dim=0)
-                for e in experts
-            ])
-
         if not (has("gate_proj", "weight") and has("up_proj", "weight") and has("down_proj", "weight")):
             raise ValueError(f"mtp.layers.{layer}.mlp.experts: incomplete per-expert weights")
         scaled = [has(p, "weight_scale_inv") for p in ("gate_proj", "up_proj", "down_proj")]
         if any(scaled) and not all(scaled):
             raise ValueError(f"mtp.layers.{layer}.mlp.experts: weight_scale_inv present for only some projections")
 
+        i_full = pieces[(layer, experts[0], "gate_proj", "weight")].shape[0]
+        if tp_size > 1:
+            lo, hi = block_aligned_range(i_full, 128, tp_rank, tp_size)
+        else:
+            lo, hi = 0, i_full  # no shard: any intermediate size packs whole
+        lb, hb = lo // 128, hi // 128 if hi % 128 == 0 else None
+
+        def stack_rows(proj: str, kind: str) -> torch.Tensor:
+            return torch.stack([pieces[(layer, e, proj, kind)][lo:hi] for e in experts])
+
+        def stack_cols(proj: str, kind: str) -> torch.Tensor:
+            return torch.stack([pieces[(layer, e, proj, kind)][:, lo:hi] for e in experts])
+
+        def stack_scale_rows(proj: str) -> torch.Tensor:
+            return torch.stack([
+                pieces[(layer, e, proj, "weight_scale_inv")][lb:hb] for e in experts
+            ])
+
+        def stack_scale_cols(proj: str) -> torch.Tensor:
+            return torch.stack([
+                pieces[(layer, e, proj, "weight_scale_inv")][:, lb:hb] for e in experts
+            ])
+
         prefix = f"mtp.layers.{layer}.mlp.experts."
-        yield prefix + "gate_up_proj", stack_gu("weight")
-        yield prefix + "down_proj", stack("down_proj", "weight")
+        yield prefix + "gate_up_proj", torch.cat(
+            (stack_rows("gate_proj", "weight"), stack_rows("up_proj", "weight")), dim=1)
+        yield prefix + "down_proj", stack_cols("down_proj", "weight")
         if scaled[0]:
-            yield prefix + "gate_up_scale_inv", stack_gu("weight_scale_inv")
-            yield prefix + "down_scale_inv", stack("down_proj", "weight_scale_inv")
+            yield prefix + "gate_up_scale_inv", torch.cat(
+                (stack_scale_rows("gate_proj"), stack_scale_rows("up_proj")), dim=1)
+            yield prefix + "down_scale_inv", stack_scale_cols("down_proj")
 
 
 def iter_weights(
@@ -311,6 +359,8 @@ def iter_weights(
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = f.get_tensor(raw_name)
+                if include_mtp:
+                    tensor = _shard_stacked_mtp(name, tensor)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
@@ -319,7 +369,8 @@ def iter_weights(
                     yield from fused
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
-    yield from _fuse_mtp_experts(mtp_pieces)
+    tp = get_tp_info()
+    yield from _fuse_mtp_experts(mtp_pieces, tp.rank, tp.size)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

@@ -460,10 +460,12 @@ def test_mtp_still_dropped_by_default(checkpoint_mtp):
 
 def test_fuse_mtp_experts_fp8_pieces():
     # released geometry: fp8 weights + BF16 128x128 block scales, gate|up stacked along
-    # the intermediate dim, scales stacking to [2I/128, H/128] with no repack.
+    # the intermediate dim, scales stacking to [2I/128, H/128] with no repack. i=384 is
+    # three scale blocks: TP2 shards them 1/2 (uneven, block-aligned -- a uniform 192-row
+    # split would straddle a scale block).
     from freetoken.models.qwen4_exp.weight import _fuse_mtp_experts
 
-    e_count, i, h, b = 2, 128, 256, 128
+    e_count, i, h, b = 2, 384, 256, 128
     pieces = {}
     for e in range(e_count):
         for proj, (rows, cols) in (("gate_proj", (i, h)), ("up_proj", (i, h)), ("down_proj", (h, i))):
@@ -477,6 +479,30 @@ def test_fuse_mtp_experts_fp8_pieces():
     assert fused["mtp.layers.0.mlp.experts.down_scale_inv"].shape == (e_count, h // b, i // b)
     assert torch.equal(fused["mtp.layers.0.mlp.experts.gate_up_proj"][1, :i], pieces[(0, 1, "gate_proj", "weight")])
     assert torch.equal(fused["mtp.layers.0.mlp.experts.gate_up_proj"][1, i:], pieces[(0, 1, "up_proj", "weight")])
+
+    r0 = dict(_fuse_mtp_experts(pieces, 0, 2))
+    r1 = dict(_fuse_mtp_experts(pieces, 1, 2))
+    assert r0["mtp.layers.0.mlp.experts.gate_up_proj"].shape == (e_count, 2 * b, h)
+    assert r0["mtp.layers.0.mlp.experts.gate_up_scale_inv"].shape == (e_count, 2, h // b)
+    assert r0["mtp.layers.0.mlp.experts.down_proj"].shape == (e_count, h, b)
+    assert r0["mtp.layers.0.mlp.experts.down_scale_inv"].shape == (e_count, h // b, 1)
+    assert r1["mtp.layers.0.mlp.experts.gate_up_proj"].shape == (e_count, 2 * 2 * b, h)
+    assert r1["mtp.layers.0.mlp.experts.gate_up_scale_inv"].shape == (e_count, 4, h // b)
+    assert r1["mtp.layers.0.mlp.experts.down_proj"].shape == (e_count, h, 2 * b)
+    assert r1["mtp.layers.0.mlp.experts.down_scale_inv"].shape == (e_count, h // b, 2)
+    # values: rank 0 keeps intermediate rows [0,128), rank 1 keeps [128,384)
+    assert torch.equal(r0["mtp.layers.0.mlp.experts.gate_up_proj"][1, :b],
+                       pieces[(0, 1, "gate_proj", "weight")][:b])
+    assert torch.equal(r0["mtp.layers.0.mlp.experts.gate_up_proj"][1, b:],
+                       pieces[(0, 1, "up_proj", "weight")][:b])
+    assert torch.equal(r1["mtp.layers.0.mlp.experts.gate_up_proj"][1, :2 * b],
+                       pieces[(0, 1, "gate_proj", "weight")][b:])
+    assert torch.equal(r1["mtp.layers.0.mlp.experts.down_proj"][1],
+                       pieces[(0, 1, "down_proj", "weight")][:, b:])
+    assert torch.equal(r1["mtp.layers.0.mlp.experts.gate_up_scale_inv"][1, :2],
+                       pieces[(0, 1, "gate_proj", "weight_scale_inv")][1:])
+    assert torch.equal(r1["mtp.layers.0.mlp.experts.gate_up_scale_inv"][1, 2:],
+                       pieces[(0, 1, "up_proj", "weight_scale_inv")][1:])
 
     del pieces[(0, 1, "up_proj", "weight")]
     with pytest.raises(ValueError, match="incomplete"):

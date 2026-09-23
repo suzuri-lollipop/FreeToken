@@ -1065,6 +1065,17 @@ class Scheduler(SchedulerIOMixin):
                 f"(row-0 argmax {spec['y1']}); the greedy determinism assumption "
                 "is broken on this GPU"
             )
+        if batch.spec_mode == "verify":
+            # rate-limited ops visibility: the running acceptance over all verifies
+            stats = getattr(self, "_spec_stats", None)
+            if stats is None:
+                stats = self._spec_stats = [0, 0]
+            stats[0] += 1
+            stats[1] += int(bool(spec["accept"]))
+            if stats[0] % 64 == 0:
+                logger.info_rank0(
+                    f"MTP spec: acceptance {stats[1]}/{stats[0]} = {stats[1] / stats[0]:.3f}"
+                )
         if spec["accept"]:
             req.complete_one()
             req.spec_replay = False
