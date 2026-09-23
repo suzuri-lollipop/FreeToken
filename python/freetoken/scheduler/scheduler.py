@@ -143,6 +143,7 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
+        self._prefill_streak = 0
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -922,12 +923,18 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        interval = self.config.prefill_decode_interval
+        batch = None
+        # schedule_next_batch consumes the admission, so the interleave guard must run
+        # BEFORE scheduling prefill: after N consecutive prefill steps hand one step to
+        # running decodes so a long chunked prompt cannot stall everyone's ITL.
+        if not (interval > 0 and self._prefill_streak >= interval and self.decode_manager.runnable):
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
+        self._prefill_streak = self._prefill_streak + 1 if batch.is_prefill else 0
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input

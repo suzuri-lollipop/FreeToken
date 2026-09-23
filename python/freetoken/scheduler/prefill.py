@@ -305,6 +305,7 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        deferred: List[PendingReq] = []
         prompt_admissions: List[Tuple[int, int, int]] = []
         # Snapshot here, before the forward's complete_one() advances cached_len: the tokens
         # forwarded this batch (extend_len) and the prefix-cache hit. SGLang counts the hit
@@ -336,10 +337,12 @@ class PrefillManager:
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
-                break  # We cannot add more requests
+                deferred.append(pending_req)
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        # Backfill: a req that does not fit this step no longer blocks smaller reqs
+        # queued behind it; the deferred keep their arrival order.
+        self.pending_list = chunked_list + deferred
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens

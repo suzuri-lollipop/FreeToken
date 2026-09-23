@@ -159,6 +159,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _nonneg_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer >= 0") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -381,6 +390,17 @@ def parse_args(
         dest="max_extend_tokens",
         default=ServerArgs.max_extend_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
+    )
+
+    parser.add_argument(
+        "--prefill-decode-interval",
+        type=_nonneg_int,
+        default=ServerArgs.prefill_decode_interval,
+        help=(
+            "After this many consecutive prefill forwards, give one step to running decodes "
+            "so a long chunked prompt cannot stall their token delivery. 0 disables the "
+            "interleave (prefill strictly first, the historical behavior)."
+        ),
     )
 
     parser.add_argument(
