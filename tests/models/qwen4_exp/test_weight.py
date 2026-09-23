@@ -295,6 +295,33 @@ def test_mtp_experts_and_table_never_loaded(loaded):
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_scale_inv"))
 
 
+def test_fp8_block_scales_scheme_resolves_for_mtp_experts():
+    # The MTP head's experts are FP8_BLOCK_SCALES (128x128 blocks, BF16 scale
+    # storage) per hf_quant_config.json. The scheme table must resolve them so
+    # MTP weight loading can be built on it; until then the loader still drops
+    # every mtp.* tensor (see test_mtp_experts_and_table_never_loaded).
+    from freetoken.layers.quantization.configs.modelopt import ModelOptConfig
+    from freetoken.layers.quantization.scheme import QuantKind
+
+    cfg = ModelOptConfig(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
+                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES", "group_size": 128},
+            },
+        }
+    )
+    s = cfg.scheme_for_name("mtp.layers.0.mlp.experts.17.gate_proj")
+    assert s is not None and s.kind is QuantKind.FP8_BLOCK
+    assert s.weight.elem == "e4m3" and s.weight.scale == "bf16"
+    assert s.weight.group == (128, 128)
+    main = cfg.scheme_for_name("model.language_model.layers.0.mlp.experts.3.down_proj")
+    assert main is not None and main.kind is QuantKind.NVFP4
+    # dense MTP tensors are not in quantized_layers -> unquantized bf16
+    assert cfg.scheme_for_name("mtp.fc_embedding") is None
+
+
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
     _folder, raw = checkpoint
     key = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"

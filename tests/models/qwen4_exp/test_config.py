@@ -135,6 +135,38 @@ def test_qwen4_args_payload():
     assert args.ngram_boundary_token_id == 248044
 
 
+def test_mtp_fields_default_to_disabled_without_a_config_block():
+    args = parse_config(_hf_config()).qwen4_args
+    assert args.mtp_num_layers == 0
+    assert args.mtp_rope_theta is None
+    assert args.mtp_use_hidden_state_from_layer is None
+
+
+def test_mtp_block_is_recorded_verbatim():
+    # the released checkpoint carries text_config.mtp = {hybrid: true,
+    # layer_types: [full_attention], num_hidden_layers: 1, rope_theta: 1e7,
+    # mtp_use_hidden_state_from_layer: null}; parse_config must record it without
+    # building or validating anything (serving without spec must keep working).
+    hf = _hf_config()
+    hf.text_config.mtp = SimpleNamespace(
+        hybrid=True,
+        layer_types=["full_attention"],
+        num_hidden_layers=1,
+        rope_theta=10000000,
+        mtp_use_hidden_state_from_layer=None,
+    )
+    args = parse_config(hf).qwen4_args
+    assert args.mtp_num_layers == 1
+    assert args.mtp_rope_theta == 10000000.0
+    assert args.mtp_use_hidden_state_from_layer is None
+    # dict-shaped mtp blocks parse the same
+    hf2 = _hf_config()
+    hf2.text_config.mtp = {"num_hidden_layers": 1, "rope_theta": 10000000,
+                           "mtp_use_hidden_state_from_layer": 47}
+    args2 = parse_config(hf2).qwen4_args
+    assert args2.mtp_num_layers == 1 and args2.mtp_use_hidden_state_from_layer == 47
+
+
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
     hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer

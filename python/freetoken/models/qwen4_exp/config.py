@@ -43,6 +43,12 @@ class Qwen4ExpArgs:
     index_budget: int
     index_ratio: int
     image_token_id: int | None = None
+    # MTP speculative head (text_config.mtp). Record-only: 0 layers when the block is
+    # absent, and nothing is built until speculative serving opts in. The head shares
+    # embed/lm_head and adds full_attention layers at indices [num_layers, ...).
+    mtp_num_layers: int = 0
+    mtp_rope_theta: float | None = None
+    mtp_use_hidden_state_from_layer: int | None = None
 
     @property
     def index_topk_blocks(self) -> int:
@@ -206,6 +212,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
+    # MTP head geometry (record-only; speculative serving validates when enabled). HF may
+    # hand back a dict or a nested config object.
+    mtp_cfg = getattr(text, "mtp", None) or {}
+    if not isinstance(mtp_cfg, dict):
+        mtp_cfg = vars(mtp_cfg)
+    mtp_theta = mtp_cfg.get("rope_theta")
+    mtp_hidden_src = mtp_cfg.get("mtp_use_hidden_state_from_layer")
+
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -225,6 +239,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
         image_token_id=getattr(hf_config, "image_token_id", None),
+        mtp_num_layers=int(mtp_cfg.get("num_hidden_layers", 0) or 0),
+        mtp_rope_theta=float(mtp_theta) if mtp_theta is not None else None,
+        mtp_use_hidden_state_from_layer=(
+            int(mtp_hidden_src) if mtp_hidden_src is not None else None
+        ),
     )
 
     return ModelConfig(

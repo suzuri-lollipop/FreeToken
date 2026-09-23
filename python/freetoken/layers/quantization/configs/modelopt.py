@@ -22,6 +22,9 @@ class ModelOptConfig(QuantConfig):
         "FP8": fp8_tensor_scheme("fp32", input_scale=True),
         "FP8_PER_CHANNEL_PER_TOKEN": fp8_tensor_scheme("fp32", per_row=True),
         "FP8_PB_WO": fp8_block_scheme("fp32"),
+        # ModelOpt name for DeepSeek-style 128x128 block fp8; the Qwen4Exp MTP
+        # head's experts carry it with BF16 scale storage (weight_scale_inv).
+        "FP8_BLOCK_SCALES": fp8_block_scheme("bf16"),
         "MXFP8": mxfp8_scheme(),
     }
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
