@@ -175,3 +175,53 @@ def test_default_wiring_is_the_probed_winner():
 
     config = parsed_config(mtp=_mtp_block())
     assert Qwen4ExpMTPHead(config, layer_id=config.num_layers).wiring == "norm_mixfrom_fc"
+
+
+def _bare_model(enabled=True):
+    """Toy model with the decoder stack and PLE emptied: the CPU-testable skeleton
+    (embed -> [nothing] -> top mixer / lm_head / head) of the spec-path API."""
+    from freetoken.models.qwen4_exp.config import extend_config_for_mtp
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    config = parsed_config(mtp=_mtp_block())
+    model = Qwen4ExpForCausalLM(extend_config_for_mtp(config) if enabled else config)
+    model.model.layers.op_list.clear()
+    model.model._ple = ()
+    fill_weights(model, seed=11, device=torch.device("cpu"))
+    return model
+
+
+def test_forward_with_residual_returns_the_premix_stream():
+    from types import SimpleNamespace
+
+    model = _bare_model(enabled=False)
+    ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    mixed, residual = model.model.forward_with_residual(ids, SimpleNamespace(mm_embeds=None))
+    want_r = model.model.embed_tokens.forward(ids).repeat(1, model.model.hc_count)
+    assert torch.equal(residual, want_r)
+    assert torch.equal(mixed, model.model.hyper_connection_mixer.mix(want_r)[0])
+
+
+def test_draft_runs_the_shared_head_chain_and_argmaxes_full_logits():
+    model = _bare_model()
+    head = model.mtp
+    head.layers.op_list.clear()  # attention/MoE kernels are GPU-only; the chain under
+    head.wiring = "norm_mix_fc"  # test here is embed -> head front end -> mixer -> lm_head
+    fill_weights(head, seed=12, device=torch.device("cpu"))
+
+    args = model._config.qwen4_args
+    residual = torch.randn(3, args.ple_state_width)
+    next_ids = torch.tensor([5, 6, 7], dtype=torch.int32)
+    got = model.draft(residual, next_ids, None)
+
+    embed = model.model.embed_tokens.forward(next_ids)
+    mixed = model.model.hyper_connection_mixer.mix(head.fuse_input(residual, embed))[0]
+    want = torch.nn.functional.linear(mixed, model.lm_head.weight).argmax(-1)
+    assert got.shape == (3,) and got.dtype == want.dtype
+    assert torch.equal(got, want)
+
+
+def test_draft_without_the_head_fails_loudly():
+    model = _bare_model(enabled=False)
+    with pytest.raises(AssertionError, match="MTP head"):
+        model.draft(torch.randn(1, 4), torch.tensor([1]), None)

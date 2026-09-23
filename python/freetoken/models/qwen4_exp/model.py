@@ -115,7 +115,12 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward_with_residual(self, input_ids: torch.Tensor, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward`` plus the raw hyper-connection residual: ``(mixed [T,H], R [T,HC*H])``.
+
+        The MTP spec path consumes R (the head's fc_hidden input) alongside the logits,
+        so the top mixer's INPUT has to escape the model too.
+        """
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
         hidden = hidden.repeat(1, self.hc_count)
         meta = None
@@ -131,7 +136,10 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        return self.hyper_connection_mixer.mix(hidden)[0], hidden
+
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        return self.forward_with_residual(input_ids, batch)[0]
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -231,6 +239,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+
+    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """Greedy MTP draft ids for the rows of ``residual`` (eager spec path, Phase 1).
+
+        Collapses the head output through the shared top mixer and computes the FULL
+        logits with a direct matmul: ParallelLMHead.forward's row selection is ctx-driven
+        (per-request last row) while drafting needs every row. TP1 only for now -- the
+        vocab-parallel gather is Phase 2+ work.
+        """
+        if self.mtp is None:
+            raise AssertionError("draft() needs the MTP head (--speculative mtp)")
+        next_embed = self.model.embed_tokens.forward(next_ids)
+        head_out = self.mtp.forward(residual, next_embed, batch)
+        mixed = self.model.hyper_connection_mixer.mix(head_out)[0]
+        return torch.nn.functional.linear(mixed, self.lm_head.weight).argmax(-1)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
