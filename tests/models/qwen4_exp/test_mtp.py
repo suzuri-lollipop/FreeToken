@@ -149,3 +149,18 @@ def test_head_experts_stay_resident_under_an_offload_engine():
     config = replace(parsed_config(mtp=_mtp_block()), moe_strategy="offload")
     head = Qwen4ExpMTPHead(config, layer_id=config.num_layers)
     assert not isinstance(head.layers.op_list[0].mlp.experts, OffloadMoELayer)
+
+
+def test_model_attaches_the_head_only_when_enabled():
+    from freetoken.models.qwen4_exp.config import extend_config_for_mtp
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    base = parsed_config(mtp=_mtp_block())
+    assert Qwen4ExpForCausalLM(base).mtp is None  # recorded, not enabled
+
+    model = Qwen4ExpForCausalLM(extend_config_for_mtp(base))
+    assert model.mtp is not None
+    # the strict-load naming: the head hangs under `mtp`, matching the checkpoint keys
+    keys = set(model.state_dict())
+    assert any(k.startswith("mtp.fc_embedding") for k in keys)
+    assert any(k.startswith("mtp.layers.0.mlp.experts.") for k in keys)

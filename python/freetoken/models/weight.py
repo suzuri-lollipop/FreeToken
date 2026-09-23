@@ -252,6 +252,7 @@ def load_weight(
     *,
     include_moe_experts: bool = True,
     include_vision: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -264,12 +265,25 @@ def load_weight(
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
+        if include_mtp:
+            raise NotImplementedError(
+                "FTW checkpoints do not carry the MTP head; convert again (the converter "
+                "runs iter_weights without include_mtp) or serve from safetensors"
+            )
         weights = iter_ftw_weights(model_path, keep=keep)
     else:
         _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
         # only a family that registers an encoder is asked about the tower; the others never load one
         kwargs = {"include_vision": include_vision} if spec.encoders else {}
+        if include_mtp:
+            import inspect
+
+            if "include_mtp" not in inspect.signature(iter_weights).parameters:
+                raise NotImplementedError(
+                    f"--speculative mtp: the {spec.module} family has no MTP weight reader"
+                )
+            kwargs["include_mtp"] = True
         weights = iter_weights(
             model_path,
             device,

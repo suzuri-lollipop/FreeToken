@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -26,6 +27,7 @@ from freetoken.utils import nvtx_annotate
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
+from .mtp import Qwen4ExpMTPHead
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -143,6 +145,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             quant_config=config.quant,
             prefix="lm_head",
+        )
+        # Speculative MTP head (--speculative mtp): attached under `mtp` so the strict
+        # weight load lines up with the checkpoint's mtp.* names. Nothing in the serving
+        # path calls it until the spec step lands (Phase 1 of _scratch/mtp_design.md);
+        # the wiring variant is the probe knob FREETOKEN_MTP_WIRING.
+        self.mtp = (
+            Qwen4ExpMTPHead(
+                config,
+                layer_id=config.num_layers,
+                wiring=os.getenv("FREETOKEN_MTP_WIRING", "norm_mix_fc"),
+            )
+            if config.qwen4_args.mtp_enabled
+            else None
         )
         super().__init__()
 
