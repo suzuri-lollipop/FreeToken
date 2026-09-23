@@ -168,3 +168,47 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"{name}: PASS")
+
+
+def test_copy_from_roundtrips_a_spec_snapshot_including_slot_states():
+    """The spec-verify rollback contract (MTP reject-replay loop): copy_from(live ->
+    scratch) snapshots before the two-row verify, copy_from(scratch -> live) restores on a
+    reject, and the sibling slot_states (the PLE n-gram window rides them) roll back too."""
+    from freetoken.models.config import SlotStateSpec
+
+    g = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+    specs = (SlotStateSpec(name="ple_ngram_ctx", shape=(2,), dtype=torch.int32,
+                           fill_value=-1),)
+    pool = LinearStatePool(group=g, num_slots=8, dtype=torch.bfloat16,
+                           device=torch.device("cpu"), tp_size=1, slot_states=specs)
+    live, scratch = pool.alloc(2)
+    pool.conv_states[:, live].normal_(generator=torch.Generator().manual_seed(1))
+    pool.recurrent_states[:, live].normal_(generator=torch.Generator().manual_seed(2))
+    pool.slot_state("ple_ngram_ctx")[live] = torch.tensor([7, 9], dtype=torch.int32)
+    snap_conv = pool.conv_states[:, live].clone()
+    snap_rec = pool.recurrent_states[:, live].clone()
+
+    pool.copy_from(live, scratch)
+    # the verify step advances the live slot by two tokens; the draft row pollutes it
+    pool.conv_states[:, live].add_(1.0)
+    pool.recurrent_states[:, live].mul_(2.0)
+    pool.slot_state("ple_ngram_ctx")[live] = torch.tensor([9, 424242], dtype=torch.int32)
+
+    pool.copy_from(scratch, live)  # reject -> restore
+    assert torch.equal(pool.conv_states[:, live], snap_conv)
+    assert torch.equal(pool.recurrent_states[:, live], snap_rec)
+    assert torch.equal(pool.slot_state("ple_ngram_ctx")[live],
+                       torch.tensor([7, 9], dtype=torch.int32))
+
+
+def test_req_spec_fields_default_to_disabled():
+    req = Req(input_ids=torch.tensor([1, 2, 3], dtype=torch.int32), table_idx=0,
+              cached_len=0, output_len=1, uid=0, sampling_params=SamplingParams(),
+              cache_handle=None)
+    assert req.spec_slot_idx is None
+    assert req.spec_residual is None
+    assert req.spec_draft is None
+    assert req.spec_replay is False

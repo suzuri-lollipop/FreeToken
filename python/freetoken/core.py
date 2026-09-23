@@ -65,6 +65,23 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
 
+    # --- MTP speculative decoding (design: _scratch/mtp_design.md, reject-replay loop) ---
+    # Scratch GDN slot holding the pre-verify snapshot: copy_from(live -> scratch) before a
+    # two-row verify step, copy_from(scratch -> live) on a reject. The pool copy covers the
+    # conv/recurrent states AND the sibling slot_states, so the PLE n-gram window rolls back
+    # with the same call. Allocated at admission (spec mode only), freed at finish.
+    spec_slot_idx: int | None = None
+    # Residual row [1, hc*hidden] (device) of the prompt's last position, stashed at the end
+    # of prefill: the head's deferred position T-1 pass consumes it on the first decode step.
+    spec_residual: torch.Tensor | None = None
+    # Pending draft token id (host int) predicted for the position after the current input
+    # token; None until the head has produced one (or right after a reject).
+    spec_draft: int | None = None
+    # Set on a reject: the next step replays the last two placed tokens to rebuild the GDN
+    # state the rejected draft polluted (deterministic accept; the row-0 argmax is checked
+    # against the replayed token as a GPU determinism canary).
+    spec_replay: bool = False
+
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
