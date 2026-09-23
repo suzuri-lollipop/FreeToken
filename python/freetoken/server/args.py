@@ -472,6 +472,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative",
+        default=ServerArgs.speculative,
+        choices=["none", "mtp"],
+        help="Speculative decoding backend. 'mtp' builds the checkpoint's MTP head"
+        " (qwen4_exp only for now) and drafts one extra token per step at small batch"
+        " sizes; the scheduler disables it automatically when more requests are running."
+        " 'none' (default) disables speculative decoding.",
+    )
+
+    parser.add_argument(
         "--model-source",
         type=str,
         default="huggingface",

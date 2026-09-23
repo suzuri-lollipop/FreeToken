@@ -167,6 +167,49 @@ def test_mtp_block_is_recorded_verbatim():
     assert args2.mtp_num_layers == 1 and args2.mtp_use_hidden_state_from_layer == 47
 
 
+def _mtp_config():
+    hf = _hf_config()
+    hf.text_config.mtp = {"num_hidden_layers": 1, "rope_theta": None,
+                          "mtp_use_hidden_state_from_layer": None}
+    return parse_config(hf)
+
+
+def test_extend_config_for_mtp_appends_the_synthetic_full_layer():
+    from freetoken.models.qwen4_exp.config import extend_config_for_mtp
+
+    base = _mtp_config()
+    full0 = next(g for g in base.attention_groups if g.kind == "full")
+    ext = extend_config_for_mtp(base)
+
+    full1 = next(g for g in ext.attention_groups if g.kind == "full")
+    mtp_id = base.num_layers
+    assert full1.layer_ids == tuple(full0.layer_ids) + (mtp_id,)
+    assert full1.num_index_layers == full0.num_index_layers + 1
+    # every other group and the layer count itself are untouched
+    lin0 = next(g for g in base.attention_groups if g.kind != "full")
+    lin1 = next(g for g in ext.attention_groups if g.kind != "full")
+    assert lin1 == lin0
+    assert ext.num_layers == base.num_layers
+    # group membership lookups see the synthetic layer as full attention
+    assert not ext.is_linear_layer(mtp_id)
+    assert ext.attention_group_for_layer(mtp_id).kind == "full"
+    # idempotent
+    assert extend_config_for_mtp(ext) is ext
+
+
+def test_extend_config_for_mtp_rejects_missing_head():
+    from freetoken.models.qwen4_exp.config import extend_config_for_mtp
+
+    with pytest.raises(ValueError, match="exactly one MTP layer"):
+        extend_config_for_mtp(parse_config(_hf_config()))  # no mtp block
+
+
+def test_speculative_field_defaults_to_none():
+    from freetoken.engine.config import EngineConfig
+
+    assert EngineConfig.speculative == "none"
+
+
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
     hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer

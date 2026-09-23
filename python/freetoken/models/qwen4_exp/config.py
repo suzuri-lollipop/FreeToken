@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Tuple
 
 import torch
@@ -280,4 +280,47 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "extend_config_for_mtp",
+    "parse_config",
+    "ple_slot_states",
+]
+
+
+def extend_config_for_mtp(config: ModelConfig) -> ModelConfig:
+    """Add the synthetic MTP decoder layer (index ``num_layers``) to the full-attention group.
+
+    Called by EngineConfig.model_config only under ``--speculative mtp``. The KV/index
+    slab factory and the QSA backend's layer->slot map both read the group's layer_ids,
+    so appending the id sizes the extra QSA layer everywhere with no further plumbing.
+    The MTP head carries no GDN layer, so the linear group is untouched.
+    """
+    if config.model_type != "qwen4_exp":
+        raise ValueError(
+            f"--speculative mtp is qwen4_exp-only for now (model_type={config.model_type})"
+        )
+    args = config.qwen4_args
+    if args.mtp_num_layers != 1:
+        raise ValueError(
+            f"--speculative mtp needs exactly one MTP layer; config carries {args.mtp_num_layers}"
+        )
+    mtp_id = config.num_layers
+    groups = []
+    extended = False
+    for g in config.attention_groups:
+        if g.kind == "full":
+            if mtp_id in g.layer_ids:
+                return config  # idempotent
+            g = replace(
+                g,
+                layer_ids=tuple(g.layer_ids) + (mtp_id,),
+                num_index_layers=g.num_index_layers + 1,
+            )
+            extended = True
+        groups.append(g)
+    if not extended:
+        raise ValueError("no full-attention group to host the MTP layer")
+    return replace(config, attention_groups=tuple(groups))

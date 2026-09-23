@@ -27,6 +27,10 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # Speculative decoding backend: "none" (default) or "mtp" (the checkpoint's MTP head;
+    # qwen4_exp only for now). "mtp" extends the model config with the synthetic head
+    # layer (KV/index slab +1 full-attention layer) before any pool is sized.
+    speculative: str = "none"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
@@ -150,7 +154,14 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        model_config = replace(model_config, quant=quant)
+        if self.speculative == "mtp":
+            from freetoken.models.qwen4_exp.config import extend_config_for_mtp
+
+            model_config = extend_config_for_mtp(model_config)
+        elif self.speculative != "none":
+            raise ValueError(f"unknown --speculative backend {self.speculative!r} (none | mtp)")
+        return model_config
 
     @cached_property
     def kv_quant(self):
