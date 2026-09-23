@@ -989,6 +989,9 @@ class Scheduler(SchedulerIOMixin):
         req = batch.reqs[0]
         if req.spec_off or not req.can_decode or not req.sampling_params.is_greedy:
             return None
+        if getattr(req, "mm_items", None):
+            req.spec_off = True  # Phase 1: image rows keep the regular decode path
+            return None
         if req.spec_replay:
             mode = "replay"
         elif req.spec_draft is not None:
@@ -1035,6 +1038,10 @@ class Scheduler(SchedulerIOMixin):
         )
         pb = Batch(reqs=[shadow], phase="prefill")
         pb.positions = torch.arange(t, dtype=torch.int32, device=self.device)
+        if self._model_is_mrope:
+            # text-only prompt rows: the three mrope axes share the sequence index
+            # (mrope_delta is 0 and mrope_positions_full is None for such requests)
+            pb.mrope_positions = pb.positions.unsqueeze(0).expand(3, -1).contiguous()
         pb.input_ids = self.token_pool[req.table_idx, 1:t + 1]
         pb.out_loc = self.engine.page_table[req.table_idx, 0:t]
         return pb

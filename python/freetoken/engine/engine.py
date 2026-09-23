@@ -1799,6 +1799,7 @@ class Engine:
                 or req.cached_len > 0
                 or getattr(req, "linear_slot_idx", None) is None
                 or not req.sampling_params.is_greedy
+                or getattr(req, "mm_items", None)
                 or req.input_ids.numel() > budget
             ):
                 req.spec_off = True
