@@ -48,6 +48,21 @@ def indexing(
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 
+    if not weights.is_cuda:
+        # The JIT launcher is CUDA-only: handing it host pointers corrupts the heap
+        # silently (the abort surfaces later in an unrelated free). CPU callers get the
+        # equivalent gather here, mirroring index.cu / masked_index_kernel semantics.
+        idx = indices.long()
+        if vocab_range is None:
+            gathered = weights[idx]
+        else:
+            start, length = vocab_range
+            local = idx - start
+            valid = (local >= 0) & (local < length)
+            gathered = weights[local.clamp(0, weights.shape[0] - 1)]
+            gathered = gathered.masked_fill(~valid.unsqueeze(-1), 0)
+        return output.copy_(gathered)
+
     element_size = weights.shape[1] * weights.element_size()
     module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))
     module.launch(weights, indices, output, vocab_range)
