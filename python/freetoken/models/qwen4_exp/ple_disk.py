@@ -232,6 +232,22 @@ class DiskRowTable:
             return _context(ids, position, self.eos_token_id)
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
+    def fill_spec_rows(self, req) -> None:
+        """Issue-time fill for the graphed MTP spec step (engine/spec_graph.py).
+
+        The two rows ([x_P, draft] on a verify, the repaired pair on a replay) are
+        host-known BEFORE dispatch, so the graph-pinned rows are staged and the flag is
+        signaled ahead of the replay -- the captured lookup's memop WAIT is satisfied on
+        arrival and no deferred post-drain fill is needed.
+        """
+        runs = [
+            torch.cat((
+                torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
+                self._ple_ids(req.input_ids[req.cached_len:req.device_len]).to(torch.int64),
+            ))
+        ]
+        self.fill(runs, graph=True)
+
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
         eos = self.eos_token_id

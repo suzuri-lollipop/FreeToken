@@ -133,6 +133,9 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
+        # the MTP spec graph gathers its input rows from the pool inside the capture;
+        # hand the engine the live reference (refreshed on every cache rebuild)
+        self.engine.spec_token_pool = self.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -194,6 +197,12 @@ class Scheduler(SchedulerIOMixin):
                 self.table_manager.rebuild(self.engine.page_table)
                 self.token_pool = self.table_manager.token_pool
             self.cache_manager.check_integrity()
+            # A rebuild can reallocate the page/token/state pools whose addresses the MTP
+            # spec graph baked in: drop it (lazy recapture follows) and refresh the ref.
+            self.engine.spec_token_pool = self.token_pool
+            _spec_runner = getattr(self.engine, "_spec_graph", None)
+            if _spec_runner is not None:
+                _spec_runner.invalidate()
         # The prefill chunk cap tracks the CURRENT window-pool size (DSV4); a rebuild that
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
         # the stale budget and crashes _alloc_window.
@@ -367,6 +376,12 @@ class Scheduler(SchedulerIOMixin):
         batch, fout = last_data[0].batch, last_data[1]
         next_tokens_cpu, copy_done = fout.next_tokens_cpu, fout.copy_done_event
         copy_done.synchronize()
+        spec_payload = fout.spec
+        if spec_payload is None and getattr(fout, "spec_cpu", None) is not None:
+            # graphed spec step: the pinned payload row landed with the copy_done event
+            v = fout.spec_cpu.tolist()
+            spec_payload = {"y1": int(v[0]), "y2": int(v[1]), "draft": int(v[2]),
+                            "accept": bool(v[3])}
         # Signal the in-flight batch's PLE rows at the earliest safe instant: its
         # readback event is a hair past this copy_done point, and every host us
         # spent here before the fill is a us the replay idles at its captured WAIT.
@@ -381,7 +396,7 @@ class Scheduler(SchedulerIOMixin):
                 # The spec drain owns this batch's bookkeeping (accept: complete_one +
                 # two tokens; reject: rollback + replay flag); the generic per-req loop
                 # below must not also run (its prefill branch would radix-commit).
-                self._drain_spec(batch, fout.spec, reply, new_finished_reqs)
+                self._drain_spec(batch, spec_payload, reply, new_finished_reqs)
             for i, req in enumerate(() if spec_two_row else batch.reqs):
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
@@ -461,12 +476,12 @@ class Scheduler(SchedulerIOMixin):
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
 
-            if getattr(batch, "spec_mode", None) == "prologue_decode" and getattr(fout, "spec", None) is not None:
+            if getattr(batch, "spec_mode", None) == "prologue_decode" and spec_payload is not None:
                 # a regular decode drain ran for this batch; all that remains is handing
                 # the head's first draft to the request for its next (verify) step.
                 for req in batch.reqs:
                     if req.table_idx != -1 and not req.aborted:
-                        req.spec_draft = fout.spec.get("draft")
+                        req.spec_draft = spec_payload.get("draft")
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell

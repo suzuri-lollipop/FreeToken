@@ -493,6 +493,10 @@ class ForwardOutput(NamedTuple):
     # consumes -- prologue_decode: {y1, draft}; verify: {y1, y2, accept, draft};
     # replay: {y1, y2, accept, draft, canary}.
     spec: dict | None = None
+    # Graphed spec steps cannot build the dict before the device->host copy lands: the
+    # pinned [y1, y2, draft, accept] row arrives here and the drain decodes it after
+    # copy_done_event.
+    spec_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -1710,6 +1714,14 @@ class Engine:
         assert len(batch.reqs) == 1, "Phase-1 spec steps run a single request"
         assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
         mode = batch.spec_mode
+        runner = getattr(self, "_spec_graph", None)
+        if mode in ("verify", "replay"):
+            if runner is None:
+                from .spec_graph import SpecGraphRunner
+
+                runner = self._spec_graph = SpecGraphRunner(self)
+            if runner.graph is not None:
+                return runner.run(self, model, batch, req)
         _dbg_spec = os.getenv("FREETOKEN_MTP_DEBUG")
         if _dbg_spec:
             import time as _time
@@ -1765,6 +1777,17 @@ class Engine:
                 )
         if _deferred_fill is not None:
             self._pending_host_fill = _deferred_fill
+
+        if (
+            runner is not None and mode in ("verify", "replay")
+            and runner.graph is None and not runner.disabled
+        ):
+            runner.warm += 1
+            if runner.warm >= runner.WARM_STEPS:
+                # capture on this step's context; the state is restored around the
+                # warm/capture/replay runs, so the step's own eager payload stays the
+                # one the drain consumes
+                runner.capture_after_step(self, model, batch, req, payload)
 
         if mode == "prologue_decode":
             req.complete_one()  # a regular decode row; the drain only picks up the draft
