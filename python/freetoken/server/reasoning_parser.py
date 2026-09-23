@@ -295,6 +295,14 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
         self._buffer = ""
         self._emitted_reasoning = 0
         self._emitted_content = 0
+        # Incremental scanner state. Bytes before the open segment are finalized in
+        # _final_*; _seg is the one segment still being received, with absolute-index
+        # watermarks so each chunk is matched only against newly-checkable bytes
+        # (a full-buffer rescan per chunk would be O(n^2) on long analysis output).
+        self._chan_from = 0
+        self._final_r = ""
+        self._final_c = ""
+        self._seg: dict | None = None
 
     def detect_and_parse(self, text: str) -> ReasoningParseResult:
         if HARMONY_CHANNEL not in text:
@@ -305,8 +313,19 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        prev_len = len(self._buffer)
         self._buffer += new_text
-        reasoning, content = self._scan(self._buffer, hold_partial=True)
+        self._advance(prev_len, hold_partial=True)
+        return self._emit(hold_partial=True)
+
+    def flush(self) -> ReasoningParseResult:
+        self._advance(len(self._buffer), hold_partial=False)
+        return self._emit(hold_partial=False)
+
+    def _emit(self, *, hold_partial: bool) -> ReasoningParseResult:
+        r_piece, c_piece = self._open_contrib(hold_partial=hold_partial)
+        reasoning = self._final_r + r_piece
+        content = self._final_c + c_piece
         result = ReasoningParseResult(
             reasoning_text=reasoning[self._emitted_reasoning :],
             normal_text=content[self._emitted_content :],
@@ -315,15 +334,77 @@ class GptOssHarmonyReasoningParser(BaseReasoningParser):
         self._emitted_content = len(content)
         return result
 
-    def flush(self) -> ReasoningParseResult:
-        reasoning, content = self._scan(self._buffer, hold_partial=False)
-        result = ReasoningParseResult(
-            reasoning_text=reasoning[self._emitted_reasoning :],
-            normal_text=content[self._emitted_content :],
-        )
-        self._emitted_reasoning = len(reasoning)
-        self._emitted_content = len(content)
-        return result
+    def _open_contrib(self, *, hold_partial: bool) -> tuple[str, str]:
+        """Cumulative output of the still-open segment (the emitted prefix must
+        grow monotonically; same hold-back rule as ``_scan``)."""
+        seg = self._seg
+        if seg is None or "body_start" not in seg:
+            return "", ""
+        if seg["is_tool"]:
+            return "", self._buffer[seg["ch"] :]
+        body = self._buffer[seg["body_start"] :]
+        if hold_partial and (held := _longest_harmony_partial_suffix(body)):
+            body = body[:-held]
+        if seg["channel"] == "analysis":
+            return body, ""
+        return "", body
+
+    _HARMONY_MAX_TOKEN = max(len(tok) for tok in HARMONY_ALL_TOKENS)
+
+    def _advance(self, prev_len: int, *, hold_partial: bool) -> None:
+        # A token starting before prev_len - max_len + 1 lies entirely in bytes
+        # already matched on, so each find only covers the newly-checkable window.
+        buf = self._buffer
+        while True:
+            seg = self._seg
+            if seg is None:
+                start = max(self._chan_from, prev_len - len(HARMONY_CHANNEL) + 1)
+                ch = buf.find(HARMONY_CHANNEL, start)
+                if ch == -1:
+                    self._chan_from = max(self._chan_from, len(buf) - len(HARMONY_CHANNEL) + 1)
+                    return
+                self._chan_from = ch + len(HARMONY_CHANNEL)
+                self._seg = seg = {"ch": ch, "msg_from": self._chan_from}
+            if "body_start" not in seg:
+                start = max(seg["msg_from"], prev_len - len(HARMONY_MESSAGE) + 1)
+                msg = buf.find(HARMONY_MESSAGE, start)
+                if msg == -1:
+                    seg["msg_from"] = max(seg["msg_from"], len(buf) - len(HARMONY_MESSAGE) + 1)
+                    return
+                header = buf[seg["ch"] + len(HARMONY_CHANNEL) : msg]
+                parts = header.split()
+                channel = parts[0] if parts else ""
+                seg["body_start"] = msg + len(HARMONY_MESSAGE)
+                seg["channel"] = channel
+                seg["is_tool"] = channel == "commentary" and "to=functions" in header
+                seg["find_from"] = seg["body_start"]
+            start = max(seg["find_from"], prev_len - self._HARMONY_MAX_TOKEN + 1)
+            best_pos: int | None = None
+            best_tok: str | None = None
+            for tok in HARMONY_BOUNDARY_TOKENS:
+                pos = buf.find(tok, start)
+                if pos != -1 and (best_pos is None or pos < best_pos):
+                    best_pos = pos
+                    best_tok = tok
+            seg["find_from"] = max(seg["find_from"], len(buf) - self._HARMONY_MAX_TOKEN + 1)
+            if best_pos is None:
+                return  # segment stays open
+            if seg["is_tool"]:
+                # verbatim slice, matching _scan: a CLOSING terminator stays inside
+                slice_end = (
+                    best_pos + len(best_tok)
+                    if best_tok in self._CLOSING_BOUNDARY_TOKENS
+                    else best_pos
+                )
+                self._final_c += buf[seg["ch"] : slice_end]
+            else:
+                body = buf[seg["body_start"] : best_pos]
+                if seg["channel"] == "analysis":
+                    self._final_r += body
+                else:
+                    self._final_c += body
+            self._seg = None
+            self._chan_from = best_pos  # an abutting <|channel|> re-opens from the boundary
 
     def _segment_end(self, text: str, start: int) -> tuple[int, str | None]:
         """Return ``(end_index, matched_token)`` for a segment body starting at
