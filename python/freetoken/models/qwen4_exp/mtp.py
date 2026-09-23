@@ -30,6 +30,7 @@ the main rope_theta (1e7), asserted at build.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -54,7 +55,15 @@ class Qwen4ExpMTPLayer(BaseOP):
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
-        self.mlp = Qwen4ExpMoE(config, layer_id, prefix=f"{prefix}.mlp")
+        # The head's experts are RESIDENT whatever the engine's moe_strategy is: the
+        # offload cache is keyed by main-decoder layer ids (0..num_layers-1), so an
+        # OffloadMoELayer at the synthetic index would fall outside every cache. The
+        # fp8-block resident method is TP1-only today (fp8_block.py tp_ok=False) --
+        # TP2 placement is Phase 2 of the design doc; until then a TP2 engine building
+        # the head fails loudly at MoE construction.
+        self.mlp = Qwen4ExpMoE(
+            replace(config, moe_strategy="fused"), layer_id, prefix=f"{prefix}.mlp"
+        )
 
     def forward(self, hidden: torch.Tensor, batch: "Batch") -> torch.Tensor:
         block_input, inject = self.attn_hyper_connection.mix(hidden)

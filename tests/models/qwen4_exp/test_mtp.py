@@ -135,3 +135,17 @@ def test_rejects_mtp_rope_theta_mismatch():
     config = parsed_config(mtp=_mtp_block(theta=12345.0))
     with pytest.raises(NotImplementedError, match="rope_theta"):
         Qwen4ExpMTPHead(config, layer_id=config.num_layers)
+
+
+def test_head_experts_stay_resident_under_an_offload_engine():
+    # The offload cache is keyed by main-decoder layer ids, so the head's MoE must not
+    # become an OffloadMoELayer at the synthetic index -- it builds resident whatever
+    # the engine's strategy says (TP2 placement of the fp8-block experts is Phase 2).
+    from dataclasses import replace
+
+    from freetoken.layers import OffloadMoELayer
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPHead
+
+    config = replace(parsed_config(mtp=_mtp_block()), moe_strategy="offload")
+    head = Qwen4ExpMTPHead(config, layer_id=config.num_layers)
+    assert not isinstance(head.layers.op_list[0].mlp.experts, OffloadMoELayer)

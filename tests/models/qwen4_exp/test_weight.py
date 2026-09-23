@@ -325,9 +325,9 @@ def test_fp8_block_scales_scheme_resolves_for_mtp_experts():
 
 def _mtp_dense_raw() -> dict[str, torch.Tensor]:
     """The full dense MTP head in toy geometry, mirroring the released checkpoint's names
-    (29 tensors: fc/norm front end, top mixer, one QSA-clone layer with both HC blocks,
-    shared expert + gate). The routed experts stay noise in _raw_checkpoint (stacked
-    shape) and gain one per-expert-shaped key here: both shapes must be skipped."""
+    (fc/norm front end, top mixer, one QSA-clone layer with both HC blocks, shared expert
+    + gate), plus the routed experts as PER-EXPERT pieces (the released shape; the toy is
+    unquantized, so plain bf16 weights and no scale_inv)."""
     raw = {
         "mtp.fc_embedding.weight": _bf16(H, H),
         "mtp.fc_hidden.weight": _bf16(H, H),
@@ -347,19 +347,42 @@ def _mtp_dense_raw() -> dict[str, torch.Tensor]:
         "mtp.layers.0.mlp.shared_expert.up_proj.weight": _bf16(I, H),
         "mtp.layers.0.mlp.shared_expert.down_proj.weight": _bf16(H, I),
         "mtp.layers.0.mlp.shared_expert_gate.weight": _bf16(1, H),
-        "mtp.layers.0.mlp.experts.0.gate_proj.weight": _bf16(I, H),  # per-expert noise
     }
+    for e in range(E):
+        raw[f"mtp.layers.0.mlp.experts.{e}.gate_proj.weight"] = _bf16(I, H)
+        raw[f"mtp.layers.0.mlp.experts.{e}.up_proj.weight"] = _bf16(I, H)
+        raw[f"mtp.layers.0.mlp.experts.{e}.down_proj.weight"] = _bf16(H, I)
     raw.update(_hc_weights("mtp.hyper_connection_mixer", inject=False))
     raw.update(_hc_weights("mtp.layers.0.attn_hyper_connection", inject=True))
     raw.update(_hc_weights("mtp.layers.0.mlp_hyper_connection", inject=True))
     return raw
 
 
+def _raw_without_mtp() -> dict[str, torch.Tensor]:
+    # the base builder ships partial mtp noise (a lone q_proj would stall the fusion
+    # buffer); mtp fixtures replace the whole mtp.* set
+    return {k: v for k, v in _raw_checkpoint().items() if not k.startswith("mtp.")}
+
+
 @pytest.fixture(scope="module")
 def checkpoint_mtp(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
-    raw = {**_raw_checkpoint(), **_mtp_dense_raw()}
+    raw = {**_raw_without_mtp(), **_mtp_dense_raw()}
     return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_mtp_ckpt"), raw, None)
+
+
+@pytest.fixture(scope="module")
+def checkpoint_mtp_stacked(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """The same head with the experts pre-stacked (the other export shape): buffer-named
+    keys that must pass through untouched."""
+    torch.manual_seed(0)
+    raw = {**_raw_without_mtp(), **_mtp_dense_raw()}
+    for e in range(E):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            del raw[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"]
+    raw["mtp.layers.0.mlp.experts.gate_up_proj"] = _bf16(E, 2 * I, H)
+    raw["mtp.layers.0.mlp.experts.down_proj"] = _bf16(E, H, I)
+    return _write_checkpoint(tmp_path_factory.mktemp("qwen4_exp_mtp_stacked"), raw, None)
 
 
 def test_mtp_dense_loads_fused_when_requested(checkpoint_mtp):
@@ -385,18 +408,83 @@ def test_mtp_dense_loads_fused_when_requested(checkpoint_mtp):
     assert "mtp.hyper_connection_mixer.input_mix_weight_down.weight" in got
     # plain keys survive verbatim
     assert torch.equal(got["mtp.layers.0.self_attn.o_proj.weight"], raw["mtp.layers.0.self_attn.o_proj.weight"])
-    # routed MTP experts stay out in BOTH export shapes until Phase 2
-    assert not [k for k in got if "mtp.layers.0.mlp.experts" in k]
-    # nothing leaked into the main model's names
-    assert not [k for k in got if k.startswith("mtp.") and "layers.0" not in k
-                and k.split(".", 2)[1] not in ("fc_embedding", "fc_hidden",
-                                               "pre_fc_norm_embedding", "pre_fc_norm_hidden",
-                                               "hyper_connection_mixer")]
+    # per-expert pieces come out fused into the resident buffer names
+    want_experts = torch.stack([
+        torch.cat((raw[f"mtp.layers.0.mlp.experts.{e}.gate_proj.weight"],
+                   raw[f"mtp.layers.0.mlp.experts.{e}.up_proj.weight"]), 0)
+        for e in range(E)])
+    assert torch.equal(got["mtp.layers.0.mlp.experts.gate_up_proj"], want_experts)
+    assert torch.equal(
+        got["mtp.layers.0.mlp.experts.down_proj"],
+        torch.stack([raw[f"mtp.layers.0.mlp.experts.{e}.down_proj.weight"] for e in range(E)]))
+    # unquantized toy export: no scale buffers
+    assert "mtp.layers.0.mlp.experts.gate_up_scale_inv" not in got
+    # no per-expert key leaks through unfused
+    import re as _re
+    assert not [k for k in got if _re.search(r"mtp\.layers\.0\.mlp\.experts\.\d+\.", k)]
+
+
+def _hf_config_with_mtp():
+    hf = hf_config()
+    hf.text_config.mtp = {"num_hidden_layers": 1, "rope_theta": None,
+                          "mtp_use_hidden_state_from_layer": None}
+    return hf
+
+
+def test_mtp_loaded_names_match_the_head_state_dict(checkpoint_mtp):
+    # the strict-load contract: with include_mtp the emitted mtp.* names are EXACTLY the
+    # head module's state dict (attached as the model's `mtp` attribute).
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPHead
+
+    folder, _ = checkpoint_mtp
+    got = _load(folder, include_mtp=True)
+    config = parse_config(_hf_config_with_mtp())
+    head = Qwen4ExpMTPHead(config, layer_id=config.num_layers)
+    assert {k for k in got if k.startswith("mtp.")} == {"mtp." + k for k in head.state_dict()}
+
+
+def test_stacked_mtp_experts_pass_through(checkpoint_mtp_stacked):
+    folder, raw = checkpoint_mtp_stacked
+    got = _load(folder, include_mtp=True)
+    assert torch.equal(got["mtp.layers.0.mlp.experts.gate_up_proj"],
+                       raw["mtp.layers.0.mlp.experts.gate_up_proj"])
+    assert torch.equal(got["mtp.layers.0.mlp.experts.down_proj"],
+                       raw["mtp.layers.0.mlp.experts.down_proj"])
 
 
 def test_mtp_still_dropped_by_default(checkpoint_mtp):
     got = _load(checkpoint_mtp[0])
     assert not [k for k in got if k.startswith("mtp.")]
+
+
+def test_fuse_mtp_experts_fp8_pieces():
+    # released geometry: fp8 weights + BF16 128x128 block scales, gate|up stacked along
+    # the intermediate dim, scales stacking to [2I/128, H/128] with no repack.
+    from freetoken.models.qwen4_exp.weight import _fuse_mtp_experts
+
+    e_count, i, h, b = 2, 128, 256, 128
+    pieces = {}
+    for e in range(e_count):
+        for proj, (rows, cols) in (("gate_proj", (i, h)), ("up_proj", (i, h)), ("down_proj", (h, i))):
+            pieces[(0, e, proj, "weight")] = torch.randint(
+                0, 127, (rows, cols), dtype=torch.uint8).view(torch.float8_e4m3fn)
+            pieces[(0, e, proj, "weight_scale_inv")] = torch.rand(rows // b, cols // b, dtype=torch.bfloat16)
+    fused = dict(_fuse_mtp_experts(pieces))
+    assert fused["mtp.layers.0.mlp.experts.gate_up_proj"].shape == (e_count, 2 * i, h)
+    assert fused["mtp.layers.0.mlp.experts.gate_up_scale_inv"].shape == (e_count, 2 * i // b, h // b)
+    assert fused["mtp.layers.0.mlp.experts.down_proj"].shape == (e_count, h, i)
+    assert fused["mtp.layers.0.mlp.experts.down_scale_inv"].shape == (e_count, h // b, i // b)
+    assert torch.equal(fused["mtp.layers.0.mlp.experts.gate_up_proj"][1, :i], pieces[(0, 1, "gate_proj", "weight")])
+    assert torch.equal(fused["mtp.layers.0.mlp.experts.gate_up_proj"][1, i:], pieces[(0, 1, "up_proj", "weight")])
+
+    del pieces[(0, 1, "up_proj", "weight")]
+    with pytest.raises(ValueError, match="incomplete"):
+        dict(_fuse_mtp_experts(pieces))
+    pieces[(0, 1, "up_proj", "weight")] = torch.zeros(i, h, dtype=torch.float8_e4m3fn)
+    del pieces[(0, 0, "down_proj", "weight_scale_inv")]
+    with pytest.raises(ValueError, match="weight_scale_inv"):
+        dict(_fuse_mtp_experts(pieces))
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):

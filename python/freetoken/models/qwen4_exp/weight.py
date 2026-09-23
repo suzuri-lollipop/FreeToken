@@ -47,6 +47,13 @@ _EXPERT_KEY_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+# Per-expert MTP head pieces (the released shape). iter_weights accumulates them and
+# yields the fused resident buffers; a stacked export (mtp.layers.N.mlp.experts.gate_up_proj)
+# already carries the buffer names and passes through _rename untouched.
+_MTP_EXPERT_PIECE_RE = re.compile(
+    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale_inv)$"
+)
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -93,13 +100,10 @@ def _rename(raw_name: str, include_mtp: bool = False) -> str | None:
     if raw_name.startswith("mtp."):
         if not include_mtp:
             return None
-        # The head attaches as the model's `mtp` attribute, so its dense keys pass
-        # through verbatim (the fuser/shard rules key off the same leaf names as the
-        # main layers). Routed MTP experts are skipped in BOTH export shapes
-        # (per-expert ".experts.<i>." and stacked ".experts.gate_up_proj") until the
-        # placement decision lands -- Phase 2 of _scratch/mtp_design.md.
-        if ".mlp.experts" in raw_name:
-            return None
+        # The head attaches as the model's `mtp` attribute, so its dense keys (and the
+        # stacked-expert export's buffer-named keys) pass through verbatim; the fuser and
+        # TP shard rules key off the same leaf names as the main layers. Per-expert MTP
+        # pieces never reach here -- iter_weights intercepts them and yields fused.
         return raw_name
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
@@ -205,6 +209,54 @@ class _DenseFuser:
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 
+def _fuse_mtp_experts(
+    pieces: dict[tuple[int, int, str, str], torch.Tensor],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Stack the per-expert MTP pieces into the resident buffers create_weights declares.
+
+    gate|up fuse along the intermediate dim exactly like the bank layout does, and this
+    checkpoint's 128-row scale blocks align at the fused boundary (gate and up scales
+    are [I/128, H/128] each and simply stack to [2I/128, H/128]), so no repack is
+    needed -- unlike a TP-sharded layout, which is Phase 2 of _scratch/mtp_design.md.
+    Pieces arrive on CPU (the fused peak stays off the GPU); the emitted names match the
+    state dict of the resident fp8-block method: ``experts.{gate_up_proj,
+    gate_up_scale_inv, down_proj, down_scale_inv}`` (scales only when the checkpoint
+    carries them -- unquantized exports have plain bf16 weights and no scale_inv).
+    """
+    for layer in sorted({k[0] for k in pieces}):
+        experts = sorted({k[1] for k in pieces if k[0] == layer})
+        if experts != list(range(len(experts))):
+            raise ValueError(
+                f"mtp.layers.{layer}.mlp.experts: expert ids are not 0..N-1 ({len(experts)} found)"
+            )
+
+        def has(proj: str, kind: str) -> bool:
+            return all((layer, e, proj, kind) in pieces for e in experts)
+
+        def stack(proj: str, kind: str) -> torch.Tensor:
+            return torch.stack([pieces[(layer, e, proj, kind)] for e in experts])
+
+        def stack_gu(kind: str) -> torch.Tensor:
+            return torch.stack([
+                torch.cat((pieces[(layer, e, "gate_proj", kind)],
+                           pieces[(layer, e, "up_proj", kind)]), dim=0)
+                for e in experts
+            ])
+
+        if not (has("gate_proj", "weight") and has("up_proj", "weight") and has("down_proj", "weight")):
+            raise ValueError(f"mtp.layers.{layer}.mlp.experts: incomplete per-expert weights")
+        scaled = [has(p, "weight_scale_inv") for p in ("gate_proj", "up_proj", "down_proj")]
+        if any(scaled) and not all(scaled):
+            raise ValueError(f"mtp.layers.{layer}.mlp.experts: weight_scale_inv present for only some projections")
+
+        prefix = f"mtp.layers.{layer}.mlp.experts."
+        yield prefix + "gate_up_proj", stack_gu("weight")
+        yield prefix + "down_proj", stack("down_proj", "weight")
+        if scaled[0]:
+            yield prefix + "gate_up_scale_inv", stack_gu("weight_scale_inv")
+            yield prefix + "down_scale_inv", stack("down_proj", "weight_scale_inv")
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -237,6 +289,9 @@ def iter_weights(
         return tensor if shard is None else shard.tensor(module_leaf(name), tensor)
 
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping, shard)
+    # MTP per-expert pieces stage on CPU: the fused stack of all 512 experts would
+    # otherwise hold pieces AND buffer on the GPU at the same time.
+    mtp_pieces: dict[tuple[int, int, str, str], torch.Tensor] = {}
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -244,6 +299,12 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
+                if include_mtp:
+                    piece = _MTP_EXPERT_PIECE_RE.match(raw_name)
+                    if piece is not None:
+                        mtp_pieces[(int(piece["layer"]), int(piece["expert"]),
+                                    piece["proj"], piece["kind"])] = f.get_tensor(raw_name).cpu()
+                        continue
                 name = _rename(raw_name, include_mtp)
                 if name is None:
                     continue
@@ -258,6 +319,7 @@ def iter_weights(
                     yield from fused
 
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    yield from _fuse_mtp_experts(mtp_pieces)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
