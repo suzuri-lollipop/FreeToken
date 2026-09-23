@@ -304,6 +304,7 @@ async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = No
         TokenizeMsg(
             uid=uid,
             text=rendered if rendered is not None else spec.messages,
+            pre_rendered=rendered is not None,
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,

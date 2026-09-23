@@ -285,3 +285,29 @@ def test_tokenize_survives_an_unhashable_effort():
     manager.tokenize([msg])
 
     assert "reasoning_effort" not in tokenizer.chat_template_kwargs
+
+
+def test_pre_rendered_pass_through_encodes_like_the_worker_render_path():
+    # The streaming adapters prerender the template frontend-side and ship the
+    # string (pass-through). The worker must encode it exactly like its own
+    # render -- add_special_tokens=False -- or bos-adding tokenizers
+    # (muse-glimmer, llama) would double it. A raw /v1/completions string
+    # keeps the tokenizer default.
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+            self.calls.append((prompt, add_special_tokens))
+            return torch.tensor([[1, 2]], dtype=torch.long)
+
+    tokenizer = Recorder()
+    manager = TokenizeManager(tokenizer)
+    pre = TokenizeMsg(
+        uid=1, text="rendered prompt", sampling_params=SamplingParams(), pre_rendered=True
+    )
+    raw = TokenizeMsg(uid=2, text="raw prompt", sampling_params=SamplingParams())
+
+    manager.tokenize([pre, raw])
+
+    assert tokenizer.calls == [("rendered prompt", False), ("raw prompt", True)]

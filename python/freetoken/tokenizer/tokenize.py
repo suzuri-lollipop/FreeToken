@@ -68,8 +68,11 @@ class TokenizeManager:
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
             # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+            # encoder path keep the default; a prerendered pass-through string IS
+            # template output, so it counts as templated too.
+            templated = (
+                isinstance(msg.text, list) or msg.pre_rendered
+            ) and self._dsv4_encoder is None
             input_ids: torch.Tensor = (  # type: ignore
                 self.tokenizer.encode(
                     prompt, return_tensors="pt", add_special_tokens=not templated
