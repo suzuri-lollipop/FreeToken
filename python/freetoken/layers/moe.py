@@ -36,6 +36,12 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 _HYBRID_PREFILL_MAX_TOKENS = int(os.getenv("FREETOKEN_HYBRID_PREFILL_MAX_TOKENS", "512"))
 
 
+def _is_spec_batch(batch) -> bool:
+    """MTP spec steps keep phase="prefill" (sequential GDN/QSA/PLE) but must stage
+    experts like decode does: device-driven on-demand fetch, no host readback."""
+    return getattr(batch, "spec_mode", None) is not None
+
+
 def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
     """(CPU executor, Q16 PCIe share) for one prefill chunk, or (None, 1 << 16) when the
     chunk stays wholly on the PCIe plan.
@@ -255,8 +261,12 @@ class OffloadMoELayer(MoELayer):
         a model can fold it with another row-parallel partial into one collective.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not _is_spec_batch(ctx.batch):
             return self.prefill_forward(hidden_states, router_logits)
+        # MTP spec batches ride phase="prefill" for the sequential GDN/QSA/PLE paths, but
+        # their expert staging is the decode one: the two rows route independently and the
+        # device-side on-demand fetch (no host readback) is both correct and far cheaper
+        # at T=2 than the prefill streaming/on-demand machinery.
         return self.decode_forward(hidden_states, router_logits)
 
     def routed_forward(
@@ -276,7 +286,7 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not _is_spec_batch(ctx.batch):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

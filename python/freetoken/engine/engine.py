@@ -1710,6 +1710,11 @@ class Engine:
         assert len(batch.reqs) == 1, "Phase-1 spec steps run a single request"
         assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
         mode = batch.spec_mode
+        _dbg_spec = os.getenv("FREETOKEN_MTP_DEBUG")
+        if _dbg_spec:
+            import time as _time
+
+            _t0 = _time.perf_counter()
 
         if mode in ("verify", "replay"):
             # Snapshot BEFORE the forward advances the GDN/PLE state; the reject drain
@@ -1720,8 +1725,13 @@ class Engine:
         with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
             if mode == "prologue_decode":
                 self._run_head_prologue(model, req, batch.spec_prologue)
+            if _dbg_spec:
+                _t1 = _time.perf_counter()
             mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
             logits = model.full_vocab_logits(mixed)
+            if _dbg_spec:
+                torch.cuda.synchronize(self.device)
+                _t2 = _time.perf_counter()
             if mode == "prologue_decode":
                 y = logits[0].argmax(-1)
                 d = model.draft(residual, y.view(1).to(torch.int32), batch)
@@ -1747,6 +1757,12 @@ class Engine:
                     "y1": int(vals[0]), "y2": int(vals[1]),
                     "accept": accept, "draft": int(vals[2]),
                 }
+            if _dbg_spec:
+                _t3 = _time.perf_counter()
+                logger.info_rank0(
+                    f"[mtp-t] {mode} pre={(_t1 - _t0) * 1e3:.1f}ms "
+                    f"fwd={(_t2 - _t1) * 1e3:.1f}ms head+read={(_t3 - _t2) * 1e3:.1f}ms"
+                )
         if _deferred_fill is not None:
             self._pending_host_fill = _deferred_fill
 
