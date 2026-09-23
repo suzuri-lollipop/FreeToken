@@ -94,7 +94,15 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    # Dense coverage at small bs: the per-user padding cost is largest when few
+    # requests share a step padded up to the next captured size -- with the old
+    # [1, 2, 4] list a bs=3 decode ran the bs=4 graph (dummy row's fetch/GEMM
+    # work, only 3 tokens delivered: measured ~the same step time as bs=4, so
+    # conc-3 per-user throughput came out BELOW conc-4). Capture is ~0.4s and
+    # ~37MB per size here, so 1..8 dense is cheap; above 8, stride by 8 to bound
+    # startup time and memory at large maxes (bs 9..15 pad to 16 as before).
+    dense_stop = min(cuda_graph_max_bs, 8)
+    candidates = list(range(1, dense_stop + 1)) + list(range(16, cuda_graph_max_bs + 1, 8))
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
 
