@@ -91,6 +91,16 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        if len({m.uid for m in msgs}) != len(msgs):
+            # Several msgs for ONE request in a single batch (an MTP spec step emits up
+            # to two): the incremental offsets are sequential per-uid state and the slice
+            # capture below reads them before any of this batch's updates, which would
+            # make the second msg re-emit the first one's text. Process those one at a
+            # time; distinct-uid batches keep the single batched decode.
+            out: List[str] = []
+            for msg in msgs:
+                out.extend(self.detokenize([msg]))
+            return out
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

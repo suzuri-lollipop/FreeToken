@@ -148,3 +148,65 @@ def test_length_finish_on_the_second_token():
     assert [m.next_token for m in reply] == [41]
     assert reply[0].finished and reply[0].finish_reason == "length"
     assert req in finished
+
+
+def _upgrade_sched(req):
+    writes = {}
+
+    class _Pool(dict):
+        def __setitem__(self, key, value):
+            writes[key] = value
+            super().__setitem__(key, value)
+
+    sched = SimpleNamespace(
+        config=SimpleNamespace(speculative="mtp"),
+        engine=SimpleNamespace(linear_state_pool=SimpleNamespace(alloc=lambda n: [5])),
+        token_pool=_Pool(),
+        _build_spec_prologue=lambda r: "PROLOGUE",
+    )
+    return sched, writes
+
+
+def _spec_req(host_len, output_len, cached_len, device_len=None, **spec):
+    req = Req(input_ids=torch.arange(host_len, dtype=torch.int32), table_idx=0,
+              cached_len=cached_len, output_len=output_len, uid=7,
+              sampling_params=SamplingParams(temperature=0.0), cache_handle=None)
+    req.device_len = device_len if device_len is not None else host_len
+    for k, v in spec.items():
+        setattr(req, k, v)
+    return req
+
+
+def test_verify_needs_room_for_two_tokens():
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import Scheduler
+
+    # remain_len == 1: an accept would append two tokens past the budget -> stay regular
+    req = _spec_req(P + 1, 1, P, spec_draft=42, spec_slot_idx=5)
+    sched, writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    assert Scheduler._as_spec_batch(sched, batch) is None
+    assert req.device_len == P + 1 and batch.spec_mode is None and not writes
+
+    # remain_len == 2: the verify upgrade stages the draft and bumps the row count
+    req2 = _spec_req(P + 1, 2, P, spec_draft=42, spec_slot_idx=5)
+    sched2, writes2 = _upgrade_sched(req2)
+    batch2 = Batch(reqs=[req2], phase="decode")
+    out = Scheduler._as_spec_batch(sched2, batch2)
+    assert out is batch2 and batch2.spec_mode == "verify" and batch2.phase == "prefill"
+    assert req2.device_len == P + 2 and writes2[(0, P + 1)] == 42
+
+
+def test_replay_runs_even_with_one_token_of_room():
+    # post-reject lenses (cached P, device P+2, host holds y1): the two-row replay is the
+    # ONLY consumer of that state, so the remain>=2 verify gate must not apply to it.
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import Scheduler
+
+    req = _spec_req(P + 2, 1, P, device_len=P + 2, spec_replay=True, spec_slot_idx=5)
+    assert req.remain_len == 1
+    sched, _writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    out = Scheduler._as_spec_batch(sched, batch)
+    assert out is batch and batch.spec_mode == "replay" and batch.phase == "prefill"
+    assert req.device_len == P + 2  # no bump: the replay rows are [x_P, y1]

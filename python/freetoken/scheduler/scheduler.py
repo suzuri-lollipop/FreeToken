@@ -962,7 +962,22 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
-                batch = self._as_spec_batch(batch) or batch
+                upgraded = self._as_spec_batch(batch)
+                if upgraded is not None:
+                    batch = upgraded
+                elif any(r.spec_replay for r in getattr(batch, "reqs", ())):
+                    # A replay-pending request holds two-row lenses the regular decode
+                    # prep cannot consume (it would feed N+1 input rows to N-sized decode
+                    # buffers). Run it alone through the spec path this tick; the other
+                    # running requests wait one step. New admissions cannot strand a
+                    # replay: the reject drain finishes any request with no room left.
+                    pending = next(r for r in batch.reqs if r.spec_replay)
+                    batch = self._as_spec_batch(Batch(reqs=[pending], phase="decode"))
+                    if batch is None:
+                        raise RuntimeError(
+                            "a replay-pending request lost its spec step; its two-row "
+                            "state cannot ride a regular decode batch"
+                        )
         if batch is None:
             return None
         # Spec batches ride phase="prefill" for the extend machinery but ARE decode steps:
@@ -1000,8 +1015,12 @@ class Scheduler(SchedulerIOMixin):
             mode = "prologue_decode"
         else:
             return None
-        if mode in ("verify", "replay") and req.remain_len < 2:
-            return None  # the last token(s) finish on the regular decode path
+        if mode == "verify" and req.remain_len < 2:
+            # The last token finishes on the regular decode path (an accept would append
+            # two). Replay is EXEMPT: a replay-pending request carries two-row lenses
+            # (cached Q, device Q+2) that only the spec prep can consume, and the reject
+            # drain's length check guarantees remain_len >= 1 whenever a replay is due.
+            return None
         if req.spec_slot_idx is None:
             pool = self.engine.linear_state_pool
             if pool is None:
@@ -1092,6 +1111,12 @@ class Scheduler(SchedulerIOMixin):
             req.spec_draft = None
             req.spec_replay = True
             tokens = (spec["y1"],)
+        if os.getenv("FREETOKEN_MTP_DEBUG"):
+            logger.info_rank0(
+                f"[mtp] {batch.spec_mode} accept={spec['accept']} y1={spec['y1']} "
+                f"y2={spec.get('y2')} draft={spec.get('draft')} emit={tokens} "
+                f"lens=({req.cached_len},{req.device_len}) host={req.input_ids.tolist()[-4:]}"
+            )
         finished = False
         for tok in tokens:
             req.append_host(torch.tensor([tok], dtype=torch.int32))
