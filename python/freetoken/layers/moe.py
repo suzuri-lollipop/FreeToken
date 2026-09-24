@@ -35,6 +35,14 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 # split entirely, a large value restores the ungated behavior for A/B.
 _HYBRID_PREFILL_MAX_TOKENS = int(os.getenv("FREETOKEN_HYBRID_PREFILL_MAX_TOKENS", "512"))
 
+# Slot-direct prefill GEMM (A/B knob; requires the auto-promote policy ON so every
+# routed row is LRU-resident): the grouped kernel reads expert rows from their slots
+# through the id->slot map, skipping the per-chunk double-buffer D2D staging.
+_PREFILL_SLOT_DIRECT = os.getenv("FREETOKEN_PREFILL_SLOT_DIRECT", "0") == "1"
+# Per-chunk promote host-time attribution, reported on the scheduler's [chunktime]
+# line (launch + any GPU backpressure that blocks the promote launches).
+_CHUNK_TIMING = os.getenv("FREETOKEN_CHUNK_TIMING", "0") == "1"
+
 
 def _is_spec_batch(batch) -> bool:
     """MTP spec steps keep phase="prefill" (sequential GDN/QSA/PLE) but must stage
@@ -482,11 +490,63 @@ class OffloadMoELayer(MoELayer):
             # slice (a gen4 x4 rank measured 16.0 ms of PCIe against a 10.1 ms balanced
             # split for 82 missing experts at T=150).
             executor, frac_q16 = _prefill_cpu_split(cache, hidden_states.shape[0])
+            if self.layer_id == 0:
+                # Chunk-boundary policy step (async harvest of the previous chunk's plan
+                # hit/miss totals + this chunk's promote gate); layer 0 runs once per
+                # prefill forward, mirroring begin_prefill's hook on the streaming path.
+                cache.ondemand_chunk_begin()
             if cache.prefill_promote_fraction > 0:
                 # Slot-assign + H2D the recency-top share of this layer's misses BEFORE
                 # the plan, so the plan gathers them D2D as hits and the rows survive
                 # the chunk (repeated content stops re-streaming). See promote_prefill_misses.
                 cache.promote_prefill_misses(self.layer_id, topk_ids)
+            elif getattr(cache, "promote_auto_frac", 0.0) > 0:
+                # Auto-promote policy: same contract, but the gate is decided per chunk
+                # from measured reuse (ondemand_chunk_begin) and the promotion runs the
+                # mask-driven fast path -- the route-sized ensure kernel behind
+                # promote_prefill_misses costs ~seconds/chunk at prefill T (measured).
+                if _CHUNK_TIMING:
+                    import time as _time
+
+                    _pt0 = _time.perf_counter()
+                cache.promote_touched(
+                    self.layer_id, topk_ids, stats=_PREFILL_SLOT_DIRECT
+                )
+                if _CHUNK_TIMING:
+                    cache._promote_host_ms += (_time.perf_counter() - _pt0) * 1e3
+                if (
+                    _PREFILL_SLOT_DIRECT
+                    and executor is None
+                    and self.layer_id not in cache._unpinned_layers
+                    and getattr(
+                        getattr(self.quant_method, "kernel", None),
+                        "supports_slot_direct_prefill", False,
+                    )
+                ):
+                    # Slot-direct prefill: promote_touched just made every routed row
+                    # resident in the LRU slot cache, so the grouped GEMM can read them
+                    # IN PLACE through the id->slot map -- skipping the plan/move that
+                    # D2D-stages the whole touched set into the double buffer every
+                    # chunk (~110 rows/layer x 48 layers: the measured ~0.7-0.8s/chunk
+                    # dominant cost at T=128 with promote reuse already at hitrate 1.0).
+                    # stats=True on the promote above keeps the policy's hit/miss
+                    # feedback alive (the plan-based accumulators never run here).
+                    if dbg is not None:
+                        dbg.prefill_layer_waited(self.layer_id)
+                    out = self._expert_gemm(
+                        cache,
+                        hidden_states,
+                        topk_weights,
+                        topk_ids,
+                        views=cache.bank_views(),
+                        n=self.num_experts,
+                        alphas=cache.alphas_for_slots(self.layer_id),
+                        is_prefill=True,
+                        slot_map=cache.slot_for_id[self.layer_id],
+                    )
+                    if dbg is not None:
+                        dbg.prefill_layer_done(self.layer_id, topk_ids)
+                    return out
             views = cache.plan_prefill_layer_ondemand(
                 self.layer_id, topk_ids, pcie_frac_q16=frac_q16
             )
@@ -595,13 +655,16 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        slot_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.quant_method is not None:
             from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
             view = ExpertView(
                 {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+                # decode: per-route slot ids; slot-direct prefill: the [E] id->slot map;
+                # double-buffer prefill: None (position == expert id)
+                slots=topk_ids if n is None else slot_map, n=n, alphas=alphas,
             )
             return self.quant_method.apply(
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

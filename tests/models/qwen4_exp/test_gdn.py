@@ -26,6 +26,39 @@ RTOL = ATOL = 2e-2
 HEADS = {2: (8, 16), 3: (16, 48)}
 
 
+@torch.no_grad()
+def test_verify_saves_first_token_state_without_overwriting_adjacent_slots():
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
+
+    torch.manual_seed(43)
+    q, k = [torch.randn(1, 2, 2, 128, device=DEV, dtype=torch.bfloat16) for _ in range(2)]
+    v = torch.randn(1, 2, 6, 128, device=DEV, dtype=torch.bfloat16)
+    a, b = [torch.randn(2, 6, device=DEV, dtype=torch.bfloat16) for _ in range(2)]
+    A, bias = [torch.randn(6, device=DEV) for _ in range(2)]
+    state = torch.randn(4, 6, 128, 128, device=DEV)
+    before = state.clone()
+    reference = state.clone()
+    live = torch.tensor([0], device=DEV, dtype=torch.int32)
+    scratch = torch.tensor([2], device=DEV, dtype=torch.int64)
+    cu1 = torch.tensor([0, 1], device=DEV, dtype=torch.int64)
+    cu2 = torch.tensor([0, 2], device=DEV, dtype=torch.int64)
+    expected = []
+    for i in range(2):
+        expected.append(gdn_decode_fla(
+            q[:, i:i+1], k[:, i:i+1], v[:, i:i+1], a[i:i+1], b[i:i+1],
+            A_log=A, dt_bias=bias, state_source=reference, indices=live,
+            cu_seqlens=cu1, scale=128 ** -0.5))
+        if i == 0:
+            middle = reference[0].clone()
+    actual = gdn_decode_fla(
+        q, k, v, a, b, A_log=A, dt_bias=bias, state_source=state, indices=live,
+        cu_seqlens=cu2, scale=128 ** -0.5, snapshot_indices=scratch)
+    torch.testing.assert_close(actual, torch.cat(expected), rtol=0, atol=0)
+    torch.testing.assert_close(state[0], reference[0], rtol=0, atol=0)
+    torch.testing.assert_close(state[2], middle, rtol=0, atol=0)
+    torch.testing.assert_close(state[[1, 3]], before[[1, 3]], rtol=0, atol=0)
+
+
 def _bf(t: torch.Tensor) -> torch.Tensor:
     return t.detach().to(DEV, torch.bfloat16)
 
@@ -110,6 +143,38 @@ def _decode(op, ctx: Context, reqs, hidden: torch.Tensor) -> torch.Tensor:
     )
     with ctx.forward_batch(batch):
         return op.forward(hidden)
+
+
+@torch.no_grad()
+def test_verify_layer_conv_and_recurrence_match_two_decode_steps():
+    op, _ = _make_layer(2)
+    ctx = _ctx(2)
+    pool = ctx.linear_state_pool
+    pool.conv_states.normal_()
+    pool.recurrent_states.normal_()
+    initial_conv = pool.conv_states.clone()
+    initial_rec = pool.recurrent_states.clone()
+    hidden = torch.randn(2, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    req = Req(input_ids=torch.zeros(12, dtype=torch.int32), table_idx=1, cached_len=10,
+              output_len=10, uid=0, sampling_params=SamplingParams(), cache_handle=None)
+    first = _decode(op, ctx, [req], hidden[:1])
+    mid_conv, mid_rec = pool.conv_states[:, 1].clone(), pool.recurrent_states[:, 1].clone()
+    second = _decode(op, ctx, [req], hidden[1:])
+    end_conv, end_rec = pool.conv_states[:, 1].clone(), pool.recurrent_states[:, 1].clone()
+    pool.conv_states.copy_(initial_conv)
+    pool.recurrent_states.copy_(initial_rec)
+    req.spec_slot_idx = 3
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = [req]
+    batch.spec_mode = "verify"
+    with ctx.forward_batch(batch):
+        got = op.forward(hidden)
+    torch.testing.assert_close(got, torch.cat([first, second]), rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.conv_states[:, 3], mid_conv, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.recurrent_states[:, 3], mid_rec, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.conv_states[:, 1], end_conv, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.recurrent_states[:, 1], end_rec, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.recurrent_states[:, 4], initial_rec[:, 4])
 
 
 @torch.no_grad()

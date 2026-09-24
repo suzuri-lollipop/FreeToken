@@ -1,12 +1,13 @@
-"""_drain_spec bookkeeping (MTP Phase 1): the accept/reject/replay host-side state
-machine, CPU-only with a stub scheduler and real Req objects.
+"""_drain_spec bookkeeping (MTP): the accept/reject host-side state machine,
+CPU-only with a stub scheduler and real Req objects.
 
-The invariants under test are the ones the reject-replay loop lives or dies by:
-accept completes once and appends two tokens; reject keeps the PRE-step lens
-(cached_len P, device_len P+2) so the replay re-reads [x_P, y1] from the pool,
-restores the GDN/PLE snapshot, repairs the draft's pool slot and releases the
-recorded pages; a replay canary miss fails loudly; an EOS in the first emitted
-token drops the bonus token and finishes the request.
+The invariants under test are the ones the two-token verify lives or dies by:
+accept completes once and appends two tokens (the live slot already holds the
+state after both rows); reject restores the scratch slot's post-row-0 state,
+commits exactly one input token (cached_len = device_len - 1), repairs the
+draft's pool slot with y1, keeps the fresh row-0 draft and releases only the
+pages beyond the committed prefix; an EOS in the first emitted token drops the
+bonus token and finishes the request.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def _req(host_len=P + 1, max_extra=20):
 
 def _setup(req, mode="verify", pages=None):
     calls = {"copy_from": [], "release": [], "freed": [], "removed": []}
-    pool = torch.zeros(4, 64, dtype=torch.int32)
+    pool = torch.zeros(4, 256, dtype=torch.int32)
     pool[0, P + 1] = 999  # the draft's staged pool slot (verify bump wrote it)
     pool[0, P + 2] = 42   # the engine's next_tokens_gpu write (Scheduler._forward)
 
@@ -43,10 +44,10 @@ def _setup(req, mode="verify", pages=None):
         r.spec_slot_idx = None
         r.spec_residual = None
         r.spec_draft = None
-        r.spec_replay = False
         r.table_idx = -1
 
     sched = SimpleNamespace(
+        config=SimpleNamespace(page_size=64),
         decode_manager=SimpleNamespace(remove_req=lambda r: calls["removed"].append(r)),
         _free_req_resources=free_resources,
         engine=SimpleNamespace(linear_state_pool=SimpleNamespace(
@@ -60,6 +61,7 @@ def _setup(req, mode="verify", pages=None):
         finished_reqs=set(),
     )
     req.spec_slot_idx = 3
+    sched._restore_spec_prefix = lambda b: Scheduler._restore_spec_prefix(sched, b)
     req.linear_slot_idx = 1
     batch = SimpleNamespace(reqs=[req], spec_mode=mode, spec_pages=pages)
     return sched, batch, calls, pool
@@ -81,14 +83,14 @@ def test_accept_completes_once_and_appends_two_tokens():
                              {"y1": 41, "y2": 42, "accept": True, "draft": 77})
     assert req.input_ids.tolist()[-2:] == [41, 42]
     assert req.cached_len == P + 2 and req.device_len == P + 3
-    assert req.spec_draft == 77 and not req.spec_replay
+    assert req.spec_draft == 77
     assert [m.next_token for m in reply] == [41, 42]
     assert not any(m.finished for m in reply) and not finished
     assert calls["copy_from"] == [] and calls["release"] == []
     assert int(pool[0, P + 2]) == 42  # the engine's pool write landed at the new position
 
 
-def test_reject_restores_repairs_and_keeps_pre_step_lens():
+def test_reject_restores_first_token_state_and_keeps_a_fresh_draft():
     req = _req(host_len=P + 2)
     req.input_ids[P + 1] = 999  # the staged draft, to be overwritten with y1
     req.device_len = P + 2
@@ -99,32 +101,11 @@ def test_reject_restores_repairs_and_keeps_pre_step_lens():
     assert calls["copy_from"] == [(3, 1)]  # scratch -> live
     assert int(pool[0, P + 1]) == 41  # the draft's pool slot repaired with the true token
     assert calls["release"] == [[(0, 1, 2)]]
-    assert req.spec_replay and req.spec_draft is None
+    assert req.spec_draft == 77
     assert req.input_ids.tolist()[-1] == 41 and req.input_ids.numel() == P + 2  # slot repaired, not appended
     # the pre-step lens: the replay step re-reads rows [P, P+1] = [x_P, y1]
-    assert req.cached_len == P and req.device_len == P + 2
+    assert req.cached_len == P + 1 and req.device_len == P + 2
     assert [m.next_token for m in reply] == [41] and not finished
-
-
-def test_replay_accept_appends_only_the_bonus_token():
-    req = _req(host_len=P + 2)  # the reject drain already appended y1
-    req.device_len = P + 2
-    req.spec_replay = True
-    sched, batch, calls, _pool = _setup(req, mode="replay")
-    reply, finished = _drain(sched, batch,
-                             {"y1": 41, "y2": 43, "accept": True, "draft": 88})
-    assert req.input_ids.tolist()[-1] == 43 and req.input_ids.numel() == P + 3
-    assert req.cached_len == P + 2 and req.device_len == P + 3
-    assert req.spec_draft == 88 and not req.spec_replay
-    assert [m.next_token for m in reply] == [43]
-
-
-def test_replay_canary_miss_fails_loudly():
-    req = _req(host_len=P + 2)
-    req.device_len = P + 2
-    sched, batch, _calls, _pool = _setup(req, mode="replay")
-    with pytest.raises(RuntimeError, match="canary"):
-        _drain(sched, batch, {"y1": 41, "y2": 43, "accept": False, "draft": 88})
 
 
 def test_eos_on_the_first_token_drops_the_bonus_and_finishes():
@@ -204,16 +185,62 @@ def test_verify_needs_room_for_two_tokens():
     assert req2.input_ids.numel() == P + 2 and int(req2.input_ids[P + 1]) == 42
 
 
-def test_replay_runs_even_with_one_token_of_room():
-    # post-reject lenses (cached P, device P+2, host holds y1): the two-row replay is the
-    # ONLY consumer of that state, so the remain>=2 verify gate must not apply to it.
-    from freetoken.core import Batch
-    from freetoken.scheduler.scheduler import Scheduler
 
-    req = _spec_req(P + 2, 1, P, device_len=P + 2, spec_replay=True, spec_slot_idx=5)
-    assert req.remain_len == 1
-    sched, _writes = _upgrade_sched(req)
-    batch = Batch(reqs=[req], phase="decode")
-    out = Scheduler._as_spec_batch(sched, batch)
-    assert out is batch and batch.spec_mode == "replay" and batch.phase == "prefill"
-    assert req.device_len == P + 2  # no bump: the replay rows are [x_P, y1]
+@pytest.mark.parametrize("position,pages,released", [
+    (63, [(0, 1, 2)], [[(0, 1, 2)]]),
+    (64, [(0, 1, 2)], []),
+    (65, None, []),
+])
+def test_reject_keeps_only_pages_containing_committed_inputs(position, pages, released):
+    req = _spec_req(position + 2, 10, position, spec_slot_idx=3)
+    sched, batch, calls, pool = _setup(req, pages=pages)
+    _drain(sched, batch, {"y1": 41, "y2": 42, "accept": False, "draft": 77})
+    assert req.cached_len == position + 1
+    assert req.device_len == position + 2
+    assert calls["release"] == released
+    sched.config.speculative = "mtp"
+    from freetoken.core import Batch
+    following = Batch(reqs=[req], phase="decode")
+    assert Scheduler._as_spec_batch(sched, following) is following
+    assert following.spec_mode == "verify"
+    assert req.extend_len == 2
+    assert int(pool[0, position + 2]) == 77
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_reject_or_abort_at_page_boundary_releases_uncommitted_page(aborted):
+    req = _spec_req(65, 10, 63, spec_slot_idx=3)
+    req.aborted = aborted
+    sched, batch, calls, _ = _setup(req, pages=[(0, 1, 2)])
+    reply, finished = _drain(sched, batch,
+                             {"y1": 2, "y2": 42, "accept": False, "draft": 77})
+    assert req in finished
+    assert req.cached_len == 64
+    assert calls["copy_from"] == [(3, 1)]
+    assert calls["release"] == [[(0, 1, 2)]]
+    assert calls["freed"] == [req]
+    assert [r.next_token for r in reply] == ([] if aborted else [2])
+
+
+def test_normal_decode_invalidates_draft_and_prompt_stash():
+    from freetoken.core import Batch
+
+    reqs = [_spec_req(P + 1, 10, P, spec_draft=42),
+            _spec_req(P + 1, 10, P, spec_residual=torch.ones(2, 4))]
+    batch = Batch(reqs=reqs, phase="decode")
+    sched = Scheduler.__new__(Scheduler)
+    sched.config = SimpleNamespace(speculative="mtp", prefill_decode_interval=0)
+    sched._prefill_debt = 0.0
+    sched._prefill_debt_s = 0.0
+    sched._chunk_target_s = 0.0
+    sched._chunk_ema_spt = None
+    sched.prefill_budget = 64
+    sched._prefill_streak = 0
+    sched.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: None)
+    sched.decode_manager = SimpleNamespace(schedule_next_batch=lambda: batch)
+    sched._prepare_batch = lambda b: b
+    sched._report_prompt_admissions = lambda b: None
+    assert sched._schedule_next_batch() is batch
+    for req in reqs:
+        assert req.spec_off and req.spec_draft is None and req.spec_residual is None
+    assert sched._as_spec_batch(Batch(reqs=reqs[:1], phase="decode")) is None

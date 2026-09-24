@@ -17,6 +17,17 @@ import torch
 from .common import fill_weights, parsed_config, toy_hf_config
 
 
+@pytest.fixture(autouse=True)
+def _rope_cache_hygiene():
+    # The CPU-toy model builds cache a CPU rope in get_rope's functools.cache; later
+    # GPU tests in the same session would hit it (flashinfer needs a CUDA cache).
+    from freetoken.layers import rotary
+
+    rotary.get_rope.cache_clear()
+    yield
+    rotary.get_rope.cache_clear()
+
+
 def _mtp_block(theta=None):
     # theta None -> the config carries no mtp rope_theta; the head then shares the
     # main rotary config unconditionally (the released checkpoint sets it equal).
@@ -225,3 +236,68 @@ def test_draft_without_the_head_fails_loudly():
     model = _bare_model(enabled=False)
     with pytest.raises(AssertionError, match="MTP head"):
         model.draft(torch.randn(1, 4), torch.tensor([1]), None)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_greedy_shards_match_full_vocab_with_padding_and_ties(tied):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    # Each identity row selects one independent set of scores. Padding is deliberately
+    # larger than every valid score; ties must pick the lowest global token id.
+    scores = torch.tensor([
+        [1., 2., 3., 4., 5., 6., 7., 100., 100.],
+        [0., 9., 9., 9., 0., 0., 9., 100., 100.],
+        [-4., -3., -2., -1., -5., -6., -7., 100., 100.],
+    ])
+    mixed = torch.eye(3)
+    expected = scores[:, :7].argmax(-1)
+    candidates = []
+    for rank in range(3):
+        shard = scores[:, rank * 3:(rank + 1) * 3].clone()
+        shard[:, max(0, min(3, 7 - rank * 3)):] = -torch.inf
+        value, index = shard.max(-1)
+        candidates.append(torch.stack((value.double(), (index + rank * 3).double()), -1))
+
+    for rank in range(3):
+        def gather(local, rank=rank):
+            torch.testing.assert_close(local.view(torch.float64), candidates[rank])
+            assert local.shape == (3, 8)
+            return torch.cat(candidates).view(torch.bfloat16)
+
+        weight = scores[:, rank * 3:(rank + 1) * 3].T.contiguous()
+        head = SimpleNamespace(
+            weight=weight, tied_embedding=SimpleNamespace(weight=weight) if tied else None,
+            bias=None, tp_size=3, vocab_range=(rank * 3, min(3, 7 - rank * 3)),
+            _comm=SimpleNamespace(all_gather=gather),
+        )
+        model = SimpleNamespace(lm_head=head)
+        got = Qwen4ExpForCausalLM.greedy_ids(model, mixed)
+        assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("row", [0, 1])
+def test_draft_projects_selected_row_but_updates_all_head_rows(monkeypatch, row):
+    model = _bare_model()
+    model.mtp.layers.op_list.clear()
+    model.mtp.wiring = "norm_mix_fc"
+    fill_weights(model.mtp, seed=12, device=torch.device("cpu"))
+    residual = torch.randn(2, model._config.qwen4_args.ple_state_width)
+    next_ids = torch.tensor([5, 6], dtype=torch.int32)
+    expected = model.draft(residual, next_ids, None)[row:row + 1]
+    forward = model.mtp.forward
+    greedy = model.greedy_ids
+    rows = []
+
+    def head_forward(r, e, batch):
+        rows.append((r.shape[0], e.shape[0]))
+        return forward(r, e, batch)
+
+    def select(mixed):
+        assert mixed.shape[0] == 1
+        return greedy(mixed)
+
+    monkeypatch.setattr(model.mtp, "forward", head_forward)
+    monkeypatch.setattr(model, "greedy_ids", select)
+    torch.testing.assert_close(
+        model.draft(residual, next_ids, None, select_row=torch.tensor([row])), expected)
+    assert rows == [(2, 2)]

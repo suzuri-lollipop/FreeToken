@@ -399,6 +399,9 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
         )
         nxt = torch.where(cand >= cu[:-1].unsqueeze(1), ids[cand.clamp_min(0)], old)
     context_pool.index_copy_(0, meta.state_slots, nxt.to(context_pool.dtype))
+    if fla is not None and getattr(fla, "spec_state_indices", None) is not None:
+        middle = torch.cat([meta.ngram_context[:, 1:], ids[:1].view(1, 1)], dim=1)
+        context_pool.index_copy_(0, fla.spec_state_indices, middle.to(context_pool.dtype))
     if fla is not None and fla.track_boundary_row is not None:
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
         context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
@@ -615,6 +618,10 @@ class PLELayer(BaseOP):
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
         fla = getattr(batch, "fla_metadata", None)
+        if fla is not None and getattr(fla, "spec_state_indices", None) is not None:
+            before = self._read_state(meta, states, x.dtype)
+            middle = torch.cat([before[..., 1:], x[:1].unsqueeze(-1)], dim=-1)
+            states.index_copy_(0, fla.spec_state_indices, middle.to(states.dtype))
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         return gated + self._short_conv(x, meta, states)

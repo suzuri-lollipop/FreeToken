@@ -74,6 +74,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    # The prefill grouped GEMM can read expert rows straight from their LRU slots
+    # through a [E] id->slot map (skips the per-chunk double-buffer D2D staging).
+    supports_slot_direct_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
@@ -119,7 +122,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
-            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            # view.slots carries the [E] id->LRU-slot map on the slot-direct prefill
+            # path (None on the double-buffer path: position == expert id).
+            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit, slot_map=view.slots)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
 
 

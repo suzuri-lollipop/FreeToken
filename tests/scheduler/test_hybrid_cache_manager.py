@@ -171,9 +171,9 @@ if __name__ == "__main__":
 
 
 def test_copy_from_roundtrips_a_spec_snapshot_including_slot_states():
-    """The spec-verify rollback contract (MTP reject-replay loop): copy_from(live ->
-    scratch) snapshots before the two-row verify, copy_from(scratch -> live) restores on a
-    reject, and the sibling slot_states (the PLE n-gram window rides them) roll back too."""
+    """The spec-verify rollback contract: on a reject copy_from(scratch -> live) restores
+    the post-row-0 state the GDN/PLE ops saved mid-forward, and the sibling slot_states
+    (the PLE n-gram window rides them) roll back with the same call."""
     from freetoken.models.config import SlotStateSpec
 
     g = LinearGatedDeltaGroupConfig(
@@ -211,7 +211,6 @@ def test_req_spec_fields_default_to_disabled():
     assert req.spec_slot_idx is None
     assert req.spec_residual is None
     assert req.spec_draft is None
-    assert req.spec_replay is False
 
 
 def test_batch_spec_fields_default_to_regular():

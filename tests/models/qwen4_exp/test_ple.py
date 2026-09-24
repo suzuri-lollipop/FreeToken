@@ -110,6 +110,36 @@ def _run_hf_reference(tmp_path, data: dict, layer_idx=2, ple_layer_index=0) -> d
     return dict(np.load(tmp_path / "out.npz"))
 
 
+def test_spec_snapshot_matches_one_token_ple_and_ngram_state():
+    config = _config()
+    layer = _make_layer(config)
+    width = config.qwen4_args.ple_state_width
+    torch.manual_seed(52)
+    residual = torch.randn(2, width)
+    states = torch.randn(4, width, layer.state_len)
+    original = states.clone()
+    reference = states.clone()
+    context = torch.tensor([[7, 8], [11, 12], [13, 14], [15, 16]])
+    context_before = context.clone()
+    meta = _meta([[21, 22]], [[7, 8]], slots=[0])
+    fla = SimpleNamespace(spec_state_indices=torch.tensor([2]), track_boundary_row=None)
+    batch = SimpleNamespace(fla_metadata=fla)
+    got = layer.forward(residual, batch, meta, states)
+    commit_ngram_context(meta, fla, context)
+    first_meta = _meta([[21]], [[7, 8]], slots=[0], decode=True)
+    first = layer.forward(residual[:1], SimpleNamespace(fla_metadata=None), first_meta, reference)
+    middle = reference[0].clone()
+    second_meta = _meta([[22]], [[8, 21]], slots=[0], decode=True)
+    second = layer.forward(residual[1:], SimpleNamespace(fla_metadata=None), second_meta, reference)
+    torch.testing.assert_close(got, torch.cat([first, second]))
+    torch.testing.assert_close(states[0], reference[0])
+    torch.testing.assert_close(states[2], middle)
+    torch.testing.assert_close(states[[1, 3]], original[[1, 3]])
+    assert context[0].tolist() == [21, 22]
+    assert context[2].tolist() == [8, 21]
+    torch.testing.assert_close(context[[1, 3]], context_before[[1, 3]])
+
+
 # --------------------------------------------------------------------------------------
 # hash
 # --------------------------------------------------------------------------------------

@@ -264,19 +264,42 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         gathered = gathered.view((head.tp_size,) + shape).permute(1, 0, 2).contiguous()
         return gathered.reshape(shape[0], head.tp_size * shape[1])[:, : head.num_embeddings]
 
-    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def greedy_ids(self, mixed: torch.Tensor) -> torch.Tensor:
+        """Select every row's global argmax with one candidate per vocab shard."""
+        head = self.lm_head
+        weight = head.tied_embedding.weight if head.tied_embedding is not None else head.weight
+        logits = torch.nn.functional.linear(mixed, weight, head.bias)
+        if head.tp_size == 1:
+            return logits.argmax(-1)
+        start, count = head.vocab_range
+        logits[:, count:] = -torch.inf
+        values, indices = logits.max(-1)
+        # Float64 preserves both FP32 scores and token ids in a single collective.
+        candidates = torch.stack(
+            (values.to(torch.float64), (indices + start).to(torch.float64)), -1
+        )
+        # PyNCCL accepts only 16-bit floats; transport the bits without conversion.
+        gathered = head._comm.all_gather(candidates.view(torch.bfloat16))
+        gathered = gathered.view(torch.float64).view(head.tp_size, mixed.shape[0], 2)
+        # Rank-major order preserves full-vocab argmax's lowest-id tie break.
+        winners = gathered[:, :, 0].argmax(0)
+        return gathered[:, :, 1].gather(0, winners.unsqueeze(0)).squeeze(0).to(torch.int64)
+
+    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch,
+              *, select_row: torch.Tensor | None = None) -> torch.Tensor:
         """Greedy MTP draft ids for the rows of ``residual`` (the spec step's head pass).
 
-        Collapses the head output through the shared top mixer and argmaxes the FULL
-        vocab logits (see full_vocab_logits for why the lm_head forward itself is not
-        usable here).
+        All rows update head KV. select_row chooses which verified prefix needs
+        a new draft before the shared mixer and vocabulary projection.
         """
         if self.mtp is None:
             raise AssertionError("draft() needs the MTP head (--speculative mtp)")
         next_embed = self.model.embed_tokens.forward(next_ids)
         head_out = self.mtp.forward(residual, next_embed, batch)
+        if select_row is not None:
+            head_out = head_out.index_select(0, select_row)
         mixed = self.model.hyper_connection_mixer.mix(head_out)[0]
-        return self.full_vocab_logits(mixed).argmax(-1)
+        return self.greedy_ids(mixed)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

@@ -1371,3 +1371,217 @@ def test_expert_bank_fill_restores_threads_when_pack_raises(monkeypatch):
         build_expert_banks(method, 1, iter(pieces), device=torch.device("cpu"))
 
     assert torch.get_num_threads() == before
+
+
+def _policy_cache():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=4, num_experts=8, cache_size=64, device=torch.device("cpu"),
+        prefill_overlap=True,
+    )
+    cache.auto_promote = True
+    return cache
+
+
+def test_auto_promote_policy_turns_on_when_working_set_fits():
+    cache = _policy_cache()
+    # slots_avail = 64 - 2*8 = 48; ws = 10/layer * 4 = 40 <= 48 -> on, full fraction
+    cache._promote_ema_touched = 10.0
+    cache._update_promote_policy()
+    assert cache._promote_on and cache.promote_auto_frac == 1.0
+
+
+def test_auto_promote_policy_partial_fraction_when_ws_grows():
+    cache = _policy_cache()
+    cache._promote_ema_touched = 10.0
+    cache._update_promote_policy()
+    cache._promote_ema_touched = 15.0  # ws = 60 > 48 -> stay on, partial frac
+    cache._update_promote_policy()
+    assert cache._promote_on
+    assert abs(cache.promote_auto_frac - 48 / 60) < 1e-9
+
+
+def test_auto_promote_policy_arms_with_partial_fraction_up_to_2x_budget():
+    cache = _policy_cache()
+    cache._promote_ema_touched = 18.0  # ws = 72 = 1.5x slots_avail(48): arm, partial
+    cache._update_promote_policy()
+    assert cache._promote_on
+    assert abs(cache.promote_auto_frac - 48 / 72) < 1e-9
+    # beyond 2x the budget a fresh policy never arms (feedback cannot save it)
+    cache2 = _policy_cache()
+    cache2._promote_ema_touched = 25.0  # ws = 100 > 96
+    cache2._update_promote_policy()
+    assert not cache2._promote_on and cache2.promote_auto_frac == 0.0
+
+
+def test_auto_promote_policy_demotes_after_thrashing_with_hysteresis():
+    cache = _policy_cache()
+    cache._promote_ema_touched = 10.0
+    cache._update_promote_policy()
+    cache._promote_harvests = 4  # past the cold-start warmup guard
+    cache._promote_ema_hitrate = 0.01  # near-zero reuse
+    cache._update_promote_policy()
+    assert cache._promote_on and cache._promote_off_streak == 1
+    cache._update_promote_policy()
+    assert not cache._promote_on and cache.promote_auto_frac == 0.0
+    # hysteresis: ws=40 <= 48 but > 0.8*48=38.4 -> stays off
+    cache._promote_ema_hitrate = 0.5
+    cache._update_promote_policy()
+    assert not cache._promote_on
+    cache._promote_ema_touched = 9.0  # ws = 36 <= 38.4 -> re-arms
+    cache._update_promote_policy()
+    assert cache._promote_on and cache.promote_auto_frac == 1.0
+
+
+def test_auto_promote_policy_cold_start_does_not_demote():
+    # The first chunks of a document are all-miss (hitrate ~0) by construction; the
+    # harvest-count warmup guard must keep them from tripping the thrash demotion.
+    cache = _policy_cache()
+    cache._promote_ema_touched = 10.0
+    cache._update_promote_policy()
+    assert cache._promote_on
+    cache._promote_ema_hitrate = 0.0
+    cache._update_promote_policy()
+    cache._update_promote_policy()
+    cache._update_promote_policy()
+    assert cache._promote_on and cache._promote_off_streak == 0
+
+
+def test_ondemand_chunk_begin_is_noop_without_pinned_stats():
+    cache = _policy_cache()  # cpu device -> _promote_pin is None
+    cache.ondemand_chunk_begin()  # must not raise
+    assert cache.promote_auto_frac == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="lru_ensure is a CUDA kernel")
+def test_promote_touched_reuses_across_chunks_and_guards_buffer_slots():
+    # GPU regression for the mask-driven fast promote (auto-promote policy):
+    # 1) cross-chunk reuse: a second chunk routing mostly the same experts must
+    #    keep their slots (only genuinely new experts are staged),
+    # 2) multi-slice buffer guard: lru_ensure increments its step PER CALL and
+    #    excludes only usage == (call step) from victims; a guard stamped once
+    #    before the slice loop goes stale and later slices dump promotions into
+    #    the double-buffer slots [0, 2E), where the plan re-classifies them as
+    #    misses and the next chunk invalidates them (measured in production as
+    #    2x chunk cadence: zero reuse AND double H2D traffic).
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.offload_kernels import promote_touched
+
+    dev = torch.device("cuda")
+    E = 8
+
+    def host(role):
+        fp8 = torch.float8_e4m3fn
+        if role == "gate_up":
+            t = torch.randint(0, 255, (E, 256, 128), dtype=torch.uint8)
+        elif role == "gate_up_scale":
+            t = (torch.rand(E, 256, 16) * 0.05 + 0.5).to(fp8)
+        elif role == "gate_up_global":
+            t = (torch.rand(E, 256) + 0.5).half()
+        elif role == "down":
+            t = torch.randint(0, 255, (E, 256, 64), dtype=torch.uint8)
+        elif role == "down_scale":
+            t = (torch.rand(E, 256, 8) * 0.05 + 0.5).to(fp8)
+        else:
+            t = (torch.rand(E, 256) + 0.5).half()
+        return [t.pin_memory(), t.pin_memory()]
+
+    banks = {r: host(r) for r in ("gate_up", "gate_up_scale", "gate_up_global",
+                                  "down", "down_scale", "down_global")}
+
+    # --- 1) cross-chunk reuse -------------------------------------------------
+    cache = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=40,
+                            device=dev, quant_format="nvfp4")
+    cache.set_bank_sources(banks)
+    t1 = torch.zeros(E, dtype=torch.int32, device=dev)
+    t1[[0, 1, 2]] = 1
+    promote_touched(cache, 0, t1, sub_k=4)
+    sf = cache.slot_for_id[0].clone()
+    assert (sf[[0, 1, 2]] >= 2 * E).all()
+    t2 = torch.zeros(E, dtype=torch.int32, device=dev)
+    t2[[1, 2, 3]] = 1
+    promote_touched(cache, 0, t2, sub_k=4)
+    sf2 = cache.slot_for_id[0]
+    assert (sf2[[1, 2]] == sf[[1, 2]]).all(), "reused rows must keep their slots"
+    assert sf2[3] >= 2 * E, "new expert promoted"
+
+    # --- 2) multi-slice stale-guard regression --------------------------------
+    cache2 = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=2 * E + 2,
+                             device=dev, quant_format="nvfp4")
+    cache2.set_bank_sources(banks)
+    t3 = torch.zeros(E, dtype=torch.int32, device=dev)
+    t3[[0, 1, 4, 5]] = 1
+    promote_touched(cache2, 0, t3, sub_k=2)  # misses in slice 0 AND slice 2
+    sf3 = cache2.slot_for_id[0]
+    assigned = sf3 >= 0
+    assert assigned.sum() == 2  # only 2 non-buffer slots exist; self-eviction is legal
+    assert (sf3[assigned] >= 2 * E).all(), (
+        f"promotions landed in double-buffer slots (stale guard): {sf3.tolist()}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernels need CUDA")
+def test_slot_direct_prefill_gemm_matches_position_id_reference():
+    # P1'' (slot-direct prefill): with every routed row LRU-resident (promote_touched),
+    # the grouped prefill GEMM reading rows THROUGH the id->slot map must produce the
+    # identical output to the reference reading position==expert-id banks. This is what
+    # lets the on-demand path skip the per-chunk double-buffer D2D staging.
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.offload_kernels import promote_touched
+
+    dev = torch.device("cuda")
+    E, S, K, I, NL = 8, 40, 256, 128, 2
+    fp8 = torch.float8_e4m3fn
+    torch.manual_seed(5)
+
+    def host(role):
+        if role == "gate_up":
+            t = torch.randint(0, 255, (E, 2 * I, K // 2), dtype=torch.uint8)
+        elif role == "gate_up_scale":
+            t = (torch.rand(E, 2 * I, K // 16) * 0.05 + 0.5).to(fp8)
+        elif role == "gate_up_global":
+            t = (torch.rand(E, 2 * I) + 0.5).half()
+        elif role == "down":
+            t = torch.randint(0, 255, (E, K, I // 2), dtype=torch.uint8)
+        elif role == "down_scale":
+            t = (torch.rand(E, K, I // 16) * 0.05 + 0.5).to(fp8)
+        else:
+            t = (torch.rand(E, K) + 0.5).half()
+        return [t.pin_memory() for _ in range(NL)]
+
+    banks = {r: host(r) for r in ("gate_up", "gate_up_scale", "gate_up_global",
+                                  "down", "down_scale", "down_global")}
+    cache = OffloadMoeCache(num_layers=NL, num_experts=E, cache_size=S,
+                            device=dev, quant_format="nvfp4", prefill_overlap=True)
+    cache.set_bank_sources(banks)
+
+    T, TOPK = 6, 2
+    x = torch.randn(T, K, device=dev, dtype=torch.bfloat16)
+    w = torch.rand(T, TOPK, device=dev, dtype=torch.float32) + 0.05
+    ids = torch.tensor([[0, 3], [1, 4], [2, 5], [0, 6], [7, 1], [3, 2]],
+                       dtype=torch.int32, device=dev)
+    touched = torch.zeros(E, dtype=torch.int32, device=dev)
+    touched.scatter_(0, ids.reshape(-1).long(), 1)
+    promote_touched(cache, 0, touched, sub_k=4)
+    torch.cuda.synchronize()
+    sf = cache.slot_for_id[0]
+    assert (sf[touched.bool()] >= 0).all()
+
+    out_sd = fused_experts_nvfp4(x, *cache.bank_views(), w, ids, E, "silu", False,
+                                 slot_map=sf)
+    order = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+    ref = fused_experts_nvfp4(x, *(banks[r][0].to(dev) for r in order), w, ids, E,
+                              "silu", False)
+    assert torch.equal(out_sd, ref), (
+        f"slot-direct mismatch: max|diff|={(out_sd.float()-ref.float()).abs().max().item()}")
+
+    # stats=True keeps the policy feedback alive on the slot-direct path:
+    # a warm re-promote counts every touched row as a hit, no fresh misses.
+    cache.auto_promote = True
+    cache._promote_pin = torch.zeros(2, dtype=torch.int64, device=dev)
+    cache.promote_touched(0, ids, stats=True)
+    torch.cuda.synchronize()
+    hits0, misses0 = cache._promote_acc.tolist()
+    n_touched = int(torch.unique(ids).numel())
+    assert (hits0, misses0) == (n_touched, 0), f"expected ({n_touched},0), got {(hits0, misses0)}"

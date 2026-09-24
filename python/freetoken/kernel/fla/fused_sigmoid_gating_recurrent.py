@@ -205,9 +205,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        # Cache intermediate states if enabled
+        # A one-step cache keeps only the rejection boundary of a two-token verify.
         if CACHE_INTERMEDIATE_STATES:
-            if cache_idx >= 0:
+            if cache_idx >= 0 and step_idx < cache_steps:
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer

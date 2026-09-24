@@ -491,7 +491,6 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
     # MTP spec payload (None for regular batches): mode-dependent host ints the drain
     # consumes -- prologue_decode: {y1, draft}; verify: {y1, y2, accept, draft};
-    # replay: {y1, y2, accept, draft, canary}.
     spec: dict | None = None
     # Graphed spec steps cannot build the dict before the device->host copy lands: the
     # pinned [y1, y2, draft, accept] row arrives here and the drain decodes it after
@@ -1621,6 +1620,28 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        # Prefill chunk graph (phase 1: single-req T=128 continuations, slot-direct
+        # promote, qsa_sparse): a captured continuation chunk samples nothing, so its
+        # replay returns a dummy ForwardOutput the ChunkedReq drain branch never reads.
+        pg = None
+        pg_before = None
+        if batch.is_prefill:
+            from .prefill_graph import prefill_graph_enabled
+
+            if prefill_graph_enabled():
+                runner = getattr(self, "_prefill_graph", None)
+                if runner is None:
+                    from .prefill_graph import PrefillGraphRunner
+
+                    runner = self._prefill_graph = PrefillGraphRunner(self)
+                if runner.graph is not None and runner.eligible(self, batch):
+                    for req in batch.reqs:
+                        req.complete_one()
+                    return runner.run(self, self.model, batch)
+                if runner.eligible(self, batch):
+                    pg = runner
+                    if pg.warm + 1 >= pg.WARM_STEPS:
+                        pg_before = pg.save_state(self, batch.reqs[0].linear_slot_idx)
         # NOTE: whole-forward SYNC instrumentation is only safe with PLE_FILL_AT_EXIT=1:
         # the captured decode graph parks at the PLE lookup's memop WAIT until the
         # deferred fill signals it post-drain, so a torch.cuda.synchronize around the
@@ -1694,6 +1715,18 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if pg is not None:
+            # Capture on THIS chunk's context after its eager result is sealed (the
+            # drain consumes the eager output above; capture restores the GDN live
+            # slot around warm/capture/replay and verifies the replay reproduces the
+            # eager post-state, so adoption is all-or-nothing). warm counts EVERY
+            # eligible eager chunk (the spec-graph pattern), not just armed ones.
+            pg.warm += 1
+            if pg_before is not None and pg.warm >= pg.WARM_STEPS:
+                after = pg.save_state(self, batch.reqs[0].linear_slot_idx)
+                pg.capture_after_chunk(
+                    self, self.model, batch, batch.reqs[0], pg_before, after
+                )
         if _dbg is not None:
             _te = _time.perf_counter()
             _dbg.host_phase("fb.sample", _te - _ts)
@@ -1702,20 +1735,20 @@ class Engine:
 
     @torch.inference_mode()
     def _forward_spec(self, batch: Batch) -> ForwardOutput:
-        """MTP spec step (Phase 1: eager, greedy, single request; _scratch/mtp_design.md).
+        """MTP spec step (greedy, single request; _scratch/mtp_design.md).
 
         All modes run the head unconditionally so the accept decision, both argmaxes and
         the next draft come back in ONE device->host read (the eager normal_loop
-        serializes here anyway; the reject-side head rows pollute head KV at positions the
-        replay step rewrites, so the wasted work is also harmless).
+        serializes here anyway). Row 0 supplies a fresh draft after a rejection;
+        row 1 supplies it after acceptance.
         """
         model = self.model
         req = batch.reqs[0]
-        assert len(batch.reqs) == 1, "Phase-1 spec steps run a single request"
+        assert len(batch.reqs) == 1, "spec steps run a single request"
         assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
         mode = batch.spec_mode
         runner = getattr(self, "_spec_graph", None)
-        if mode in ("verify", "replay"):
+        if mode == "verify":
             if runner is None:
                 from .spec_graph import SpecGraphRunner
 
@@ -1728,11 +1761,10 @@ class Engine:
 
             _t0 = _time.perf_counter()
 
-        if mode in ("verify", "replay"):
-            # Snapshot BEFORE the forward advances the GDN/PLE state; the reject drain
-            # restores from this scratch slot (copy_from covers the sibling slot_states,
-            # so the PLE n-gram window rolls back with the same call).
-            self.linear_state_pool.copy_from(req.linear_slot_idx, req.spec_slot_idx)
+        capture_state = None
+        if (mode == "verify" and not runner.disabled
+                and runner.warm + 1 >= runner.WARM_STEPS):
+            capture_state = runner.save_state(req.linear_slot_idx)
 
         with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
             if mode == "prologue_decode":
@@ -1740,30 +1772,23 @@ class Engine:
             if _dbg_spec:
                 _t1 = _time.perf_counter()
             mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-            logits = model.full_vocab_logits(mixed)
+            ids = model.greedy_ids(mixed)
             if _dbg_spec:
                 torch.cuda.synchronize(self.device)
                 _t2 = _time.perf_counter()
             if mode == "prologue_decode":
-                y = logits[0].argmax(-1)
+                y = ids[0]
                 d = model.draft(residual, y.view(1).to(torch.int32), batch)
                 vals = torch.stack([y, d[0]]).tolist()
                 next_tokens_gpu = y.view(1).to(torch.int32)
                 payload = {"y1": int(vals[0]), "draft": int(vals[1])}
             else:
-                y1 = logits[0].argmax(-1)
-                y2 = logits[1].argmax(-1)
-                d = model.draft(residual, torch.stack([y1, y2]).to(torch.int32), batch)
-                rows = [y1, y2, d[1]]
-                if mode == "replay":
-                    rows.append(batch.input_ids[1].to(torch.int64))
-                vals = torch.stack(rows).tolist()
-                if mode == "verify":
-                    accept = int(vals[0]) == batch.spec_draft_id
-                else:
-                    # the replayed row-0 argmax must reproduce the placed token: a
-                    # deterministic-GPU canary (a miss raises in the drain)
-                    accept = int(vals[0]) == int(vals[3])
+                y1, y2 = ids[0], ids[1]
+                accepted = y1 == batch.spec_draft_id
+                d = model.draft(residual, torch.stack([y1, y2]).to(torch.int32), batch,
+                                select_row=accepted.to(torch.int64).view(1))
+                vals = torch.stack([y1, y2, d[0]]).tolist()
+                accept = int(vals[0]) == batch.spec_draft_id
                 next_tokens_gpu = y2.view(1).to(torch.int32)
                 payload = {
                     "y1": int(vals[0]), "y2": int(vals[1]),
@@ -1779,7 +1804,7 @@ class Engine:
             self._pending_host_fill = _deferred_fill
 
         if (
-            runner is not None and mode in ("verify", "replay")
+            runner is not None and mode == "verify"
             and runner.graph is None and not runner.disabled
         ):
             runner.warm += 1
@@ -1787,12 +1812,11 @@ class Engine:
                 # capture on this step's context; the state is restored around the
                 # warm/capture/replay runs, so the step's own eager payload stays the
                 # one the drain consumes
-                runner.capture_after_step(self, model, batch, req, payload)
+                runner.capture_after_step(self, model, batch, req, payload, capture_state)
 
         if mode == "prologue_decode":
             req.complete_one()  # a regular decode row; the drain only picks up the draft
-        # verify/replay leave the Req lens to the drain: accept completes once and appends
-        # two tokens; reject keeps the pre-step lens so the replay re-reads the span.
+        # The drain commits both input rows on acceptance, or just row 0 on rejection.
 
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()

@@ -17,15 +17,19 @@ from types import SimpleNamespace
 import torch
 
 
-def _stub_scheduler(interval: int, decode_runnable: bool = True):
+def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float = 0.0,
+                    debt: float = 0.0, chunk_target: float = 0.0,
+                    chunk_ema: float | None = None, budget: int = 99):
     from freetoken.scheduler.scheduler import Scheduler
 
     calls: list[str] = []
+    budgets: list[int] = []
     prefill_batch = SimpleNamespace(is_prefill=True, prompt_admissions=[])
     decode_batch = SimpleNamespace(is_prefill=False, prompt_admissions=[])
 
     def prefill(_budget):
         calls.append("prefill")
+        budgets.append(_budget)
         return prefill_batch
 
     def decode():
@@ -33,15 +37,20 @@ def _stub_scheduler(interval: int, decode_runnable: bool = True):
         return decode_batch
 
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.prefill_budget = 99
+    scheduler.prefill_budget = budget
     scheduler.config = SimpleNamespace(prefill_decode_interval=interval)
     scheduler._prefill_streak = 0
+    scheduler._prefill_debt = debt
+    scheduler._prefill_debt_s = debt_s
+    scheduler._chunk_target_s = chunk_target
+    scheduler._chunk_ema_spt = chunk_ema
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=prefill)
     scheduler.decode_manager = SimpleNamespace(
         schedule_next_batch=decode, runnable=decode_runnable
     )
     scheduler._prepare_batch = lambda batch: batch
     scheduler._report_prompt_admissions = lambda batch: None
+    scheduler.recorded_budgets = budgets
     return scheduler, calls
 
 
@@ -66,6 +75,79 @@ def test_interval_zero_restores_prefill_first_behavior():
 def test_interleave_off_when_no_decode_is_running():
     scheduler, _calls = _stub_scheduler(interval=2, decode_runnable=False)
     assert _phases(scheduler, 6) == ["p"] * 6
+
+
+def test_time_debt_forces_decode_before_the_count_interval():
+    # count-based guard disabled (interval=0); the accrued wall-clock debt alone
+    # must hand the first step to decode, then reset so prefill resumes.
+    scheduler, _calls = _stub_scheduler(interval=0, debt_s=2.0, debt=7.3)
+    assert _phases(scheduler, 4) == ["d", "p", "p", "p"]
+    assert scheduler._prefill_debt == 0.0
+
+
+def test_time_debt_zero_never_forces_decode():
+    scheduler, _calls = _stub_scheduler(interval=0, debt_s=0.0, debt=1e9)
+    assert _phases(scheduler, 4) == ["p"] * 4
+
+
+def test_time_debt_below_threshold_keeps_prefilling():
+    scheduler, _calls = _stub_scheduler(interval=0, debt_s=2.0, debt=1.5)
+    assert _phases(scheduler, 4) == ["p"] * 4
+
+
+def test_debt_not_owed_when_no_decode_is_running():
+    scheduler, _calls = _stub_scheduler(
+        interval=0, debt_s=2.0, debt=7.3, decode_runnable=False
+    )
+    assert _phases(scheduler, 4) == ["p"] * 4
+
+
+def _stub_drain_scheduler(debt_s: float, decode_runnable: bool, chunk_target: float = 0.0):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._prefill_debt = 0.0
+    scheduler._prefill_debt_s = debt_s
+    scheduler._chunk_target_s = chunk_target
+    scheduler._chunk_ema_spt = None
+    scheduler.decode_manager = SimpleNamespace(runnable=decode_runnable)
+    return scheduler
+
+
+def test_account_prefill_debt_accrues_schedule_to_drain_window():
+    import time as _time
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=True)
+    batch = SimpleNamespace(
+        is_prefill=True, spec_mode=None, scheduled_at=_time.perf_counter() - 7.3
+    )
+    Scheduler._account_prefill_debt(scheduler, batch)
+    assert 7.2 < scheduler._prefill_debt < 8.0
+
+
+def test_account_prefill_debt_skips_non_prefill_spec_and_idle():
+    import time as _time
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    stamp = _time.perf_counter() - 5.0
+    cases = [
+        SimpleNamespace(is_prefill=False, spec_mode=None, scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, spec_mode="verify", scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, spec_mode=None, scheduled_at=0.0),
+    ]
+    for batch in cases:
+        scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=True)
+        Scheduler._account_prefill_debt(scheduler, batch)
+        assert scheduler._prefill_debt == 0.0
+    # debt is only "owed" while somebody waits: no runnable decode -> no accrual
+    scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=False)
+    Scheduler._account_prefill_debt(
+        scheduler, SimpleNamespace(is_prefill=True, spec_mode=None, scheduled_at=stamp)
+    )
+    assert scheduler._prefill_debt == 0.0
 
 
 def _build_managers(num_pages):
@@ -138,3 +220,108 @@ def test_deferred_requests_keep_arrival_order():
 
     assert [req.uid for req in batch.reqs] == [3]
     assert [req.uid for req in prefill_manager.pending_list] == [1, 2]
+
+
+# ---------------------------------------------------------------- P2: adaptive chunk budget
+
+
+def test_adaptive_budget_shrinks_only_while_decode_waits():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    # 7.3s / 8192tok measured -> 0.89 ms/tok; target 0.5s -> 561 -> align64 -> 512
+    scheduler, _ = _stub_scheduler(
+        interval=0, debt_s=0.0, chunk_target=0.5, chunk_ema=7.3 / 8192, budget=8192
+    )
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 512
+    # no victim waiting -> the solo huge prompt keeps the full configured chunk
+    scheduler.decode_manager.runnable = False
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 8192
+
+
+def test_adaptive_budget_floor_and_cap():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler, _ = _stub_scheduler(
+        interval=0, debt_s=0.0, chunk_target=0.5, chunk_ema=1.0 / 256, budget=8192
+    )
+    # 0.5s / 3.9ms-per-tok = 128 -> align 64 -> floor 128
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 128
+    scheduler._chunk_ema_spt = 0.5 / 32  # even slower -> still floored
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 128
+    scheduler._chunk_ema_spt = 0.5 / 100000  # absurdly fast
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 8192  # capped at budget
+    # a budget smaller than the floor clamps the floor (never exceeds the config)
+    small, _ = _stub_scheduler(interval=0, debt_s=0.0, chunk_target=0.5,
+                               chunk_ema=1.0 / 256, budget=99)
+    assert Scheduler._adaptive_prefill_budget(small) == 99
+
+
+def test_adaptive_budget_off_without_target_or_ema():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler, _ = _stub_scheduler(interval=0, debt_s=0.0)
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 99
+    scheduler, _ = _stub_scheduler(interval=0, debt_s=0.0, chunk_target=0.5)
+    assert scheduler._chunk_ema_spt is None
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 99
+
+
+def test_schedule_next_batch_uses_the_adaptive_budget():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler, calls = _stub_scheduler(
+        interval=0, debt_s=0.0, chunk_target=0.5, chunk_ema=7.3 / 8192, budget=8192
+    )
+    _phases(scheduler, 2)
+    assert calls == ["prefill", "prefill"]
+    assert scheduler.recorded_budgets == [512, 512]
+
+
+def test_observe_chunk_time_updates_ema():
+    import time as _time
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = _stub_drain_scheduler(debt_s=0.0, decode_runnable=True, chunk_target=0.5)
+    batch = SimpleNamespace(
+        is_prefill=True, spec_mode=None,
+        scheduled_at=_time.perf_counter() - 7.3, log_new_tokens=8192,
+    )
+    Scheduler._observe_chunk_time(scheduler, batch)
+    assert scheduler._chunk_ema_spt is not None
+    first = scheduler._chunk_ema_spt
+    assert abs(first - 7.3 / 8192) < 0.0005
+    # second sample moves the EMA 30% toward itself
+    batch2 = SimpleNamespace(
+        is_prefill=True, spec_mode=None,
+        scheduled_at=_time.perf_counter() - 2.0, log_new_tokens=512,
+    )
+    Scheduler._observe_chunk_time(scheduler, batch2)
+    expected = 0.7 * first + 0.3 * (batch2_spt := 2.0 / 512)
+    assert abs(scheduler._chunk_ema_spt - expected) < 0.0005
+    # spec batches and zero-token batches never feed the EMA
+    before = scheduler._chunk_ema_spt
+    Scheduler._observe_chunk_time(scheduler, SimpleNamespace(
+        is_prefill=True, spec_mode="verify",
+        scheduled_at=_time.perf_counter() - 9.0, log_new_tokens=2))
+    Scheduler._observe_chunk_time(scheduler, SimpleNamespace(
+        is_prefill=True, spec_mode=None,
+        scheduled_at=_time.perf_counter() - 9.0, log_new_tokens=0))
+    assert scheduler._chunk_ema_spt == before
+
+
+def test_effective_debt_follows_chunk_target_in_adaptive_mode():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler, _ = _stub_scheduler(
+        interval=0, debt_s=2.0, chunk_target=0.5, chunk_ema=7.3 / 8192
+    )
+    # adaptive + victim waiting -> concede after (nearly) every shrunken chunk
+    assert Scheduler._effective_debt_s(scheduler) == 0.25
+    scheduler.decode_manager.runnable = False
+    assert Scheduler._effective_debt_s(scheduler) == 2.0
+    scheduler.decode_manager.runnable = True
+    scheduler._chunk_target_s = 0.0
+    assert Scheduler._effective_debt_s(scheduler) == 2.0
+    scheduler._chunk_target_s, scheduler._chunk_ema_spt = 0.5, None
+    assert Scheduler._effective_debt_s(scheduler) == 2.0

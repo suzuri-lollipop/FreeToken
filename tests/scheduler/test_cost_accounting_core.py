@@ -96,6 +96,10 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
     scheduler.config = SimpleNamespace(prefill_decode_interval=4)
     scheduler._prefill_streak = 0
+    scheduler._prefill_debt = 0.0
+    scheduler._prefill_debt_s = 0.0
+    scheduler._chunk_target_s = 0.0
+    scheduler._chunk_ema_spt = None
     events = []
 
     def prepare(value):
@@ -122,6 +126,10 @@ def test_prepare_failure_emits_no_prompt_admission():
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None, runnable=False)
     scheduler.config = SimpleNamespace(prefill_decode_interval=4)
     scheduler._prefill_streak = 0
+    scheduler._prefill_debt = 0.0
+    scheduler._prefill_debt_s = 0.0
+    scheduler._chunk_target_s = 0.0
+    scheduler._chunk_ema_spt = None
     sent = []
 
     def fail_prepare(_batch):
@@ -209,6 +217,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
+    scheduler._chunk_timing = False
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
     scheduler._schedule_next_batch = lambda: None
     sent = []

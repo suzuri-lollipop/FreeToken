@@ -32,6 +32,8 @@ class FLAMetadata:
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    # One slot per verify request, receiving the state after its first input token.
+    spec_state_indices: torch.Tensor | None = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -79,6 +81,12 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
     track = _build_track_metadata(reqs, cu_host, device, pin)
+    spec_indices = None
+    if getattr(batch, "spec_mode", None) == "verify":
+        assert len(reqs) == 1 and lens == [2]
+        spec_indices = torch.tensor(
+            [reqs[0].spec_slot_idx], dtype=torch.int64, **pin
+        ).to(device, non_blocking=True)
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),
@@ -87,6 +95,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
         fresh_state_indices=(
             fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
         ),
+        spec_state_indices=spec_indices,
         **track,
     )
 

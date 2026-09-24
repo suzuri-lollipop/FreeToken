@@ -276,8 +276,8 @@ class CacheManager:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
-        # Spec batches record what they charged: a rejected verify releases the span because
-        # the replay step re-charges the same positions (see release_paged).
+        # Spec batches record what they charged: a rejected verify releases the pages beyond
+        # the committed prefix, and the next verify re-charges them (see release_paged).
         return allocation_info if record else None
 
     def release_paged(self, allocation_info: List[Tuple[int, int, int]]) -> None:
@@ -285,8 +285,8 @@ class CacheManager:
 
         The page-table entries still point at them; the caller must re-charge the span
         (which overwrites the entries) before the freed slots are handed out again -- the
-        spec replay step does exactly that. SWA-mapped pools are not supported (the spec
-        gate excludes them).
+        next spec verify step does exactly that. SWA-mapped pools are not supported (the
+        spec gate excludes them).
         """
         assert not self.swa_paged, "release_paged: swa pools need their slot mapping undone"
         for table_idx, first_page, last_page in allocation_info:

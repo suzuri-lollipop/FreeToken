@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -22,6 +23,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
@@ -48,6 +50,46 @@ Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
+
+
+# Wall-clock bound on how long running decodes may wait behind consecutive prefill
+# steps. The count-based prefill_decode_interval cannot bound ITL when chunk times
+# swing by 10x (PLE device-latency spikes turn a 7s chunk into 55-155s); the debt
+# hands a step to decode once this many prefill SECONDS accrued while a decode was
+# runnable. 0 keeps the pure count-based behavior. Default 2.0: measured on the
+# 2x RTX PRO 4000 rig (churn: 2 victims + a 30k-token aggressor) the victims' max
+# inter-token gap dropped from the whole prefill window (91-159s) to one chunk
+# (~7s) in both healthy and NVMe-pathological device states (_scratch/agent3).
+def _prefill_debt_budget() -> float:
+    raw = os.environ.get("FREETOKEN_PREFILL_DEBT_S", "2.0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise ValueError(f"FREETOKEN_PREFILL_DEBT_S must be a number, got {raw!r}")
+
+
+# Victim-aware adaptive chunking: while a decode is waiting, shrink the prefill
+# chunk so ONE chunk's forward time tracks this target. The gap a waiting user
+# perceives is bounded by one chunk (+ its concede step), so the target is the
+# stall budget in seconds. 0 keeps the static configured chunk for everyone.
+def _adaptive_chunk_target_s() -> float:
+    raw = os.environ.get("FREETOKEN_ADAPTIVE_CHUNK_TARGET_S", "0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise ValueError(f"FREETOKEN_ADAPTIVE_CHUNK_TARGET_S must be a number, got {raw!r}")
+
+
+# Adaptive chunk shaping: multiples of 64 keep the hybrid GDN x64 snapshot
+# boundaries (prefill_chunk_align's reuse points); the floor stops a slow outlier
+# chunk from collapsing the prompt into per-chunk-overhead-dominated slivers.
+_CHUNK_ALIGN = 64
+# Floor 128: at 256-token chunks this model's per-layer touched set (~132) times 48
+# layers (~6.3k rows) OVERFLOWS the ~6k-slot LRU budget, and global LRU thrashes
+# cyclically (layer L's promotions evict layer L+1's rows) -- measured: cross-chunk
+# reuse collapses despite ~83% touched overlap, cadence 2x. At 128 the working set
+# (~4-5k) fits and the promote reuse survives (see _scratch/agent3 RESULTS).
+_CHUNK_MIN = 128
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
@@ -147,6 +189,14 @@ class Scheduler(SchedulerIOMixin):
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self._prefill_streak = 0
+        self._prefill_debt = 0.0  # prefill seconds accrued while a decode was runnable
+        self._prefill_debt_s = _prefill_debt_budget()
+        self._chunk_target_s = _adaptive_chunk_target_s()
+        self._chunk_ema_spt: float | None = None  # EMA of prefill seconds per token
+        # Opt-in per-chunk wall-clock breakdown ([chunktime] log lines). Independent of
+        # the moe _debug_stats probe (which must not be enabled on PLE-graph rigs).
+        self._chunk_timing = os.environ.get("FREETOKEN_CHUNK_TIMING", "0") == "1"
+        self._ct_chunks = 0
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -203,6 +253,10 @@ class Scheduler(SchedulerIOMixin):
             _spec_runner = getattr(self.engine, "_spec_graph", None)
             if _spec_runner is not None:
                 _spec_runner.invalidate()
+            # the prefill chunk graph bakes the same pools (token_pool/page_table gathers)
+            _pg_runner = getattr(self.engine, "_prefill_graph", None)
+            if _pg_runner is not None:
+                _pg_runner.invalidate()
         # The prefill chunk cap tracks the CURRENT window-pool size (DSV4); a rebuild that
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
         # the stale budget and crashes _alloc_window.
@@ -232,6 +286,9 @@ class Scheduler(SchedulerIOMixin):
             import time as _time
 
             _t = _time.perf_counter()
+        _ct = self._chunk_timing
+        if _ct:
+            _ct0 = time.perf_counter()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -240,6 +297,8 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        if _ct:
+            _ct1 = time.perf_counter()
         if _dbg is not None:
             _n = _time.perf_counter()
             _dbg.host_phase("recv", _n - _t)
@@ -261,6 +320,8 @@ class Scheduler(SchedulerIOMixin):
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
+        if _ct:
+            _ct2 = time.perf_counter()
         if _dbg is not None:
             _n = _time.perf_counter()
             _dbg.host_phase("sched", _n - _t)
@@ -286,6 +347,8 @@ class Scheduler(SchedulerIOMixin):
                     _dbg.host_phase(
                         ("p." if forward_input.batch.is_prefill else "d.") + "fw.total",
                         _n2 - _n1)
+        if _ct:
+            _ct3 = time.perf_counter()
         if _dbg is not None:
             _n = _time.perf_counter()
             _dbg.host_phase("fwd_issue", _n - _t)
@@ -306,6 +369,9 @@ class Scheduler(SchedulerIOMixin):
             # wait is ~0 here), while the replay's captured memop WAIT keeps the ordering.
             # In a finally so a drain failure can never leave the WAIT unanswered.
             self.engine.run_pending_host_fill()
+        if _ct:
+            self._log_chunk_timing(last_data, (_ct1 - _ct0, _ct2 - _ct1,
+                                               _ct3 - _ct2, time.perf_counter() - _ct3))
         if _dbg is not None:
             _n = _time.perf_counter()
             _dbg.host_phase("drain", _n - _t)
@@ -314,7 +380,44 @@ class Scheduler(SchedulerIOMixin):
             _dbg.dump("loop")
         return ongoing_data
 
+    def _log_chunk_timing(self, last_data, phases) -> None:
+        """One [chunktime] line per drained prefill chunk: window = schedule->drain wall
+        (the victim-perceived cadence), plus THIS iteration's host phases (which belong
+        to the next batch's issue cycle) and 32-chunk PLE row-cache deltas."""
+        batch = last_data[0].batch if last_data is not None else None
+        if batch is None or not batch.is_prefill or getattr(batch, "spec_mode", None):
+            return
+        self._ct_chunks += 1
+        window_ms = (time.perf_counter() - batch.scheduled_at) * 1e3 if batch.scheduled_at else -1.0
+        recv, sched, issue, drain = (x * 1e3 for x in phases)
+        promote = ""
+        moc = getattr(self.engine, "moe_offload_cache", None)
+        if moc is not None:
+            cur = getattr(moc, "_promote_host_ms", 0.0)
+            base = getattr(self, "_ct_promote_base", 0.0)
+            promote = f" promote={cur - base:.0f}ms"
+            self._ct_promote_base = cur
+        ple = ""
+        if self._ct_chunks % 32 == 0:
+            table = getattr(self.engine.model, "_ple_table", None)
+            store = getattr(table, "_store", None)
+            if store is not None:
+                try:
+                    st = store.cache_stats()
+                    ple = (f" ple[hits={st.get('hits')} miss={st.get('misses')}"
+                           f" evict={st.get('evicts')} slots={st.get('slots')}]")
+                except Exception:  # noqa: BLE001 -- instrumentation must never break the loop
+                    pass
+        logger.info_rank0(
+            f"[chunktime] #{self._ct_chunks} T={batch.log_new_tokens} "
+            f"window={window_ms:.0f}ms recv={recv:.1f} sched={sched:.1f} "
+            f"issue={issue:.1f} drain={drain:.1f}{promote}{ple}"
+        )
+
     def normal_loop(self) -> None:
+        _ct = self._chunk_timing
+        if _ct:
+            _ct0 = time.perf_counter()
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -322,6 +425,8 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        if _ct:
+            _ct1 = time.perf_counter()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -332,11 +437,15 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
 
         forward_input = self._schedule_next_batch()
+        if _ct:
+            _ct2 = time.perf_counter()
         ongoing_data = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
             ongoing_data = (forward_input, self._forward(forward_input))
+        if _ct:
+            _ct3 = time.perf_counter()
 
         # Non-overlap drains the batch it just issued: the deferred PLE fill MUST run
         # first -- this batch's own replay is WAITing on its flag, so draining before
@@ -344,6 +453,9 @@ class Scheduler(SchedulerIOMixin):
         self.engine.run_pending_host_fill()
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
+        if _ct:
+            self._log_chunk_timing(ongoing_data, (_ct1 - _ct0, _ct2 - _ct1,
+                                                  _ct3 - _ct2, time.perf_counter() - _ct3))
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -390,11 +502,11 @@ class Scheduler(SchedulerIOMixin):
         self.engine.run_pending_host_fill()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
-        spec_two_row = getattr(batch, "spec_mode", None) in ("verify", "replay")
+        spec_two_row = getattr(batch, "spec_mode", None) == "verify"
         with self.cache_manager.lazy_free_region():
             if spec_two_row:
                 # The spec drain owns this batch's bookkeeping (accept: complete_one +
-                # two tokens; reject: rollback + replay flag); the generic per-req loop
+                # two tokens; reject: rollback to the post-row-0 state); the generic loop
                 # below must not also run (its prefill branch would radix-commit).
                 self._drain_spec(batch, spec_payload, reply, new_finished_reqs)
             for i, req in enumerate(() if spec_two_row else batch.reqs):
@@ -484,6 +596,8 @@ class Scheduler(SchedulerIOMixin):
                         req.spec_draft = spec_payload.get("draft")
 
         self.finished_reqs = new_finished_reqs
+        self._account_prefill_debt(batch)
+        self._observe_chunk_time(batch)
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -512,6 +626,80 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _account_prefill_debt(self, batch) -> None:
+        """Accrue the wall time a prefill batch held the engine while decodes waited.
+
+        Schedule->drain is the window a victim perceives as its inter-token stall.
+        Only counted while a decode is actually runnable, so a pure-prefill stretch
+        with nobody waiting accrues nothing (and cannot suppress the next admission).
+        """
+        if (
+            self._prefill_debt_s <= 0
+            or not batch.is_prefill
+            or getattr(batch, "spec_mode", None) is not None
+            or not getattr(batch, "scheduled_at", 0.0)
+            or not self.decode_manager.runnable
+        ):
+            return
+        self._prefill_debt += time.perf_counter() - batch.scheduled_at
+
+    def _observe_chunk_time(self, batch) -> None:
+        """EMA of prefill seconds-per-token, from the same schedule->drain window the
+        debt accounts. Feeds the adaptive chunk budget; one update per prefill batch."""
+        if (
+            self._chunk_target_s <= 0
+            or not batch.is_prefill
+            or getattr(batch, "spec_mode", None) is not None
+            or not getattr(batch, "scheduled_at", 0.0)
+        ):
+            return
+        tokens = getattr(batch, "log_new_tokens", 0)
+        if tokens <= 0:
+            return
+        spt = (time.perf_counter() - batch.scheduled_at) / tokens
+        ema = self._chunk_ema_spt
+        self._chunk_ema_spt = spt if ema is None else 0.7 * ema + 0.3 * spt
+
+    def _adaptive_prefill_budget(self) -> int:
+        """Token budget for this scheduling pass.
+
+        While a decode is waiting AND a chunk-time target is configured, shrink the
+        chunk so its forward time tracks the target: the waiting user's perceived stall
+        is one chunk (+ its concede step), so the target IS the stall budget. Nobody
+        waiting -> the full configured budget (a solo huge prompt keeps its TTFT, and
+        the shrink costs the aggressor expert re-stream per chunk boundary). Chunks are
+        aligned to _CHUNK_ALIGN and floored at _CHUNK_MIN so per-chunk fixed overhead
+        (PLE fill, staging, fence) cannot dominate.
+        """
+        if (
+            self._chunk_target_s <= 0
+            or self._chunk_ema_spt is None
+            or self._chunk_ema_spt <= 0
+            or not self.decode_manager.runnable
+        ):
+            return self.prefill_budget
+        tok = int(self._chunk_target_s / self._chunk_ema_spt)
+        tok = (tok // _CHUNK_ALIGN) * _CHUNK_ALIGN
+        # the floor must never exceed the configured budget (small-budget configs/tests)
+        return max(min(_CHUNK_MIN, self.prefill_budget), min(tok, self.prefill_budget))
+
+    def _effective_debt_s(self) -> float:
+        """Debt threshold for the interleave guard.
+
+        In adaptive mode the threshold drops with the chunk target so a decode step is
+        conceded after (nearly) every shrunken chunk -- gap ~= one chunk forward, which
+        is the whole point of shrinking. Otherwise the configured static debt applies.
+        """
+        if self._prefill_debt_s <= 0:
+            return self._prefill_debt_s
+        if (
+            self._chunk_target_s > 0
+            and self._chunk_ema_spt is not None
+            and self.decode_manager.runnable
+        ):
+            return min(self._prefill_debt_s, max(self._chunk_target_s * 0.5, 0.05))
+        return self._prefill_debt_s
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -724,7 +912,6 @@ class Scheduler(SchedulerIOMixin):
         req.spec_slot_idx = None
         req.spec_residual = None
         req.spec_draft = None
-        req.spec_replay = False
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -901,9 +1088,9 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table. Spec batches
-        # record their charges: a rejected verify releases them (the replay re-charges).
+        # record their charges so rejection can free pages beyond the committed prefix.
         recorded = self.cache_manager.allocate_paged(
-            batch.reqs, record=getattr(batch, "spec_mode", None) in ("verify", "replay")
+            batch.reqs, record=getattr(batch, "spec_mode", None) == "verify"
         )
         if recorded:
             batch.spec_pages = recorded
@@ -970,35 +1157,39 @@ class Scheduler(SchedulerIOMixin):
         interval = self.config.prefill_decode_interval
         batch = None
         # schedule_next_batch consumes the admission, so the interleave guard must run
-        # BEFORE scheduling prefill: after N consecutive prefill steps hand one step to
-        # running decodes so a long chunked prompt cannot stall everyone's ITL.
-        if not (interval > 0 and self._prefill_streak >= interval and self.decode_manager.runnable):
-            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        # BEFORE scheduling prefill: after N consecutive prefill steps -- or after
+        # _prefill_debt_s prefill SECONDS accrued while a decode was runnable (wall-clock
+        # bound: chunk times swing ~10x under PLE device-latency spikes, which the count
+        # cannot see) -- hand one step to running decodes so a long chunked prompt cannot
+        # stall everyone's ITL.
+        owed = (interval > 0 and self._prefill_streak >= interval) or (
+            self._prefill_debt >= self._effective_debt_s() > 0
+        )
+        if not (owed and self.decode_manager.runnable):
+            batch = self.prefill_manager.schedule_next_batch(self._adaptive_prefill_budget())
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
                 upgraded = self._as_spec_batch(batch)
                 if upgraded is not None:
                     batch = upgraded
-                elif any(r.spec_replay for r in getattr(batch, "reqs", ())):
-                    # A replay-pending request holds two-row lenses the regular decode
-                    # prep cannot consume (it would feed N+1 input rows to N-sized decode
-                    # buffers). Run it alone through the spec path this tick; the other
-                    # running requests wait one step. New admissions cannot strand a
-                    # replay: the reject drain finishes any request with no room left.
-                    pending = next(r for r in batch.reqs if r.spec_replay)
-                    batch = self._as_spec_batch(Batch(reqs=[pending], phase="decode"))
-                    if batch is None:
-                        raise RuntimeError(
-                            "a replay-pending request lost its spec step; its two-row "
-                            "state cannot ride a regular decode batch"
-                        )
+                else:
+                    # Regular decode skips the head's KV updates, so an old draft must
+                    # never resume after a concurrent request leaves the batch.
+                    for req in getattr(batch, "reqs", ()):
+                        req.spec_off = True
+                        req.spec_draft = None
+                        req.spec_residual = None
         if batch is None:
             return None
         # Spec batches ride phase="prefill" for the extend machinery but ARE decode steps:
         # they must not feed the prefill-interleave streak.
         is_spec = getattr(batch, "spec_mode", None) is not None
-        self._prefill_streak = self._prefill_streak + 1 if (batch.is_prefill and not is_spec) else 0
+        if batch.is_prefill and not is_spec:
+            self._prefill_streak += 1
+        else:
+            self._prefill_streak = 0
+            self._prefill_debt = 0.0
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -1006,13 +1197,9 @@ class Scheduler(SchedulerIOMixin):
     def _as_spec_batch(self, batch: Batch) -> Batch | None:
         """Upgrade a single-request decode batch into an MTP spec batch, or None to keep it regular.
 
-        Phase-1 gate: exactly one running request, greedy sampling, room for a two-token
-        emit, and a head that has either a draft to verify, a replay to run, or a residual
-        stash to prologue from. verify stages the draft into the token pool at the new
-        position and bumps device_len so the extend machinery emits two rows [last placed
-        token, draft]; replay needs no staging (the reject drain already repaired the pool
-        row). The batch rides phase="prefill" from here: GDN processes the two rows through
-        its chunk branch, the sparse backend and the PLE fill take their extend paths.
+        Only a single greedy request with room for two output tokens is eligible.
+        The draft is staged after the last placed token; both rows use the extend
+        attention path, with intermediate GDN/PLE state saved for rejection.
         """
         if getattr(self.config, "speculative", "none") != "mtp" or len(batch.reqs) != 1:
             return None
@@ -1022,19 +1209,13 @@ class Scheduler(SchedulerIOMixin):
         if getattr(req, "mm_items", None):
             req.spec_off = True  # Phase 1: image rows keep the regular decode path
             return None
-        if req.spec_replay:
-            mode = "replay"
-        elif req.spec_draft is not None:
+        if req.spec_draft is not None:
             mode = "verify"
         elif req.spec_residual is not None:
             mode = "prologue_decode"
         else:
             return None
         if mode == "verify" and req.remain_len < 2:
-            # The last token finishes on the regular decode path (an accept would append
-            # two). Replay is EXEMPT: a replay-pending request carries two-row lenses
-            # (cached Q, device Q+2) that only the spec prep can consume, and the reject
-            # drain's length check guarantees remain_len >= 1 whenever a replay is due.
             return None
         if req.spec_slot_idx is None:
             pool = self.engine.linear_state_pool
@@ -1054,8 +1235,6 @@ class Scheduler(SchedulerIOMixin):
             req.append_host(torch.tensor([req.spec_draft], dtype=torch.int32))
             req.device_len += 1
             batch.spec_draft_id = req.spec_draft
-            batch.phase = "prefill"
-        elif mode == "replay":
             batch.phase = "prefill"
         else:
             batch.spec_prologue = self._build_spec_prologue(req)
@@ -1087,25 +1266,31 @@ class Scheduler(SchedulerIOMixin):
         pb.out_loc = self.engine.page_table[req.table_idx, 0:t]
         return pb
 
+    def _restore_spec_prefix(self, batch: Batch) -> None:
+        req = batch.reqs[0]
+        self.engine.linear_state_pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+        req.cached_len = req.device_len - 1
+        if batch.spec_pages:
+            first_unused = div_ceil(req.cached_len, self.config.page_size)
+            unused = [(table, max(lo, first_unused), hi)
+                      for table, lo, hi in batch.spec_pages if hi > first_unused]
+            if unused:
+                self.cache_manager.release_paged(unused)
+
     def _drain_spec(self, batch: Batch, spec: dict | None,
                     reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
-        """Accept/reject bookkeeping of a verify/replay step (single request, Phase 1)."""
+        """Commit one or two verified inputs and emit the corresponding target tokens."""
         req = batch.reqs[0]
+        if req in self.finished_reqs:
+            return
         if req.aborted:
+            self._restore_spec_prefix(batch)
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
             finished_out.add(req)
             return
         if spec is None:
             raise RuntimeError("MTP spec step returned no payload")
-        if req in self.finished_reqs:
-            return
-        if batch.spec_mode == "replay" and not spec["accept"]:
-            raise RuntimeError(
-                "MTP replay canary failed: re-running a placed token diverged "
-                f"(row-0 argmax {spec['y1']}); the greedy determinism assumption "
-                "is broken on this GPU"
-            )
         if batch.spec_mode == "verify":
             # rate-limited ops visibility: the running acceptance over all verifies
             stats = getattr(self, "_spec_stats", None)
@@ -1119,23 +1304,16 @@ class Scheduler(SchedulerIOMixin):
                 )
         if spec["accept"]:
             req.complete_one()
-            req.spec_replay = False
             req.spec_draft = spec.get("draft")
-            tokens = (spec["y1"], spec["y2"]) if batch.spec_mode == "verify" else (spec["y2"],)
-            # An accepted verify's y1 IS the draft _as_spec_batch staged onto the host
-            # buffer; a replay's single token (y2) is new and appends.
-            skip_first_append = batch.spec_mode == "verify"
+            tokens = (spec["y1"], spec["y2"])
+            skip_first_append = True
         else:
-            # Reject: roll the GDN/PLE state back to the pre-verify snapshot, repair the
-            # draft's slots with the true token, and release this step's page charges
-            # (the replay re-charges the span). The Req lens stay pre-step so the replay
-            # rows read exactly [x_P, y1] from the pool.
-            pool = self.engine.linear_state_pool
-            pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+            # The scratch slot holds the state AFTER row 0, so a reject commits one
+            # input token and can verify again without re-running the main model.
+            self._restore_spec_prefix(batch)
             self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
             req.input_ids[req.device_len - 1] = spec["y1"]  # the staged draft slot
-            req.spec_draft = None
-            req.spec_replay = True
+            req.spec_draft = spec.get("draft")
             tokens = (spec["y1"],)
             skip_first_append = True
         if os.getenv("FREETOKEN_MTP_DEBUG"):
@@ -1183,8 +1361,6 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
             finished_out.add(req)
-        elif not spec["accept"] and batch.spec_pages:
-            self.cache_manager.release_paged(batch.spec_pages)
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

@@ -1,23 +1,10 @@
-"""CUDA graph for the bs-1 MTP spec step (Phase 3; design: _scratch/mtp_design.md).
+"""CUDA graph for single-request, two-token MTP verification.
 
-One capture serves every verify/replay step of every request: the two-row shape is
-invariant, and every per-step value enters through either a small static buffer staged
-before the replay or an in-graph gather from persistent engine tensors (token_pool,
-page_table, the linear-state pool). Recorded op order: the GDN/PLE snapshot
-(live -> scratch), the two-row main forward (chunk GDN, extend QSA, device-side MoE
-decode staging), the dual argmax, the accept/canary compare, the MTP head pass
-producing the next draft, the accepted token's pool write and the payload pack.
-
-The PLE rows are filled AT ISSUE TIME (``fill_spec_rows`` stages the graph-pinned rows
-and signals the flag) so the captured lookup's memop WAIT is already satisfied when the
-replay reaches it -- legal because a spec step's two input tokens ([last placed, draft]
-or the replay pair) are host-known before dispatch. The reject-side state restore stays
-eager in the drain: the normal_loop drains before the next issue, so no branch-free
-in-graph commit is needed. Cross-step safety rests on the audits recorded in the design
-doc: the QSA extend kernels take no host scalars (grids derive from the constant row
-count), the fla chunk metadata is static except the staged slot, PLE lookups consume
-positional graph rows, and block_table/out_loc/input_ids are re-gathered IN the graph
-from the persistent tensors, so page changes need no recapture.
+GDN, conv and PLE save their state after row 0 into the scratch slot while the
+live slot advances through both rows. A rejection restores that intermediate
+state and continues with a fresh draft; it never re-runs the rejected step.
+Per-step inputs are staged or gathered inside the graph. Disk PLE rows are
+filled before graph replay because both input tokens are already host-known.
 """
 
 from __future__ import annotations
@@ -38,8 +25,7 @@ if TYPE_CHECKING:
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
 # scalar staging layout (one pinned int64 row -> one H2D per step)
-S_POS, S_TABLE, S_LIVE, S_SCRATCH, S_DRAFT, S_MODE, S_SEQ, S_N = 0, 1, 2, 3, 4, 5, 6, 8
-MODE_VERIFY, MODE_REPLAY = 0, 1
+S_POS, S_TABLE, S_LIVE, S_SCRATCH, S_DRAFT, S_SEQ, S_N = 0, 1, 2, 3, 4, 5, 6
 
 
 class SpecGraphRunner:
@@ -95,6 +81,7 @@ class SpecGraphRunner:
             cache_indices=self.d_live,
             has_initial_state=self.c_true,
             fresh_state_indices=None,
+            spec_state_indices=self.d_scratch,
         )
         from freetoken.attention.qsa_sparse import QSASparseMetadata
 
@@ -120,7 +107,6 @@ class SpecGraphRunner:
         h[S_LIVE] = req.linear_slot_idx
         h[S_SCRATCH] = req.spec_slot_idx
         h[S_DRAFT] = batch.spec_draft_id
-        h[S_MODE] = MODE_VERIFY if batch.spec_mode == "verify" else MODE_REPLAY
         h[S_SEQ] = req.device_len
         self.d_scal.copy_(h, non_blocking=True)
 
@@ -144,34 +130,21 @@ class SpecGraphRunner:
         self.md.ring_slots = self.d_table.to(torch.int32)
         self.md.block_table = backend._block_table(self.md.ring_slots.to(torch.int64))
 
-    def _snapshot(self, engine: "Engine") -> None:
-        """In-graph GDN+PLE state snapshot (live -> scratch), slot-indexed on device."""
-        pool = engine.linear_state_pool
-        live, scratch = self.d_live.to(torch.int64), self.d_scratch
-        pool.conv_states.index_copy_(1, scratch, pool.conv_states.index_select(1, live))
-        pool.recurrent_states.index_copy_(1, scratch, pool.recurrent_states.index_select(1, live))
-        for t in pool.slot_states.values():
-            t.index_copy_(1, scratch, t.index_select(1, live))
-
     def _body(self, engine: "Engine", model: "Qwen4ExpForCausalLM") -> None:
         self._fanout()
         self._gather_inputs(engine)
-        self._snapshot(engine)
         batch = self.batch
         mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-        logits = model.full_vocab_logits(mixed)
-        y1 = logits[0].argmax(-1)
-        y2 = logits[1].argmax(-1)
+        ids = model.greedy_ids(mixed)
+        y1, y2 = ids[0], ids[1]
         draft_in = torch.stack([y1, y2]).to(torch.int32)
-        d = model.draft(residual, draft_in, batch)
-        # accept: verify compares against the staged draft; replay against the placed
-        # row-1 token (the canary)
-        is_replay = self.d_scal[S_MODE] == MODE_REPLAY
-        cmp_tok = torch.where(is_replay, batch.input_ids[1].to(torch.int64), self.d_scal[S_DRAFT])
-        accept = (y1 == cmp_tok).to(torch.int64)
+        accepted = y1 == self.d_scal[S_DRAFT]
+        d = model.draft(residual, draft_in, batch,
+                        select_row=accepted.to(torch.int64).view(1))
+        accept = accepted.to(torch.int64)
         self.d_payload[0] = y1
         self.d_payload[1] = y2
-        self.d_payload[2] = d[1]
+        self.d_payload[2] = d[0]
         self.d_payload[3] = accept
         self.d_next.copy_(y2.view(1).to(torch.int32))
         # the accepted bonus token lands at position device_len (the scheduler's write
@@ -188,10 +161,10 @@ class SpecGraphRunner:
         self.warm = 0
 
     def capture_after_step(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
-                           batch: "Batch", req, eager_payload: dict) -> bool:
+                           batch: "Batch", req, eager_payload: dict, before_state) -> bool:
         """Capture using the just-run eager step's context (state restored around the
         warm/capture/replay executions, exactly the sequence the P3 spike proved). The
-        final replay must reproduce the eager step's payload or the graph is disabled."""
+        final replay must reproduce the eager payload; a failure stops the engine."""
         table = getattr(model, "_ple_table", None)
         if table is None or not hasattr(table, "fill_spec_rows"):
             self.disabled = True
@@ -199,10 +172,9 @@ class SpecGraphRunner:
             return False
         self._alloc_static(model)
         self._stage(batch, req)
-        pool = engine.linear_state_pool
         try:
             table.fill_spec_rows(req)
-            pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)  # back to pre-step
+            self.restore_state(req.linear_slot_idx, before_state)
             torch.cuda.synchronize(self.device)
             with engine.ctx.forward_batch(self.batch):
                 s = self._stream
@@ -211,7 +183,7 @@ class SpecGraphRunner:
                     self._body(engine, model)
                 torch.cuda.current_stream().wait_stream(s)
             torch.cuda.synchronize(self.device)
-            pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+            self.restore_state(req.linear_slot_idx, before_state)
             torch.cuda.synchronize(self.device)
 
             table.fill_spec_rows(req)
@@ -220,7 +192,7 @@ class SpecGraphRunner:
                 with torch.cuda.graph(graph, stream=self._stream):
                     self._body(engine, model)
             torch.cuda.synchronize(self.device)
-            pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+            self.restore_state(req.linear_slot_idx, before_state)
             torch.cuda.synchronize(self.device)
 
             table.fill_spec_rows(req)
@@ -232,17 +204,25 @@ class SpecGraphRunner:
             if got != want:
                 raise RuntimeError(f"spec graph replay diverged from eager: {got} != {want}")
             self.graph = graph
-            logger.info_rank0("MTP spec graph captured (two-row verify/replay step)")
+            logger.info_rank0("MTP spec graph captured (two-row verify step)")
             return True
-        except Exception as e:  # any capture problem -> eager forever (correct, slower)
-            import traceback
-
+        except Exception as e:
             self.disabled = True
             self.graph = None
-            logger.warning_rank0(
-                "MTP spec graph capture failed; staying eager:\n" + traceback.format_exc()
-            )
-            return False
+            raise RuntimeError(
+                "MTP graph capture failed after modifying model state; cannot safely continue"
+            ) from e
+
+    def save_state(self, slot: int):
+        pool = self.engine.linear_state_pool
+        tensors = [pool.conv_states, pool.recurrent_states, *pool.slot_states.values()]
+        return [t[:, slot].clone() for t in tensors]
+
+    def restore_state(self, slot: int, saved) -> None:
+        pool = self.engine.linear_state_pool
+        tensors = [pool.conv_states, pool.recurrent_states, *pool.slot_states.values()]
+        for tensor, value in zip(tensors, saved, strict=True):
+            tensor[:, slot].copy_(value)
 
     # ------------------------------------------------------------------ replay
     def run(self, engine: "Engine", model: "Qwen4ExpForCausalLM",

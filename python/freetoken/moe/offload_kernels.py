@@ -60,6 +60,63 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
+def promote_touched(
+    cache, layer_id: int, touched: torch.Tensor, sub_k: int = 128,
+    miss_acc: torch.Tensor | None = None,
+) -> None:
+    """Mask-driven slot promotion for one on-demand prefill layer (auto-promote policy).
+
+    Input is the [num_experts] touched mask, NOT the [T, top_k] route list: the fixed
+    E-length query (touched ids + one repeated dummy id that lru_ensure's dedup collapses
+    to a single entry) is processed in ``sub_k`` slices so flashlib's phase-1 dedup matrix
+    stays at sub_k^2 per launch. The route-sized alternative (ensure_experts_hybrid's
+    kernel loops T*top_k routes serially on ONE SM) costs ~seconds per chunk at prefill
+    T -- measured: chunk cadence 1.0s -> 2.0s. Slices run sequentially and each sees the
+    previous slice's assignments, so an id is never double-assigned; ``num_indices`` is
+    per-call, so each slice's misses are copied right after its ensure. ``miss_acc``
+    (a [1] device int64) accumulates the fresh-miss count across the slices for the
+    policy feedback (the slot-direct path runs no plan, so nothing else counts them).
+    """
+    num_experts = cache.num_experts
+    query = torch.where(touched != 0, cache._promote_arange, cache._promote_dummy)
+    buffer_slots = 2 * num_experts
+    n_slices = -(-num_experts // sub_k)
+    # Future-stamp the double-buffer guard ONCE for the whole slice loop. lru_ensure
+    # bumps its step per call and excludes only usage == (own call's step) from the
+    # victim argmin, so a stamp of step + n_slices keeps the buffers strictly NEWEST
+    # across every slice (no other slot's usage can exceed the current step; the
+    # final slice's own equality-exclusion covers the last one). The earlier
+    # per-slice freshen cost 2 launches x n_slices per layer in the host-launch-bound
+    # chunk cadence; this needs 2 total. A once-per-loop step+1 stamp was the STALE
+    # variant (slices 2+ could victim the buffers: promotions below 2E are re-missed
+    # by the plan and invalidated next chunk -- zero reuse, double traffic); the
+    # regression test pins the assigned-slots >= 2E invariant. Buffers age back into
+    # eviction candidacy once the step counter passes the stamp.
+    torch.maximum(
+        cache.usage[:buffer_slots], cache.step + n_slices, out=cache.usage[:buffer_slots]
+    )
+    cache._pending_src_layer = layer_id
+    cache._pending_whole_layer = False
+    for lo in range(0, num_experts, sub_k):
+        sub = query[lo : lo + sub_k]
+        lru_ensure(
+            sub,
+            cache.slot_for_id.view(-1),
+            cache.id_of_slot,
+            cache.usage,
+            cache.step,
+            sub,
+            cache.src_indices,
+            cache.evict_slots,
+            cache.num_indices,
+            stats=None,
+            id_base=layer_id * num_experts,
+        )
+        if miss_acc is not None:
+            miss_acc += cache.num_indices
+        cache.copy_missing()
+
+
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 

@@ -257,6 +257,45 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        # Measurement probe (FREETOKEN_TOUCH_OVERLAP_PROBE=1): per-layer cross-chunk
+        # touched-expert overlap -- the go/no-go number for ANY cross-chunk expert reuse
+        # scheme (promote family). Pure measurement: staging behavior is untouched.
+        self._touch_probe = os.environ.get("FREETOKEN_TOUCH_OVERLAP_PROBE", "0") == "1"
+        self._probe_prev_touched: torch.Tensor | None = None
+        self._probe_acc: torch.Tensor | None = None
+        self._probe_chunk = 0
+        if self._touch_probe:
+            self._probe_prev_touched = torch.zeros(
+                (self.num_layers, self.num_experts), dtype=torch.bool, device=self.device
+            )
+            self._probe_acc = torch.zeros(2, dtype=torch.int64, device=self.device)
+        # Auto-promote policy (see ondemand_chunk_begin): per-chunk decision to slot-
+        # promote the touched-and-missing experts during on-demand prefill staging, so
+        # consecutive chunks of one document gather them D2D instead of re-streaming
+        # (measured cross-chunk touched overlap: ~83-90% within a document, and the
+        # overlap the fixed-fraction promote path could never exploit because its
+        # route-sized ensure kernel costs ~seconds per chunk at prefill T). Env-gated
+        # for A/B; an explicit prefill_promote_fraction > 0 takes precedence.
+        self.auto_promote = os.environ.get("FREETOKEN_PREFILL_AUTO_PROMOTE", "0") == "1"
+        self.promote_auto_frac = 0.0  # policy output for the chunk in flight
+        self._promote_on = False
+        self._promote_off_streak = 0  # consecutive thrashing chunks while on
+        self._promote_frozen = False  # set during graph capture: no policy flips mid-capture
+        self._promote_host_ms = 0.0  # chunk-timing attribution (see layers/moe.py)
+        self._promote_ema_touched: float | None = None  # per-layer touched EMA
+        self._promote_ema_hitrate: float | None = None
+        self._promote_harvests = 0
+        self._promote_acc = torch.zeros(2, dtype=torch.int64, device=self.device)
+        self._promote_miss_tmp = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._promote_pin: torch.Tensor | None = None
+        self._promote_ev = None
+        self._promote_ev_graph = None  # dedicated event for in-capture rotations
+        self._promote_arange = torch.arange(
+            self.num_experts, dtype=torch.int32, device=self.device
+        )
+        self._promote_dummy = torch.zeros((), dtype=torch.int32, device=self.device)
+        if self.auto_promote and self.device.type == "cuda":
+            self._promote_pin = torch.zeros(2, dtype=torch.int64, pin_memory=True)
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
@@ -1008,6 +1047,148 @@ class OffloadMoeCache:
         )
         self.copy_missing()
 
+    def promote_touched(
+        self, layer_id: int, topk_ids: torch.Tensor, stats: bool = False
+    ) -> None:
+        """Fast mask-driven promote for the auto policy (offload_kernels.promote_touched).
+
+        Builds the touched mask exactly like ``plan_prefill_layer_ondemand`` does (the
+        plan rebuilds it right after; the scatter is microseconds) and promotes ALL
+        touched-and-missing rows -- the policy gate decides WHETHER this runs, not a
+        per-call fraction, because the fast path's cost is per-launch, not per-route.
+
+        ``stats=True`` (the slot-direct prefill path, which runs no plan) accumulates
+        [hits, misses] into ``_promote_acc`` so the policy feedback keeps measuring
+        reuse: a hit is a touched row that was already resident (no fresh H2D).
+        """
+        if layer_id in self._unpinned_layers:
+            return
+        from freetoken.moe.offload_kernels import promote_touched
+
+        touched = self._prefill_touched
+        touched.zero_()
+        touched.scatter_(0, topk_ids.reshape(-1).long(), 1)
+        count = stats and self.auto_promote and self._promote_pin is not None
+        if count:
+            self._promote_miss_tmp.zero_()
+        promote_touched(
+            self, layer_id, touched, miss_acc=self._promote_miss_tmp if count else None
+        )
+        if count:
+            total = torch.count_nonzero(touched)
+            # clamp: the promote query's dummy pad id counts as a miss when expert 0 is
+            # cold, which would push hits negative and the hit-rate EMA below the demote
+            # threshold on the very first (all-miss) chunks of a document.
+            miss = torch.minimum(self._promote_miss_tmp, total)
+            self._promote_acc[1:2] += miss
+            self._promote_acc[0:1] += total - miss
+
+    def ondemand_chunk_begin(self) -> None:
+        """Auto-promote policy step at the first MoE layer of each on-demand prefill chunk.
+
+        Harvests the previous chunk's plan hit/miss totals WITHOUT a host sync (they ride
+        a pinned async copy whose event is polled with query(); the stats therefore lag one
+        chunk, which is fine for a feedback policy), updates the EMAs, decides this chunk's
+        promote gate, and re-arms the accumulator. All device work is stream-ordered on the
+        compute stream after the previous chunk's plans.
+        """
+        if not self.auto_promote or self._promote_pin is None:
+            return
+        self.harvest_promote_stats()
+        self.rotate_promote_acc()
+
+    def harvest_promote_stats(self) -> None:
+        """Host half of the policy feedback (see ondemand_chunk_begin). Split out so the
+        prefill chunk graph can call it between replays: the in-graph layer-0 rotation
+        (baked at capture) refills the pin, but host code does not run during a replay."""
+        if not self.auto_promote or self._promote_pin is None or self._promote_frozen:
+            return
+        if self._promote_ev is not None and self._promote_ev.query():
+            hits = int(self._promote_pin[0])
+            misses = int(self._promote_pin[1])
+            touched = hits + misses
+            if touched > 0:
+                per_layer = touched / self.num_layers
+                ema = self._promote_ema_touched
+                self._promote_ema_touched = per_layer if ema is None else 0.7 * ema + 0.3 * per_layer
+                rate = hits / touched
+                ema_r = self._promote_ema_hitrate
+                self._promote_ema_hitrate = rate if ema_r is None else 0.7 * ema_r + 0.3 * rate
+                self._promote_harvests += 1
+                if self._promote_harvests % 32 == 0:
+                    # rate-limited observability: the plan hit-rate the policy sees
+                    # (~overlap when reuse works; ~incidental decode-row hits when the
+                    # working set overflows the pool and the LRU thrashes cyclically).
+                    logger.info_rank0(
+                        f"auto-promote: chunk {self._promote_harvests} "
+                        f"hitrate_ema={self._promote_ema_hitrate:.3f} "
+                        f"touched/layer~{self._promote_ema_touched:.0f} on={self._promote_on}"
+                    )
+                self._update_promote_policy()
+
+    def rotate_promote_acc(self) -> None:
+        """Device half: async-copy the accumulator to the pin, mark the event, re-arm.
+        Pure stream-ordered device ops, so it captures into the prefill chunk graph.
+
+        Under capture the record must go to a DEDICATED event: recording a regular
+        event on a capturing stream taints it for host queries (cudaEventQuery ->
+        "invalid argument"), which would break the eager harvest after any graphed
+        chunk. The graph event is a baked node nobody queries; the regular event
+        keeps its last eager record (already complete), and the pin it guards holds
+        the latest replay's totals, so a stale-but-signaled query still reads fresh
+        stats."""
+        capturing = (
+            self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing:
+            if self._promote_ev_graph is None:
+                self._promote_ev_graph = torch.cuda.Event()
+            ev = self._promote_ev_graph
+        else:
+            if self._promote_ev is None:
+                self._promote_ev = torch.cuda.Event()
+            ev = self._promote_ev
+        self._promote_pin.copy_(self._promote_acc, non_blocking=True)
+        ev.record(torch.cuda.current_stream(self.device))
+        self._promote_acc.zero_()
+
+    def _update_promote_policy(self) -> None:
+        """Bang-bang policy with hysteresis over the measured EMAs.
+
+        First arm is optimistic: ON while the chunk working set (touched/layer x layers)
+        is within 2x the slot budget (cache_size minus the two borrowed double-buffer
+        layers). The plan hit-rate is the real judge: OFF after two consecutive chunks of
+        near-zero reuse (thrashing: promotion paid the ensure/copy overhead and bought
+        nothing), and re-arming afterwards requires the estimate within 80% of the budget.
+        """
+        slots_avail = max(self.cache_size - 2 * self.num_experts, 0)
+        ws = (self._promote_ema_touched or 0.0) * self.num_layers
+        was_on = self._promote_on
+        if self._promote_on:
+            if (
+                self._promote_ema_hitrate is not None
+                and self._promote_ema_hitrate < 0.05
+                and self._promote_harvests >= 4  # cold-start chunks must not trip demotion
+            ):
+                self._promote_off_streak += 1
+                if self._promote_off_streak >= 2:
+                    self._promote_on = False
+            else:
+                self._promote_off_streak = 0
+        elif ws > 0 and ws <= slots_avail * (0.8 if self._promote_off_streak else 2.0):
+            self._promote_on = True
+            self._promote_off_streak = 0
+        self.promote_auto_frac = (
+            min(1.0, slots_avail / ws) if (self._promote_on and ws > 0) else 0.0
+        )
+        if self._promote_on != was_on:
+            hr = self._promote_ema_hitrate
+            logger.info_rank0(
+                f"auto-promote {'ON' if self._promote_on else 'OFF'}: ws~{ws:.0f} "
+                f"slots_avail={slots_avail} hitrate={'n/a' if hr is None else round(hr, 3)} "
+                f"frac={self.promote_auto_frac:.2f}"
+            )
+
     def plan_prefill_layer_ondemand(
         self, layer_id: int, topk_ids: torch.Tensor, pcie_frac_q16: int = 1 << 16
     ) -> tuple[torch.Tensor, ...]:
@@ -1038,7 +1219,30 @@ class OffloadMoeCache:
         touched = self._prefill_touched
         touched.zero_()
         touched.scatter_(0, topk_ids.reshape(-1).long(), 1)
+        if self._touch_probe:
+            # prev-chunk overlap of THIS layer's touched set; the per-chunk ratio is
+            # logged at the last layer (one small sync per chunk, probe builds only).
+            prev = self._probe_prev_touched[layer_id]
+            cur = touched != 0
+            self._probe_acc[0] += torch.count_nonzero(torch.logical_and(cur, prev))
+            self._probe_acc[1] += torch.count_nonzero(cur)
+            prev.copy_(cur)
+            if layer_id == self.num_layers - 1:
+                ov, tv = (int(x) for x in self._probe_acc.tolist())
+                self._probe_chunk += 1
+                if self._probe_chunk > 1:
+                    logger.info_rank0(
+                        f"touch-overlap: chunk {self._probe_chunk} T={topk_ids.shape[0]}: "
+                        f"prev&cur/cur = {ov}/{tv} = {ov / max(tv, 1):.3f}"
+                    )
+                self._probe_acc.zero_()
         prefill_ondemand_compact(self, layer_id, buffer_id, touched, pcie_frac_q16=pcie_frac_q16)
+        if self.auto_promote and self._promote_pin is not None:
+            # chunk totals for the policy feedback (harvested at the next chunk begin);
+            # stream-ordered after the compact kernel that wrote the per-layer counts.
+            # [0:1] slices: += against the [1]-shaped counters must not reshape the view.
+            self._promote_acc[0:1] += self._prefill_hit_num
+            self._promote_acc[1:2] += self._prefill_miss_num
         self._invalidate_prefill_buffer(buffer_id)
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 

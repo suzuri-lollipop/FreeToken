@@ -239,6 +239,7 @@ def _prefill_nvfp4_moe_kernel(
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
     lut_ptr,
+    slot_map_ptr,      # [E] int32 expert id -> LRU slot (USE_SLOT_MAP only)
     N,
     K,
     EM,
@@ -254,6 +255,7 @@ def _prefill_nvfp4_moe_kernel(
     BLOCK_SIZE_KB: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    USE_SLOT_MAP: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
@@ -281,6 +283,13 @@ def _prefill_nvfp4_moe_kernel(
     a_ptrs_hi = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb + 1)[None, :] * stride_ak)
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if USE_SLOT_MAP:
+        # Slot-direct prefill: expert id -> LRU slot. The rows live in the unified slot
+        # cache (a promote step made every routed id resident) instead of a per-chunk
+        # double-buffer D2D staging copy. Valid blocks always carry a real expert id
+        # (padding blocks returned above at num_tokens_post_padded), and the promote
+        # guarantees slot_map[id] >= 0 for every routed id.
+        slot = tl.load(slot_map_ptr + slot).to(tl.int64)
     packed_base = packed_ptr + slot * stride_pe + offs_bn[None, :] * stride_pn
     scale_base = scale_ptr + slot * stride_se + offs_bn[None, :] * stride_sn
 

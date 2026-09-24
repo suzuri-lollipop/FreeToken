@@ -157,11 +157,22 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode or fla.spec_state_indices is not None:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            if fla.spec_state_indices is not None:
+                states = pool.conv_states[li]
+                before = states.index_select(0, fla.cache_indices.long())
+                middle = torch.cat([before[..., 1:], conv_in[:1].unsqueeze(-1)], -1)
+                states.index_copy_(0, fla.spec_state_indices, middle.to(states.dtype))
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                # The recurrent kernel assumes contiguous head features; varlen conv
+                # returns a transposed [T, C] view with a non-unit feature stride.
+                mixed = mixed.contiguous()
+            else:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -171,6 +182,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                snapshot_indices=fla.spec_state_indices,
             )
         else:
             mixed = self._conv_prefill(

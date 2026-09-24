@@ -319,15 +319,22 @@ class DiskRowTable:
                     for r, t in zip(reqs, tokens)]
             self.fill(runs, graph=use_graph)
             return None
-        runs = [
+        runs = self.prefill_runs(batch)
+        self.fill(runs, graph=False)
+        return None
+
+    def prefill_runs(self, batch: Batch) -> list:
+        """The per-request PLE row runs of a prefill batch (two context ids, then the
+        new tokens), host-known at ENTER. Extracted so the prefill chunk graph can fill
+        them into the graph-pinned buffer + flag itself (its captured lookup WAITs on
+        the same protocol as the decode/spec graphs)."""
+        return [
             torch.cat((
                 torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
                 self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
-        return None
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
