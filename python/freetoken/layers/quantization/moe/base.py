@@ -10,7 +10,9 @@ import torch
 
 from ..method import QuantMethod
 from ..scheme import FP8_BLOCK as FP8_BLOCK_SIZE
+from ..scheme import NVFP4_GROUP as NVFP4_BLOCK_SIZE
 from ..scheme import QuantKind, QuantScheme
+from ..shard_balance import get_expert_shard_weights
 
 
 def block_aligned_range(total: int, block: int, rank: int, size: int) -> tuple[int, int]:
@@ -22,6 +24,36 @@ def block_aligned_range(total: int, block: int, rank: int, size: int) -> tuple[i
     blocks, rem = divmod(total, block)
     assert rem == 0, f"total {total} is not a multiple of the scale block {block}"
     return blocks * rank // size * block, blocks * (rank + 1) // size * block
+
+
+def weighted_block_ranges(
+    total: int, block: int, weights: "tuple[float, ...]"
+) -> "list[tuple[int, int]] | None":
+    """Per-rank [lo, hi) row ranges splitting ``total`` rows proportionally to ``weights``
+    in whole ``block``-row groups (largest-remainder apportionment, deterministic: the
+    same weights resolve to the same ranges on every rank).
+
+    Returns ``None`` when the split cannot honor the block grain (``total`` not a
+    multiple of ``block``, fewer groups than ranks, or a rank that would end up with
+    zero groups): callers fall back to the even split.
+    """
+    blocks, rem = divmod(total, block)
+    n = len(weights)
+    if rem != 0 or blocks < n or any(w <= 0 for w in weights):
+        return None
+    tot = float(sum(weights))
+    raw = [blocks * (w / tot) for w in weights]
+    cnt = [int(r) for r in raw]
+    if min(cnt) < 1:
+        return None
+    order = sorted(range(n), key=lambda r: (-(raw[r] - cnt[r]), r))
+    for r in order[: blocks - sum(cnt)]:
+        cnt[r] += 1
+    ranges, lo = [], 0
+    for c in cnt:
+        ranges.append((lo * block, (lo + c) * block))
+        lo += c
+    return ranges
 
 
 @dataclass(frozen=True)
@@ -44,6 +76,9 @@ class MoEConfig:
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"
     decode_target: str = "gpu"
+    # per-rank relative weights for an uneven (bandwidth-balanced) intermediate split
+    # of OFFLOADED nvfp4 experts; None keeps the even split (see shard_balance.py)
+    shard_weights: "tuple[float, ...] | None" = None
 
     @classmethod
     def from_layer(cls, layer: Any, scheme: QuantScheme | None) -> "MoEConfig":
@@ -64,6 +99,7 @@ class MoEConfig:
             apply_router_weight_on_input=bool(layer.apply_router_weight_on_input),
             strategy=layer.strategy,
             decode_target=layer.decode_target,
+            shard_weights=get_expert_shard_weights(),
         )
 
     @property
@@ -76,14 +112,49 @@ class MoEConfig:
         """This rank's [lo, hi) rows of the full intermediate dim.
 
         FP8 block scales shard by whole 128-row blocks (possibly uneven across ranks:
-        640 rows = 5 blocks gives 256/384 over TP2); every other kind splits evenly.
+        640 rows = 5 blocks gives 256/384 over TP2); offloaded nvfp4 experts may shard
+        unevenly by whole 16-row scale groups when the engine resolved per-rank
+        bandwidth weights (a slow PCIe link banks fewer bytes per expert, so its slot
+        cache holds more experts and its per-step miss traffic shrinks); every other
+        kind splits evenly.
         """
         if self.scheme is not None and self.scheme.kind == QuantKind.FP8_BLOCK:
             return block_aligned_range(
                 self.intermediate, FP8_BLOCK_SIZE, self.tp_rank, self.tp_size
             )
+        rng = self.weighted_range()
+        if rng is not None:
+            return rng[self.tp_rank]
         per = self.intermediate // self.tp_size
         return per * self.tp_rank, per * (self.tp_rank + 1)
+
+    def weighted_range(self) -> "list[tuple[int, int]] | None":
+        """The uneven per-rank ranges for this config, or None when they do not apply.
+
+        Gated to offloaded nvfp4 experts under TP>1: resident (fused) experts never
+        cross PCIe so an uneven split would only unbalance compute, and the cpu/hybrid
+        decode executors size their buffers from an even local intermediate.
+        """
+        if (
+            self.tp_size < 2
+            or self.strategy != "offload"
+            or self.decode_target != "gpu"
+            or self.shard_weights is None
+            or len(self.shard_weights) != self.tp_size
+            or self.scheme is None
+            or self.scheme.kind != QuantKind.NVFP4
+        ):
+            return None
+        return weighted_block_ranges(self.intermediate, NVFP4_BLOCK_SIZE, self.shard_weights)
+
+    @property
+    def uneven_tp_shard(self) -> bool:
+        """True when this rank's intermediate slice differs from the even split."""
+        if self.tp_size < 2:
+            return False
+        per = self.intermediate // self.tp_size
+        lo, hi = self.local_intermediate_range
+        return (lo, hi) != (per * self.tp_rank, per * (self.tp_rank + 1))
 
     @property
     def plain_silu(self) -> bool:

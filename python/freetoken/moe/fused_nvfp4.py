@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -34,13 +35,15 @@ _DECODE_WARPS = 4
 # Marlin-style decode config (int32 wide loads + deferred reduction). Offline sweep over
 # the qwen35/qwen3moe (I=512/768) decode shapes picked BLOCK_N=16, BLOCK_KW=16 (== 128
 # k-values/iter), 4 warps -- the wide load lifts the gate/up GEMM ~43%->~51% of peak BW.
-_DECODE_MARLIN_BLOCK_N = 16
+# Env-overridable for A/B on shapes the offline sweep did not cover (an uneven expert
+# TP shard changes the local intermediate, e.g. qwen4_exp rank0 I=384 / rank1 I=256).
+_DECODE_MARLIN_BLOCK_N = int(os.environ.get("FREETOKEN_DECODE_MARLIN_BLOCK_N", "16") or "16")
 _DECODE_MARLIN_BLOCK_KW = 16
 _DECODE_MARLIN_WARPS = 4
 # Deep-K variant: at K > 2048 (qwen4_exp gate_up, K=2560) a narrower N tile with the whole
 # K strip in one program iteration measures ~13% faster (18.6 vs 21.0us); short-K shapes
 # regress under it, so the split is by K, not by gemm position.
-_DECODE_MARLIN_DEEPK_BLOCK_N = 8
+_DECODE_MARLIN_DEEPK_BLOCK_N = int(os.environ.get("FREETOKEN_DECODE_MARLIN_DEEPK_BLOCK_N", "8") or "8")
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 128
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
 

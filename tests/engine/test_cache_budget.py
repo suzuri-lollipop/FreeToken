@@ -813,3 +813,46 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_uneven_shard_keeps_kv_geometry_and_resplits_local_slots():
+    """per_expert_bytes_ref plans the shared KV geometry; the rank with the thinner
+    shard banks MORE slots in the same bytes (the capacity feedback the bandwidth-
+    weighted split buys). num_pages must come out identical on both ranks."""
+    common = dict(
+        baseline_free=20 << 30, weights_bytes=6 << 30, memory_ratio=0.85,
+        cache_per_page=4096, fixed_cache_size=1 << 30,
+        num_experts=512, total_experts=24576, prefill_overlap=True,
+        kv_reserve_tokens=8192, page_size=64, max_slots=None,
+    )
+    ref = 1_673_000   # the fattest rank's slot bytes (cross-rank MAX)
+    thin = 1_115_000  # this rank's thinner shard
+    size_ref, pages_ref, overlap_ref = resolve_moe_cache_auto(
+        per_expert_bytes=ref, per_expert_bytes_ref=ref, **common)
+    size_thin, pages_thin, overlap_thin = resolve_moe_cache_auto(
+        per_expert_bytes=thin, per_expert_bytes_ref=ref, **common)
+    assert (pages_thin, overlap_thin) == (pages_ref, overlap_ref)  # scheduler-shared geometry
+    assert size_thin > size_ref                                    # cheaper slots -> more of them
+    budget = size_ref * ref + pages_ref * 4096                     # <= shared budget
+    assert size_thin * thin + pages_thin * 4096 <= max(budget, size_thin * thin + pages_thin * 4096)
+    # the thin rank's slots still fit the SAME budget the ref plan was solved against
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+    b = net_cache_budget_bytes(
+        common["memory_ratio"], common["baseline_free"], common["weights_bytes"],
+        common["fixed_cache_size"], device_total=0, nonpool_overhead_bytes=0)
+    assert size_ref * ref + pages_ref * 4096 <= b
+    assert size_thin * thin + pages_thin * 4096 <= b
+    # and it is the greedy fill of the bytes left after the shared KV geometry
+    assert size_thin == min((b - pages_thin * 4096) // thin, common["total_experts"])
+
+
+def test_even_shard_ref_is_a_no_op():
+    common = dict(
+        baseline_free=20 << 30, weights_bytes=6 << 30, memory_ratio=0.85,
+        cache_per_page=4096, fixed_cache_size=1 << 30, per_expert_bytes=1_393_920,
+        num_experts=512, total_experts=24576, prefill_overlap=True,
+        kv_reserve_tokens=8192, page_size=64, max_slots=None,
+    )
+    a = resolve_moe_cache_auto(**common)
+    b = resolve_moe_cache_auto(per_expert_bytes_ref=1_393_920, **common)
+    assert a == b

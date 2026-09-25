@@ -190,6 +190,38 @@ def plan_cache_budget(
     return moe_cache_size, num_pages, overlap
 
 
+def replan_local_slots(
+    *,
+    budget_bytes: int,
+    num_pages: int,
+    cache_per_page: int,
+    per_expert_bytes: int,
+    num_experts: int,
+    total_experts: int,
+    prefill_overlap: bool,
+    max_slots: int,
+) -> int:
+    """This rank's expert slot count for a FIXED KV geometry under an uneven TP shard.
+
+    ``plan_cache_budget`` solved the shared byte budget with the cross-rank MAX
+    per-expert bytes, so ``num_pages`` is identical on every rank (the scheduler on
+    rank 0 allocates page indices that every rank's pool must honor). This re-splits
+    the same bytes into this rank's own slots: a rank whose shard of each expert is
+    thinner gets MORE slots (a bigger resident working set, fewer PCIe misses), which
+    is exactly the capacity feedback the bandwidth-weighted split is buying.
+    """
+    hi = min(total_experts, max_slots)
+    lo = 2 * num_experts if prefill_overlap else num_experts
+    slot_bytes = budget_bytes - num_pages * cache_per_page
+    size = max(lo, min(slot_bytes // per_expert_bytes, hi))
+    total = size * per_expert_bytes + num_pages * cache_per_page
+    assert total <= budget_bytes, (
+        f"local slot replan exceeds the budget: {size} slots x {per_expert_bytes} B "
+        f"+ {num_pages} pages x {cache_per_page} B = {total} B > {budget_bytes} B"
+    )
+    return size
+
+
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,
@@ -206,10 +238,15 @@ def resolve_moe_cache_auto(
     max_slots: int | None = None,
     device_total: int = 0,
     nonpool_overhead_bytes: int = 0,
+    per_expert_bytes_ref: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
+
+    ``per_expert_bytes_ref`` is the cross-rank MAX per-slot bytes under an uneven
+    (bandwidth-weighted) expert shard: the KV geometry is planned from it so every rank
+    agrees on num_pages, then this rank's slot count is re-split from its own bytes.
 
     Applies memory_ratio exactly once via net_cache_budget_bytes (the usage-cap reading
     when a device total is given), then defers the MoE-vs-KV split to plan_cache_budget.
@@ -225,9 +262,10 @@ def resolve_moe_cache_auto(
     )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
-    return plan_cache_budget(
+    ref_bytes = per_expert_bytes if per_expert_bytes_ref is None else per_expert_bytes_ref
+    size, num_pages, overlap = plan_cache_budget(
         budget_bytes=budget_bytes,
-        per_expert_bytes=per_expert_bytes,
+        per_expert_bytes=ref_bytes,
         cache_per_page=cache_per_page,
         num_experts=num_experts,
         total_experts=total_experts,
@@ -235,3 +273,15 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+    if ref_bytes != per_expert_bytes:
+        size = replan_local_slots(
+            budget_bytes=budget_bytes,
+            num_pages=num_pages,
+            cache_per_page=cache_per_page,
+            per_expert_bytes=per_expert_bytes,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            prefill_overlap=overlap,
+            max_slots=max_slots,
+        )
+    return size, num_pages, overlap

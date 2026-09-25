@@ -546,6 +546,11 @@ class Engine:
         )
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        # Resolve the (possibly uneven, bandwidth-weighted) expert TP shard BEFORE the
+        # model is built: MoE configs are baked at layer construction and every bank,
+        # slot-cache row and kernel shape derives from them.
+        self._resolve_expert_shard_weights(config)
+
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
@@ -828,6 +833,92 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
+    def _resolve_expert_shard_weights(self, config: EngineConfig) -> None:
+        """Resolve the per-rank share of each offloaded nvfp4 expert (uneven TP shard).
+
+        With an even split both ranks pull the same miss bytes per decode step, so a
+        rank on a slow PCIe slot (gen4 x4 ~6.6 GB/s next to gen5 x16 ~21 GB/s, measured)
+        sets the step time while the fast link idles AND its slot cache holds fewer
+        experts per byte budget. Weighting the intermediate split by probed bandwidth
+        (fraction ~ bw**gamma, gamma default 0.4 -- a pure bw-proportional split is too
+        aggressive because the fat rank's smaller slot cache raises its miss count)
+        balances the per-step transfer time. Every rank MUST resolve the same fractions,
+        so the probe result is all-gathered before the pure-math split.
+        """
+        from freetoken.layers.quantization.shard_balance import set_expert_shard_weights
+
+        set_expert_shard_weights(None)
+        if config.tp_info.size < 2 or config.moe_strategy != "offload":
+            return
+        try:
+            cpu_layers = float(config.moe_cpu_layers or 0)
+        except (TypeError, ValueError):
+            cpu_layers = 1.0
+        if cpu_layers:
+            logger.info_rank0(
+                "uneven expert TP shard: disabled (--moe-cpu-layers executors size "
+                "their buffers from the even split)"
+            )
+            return
+        weights = None
+        env = os.getenv("FREETOKEN_EXPERT_SHARD_FRAC", "").strip()
+        if env:
+            try:
+                fracs = [float(x) for x in env.split(",") if x.strip()]
+            except ValueError:
+                raise ValueError(
+                    f"FREETOKEN_EXPERT_SHARD_FRAC must be comma-separated positive "
+                    f"numbers, got {env!r}"
+                ) from None
+            if len(fracs) != config.tp_info.size or any(f <= 0 for f in fracs):
+                raise ValueError(
+                    f"FREETOKEN_EXPERT_SHARD_FRAC must hold {config.tp_info.size} "
+                    f"positive per-rank fractions, got {env!r}"
+                )
+            weights = tuple(fracs)
+        else:
+            bws = self._gather_pcie_h2d_gbs()
+            if bws is not None:
+                gamma = float(os.getenv("FREETOKEN_EXPERT_SHARD_GAMMA", "0.4"))
+                weights = tuple(bw**gamma for bw in bws)
+        if weights is None:
+            return
+        set_expert_shard_weights(weights)
+        total = sum(weights)
+        fr = ", ".join(f"rank{i}={w / total:.3f}" for i, w in enumerate(weights))
+        logger.info_rank0(
+            f"uneven expert TP shard: bandwidth-weighted intermediate fractions ({fr})"
+            + (f" from FREETOKEN_EXPERT_SHARD_FRAC={env}" if env else " from the live PCIe probe")
+        )
+
+    def _gather_pcie_h2d_gbs(self) -> "list[float] | None":
+        """Every rank's probed H2D GB/s in rank order (identical list on all ranks).
+
+        None when unprobed or when any rank failed its probe -- an uneven split needs
+        unanimous agreement, so a single bad probe keeps the even split everywhere.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if size < 2:
+            return None
+        bw = _probe_pcie_h2d_gbs(self.device)
+        probe = torch.tensor([bw if bw and bw > 0 else -1.0], dtype=torch.float64)
+        gathered = [torch.empty(1, dtype=torch.float64) for _ in range(size)]
+        torch.distributed.all_gather(gathered, probe, group=self.tp_cpu_group)
+        vals = [float(g.item()) for g in gathered]
+        if any(v <= 0 for v in vals):
+            logger.info_rank0(
+                "uneven expert TP shard: disabled (a rank's PCIe probe failed); "
+                "keeping the even split"
+            )
+            return None
+        logger.info_rank0(
+            "PCIe H2D probe: "
+            + ", ".join(f"rank{i}={v:.1f} GB/s" for i, v in enumerate(vals))
+        )
+        return vals
+
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -846,6 +937,21 @@ class Engine:
         num_moe_layers = config.model_config.num_moe_layers
         total_experts = num_moe_layers * num_experts
         per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        # Under an uneven (bandwidth-weighted) expert shard the per-slot bytes are
+        # rank-local. The KV geometry must stay IDENTICAL across ranks (rank 0's
+        # scheduler allocates page indices every rank honors), so the plan solves the
+        # shared budget with the cross-rank MAX slot bytes and each rank then re-splits
+        # the same bytes into its own (cheaper) slots; see resolve_moe_cache_auto.
+        per_expert_ref = per_expert_bytes
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=self.tp_cpu_group) > 1
+        ):
+            ref = torch.tensor([per_expert_bytes], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                ref, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+            )
+            per_expert_ref = int(ref.item())
         # A --moe-cpu-layers split leaves the CPU-decoded experts unreachable in the slot
         # cache; without this cap the greedy fill spends the whole budget on dead slots
         # instead of KV, and asks the driver for one bank-sized contiguous allocation.
@@ -875,6 +981,7 @@ class Engine:
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
             per_expert_bytes=per_expert_bytes,
+            per_expert_bytes_ref=per_expert_ref,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -896,8 +1003,10 @@ class Engine:
         spendable: it is what the ratio reserves for CUDA-graph capture and the largest
         prefill chunk's activations, so the growth stops at the ceiling and a plan that
         already sits on it does not grow at all. Runs BEFORE the first graph capture, so no
-        re-capture is needed. The target derives from the cross-rank MIN free memory, so
-        every TP rank grows to the same size. Returns the free memory after the growth.
+        re-capture is needed. The byte budget derives from the cross-rank MIN free memory,
+        so every TP rank grows by the same BYTES (with an uneven expert shard the slot
+        counts differ per rank: each rank's slots cost its own per-expert bytes). Returns
+        the free memory after the growth.
 
         TP-collective discipline: the go/no-go decision is all-reduced (MIN) AFTER a
         local probe allocation, and ``_sync_get_memory`` (itself collective) runs only
