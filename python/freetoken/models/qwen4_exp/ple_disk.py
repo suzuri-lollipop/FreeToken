@@ -175,6 +175,8 @@ class DiskRowTable:
             and _ple_store.event_sync_available()
         )
         sync = "wait-sync" if self._wait_sync else "launch-gating"
+        if self._wait_sync and self._rows_gated(2):
+            sync = "wait-sync bs1, launch-gating bs>=2 (shm one-shot AR interlock)"
         logger.info_rank0(
             f"PLE disk backend: {self._store.io_backend()}, {sync}"
             + (", cpp fill" if self._cpp_fill else "")
@@ -199,6 +201,25 @@ class DiskRowTable:
             raise RuntimeError("FREETOKEN_PLE_SYNC=wait but stream memops are unavailable")
         return ok
 
+    def _rows_gated(self, rows: int) -> bool:
+        """Whether a ``rows``-row graph fill/lookup uses launch-gating instead of wait-sync.
+
+        Interlock with the host-shm all-reduce (distributed/shm_ar.py): when the live
+        shm reducer accepts payloads >= 10 KiB, the resident K2 spin kernel enters
+        every >=2-row graph whose rows ride an all-reduce (bs>=2 decode, spec, the
+        prefill chunk graph). A graph that mixes a K2 spin with PLE WAIT memops
+        reproducibly blocks its NEXT cudaGraphLaunch (driver level), so those graphs
+        instead stage their pinned rows BEFORE launch (gating) and capture the lookup
+        without the WAIT memop. bs1 keeps wait-sync: its K2 payload stays <= 5 KiB
+        and that mix is production-proven. The reducer state is collective, so every
+        rank resolves the same protocol for the same graph.
+        """
+        if rows < 2 or not self._wait_sync:
+            return False
+        from freetoken.distributed.shm_ar import large_shm_ar_active
+
+        return large_shm_ar_active()
+
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
@@ -211,7 +232,10 @@ class DiskRowTable:
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
             offset += run.numel() - 2
-        self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+        # a gated graph has no WAIT node to satisfy: signaling the shared flag would
+        # leave it raised and prematurely satisfy a LATER bs1 wait-sync replay
+        signal = graph and self._wait_sync and not self._rows_gated(offset)
+        self._store.flush(self._flag.data_ptr() if signal else 0)
         if log_fills and self._fill_log_n <= 3000:
             import hashlib
 
@@ -253,7 +277,7 @@ class DiskRowTable:
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
-            if use_graph and self._wait_sync:
+            if use_graph and self._wait_sync and not self._rows_gated(batch.padded_size):
                 bs = batch.padded_size
                 if self._cpp_fill and all(r.input_ids.dtype == torch.int32 for r in reqs):
                     # Same ENTER-time snapshot rule as the Python builder below, but the
@@ -353,7 +377,7 @@ class DiskRowTable:
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and self._wait_sync:
+        if capturing and self._wait_sync and not self._rows_gated(rows):
             from freetoken.kernel import _ple_store
 
             _ple_store.memop_wait_reset(

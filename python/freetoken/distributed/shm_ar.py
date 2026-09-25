@@ -167,15 +167,17 @@ class ShmOneShotAllReducer:
                 raise RuntimeError(f"cudaHostGetDevicePointer: {dres[0]}")
             counter = torch.zeros(1, dtype=torch.int64, device=f"cuda:{device}")
             local = cls(rank, int(dres[1]), counter, owns=(fd, mm, host_addr))
-            # Default to single-token (bs=1) reductions: on a 2-GPU PCIe box the
-            # bs>=2 decode graphs also carry CPU-MoE front-end WAIT nodes, and a
-            # graph that mixes those with the resident K2 spin kernel reproducibly
-            # blocks the NEXT cudaGraphLaunch of that exec (driver-level; bisected
-            # via FREETOKEN_SHM_AR_MAX_KIB: 5 KiB = bs1-only is stable, >=10 KiB
-            # hangs the first bs>=2 step). bs=1 is also where the win is largest
-            # (the step is shortest, so AR latency dominates). Raise the knob only
-            # on stacks where the mixed-graph launch behaves.
-            kib = int(os.getenv("FREETOKEN_SHM_AR_MAX_KIB", "5") or "5")
+            # Threshold >= 10 KiB puts the resident K2 spin kernel into the bs>=2
+            # decode graphs. A graph that mixes K2 with PLE WAIT memop nodes
+            # reproducibly blocks the NEXT cudaGraphLaunch of that exec (driver
+            # level; bisected via this knob). The interlock lives in ple_disk: when
+            # large_shm_ar_active() reports a >= 10 KiB reducer, every graph with
+            # >= 2 rows (bs>=2 decode, spec, prefill-graph) captures in launch-
+            # gating mode (fill before launch, no WAIT nodes), leaving K2 alone in
+            # those execs; bs1 keeps the wait-sync PLE protocol (its <= 5 KiB K2
+            # mix is production-proven). FREETOKEN_SHM_AR_MAX_KIB <= 5 restores the
+            # historical all-wait-sync PLE protocol automatically.
+            kib = int(os.getenv("FREETOKEN_SHM_AR_MAX_KIB", "20") or "20")
             local.max_bytes = min(_MAX_BYTES, max(4, kib) * 1024)
             local.max_elems = local.max_bytes // 2
         except Exception as exc:  # noqa: BLE001
@@ -248,6 +250,8 @@ class ShmOneShotAllReducer:
         logger.info_rank0(
             "shm one-shot all-reduce probe OK (host rendezvous, in-kernel seq flags)"
         )
+        global _ACTIVE
+        _ACTIVE = local
         return local
 
     def _teardown(self) -> None:
@@ -284,3 +288,18 @@ class ShmOneShotAllReducer:
 
 def shm_ar_enabled() -> bool:
     return os.getenv("FREETOKEN_SHM_AR", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+_ACTIVE: "ShmOneShotAllReducer | None" = None
+
+
+def large_shm_ar_active(min_bytes: int = 10 * 1024) -> bool:
+    """Whether the LIVE shm reducer takes payloads >= ``min_bytes``.
+
+    ple_disk keys the PLE graph-fill protocol off this: a threshold >= 10 KiB
+    puts the resident K2 spin kernel into the bs>=2 decode graphs, which must
+    then capture WITHOUT PLE WAIT memops (the mixed exec reproducibly blocks its
+    next launch). Every rank resolves the same value (the reducer is built
+    collectively), so the per-graph protocol choice stays rank-consistent.
+    """
+    return _ACTIVE is not None and _ACTIVE.max_bytes >= min_bytes

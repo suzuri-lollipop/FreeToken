@@ -437,3 +437,37 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+def test_rows_gated_follows_the_shm_ar_interlock(monkeypatch):
+    """The per-graph PLE protocol choice: wait-sync (WAIT memop + deferred fill)
+    stays for bs1; graphs with >=2 rows switch to launch-gating exactly when the
+    live shm one-shot reducer would put its resident K2 spin kernel in them
+    (threshold >= 10 KiB). The mixed K2+WAIT exec is the documented hang."""
+    from freetoken.distributed import shm_ar
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    store = DiskRowTable.__new__(DiskRowTable)  # no __init__: the predicate touches only these
+    store._wait_sync = True
+
+    monkeypatch.setattr(shm_ar, "_ACTIVE", None)
+    assert not store._rows_gated(1)
+    assert not store._rows_gated(4)          # no shm reducer -> legacy wait-sync graphs
+
+    class _Fake:
+        max_bytes = 20 * 1024
+
+    monkeypatch.setattr(shm_ar, "_ACTIVE", _Fake())
+    assert store._rows_gated(2)              # K2 lands in bs>=2 graphs -> gate them
+    assert store._rows_gated(128)
+    assert not store._rows_gated(1)          # bs1 keeps wait-sync (K2 <= 5 KiB, proven mix)
+
+    class _FakeSmall:
+        max_bytes = 5 * 1024
+
+    monkeypatch.setattr(shm_ar, "_ACTIVE", _FakeSmall())
+    assert not store._rows_gated(4)          # bs>=2 ARs stay NCCL -> no interlock needed
+
+    store._wait_sync = False
+    monkeypatch.setattr(shm_ar, "_ACTIVE", _Fake())
+    assert not store._rows_gated(4)          # explicit gate mode: call sites branch on _wait_sync
