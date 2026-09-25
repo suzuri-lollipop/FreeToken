@@ -23,6 +23,11 @@ class _LinearTPImpl(BaseOP):
     # projections measured a win; row/o_proj/replicated shapes lose more to the per-step
     # activation quantization than the GEMM saves (docs/qwen38_flash_next_optimizations.md).
     fp8_decode_ok = False
+    # Opt-in for the W8A16 decode path (default on): the bf16 weight is REPLACED by a
+    # per-channel fp8 copy at finalize, decode runs a fused triton GEMV (activation
+    # stays bf16 -- no quantization overhead, so small shapes win too) and prefill
+    # dequantizes on the fly. The freed VRAM goes to the expert slot cache.
+    w8a16_decode_ok = False
 
     def __init__(
         self,
@@ -76,6 +81,8 @@ class LinearReplicated(_LinearTPImpl):
     Each GPU holds the full weight matrix.
     """
 
+    w8a16_decode_ok = True
+
     def __init__(
         self,
         input_size: int,
@@ -98,6 +105,7 @@ class LinearReplicated(_LinearTPImpl):
 
 class LinearColParallelMerged(_LinearTPImpl):
     fp8_decode_ok = True
+    w8a16_decode_ok = True
 
     def __init__(
         self,
@@ -120,6 +128,8 @@ class LinearColParallelMerged(_LinearTPImpl):
 
 
 class LinearQKVMerged(_LinearTPImpl):
+    w8a16_decode_ok = True
+
     def __init__(
         self,
         hidden_size: int,
@@ -148,6 +158,7 @@ class LinearQKVMerged(_LinearTPImpl):
 
 class LinearOProj(_LinearTPImpl):
     bias_after_reduce = True
+    w8a16_decode_ok = True
 
     def __init__(
         self,
@@ -176,6 +187,7 @@ class LinearOProj(_LinearTPImpl):
 
 class LinearRowParallel(_LinearTPImpl):
     bias_after_reduce = True
+    w8a16_decode_ok = True
 
     def __init__(
         self,
