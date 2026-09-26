@@ -200,6 +200,7 @@ def replan_local_slots(
     total_experts: int,
     prefill_overlap: bool,
     max_slots: int,
+    skew_bytes: int = 0,
 ) -> int:
     """This rank's expert slot count for a FIXED KV geometry under an uneven TP shard.
 
@@ -212,6 +213,11 @@ def replan_local_slots(
     """
     hi = min(total_experts, max_slots)
     lo = 2 * num_experts if prefill_overlap else num_experts
+    # skew_bytes: per-rank slot-budget tilt (FREETOKEN_SLOT_BUDGET_SKEW_MIB). A rank
+    # whose fetch path is the straggler (fatter shard bytes per miss) banks extra slots
+    # from the (1 - memory_ratio) headroom; the peer gives the same bytes back. The KV
+    # geometry is untouched (num_pages stays cross-rank identical).
+    budget_bytes += skew_bytes
     slot_bytes = budget_bytes - num_pages * cache_per_page
     size = max(lo, min(slot_bytes // per_expert_bytes, hi))
     total = size * per_expert_bytes + num_pages * cache_per_page
@@ -239,6 +245,7 @@ def resolve_moe_cache_auto(
     device_total: int = 0,
     nonpool_overhead_bytes: int = 0,
     per_expert_bytes_ref: int | None = None,
+    slot_budget_skew_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -273,7 +280,7 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
-    if ref_bytes != per_expert_bytes:
+    if ref_bytes != per_expert_bytes or slot_budget_skew_bytes:
         size = replan_local_slots(
             budget_bytes=budget_bytes,
             num_pages=num_pages,
@@ -283,5 +290,6 @@ def resolve_moe_cache_auto(
             total_experts=total_experts,
             prefill_overlap=overlap,
             max_slots=max_slots,
+            skew_bytes=slot_budget_skew_bytes,
         )
     return size, num_pages, overlap

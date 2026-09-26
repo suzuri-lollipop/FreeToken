@@ -974,7 +974,34 @@ class Engine:
             # solve_num_pages spends the pinned KV geometry whatever the plan says, so the
             # greedy expert fill must leave room for it, not just for kv_reserve_tokens.
             kv_reserve_tokens = max(kv_reserve_tokens, config.num_page_override * page_tokens)
+        # Per-rank slot-budget tilt out of the (1 - memory_ratio) headroom. The
+        # default "+512,+512" reclaims half a GiB per rank for expert slots (measured
+        # on the 2x24GB NVFP4 rig: misses -3.6%/rank, greedy 4-user decode +1tps,
+        # worst-case 8k-chunk prefill still leaves >1.5 GiB free). Each rank's claim
+        # is clamped so an estimated headroom floor stays untouched; set the knob to
+        # "0" (or run without a measured device total) to disable the reclaim.
+        skew = 0
+        spec = os.environ.get("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "+512,+512")
+        try:
+            parts = [int(x) for x in spec.split(",")]
+        except ValueError:
+            parts = []
+            logger.warning_rank0(
+                f"ignoring malformed FREETOKEN_SLOT_BUDGET_SKEW_MIB={spec!r}"
+            )
+        rank = getattr(getattr(config, "tp_info", None), "rank", 0)
+        if rank < len(parts) and parts[rank] > 0 and self._device_total > 0:
+            floor = int(
+                os.environ.get("FREETOKEN_SLOT_RECLAIM_FLOOR_MIB", "2048")
+            ) * (1 << 20)
+            headroom_est = int(
+                self._device_total * (1.0 - config.memory_ratio)
+            ) - self._nonpool_overhead_floor
+            skew = min(parts[rank] * (1 << 20), max(0, headroom_est - floor))
+        elif rank < len(parts):
+            skew = parts[rank] * (1 << 20)
         return resolve_moe_cache_auto(
+            slot_budget_skew_bytes=skew,
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,

@@ -323,7 +323,9 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
-def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
+def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
+    # pin the headroom-reclaim knob off: this test maps the resolver kwargs exactly
+    monkeypatch.setenv("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "0")
     import torch
 
     from freetoken.engine.engine import Engine
@@ -460,7 +462,8 @@ def _auto_plan_stub(num_layers=4, *, layer_residency="unset", num_page_override=
     return engine, Config(), Banks()
 
 
-def test_auto_plan_spends_unreachable_expert_bytes_on_kv():
+def test_auto_plan_spends_unreachable_expert_bytes_on_kv(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "0")
     # The WSL2 shape: --moe-cpu-layers leaves 1 of 4 MoE layers with a device address. The
     # greedy fill must not plan all 16 experts on GPU (7.7 MB of the 8 MB budget, in one
     # bank-sized contiguous allocation); the unreachable bytes belong to the KV pool.
@@ -475,7 +478,8 @@ def test_auto_plan_spends_unreachable_expert_bytes_on_kv():
     assert size * 480_000 + pages * 131_072 <= 8_000_000
 
 
-def test_auto_plan_reserves_a_pinned_kv_geometry():
+def test_auto_plan_reserves_a_pinned_kv_geometry(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "0")
     # --num-tokens pins the KV pool; solve_num_pages spends it whatever the plan says, so
     # the expert fill must leave room for it, not only for kv_reserve_tokens.
     engine, config, banks = _auto_plan_stub(layer_residency=None, num_page_override=3)
@@ -856,3 +860,42 @@ def test_even_shard_ref_is_a_no_op():
     a = resolve_moe_cache_auto(**common)
     b = resolve_moe_cache_auto(per_expert_bytes_ref=1_393_920, **common)
     assert a == b
+
+
+def test_slot_budget_skew_tilts_local_slots_only():
+    """FREETOKEN_SLOT_BUDGET_SKEW_MIB support: a rank's slot count tilts with its
+    skew while the cross-rank KV geometry (num_pages) stays identical."""
+    common = dict(
+        baseline_free=20 << 30, weights_bytes=6 << 30, memory_ratio=0.85,
+        cache_per_page=4096, fixed_cache_size=1 << 30,
+        num_experts=512, total_experts=24576, prefill_overlap=True,
+        kv_reserve_tokens=8192, page_size=64, max_slots=None,
+    )
+    fat, thin = 1_673_216, 1_115_136  # rank0/rank1 per-slot bytes (uneven shard)
+    base_size, pages, overlap = resolve_moe_cache_auto(
+        per_expert_bytes=fat, per_expert_bytes_ref=fat, **common
+    )
+    plus_size, plus_pages, _ = resolve_moe_cache_auto(
+        per_expert_bytes=fat, per_expert_bytes_ref=fat,
+        slot_budget_skew_bytes=512 << 20, **common
+    )
+    minus_size, minus_pages, _ = resolve_moe_cache_auto(
+        per_expert_bytes=thin, per_expert_bytes_ref=fat,
+        slot_budget_skew_bytes=-(512 << 20), **common
+    )
+    # KV geometry is rank-invariant under skew
+    assert plus_pages == pages and minus_pages == pages
+    # positive skew banks extra slots (~512MiB / per-slot bytes, modulo the floor)
+    assert plus_size - base_size == (512 << 20) // fat
+    # the peer's slot count shrinks with a negative skew, never below the plan floor
+    thin_base, _, _ = resolve_moe_cache_auto(
+        per_expert_bytes=thin, per_expert_bytes_ref=fat, **common
+    )
+    assert minus_size <= thin_base
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+    b = net_cache_budget_bytes(
+        common["memory_ratio"], common["baseline_free"], common["weights_bytes"],
+        common["fixed_cache_size"], device_total=0, nonpool_overhead_bytes=0)
+    # the tilted plan fits its own tilted budget (and the base plan is untouched)
+    assert plus_size * fat + pages * 4096 <= b + (512 << 20)
+    assert base_size * fat + pages * 4096 <= b
