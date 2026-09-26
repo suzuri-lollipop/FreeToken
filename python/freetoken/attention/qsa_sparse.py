@@ -31,6 +31,7 @@ static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturab
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List
@@ -147,6 +148,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
+        # second static buffer set for the dual-microbatch decode's trailing half
+        self._graph_alt: "dict[str, torch.Tensor] | None" = None
         self.capture_bs: List[int] = []
 
     @staticmethod
@@ -498,6 +501,37 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return buffer[:rows]
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
+    @contextlib.contextmanager
+    def dual_profile(self, slot: int):
+        """Point the static decode buffers at one dual-microbatch half's set.
+
+        The dual decode runs the bs4 step as two bs2 half-batches on skewed streams;
+        each half stages addressing and scratch into its OWN buffer set so the two
+        streams never alias (capture bakes the addresses; replay restages contents)."""
+        if slot == 0 or self._graph_alt is None:
+            yield
+            return
+        primary = self._graph
+        self._graph = self._graph_alt
+        try:
+            yield
+        finally:
+            self._graph = primary
+
+    def stage_dual_replay(self, batch: Batch) -> None:
+        """Restage both halves' decode addressing for one dual-graph replay."""
+        from types import SimpleNamespace
+
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata)
+        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        half = batch.padded_size // 2
+        table = batch.active_table_idx.to(torch.int64)
+        for slot, sl in ((0, slice(0, half)), (1, slice(half, batch.padded_size))):
+            half_md = SimpleNamespace(kv_len_cpu=md.kv_len_cpu[sl])
+            with self.dual_profile(slot):
+                self._stage_decode(half_md, half if slot == 0 else batch.padded_size - half, table[sl])
+
     # ----- CUDA graph (decode) --------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.capture_bs = sorted(bs_list)
@@ -511,7 +545,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
             return torch.empty(shape, dtype=dtype, device=self.device)
 
-        self._graph = {
+        self._graph_alt = None
+        self._graph = self._new_graph_buffers(max_bs, pages, columns, chunk, topk_scratch, empty)
+        if os.getenv("FREETOKEN_DUAL_STREAM_DECODE", "0") == "1" and max_bs >= 2:
+            self._graph_alt = self._new_graph_buffers(
+                max_bs, pages, columns, chunk, topk_scratch, empty
+            )
+
+    def _new_graph_buffers(self, max_bs, pages, columns, chunk, topk_scratch, empty):
+        bufs = {
             "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
             "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -526,7 +568,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
         if topk_scratch:
-            self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+            bufs["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+        return bufs
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
@@ -547,6 +590,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def reset_capture(self) -> None:
         super().reset_capture()
         self._graph = {}
+        self._graph_alt = None
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

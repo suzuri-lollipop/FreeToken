@@ -109,6 +109,27 @@ def _w8a16_epilogue_kernel(
     tl.store(y_ptr + offs, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
+_WS_SLOT = 0
+
+
+def set_ws_slot(slot: int) -> int:
+    """Switch the split-K workspace partition; returns the previous slot.
+
+    The dual-microbatch decode runs two half-batches on concurrent streams: their
+    split-K partials must not alias (the ws address is baked into the graph), so
+    each half owns its own workspace keyed by this slot. The model driver sets it
+    per half at issue time (capture) and restores it afterwards."""
+    global _WS_SLOT
+    prev = _WS_SLOT
+    _WS_SLOT = slot
+    return prev
+
+
+def restore_ws_slot(prev: int) -> None:
+    global _WS_SLOT
+    _WS_SLOT = prev
+
+
 def _workspace(key, shape, device) -> torch.Tensor:
     ws = _WS.get(key)
     if ws is None or ws.numel() < shape[0] * shape[1]:
@@ -156,7 +177,7 @@ def w8a16_linear_decode(
             num_warps=warps, num_stages=stages,
         )
         return y
-    ws = _workspace((x.device.index, N), (split_k * _BLOCK_M, N), x.device)
+    ws = _workspace((x.device.index, N, _WS_SLOT), (split_k * _BLOCK_M, N), x.device)
     _w8a16_main_kernel[(triton.cdiv(N, block_n), split_k)](
         x, w_view, scale, bias if bias is not None else x, y, ws,
         M, N, K, x.stride(0), w_fp8.stride(0),

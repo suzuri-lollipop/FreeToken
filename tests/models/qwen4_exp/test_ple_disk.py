@@ -471,3 +471,34 @@ def test_rows_gated_follows_the_shm_ar_interlock(monkeypatch):
     store._wait_sync = False
     monkeypatch.setattr(shm_ar, "_ACTIVE", _Fake())
     assert not store._rows_gated(4)          # explicit gate mode: call sites branch on _wait_sync
+
+
+@requires_cuda
+def test_disk_lookup_row_offset_reads_its_window():
+    """Dual-microbatch decode: the host fill stages the FULL batch's rows in order,
+    so a half's lookup must read pinned/dev at row_offset (rows [off, off+n))."""
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    rows_total, token_bytes = 4, 8
+    pinned = torch.arange(rows_total * token_bytes, dtype=torch.uint8).pin_memory()
+    dev = torch.zeros(rows_total * token_bytes, dtype=torch.uint8, device="cuda")
+    table = DiskRowTable.__new__(DiskRowTable)
+    table._token_bytes = token_bytes
+    table._eager_pinned = pinned
+    table._eager_dev = dev
+    table._graph_pinned = pinned
+    table._graph_dev = dev
+    # fp8 passthrough dtype: .to() is a no-op, so the window stays bit-exact
+    table.dtype = torch.float8_e4m3fn
+    table.scale = 1.0
+    table._wait_sync = False
+
+    row_ids = torch.zeros(2, 1, dtype=torch.int64)  # ids unused: the staged window is positional
+    lo = table.lookup(row_ids, row_offset=0)
+    hi = table.lookup(row_ids, row_offset=2)
+    want_lo = pinned[: 2 * token_bytes]
+    want_hi = pinned[2 * token_bytes :]
+    assert torch.equal(lo.reshape(-1).view(torch.uint8).cpu(), want_lo)
+    assert torch.equal(hi.reshape(-1).view(torch.uint8).cpu(), want_hi)
+    # the window landed at its own offset in the device buffer, not at 0
+    assert torch.equal(dev[2 * token_bytes :].cpu(), want_hi)

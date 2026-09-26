@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
@@ -92,6 +94,12 @@ class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        # Dual-microbatch decode routes the trailing half's reductions through a
+        # SECOND shm one-shot instance (its own counter/flags/data slots): two
+        # independent call sequences must never share one seq-locked reducer, and
+        # the per-stream choice is baked at graph-capture time by ``ar_instance``.
+        if _AR_INSTANCE == 1 and _DUAL_IMPL is not None:
+            return _DUAL_IMPL.all_reduce(x)
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
@@ -150,10 +158,53 @@ def enable_pynccl_distributed(
             f"One-shot {kind} all-reduce enabled for contiguous bf16 <= "
             f"{ar.max_bytes // 1024} KiB (NCCL above)"
         )
+        if (
+            kind == "host-shm"
+            and os.getenv("FREETOKEN_DUAL_STREAM_DECODE", "0") == "1"
+        ):
+            # Second independent reducer for the dual-microbatch decode's trailing
+            # half (see ar_instance). Collective like the primary build; a failure
+            # simply leaves dual decode disabled (the graph runner checks
+            # dual_ar_available()).
+            from .shm_ar import ShmOneShotAllReducer
+
+            ar2 = ShmOneShotAllReducer.try_build(tp_info, tp_cpu_group, tag="d1")
+            if ar2 is not None and ar2.max_elems == ar.max_elems:
+                global _DUAL_IMPL
+                _DUAL_IMPL = P2POneShotDistributedImpl(inner, ar2, max_elems)
+                logger.info_rank0(
+                    "dual-microbatch decode: second shm one-shot all-reduce instance ready"
+                )
+
+
+_DUAL_IMPL: "DistributedImpl | None" = None
+_AR_INSTANCE = 0
+
+
+@contextlib.contextmanager
+def ar_instance(slot: int):
+    """Route all_reduce through the dual (slot=1) or primary (slot=0) fast impl.
+
+    Capture-time switch: the kernels each half records bind to its instance, and
+    the two instances' seq counters advance independently in rank lockstep."""
+    global _AR_INSTANCE
+    prev = _AR_INSTANCE
+    _AR_INSTANCE = slot
+    try:
+        yield
+    finally:
+        _AR_INSTANCE = prev
+
+
+def dual_ar_available() -> bool:
+    return _DUAL_IMPL is not None
 
 
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    global _DUAL_IMPL, _AR_INSTANCE
+    _DUAL_IMPL = None
+    _AR_INSTANCE = 0
     DistributedCommunicator.plugins = []

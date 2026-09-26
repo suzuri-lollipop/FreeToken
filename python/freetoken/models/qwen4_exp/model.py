@@ -141,8 +141,121 @@ class Qwen4ExpModel(BaseOP):
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         return self.forward_with_residual(input_ids, batch)[0]
 
+    def forward_dual(self, batchA: Batch, batchB: Batch, side: torch.cuda.Stream) -> torch.Tensor:
+        """Dual-microbatch decode: run the two half-batches on skewed streams.
+
+        Per layer the leading half issues first (current stream), then the trailing
+        half (side stream); the MoE cross-waits (layers/moe.py _decode_dual_moe) make
+        one half's PCIe miss fetch overlap the other half's dense/attention SM work.
+        Each half runs with its own all-reduce instance, QSA staging profile and MoE
+        fetch plan (batch.dual_slot), so the streams share no mutable state besides
+        the slot cache's LRU bookkeeping, which the per-layer events serialize.
+        Returns the merged mixed hidden [TA+TB, H] in batch row order."""
+        import contextlib
+
+        from freetoken.distributed import ar_instance
+        from freetoken.kernel.triton.w8a16_linear import restore_ws_slot, set_ws_slot
+
+        from .ple import build_ple_metadata, commit_ngram_context
+
+        ctx = get_global_ctx()
+        profile = getattr(getattr(ctx, "attn_backend", None), "dual_profile", None)
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        side.wait_event(fork)
+
+        def half_stack(batch: Batch, slot: int, on_side: bool) -> contextlib.ExitStack:
+            st = contextlib.ExitStack()
+            st.enter_context(ctx.swap_batch(batch))
+            # resource slot: batch.dual_slot (the DUAL_SLOT0 probe collapses both
+            # halves onto instance 0); the QSA staging profile always follows the
+            # true slot so the halves' static buffers stay disjoint.
+            rslot = getattr(batch, "dual_slot", slot)
+            st.enter_context(ar_instance(rslot if rslot >= 0 else slot))
+            # per-half split-K workspace partition (the ws address bakes into the
+            # graph; the halves run concurrently and must not alias)
+            prev_ws = set_ws_slot(rslot if rslot >= 0 else slot)
+            st.callback(restore_ws_slot, prev_ws)
+            if profile is not None:
+                st.enter_context(profile(slot))
+            if on_side:
+                st.enter_context(torch.cuda.stream(side))
+            return st
+
+        def embed_half(batch: Batch, slot: int, on_side: bool):
+            with half_stack(batch, slot, on_side):
+                hidden = embed_input_ids(self.embed_tokens, batch.input_ids, batch)
+                hidden = hidden.repeat(1, self.hc_count)
+                if self._ple:
+                    meta = build_ple_metadata(
+                        batch, self._ple[0].args, batch.input_ids.device
+                    )
+                    # PLELayer.forward picks this up (the start_prefetch pair would
+                    # race on the single _pending slot across the two halves).
+                    batch.ple_meta_pre = meta
+                    return hidden, meta
+                return hidden, None
+
+        # FREETOKEN_DUAL_SERIAL=1: fully serialize the halves (correctness probe --
+        # isolates overlap-mechanics races from half-view plumbing bugs). Every
+        # phase boundary gets an event pair: the capture-pool allocator reuses a
+        # freed block on the OTHER stream with no execution ordering, so any
+        # concurrent phase could write a block the peer's kernels still read.
+        serial = os.getenv("FREETOKEN_DUAL_SERIAL", "0") == "1"
+
+        def sync_to_side():
+            ev = torch.cuda.Event()
+            ev.record(main)
+            side.wait_event(ev)
+
+        def sync_to_main():
+            ev = torch.cuda.Event()
+            ev.record(side)
+            main.wait_event(ev)
+
+        hiddenA, metaA = embed_half(batchA, 0, False)
+        if serial:
+            sync_to_side()
+        hiddenB, metaB = embed_half(batchB, 1, True)
+        if serial:
+            sync_to_main()
+        for layer in self.layers.op_list:
+            with half_stack(batchA, 0, False):
+                hiddenA = layer.forward(hiddenA, batchA)
+            if serial:
+                sync_to_side()
+            with half_stack(batchB, 1, True):
+                hiddenB = layer.forward(hiddenB, batchB)
+            if serial:
+                sync_to_main()
+        if self._ple:
+            if serial:
+                sync_to_side()
+            with half_stack(batchA, 0, False):
+                commit_ngram_context(metaA, getattr(batchA, "fla_metadata", None))
+            if serial:
+                sync_to_main()
+                sync_to_side()
+            with half_stack(batchB, 1, True):
+                commit_ngram_context(metaB, getattr(batchB, "fla_metadata", None))
+            if serial:
+                sync_to_main()
+        with half_stack(batchA, 0, False):
+            mixedA = self.hyper_connection_mixer.mix(hiddenA)[0]
+        if serial:
+            sync_to_side()
+        with half_stack(batchB, 1, True):
+            mixedB = self.hyper_connection_mixer.mix(hiddenB)[0]
+            join = torch.cuda.Event()
+            join.record(side)
+        main.wait_event(join)
+        return torch.cat([mixedA, mixedB], dim=0)
+
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
+    # the graph runner dual-captures the bs4 decode graph through model.forward_dual
+    supports_dual_decode = True
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
@@ -238,6 +351,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
+        dual = getattr(self, "_dual_halves", None)
+        if dual is not None:
+            # dual-microbatch decode capture/warm: the halves carry their slices of
+            # the static graph buffers; the head pass stays on the merged rows with
+            # the FULL batch as ctx (same row selection as the single-stream graph).
+            return self.lm_head.forward(
+                self.model.forward_dual(dual[0], dual[1], self._dual_stream)
+            )
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
     def forward_with_residual_ctx(self) -> tuple[torch.Tensor, torch.Tensor]:

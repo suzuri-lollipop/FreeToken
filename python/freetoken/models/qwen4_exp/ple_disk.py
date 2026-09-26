@@ -374,7 +374,9 @@ class DiskRowTable:
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None, row_offset: int = 0
+    ) -> torch.Tensor:
         rows = row_ids.shape[0]
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync and not self._rows_gated(rows):
@@ -386,9 +388,12 @@ class DiskRowTable:
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
         )
+        # dual-microbatch decode: the host fill staged the FULL batch's rows in order,
+        # so this half reads its window at row_offset (0 on every single-stream path).
+        off = row_offset * self._token_bytes
         nbytes = rows * self._token_bytes
-        dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        dev[off : off + nbytes].copy_(pinned[off : off + nbytes], non_blocking=True)
+        values = dev[off : off + nbytes].view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

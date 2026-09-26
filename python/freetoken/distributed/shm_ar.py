@@ -118,6 +118,7 @@ class ShmOneShotAllReducer:
         cls,
         tp_info: "DistributedInfo",
         tp_cpu_group: "ProcessGroup",
+        tag: str = "",
     ) -> "ShmOneShotAllReducer | None":
         """Build + functionally probe, or return None (logged) leaving NCCL.
 
@@ -130,20 +131,21 @@ class ShmOneShotAllReducer:
         if tp_info.size != 2:
             return None
         try:
-            return cls._build(tp_info, tp_cpu_group)
+            return cls._build(tp_info, tp_cpu_group, tag)
         except Exception as exc:  # noqa: BLE001 -- degrade, never kill boot
             logger.warning(f"shm one-shot all-reduce unavailable ({exc}); keeping NCCL")
             return None
 
     @classmethod
-    def _build(cls, tp_info, tp_cpu_group):
+    def _build(cls, tp_info, tp_cpu_group, tag: str = ""):
         from cuda.bindings import runtime as rt
 
         rank = tp_info.rank
         device = torch.cuda.current_device()
 
         # ---- collective 1: agree on the shm name
-        name = [f"/freetoken_shm_ar_{os.getpid()}_{device}" if rank == 0 else None]
+        suffix = f"_{tag}" if tag else ""
+        name = [f"/freetoken_shm_ar_{os.getpid()}_{device}{suffix}" if rank == 0 else None]
         torch.distributed.broadcast_object_list(name, src=0, group=tp_cpu_group)
         path = "/dev/shm" + name[0]
         keep = os.getenv("FREETOKEN_SHM_AR_KEEP", "0") == "1"
@@ -248,10 +250,12 @@ class ShmOneShotAllReducer:
                 local._teardown()
             raise RuntimeError(f"shm all-reduce probe failed ({err})")
         logger.info_rank0(
-            "shm one-shot all-reduce probe OK (host rendezvous, in-kernel seq flags)"
+            f"shm one-shot all-reduce probe OK (host rendezvous, in-kernel seq flags"
+            f"{', instance ' + tag if tag else ''})"
         )
-        global _ACTIVE
-        _ACTIVE = local
+        if not tag:
+            global _ACTIVE
+            _ACTIVE = local
         return local
 
     def _teardown(self) -> None:

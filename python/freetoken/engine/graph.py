@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import dual_ar_available, get_tp_info
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -139,11 +140,63 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
+        # Dual-microbatch decode (FREETOKEN_DUAL_STREAM_DECODE=1): the bs>=4 even-size
+        # decode graphs run the batch as two half-batches on skewed streams so one
+        # half's PCIe miss fetch overlaps the other half's SM work. Opt-in; every
+        # eligibility check below falls back to the single-stream graph.
+        self._dual_stream = (
+            torch.cuda.Stream(device=device)
+            if os.getenv("FREETOKEN_DUAL_STREAM_DECODE", "0") == "1"
+            else None
+        )
+        self._dual_bs: set = set()
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
+
+    def _dual_backend(self):
+        return getattr(self.attn_backend, "decode_backend", self.attn_backend)
+
+    def _dual_ok(self, model, bs: int) -> bool:
+        if self._dual_stream is None or bs < 4 or bs % 2:
+            return False
+        backend = self._dual_backend()
+        return bool(
+            getattr(model, "supports_dual_decode", False)
+            and self.moe_offload_cache is not None
+            and hasattr(backend, "stage_dual_replay")
+            and hasattr(backend, "dual_profile")
+            and dual_ar_available()
+        )
+
+    def _build_dual_half(self, buffer, lo: int, hi: int, slot: int) -> Batch:
+        """A half-batch VIEW over the static capture buffers (rows [lo, hi))."""
+        from freetoken.attention.linear import FLAMetadata
+
+        n = hi - lo
+        half = Batch(reqs=[self.dummy_req] * n, phase="decode")
+        half.padded_reqs = half.reqs
+        _s = slice(lo, hi)
+        half.input_ids = buffer.input_ids[_s]
+        half.out_loc = buffer.out_loc[_s]
+        half.positions = buffer.positions[_s]
+        if buffer.mrope_positions is not None:
+            half.mrope_positions = buffer.mrope_positions[:, _s]
+        half.linear_table_idx = buffer.table_idx[_s]
+        half.fla_metadata = FLAMetadata(
+            cu_seqlens=self._dual_cu[slot][: n + 1],
+            cache_indices=buffer.table_idx[_s],
+        )
+        half.ple_row_offset = lo
+        # FREETOKEN_DUAL_SLOT0=1: both halves use the slot-0 instances (AR, MoE plan,
+        # w8a16 ws) while keeping their row slices -- a bisection probe that separates
+        # second-instance bugs from row-slicing bugs (only valid with DUAL_SERIAL=1).
+        half.dual_slot = (
+            0 if os.getenv("FREETOKEN_DUAL_SLOT0", "0") == "1" else slot
+        )
+        return half
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         # Mark the post-weights "warmup" phase for /health: this stretch (graph capture — or the
@@ -177,6 +230,21 @@ class GraphRunner:
             unit="batch",
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
+        if self._dual_stream is not None and getattr(model, "supports_dual_decode", False):
+            self._dual_cu = [
+                torch.arange(
+                    (max(self.graph_bs_list) // 2) + 1, dtype=torch.int32, device=self.device
+                )
+                for _ in range(2)
+            ]
+            n_layers = len(model.model.layers.op_list)
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.ensure_dual_plans(n_layers)
+            logger.info_rank0(
+                f"Dual-microbatch decode capture armed for even bs >= 4 "
+                f"(half = bs/2, {n_layers} layers; per-size eligibility still "
+                f"needs the second shm AR instance)"
+            )
         pool = None
         for bs in pbar:
             free_memory = get_free_memory(self.device)
@@ -194,13 +262,29 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
-            with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
-                # Keep the offload cache warmed for capture. Resetting here forces
-                # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+            dual = self._dual_ok(model, bs)
+            if dual:
+                halfA = self._build_dual_half(self.buffer, 0, bs // 2, 0)
+                halfB = self._build_dual_half(self.buffer, bs // 2, bs, 1)
+                backend = self._dual_backend()
+                with backend.dual_profile(0):
+                    backend.prepare_for_capture(halfA)
+                with backend.dual_profile(1):
+                    backend.prepare_for_capture(halfB)
+                model._dual_halves = (halfA, halfB)
+                model._dual_stream = self._dual_stream
+            try:
+                with get_global_ctx().forward_batch(batch):
                     self.buffer.logits[:bs] = model.forward()
-                self._reset_moe_offload_cache()
+                    # Keep the offload cache warmed for capture. Resetting here forces
+                    # CUDA graph capture to replay cold-cache expert copies.
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
+                    self._reset_moe_offload_cache()
+            finally:
+                if dual:
+                    model._dual_halves = None
+                    self._dual_bs.add(bs)
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
@@ -223,7 +307,10 @@ class GraphRunner:
             _t0 = _time.perf_counter()
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
-        self.attn_backend.prepare_for_replay(batch)
+        if batch.padded_size in self._dual_bs:
+            self._dual_backend().stage_dual_replay(batch)
+        else:
+            self.attn_backend.prepare_for_replay(batch)
         if _dbg is not None:
             _t1 = _time.perf_counter()
         g.replay()
@@ -250,4 +337,5 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
+        self._dual_bs = set()
         gc.collect()

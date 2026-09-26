@@ -116,3 +116,47 @@ def test_graph_capture_replays_alternate_slots():
         x0 = (x0.float() * 2).to(torch.bfloat16)
         assert torch.equal(x, x0), i
         assert int(ctr) == 2 + i
+
+
+def test_ar_instance_routes_to_the_dual_impl():
+    """Dual-microbatch decode: the trailing half's all_reduce must hit the second
+    reducer instance, and the switch must restore on exit (capture-time routing)."""
+    from freetoken.distributed import impl as impl_mod
+    from freetoken.distributed.impl import DistributedCommunicator, ar_instance
+
+    class _Recorder:
+        def __init__(self, tag):
+            self.tag = tag
+            self.calls = 0
+
+        def all_reduce(self, x):
+            self.calls += 1
+            return x
+
+        def all_gather(self, x):
+            return x
+
+    primary, dual = _Recorder("primary"), _Recorder("dual")
+    saved_plugins = DistributedCommunicator.plugins
+    saved_dual = impl_mod._DUAL_IMPL
+    try:
+        DistributedCommunicator.plugins = [primary]
+        impl_mod._DUAL_IMPL = dual
+        comm = DistributedCommunicator()
+        x = object()
+        comm.all_reduce(x)
+        with ar_instance(1):
+            comm.all_reduce(x)
+            with ar_instance(0):
+                comm.all_reduce(x)
+            comm.all_reduce(x)
+        comm.all_reduce(x)
+    finally:
+        DistributedCommunicator.plugins = saved_plugins
+        impl_mod._DUAL_IMPL = saved_dual
+    # primary: call 1, nested ar_instance(0) call, and the post-exit call;
+    # dual: the two calls made directly under ar_instance(1)
+    assert (primary.calls, dual.calls) == (3, 2)
+    # all_gather never routes to the dual instance (the vocab AG stays on the
+    # primary/NCCL path, single-instance ordering)
+    assert impl_mod._AR_INSTANCE == 0

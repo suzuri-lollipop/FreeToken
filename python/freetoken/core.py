@@ -185,6 +185,17 @@ class Batch:
     # (positions 0..T-1, embeds = tokens 1..T-1 plus the first sampled token).
     spec_prologue: "Batch | None" = field(default=None, init=False)
 
+    # Dual-microbatch decode (FREETOKEN_DUAL_STREAM_DECODE): a bs4 decode step runs as
+    # two bs2 half-batches on skewed streams. Each half is a Batch VIEW carrying its
+    # slice of the static graph buffers plus these two markers:
+    # ple_row_offset -- this half's first row in the graph-pinned PLE staging buffer
+    #   (the fill stages rows in FULL-batch order before the launch);
+    # dual_slot -- 0 for the leading half (main stream), 1 for the trailing half
+    #   (side stream): it selects the per-instance all-reduce, QSA staging profile
+    #   and MoE fetch plan, keeping the two halves' shared-state mutations disjoint.
+    ple_row_offset: int = field(default=0, init=False)
+    dual_slot: int = field(default=-1, init=False)
+
     @property
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
@@ -231,6 +242,19 @@ class Context:
             yield
         finally:
             self._batch = None
+
+    @contextmanager
+    def swap_batch(self, batch: Batch):
+        """Re-entrant ``forward_batch``: restores the PREVIOUS batch on exit.
+
+        The dual-microbatch decode driver swaps the half-batch views in and out
+        under the engine's outer forward_batch scope (per half, per layer)."""
+        prev = self._batch
+        try:
+            self._batch = batch
+            yield
+        finally:
+            self._batch = prev
 
 
 _GLOBAL_CTX: Context | None = None

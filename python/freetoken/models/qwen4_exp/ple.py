@@ -64,7 +64,9 @@ class PLETableBackend(Protocol):
     head_dim: int
     dtype: torch.dtype
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None, row_offset: int = 0
+    ) -> torch.Tensor: ...
 
     def prefetch(self, row_ids: torch.Tensor) -> None: ...
 
@@ -82,7 +84,9 @@ class GpuResidentTable:
             torch.bfloat16 if weight.dtype.itemsize < 2 else weight.dtype
         )
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None, row_offset: int = 0
+    ) -> torch.Tensor:
         rows = self.weight.index_select(0, row_ids.reshape(-1)).to(self.dtype)
         if self.scale != 1.0:
             rows = rows * self.scale
@@ -104,7 +108,9 @@ class ZeroTable:
         self.head_dim = head_dim
         self.dtype = dtype
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None, row_offset: int = 0
+    ) -> torch.Tensor:
         if out is not None:
             return out.zero_()
         return torch.zeros(
@@ -194,7 +200,9 @@ class PinnedUVATable:
             self._gather(row_ids, dst)
         self._pending = (row_ids, dst)
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None, row_offset: int = 0
+    ) -> torch.Tensor:
         pending, self._pending = self._pending, None
         if pending is not None:
             # join even on a miss: the stale prefetch owns the staging buffer about to be reused
@@ -294,6 +302,10 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    # dual-microbatch decode: this half's first row in the graph-pinned staging buffer
+    # (the host fill stages rows in FULL-batch order; the position-keyed disk lookup
+    # reads its window at row_offset). 0 for every single-stream path.
+    row_offset: int = 0
 
 
 def _state_slot(req) -> int:
@@ -349,8 +361,7 @@ def build_ple_metadata(
             ngram_context=context_pool.index_select(0, slots).long(),
             state_slots=slots,
             fresh_slots=None,
-            is_decode=True,
-        )
+            is_decode=True, row_offset=getattr(batch, "ple_row_offset", 0),)
 
     lens = [r.extend_len for r in reqs]
     if fla is not None and fla.has_initial_state is not None:
@@ -371,8 +382,7 @@ def build_ple_metadata(
         ngram_context=context,
         state_slots=slots,
         fresh_slots=fresh,
-        is_decode=batch.is_decode,
-    )
+        is_decode=batch.is_decode, row_offset=getattr(batch, "ple_row_offset", 0),)
 
 
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
@@ -486,7 +496,7 @@ class NGramEmbedding(BaseOP):
         return torch.cat(blocks, dim=-1)
 
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        return self.table.lookup(self.row_ids(meta), out, row_offset=meta.row_offset)
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -601,13 +611,20 @@ class PLELayer(BaseOP):
             if pending is not None:
                 meta, row_ids = pending
             else:
-                meta = build_ple_metadata(batch, self.args, R.device)
+                # dual-microbatch decode: the driver prebuilds one metadata per half
+                # (its start_prefetch pair would race on _pending); the disk table's
+                # prefetch is a no-op, so nothing is lost by skipping it here.
+                meta = getattr(batch, "ple_meta_pre", None) or build_ple_metadata(
+                    batch, self.args, R.device
+                )
         elif pending is not None and pending[0] is meta:
             row_ids = pending[1]
         if row_ids is None:
             row_ids = self.ple_embedding.row_ids(meta)
 
-        embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
+        embeddings = self.ple_embedding.table.lookup(
+            row_ids, row_offset=getattr(meta, "row_offset", 0)
+        ).to(R.dtype)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)

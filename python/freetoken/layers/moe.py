@@ -25,6 +25,11 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
+# Dual-microbatch decode: blocks/bank for each half's miss gather. Narrow grids
+# saturate the PCIe link (measured: 1-2 blocks/bank reach link rate) while leaving
+# the SMs to the concurrent half's dense/attention work.
+_DUAL_GATHER_BPB = int(os.getenv("FREETOKEN_DUAL_GATHER_BPB", "2") or "2")
+
 # The CPU side of a prefill chunk pays routes-per-expert (~num_tokens * top_k / touched),
 # while its PCIe side pays a flat per-expert row: the T=150 balance measurement behind
 # prefill_fetch_fraction does NOT extrapolate to full chunks. Measured on a 2x24GB rig
@@ -374,6 +379,14 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_slots(self.layer_id),
                 is_prefill=False,
             )
+        try:
+            dual_slot = getattr(get_global_ctx().batch, "dual_slot", -1)
+        except AssertionError:
+            dual_slot = -1  # unit harnesses decode without a global ctx
+        if dual_slot >= 0 and cache.dual_events is not None:
+            return self._decode_dual_moe(
+                cache, hidden_states, topk_weights, topk_ids, dual_slot
+            )
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         from freetoken.moe import _debug_stats
@@ -391,6 +404,48 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_dual_moe(
+        self,
+        cache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        slot: int,
+    ) -> torch.Tensor:
+        """Dual-microbatch decode: this half's MoE with cross-stream eviction safety.
+
+        Both halves share the slot cache's LRU state, and an ``ensure_experts`` call
+        evicts slots stamped before its own -- including slots the OTHER half's
+        in-flight GEMV is still reading. Per-layer events serialize mutation against
+        reads in the issue order A_l -> B_l -> A_{l+1}: the trailing half's ensure
+        waits for the leading half's layer-l expert GEMV, and the leading half's
+        layer-(l+1) ensure waits for the trailing half's layer-l GEMV. The waits sit
+        inside the MoE (after this half's attention/gate), so one half's dense SM
+        work overlaps the other half's PCIe fetch. Every edge points forward in the
+        capture's issue order, so the captured graph is acyclic. The side-stream
+        gather runs narrow (few blocks/bank: link-saturating, SMs left for the
+        concurrent half)."""
+        cur = torch.cuda.current_stream()
+        ev_a, ev_b = cache.dual_events[self.layer_id]
+        if slot == 1:
+            cur.wait_event(ev_a)
+        elif self.layer_id > 0:
+            cur.wait_event(cache.dual_events[self.layer_id - 1][1])
+        cache.ensure_experts(self.layer_id, topk_ids, plan=slot)
+        cache.copy_missing(plan=slot, blocks_per_bank=_DUAL_GATHER_BPB)
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        (ev_a if slot == 0 else ev_b).record(cur)
+        return out
 
     def _decode_hybrid(
         self,

@@ -247,6 +247,16 @@ class OffloadMoeCache:
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # Dual-microbatch decode (FREETOKEN_DUAL_STREAM_DECODE): the trailing half runs
+        # its own ensure/copy plan so the two streams' fetch staging never aliases, and
+        # per-layer events serialize the two halves' LRU mutations against each other's
+        # in-flight slot reads (see layers/moe.py _decode_routed). Allocated on demand
+        # by ensure_dual_plans() before the dual graph warms up.
+        self.evict_slots2: torch.Tensor | None = None
+        self.src_indices2: torch.Tensor | None = None
+        self.num_indices2: torch.Tensor | None = None
+        self.dual_events: list | None = None
+        self._pending_src_layer2 = None
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
         # CPU computes this step. Written by the hybrid ensure kernel.
@@ -614,6 +624,9 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        if self.evict_slots2 is not None:
+            self.evict_slots2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+            self.src_indices2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -1314,17 +1327,43 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_dual_plans(self, num_layers: int) -> None:
+        """Materialize the trailing half's fetch plan + the per-layer dual events.
+
+        Idempotent; called by the graph runner before the dual decode graph warms up
+        (never during capture: fresh device allocations must precede it)."""
+        if self.evict_slots2 is not None:
+            return
+        plan_slots = max(self.num_experts, self.cache_size)
+        self.evict_slots2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.src_indices2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self.num_indices2 = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # [layer][0]=A-done (recorded after the leading half's expert GEMV),
+        # [layer][1]=B-done (trailing half's); waits are always forward edges in the
+        # capture's issue order (A_l -> B_l -> A_{l+1}).
+        self.dual_events = [
+            (torch.cuda.Event(), torch.cuda.Event()) for _ in range(num_layers)
+        ]
+
+    def _plan_buffers(self, plan: int):
+        if plan:
+            return self.src_indices2, self.evict_slots2, self.num_indices2
+        return self.src_indices, self.evict_slots, self.num_indices
+
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, plan: int = 0) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
+        if plan:
+            self._pending_src_layer2 = layer_id
+        else:
+            self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        ensure_experts(self, layer_id, expert_ids, plan=plan)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -1482,9 +1521,9 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing(self, plan: int = 0, blocks_per_bank: int | None = None) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
-        layer_id = self._pending_src_layer
+        layer_id = self._pending_src_layer2 if plan else self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
@@ -1505,13 +1544,16 @@ class OffloadMoeCache:
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
+            src_indices, evict_slots, num_indices = self._plan_buffers(plan)
+            kwargs = {} if blocks_per_bank is None else {"blocks_per_bank": blocks_per_bank}
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
                 self._copy_feat_bytes,
-                self.evict_slots,
-                self.src_indices,
-                self.num_indices,
+                evict_slots,
+                src_indices,
+                num_indices,
+                **kwargs,
             )
             return
 
