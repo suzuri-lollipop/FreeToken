@@ -95,6 +95,29 @@ def _leaf_runs(config) -> dict[str, list[tuple[int, int]]]:
     return {"in_proj_qkv": runs, "linear_attn.conv1d": runs}
 
 
+def _leaf_run_heads(config) -> dict[str, list[tuple[int, int, int]]]:
+    """``(offset, length, n_heads)`` runs of the GDN leaves whose units are whole heads.
+
+    Only consumed when uneven dense shard weights are registered; the head counts here
+    MUST match gdn_local_dims' split so the loader's rows land in the module's buffers."""
+    group = config.linear_attention_group()
+    if group is None:
+        return {}
+    kh, vh = group.num_key_heads, group.num_value_heads
+    key, value = kh * group.key_head_dim, vh * group.value_head_dim
+    qkv = [(0, key, kh), (key, key, kh), (2 * key, value, vh)]
+    return {
+        "in_proj_qkv": qkv,
+        "linear_attn.conv1d": qkv,
+        "in_proj_z": [(0, value, vh)],
+        "in_proj_b": [(0, vh, vh)],
+        "in_proj_a": [(0, vh, vh)],
+        "A_log": [(0, vh, vh)],
+        "dt_bias": [(0, vh, vh)],
+        "out_proj": [(0, value, vh)],
+    }
+
+
 class TpShard:
     """Cuts one checkpoint tensor to the slice this rank's model buffers hold.
 
@@ -103,10 +126,11 @@ class TpShard:
     leaf table lives with the tower in ``models/qwen3_vl/vision.py``).
     """
 
-    def __init__(self, rank: int, world: int, axes, units, runs=None) -> None:
+    def __init__(self, rank: int, world: int, axes, units, runs=None, run_heads=None) -> None:
         self.rank, self.world = rank, world
         self.axes, self.units = axes, units
         self.runs = runs or {}
+        self.run_heads = run_heads or {}
 
     def part(self, leaf: str, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         total = self.units.get(leaf)
@@ -129,11 +153,26 @@ class TpShard:
         if not blocks or total % blocks:
             return tensor  # this axis is not the split one (a [rows, 1] scale column)
         per_block = total // blocks
+        head_runs = self.run_heads.get(leaf)
+        shares_cache: dict[int, "list[int] | None"] = {}
         pieces = []
-        for offset, length in self.runs.get(leaf, ((0, total),)):
+        for run_i, (offset, length) in enumerate(self.runs.get(leaf, ((0, total),))):
             padded = leaf in CEIL_LEAVES and per_block == 1
             local = div_ceil(length, self.world) if padded else length // self.world
             start = self.rank * local
+            if head_runs is not None and run_i < len(head_runs) and not padded:
+                n_heads = head_runs[run_i][2]
+                if n_heads not in shares_cache:
+                    from freetoken.layers.quantization.shard_balance import (
+                        dense_head_shares,
+                    )
+
+                    shares_cache[n_heads] = dense_head_shares(n_heads, self.world)
+                shares = shares_cache[n_heads]
+                if shares is not None:
+                    unit = length // n_heads
+                    local = shares[self.rank] * unit
+                    start = sum(shares[: self.rank]) * unit
             take = max(0, min(local, length - start))
             if local < per_block or local % per_block:
                 return tensor  # the run is smaller than one scale block: not sharded this way
@@ -160,7 +199,8 @@ class TpShard:
 
 def tp_shard_for(config, rank: int, world: int) -> TpShard:
     """The text tower's slicer for an explicit rank, so a test can pin one without a process group."""
-    return TpShard(rank, world, LEAF_AXIS, _leaf_units(config), _leaf_runs(config))
+    return TpShard(rank, world, LEAF_AXIS, _leaf_units(config), _leaf_runs(config),
+                   _leaf_run_heads(config))
 
 
 def tp_shard(config) -> TpShard | None:

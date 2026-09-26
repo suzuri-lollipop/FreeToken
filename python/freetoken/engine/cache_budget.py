@@ -246,6 +246,7 @@ def resolve_moe_cache_auto(
     nonpool_overhead_bytes: int = 0,
     per_expert_bytes_ref: int | None = None,
     slot_budget_skew_bytes: int = 0,
+    fixed_cache_size_ref: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -270,8 +271,22 @@ def resolve_moe_cache_auto(
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     ref_bytes = per_expert_bytes if per_expert_bytes_ref is None else per_expert_bytes_ref
+    # Uneven dense head split: the GDN state pool (part of fixed_cache_size) is rank-
+    # local, but the KV geometry must stay cross-rank identical -- plan the shared
+    # geometry from the MAX fixed cost, then re-split this rank's own (cheaper) bytes
+    # into slots, exactly like the uneven expert shard does for per-expert bytes.
+    plan_budget = budget_bytes
+    if fixed_cache_size_ref is not None and fixed_cache_size_ref != fixed_cache_size:
+        plan_budget = net_cache_budget_bytes(
+            memory_ratio,
+            baseline_free,
+            weights_bytes,
+            fixed_cache_size_ref,
+            device_total=device_total,
+            nonpool_overhead_bytes=nonpool_overhead_bytes,
+        )
     size, num_pages, overlap = plan_cache_budget(
-        budget_bytes=budget_bytes,
+        budget_bytes=plan_budget,
         per_expert_bytes=ref_bytes,
         cache_per_page=cache_per_page,
         num_experts=num_experts,
@@ -280,7 +295,7 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
-    if ref_bytes != per_expert_bytes or slot_budget_skew_bytes:
+    if ref_bytes != per_expert_bytes or slot_budget_skew_bytes or plan_budget != budget_bytes:
         size = replan_local_slots(
             budget_bytes=budget_bytes,
             num_pages=num_pages,

@@ -113,12 +113,19 @@ class LinearColParallelMerged(_LinearTPImpl):
         output_sizes: List[int],
         has_bias: bool,
         *,
+        local_output_sizes: List[int] | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        # local_output_sizes: the caller's head-snapped uneven split (dense shard
+        # weights); it must sum consistently per segment and defaults to the even cut.
+        tp_output_sizes = (
+            list(local_output_sizes)
+            if local_output_sizes is not None
+            else [div_even(size, tp_info.size) for size in output_sizes]
+        )
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(
@@ -166,13 +173,18 @@ class LinearOProj(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
         *,
+        local_input_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         tp_info = get_tp_info()
         full_isize = input_size
         full_osize = output_size
-        local_isize = div_even(input_size, tp_info.size)
+        local_isize = (
+            local_input_size
+            if local_input_size is not None
+            else div_even(input_size, tp_info.size)
+        )
         local_osize = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
@@ -195,11 +207,14 @@ class LinearRowParallel(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
         *,
+        local_input_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         tp_info = get_tp_info()
-        local_input_size = div_even(input_size, tp_info.size)
+        # local_input_size: the caller's head-snapped uneven split (dense shard weights)
+        if local_input_size is None:
+            local_input_size = div_even(input_size, tp_info.size)
         local_output_size = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size

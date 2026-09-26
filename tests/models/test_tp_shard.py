@@ -209,3 +209,51 @@ def test_an_uncut_leaf_and_a_padded_vocab_shard_stay_exact():
     for rank in (0, 1, 2):
         piece = _shard(rank, 3).tensor("embed_tokens", vocab)
         assert piece.untyped_storage().size() == piece.numel() * piece.element_size()
+
+
+def test_uneven_dense_split_cuts_gdn_leaves_on_head_boundaries():
+    """With dense shard weights registered, the GDN leaves slice by head shares that
+    match gdn_local_dims; without them every cut stays even (registry default)."""
+    from freetoken.layers.quantization.shard_balance import set_dense_shard_weights
+    from freetoken.models.qwen3_5_moe.gdn import gdn_local_dims
+
+    # even head shares only (odd splits are rejected: measured GDN garbage on 7/9)
+    cfg = dict(num_key_heads=8, num_value_heads=16)
+    group = SimpleNamespace(
+        num_key_heads=8, num_value_heads=16, key_head_dim=GD, value_head_dim=GD
+    )
+    try:
+        set_dense_shard_weights((0.25, 0.75))
+        # module dims and loader rows must agree
+        assert gdn_local_dims(8, 16, GD, GD, 2, rank=0) == (2, 4, 2 * GD, 4 * GD, 8 * GD)
+        s0 = tp_shard_for(_config(**cfg, linear_attention_group=lambda: group), 0, 2)
+        s1 = tp_shard_for(_config(**cfg, linear_attention_group=lambda: group), 1, 2)
+
+        key, value = 8 * GD, 16 * GD  # global run lengths
+        qkv = torch.arange(2 * key + value).unsqueeze(1).float()
+        c0, c1 = s0.tensor("in_proj_qkv", qkv), s1.tensor("in_proj_qkv", qkv)
+        assert c0.shape[0] == 2 * GD + 2 * GD + 4 * GD  # k:2/8, k:2/8, v:4/16 heads
+        assert c1.shape[0] == 6 * GD + 6 * GD + 12 * GD
+        want0 = torch.cat(
+            [qkv[0 : 2 * GD], qkv[key : key + 2 * GD], qkv[2 * key : 2 * key + 4 * GD]]
+        )
+        assert torch.equal(c0, want0)
+        assert c0.shape[0] + c1.shape[0] == qkv.shape[0]  # shares tile the tensor
+
+        out = torch.arange(H * value).reshape(H, value).float()  # out_proj: COLS axis
+        o0 = s0.tensor("out_proj", out)
+        assert o0.shape[1] == 4 * GD and torch.equal(o0, out[:, : 4 * GD])
+
+        alog = torch.arange(16).unsqueeze(1).float()
+        assert s0.tensor("A_log", alog).shape[0] == 4
+        assert s1.tensor("A_log", alog).shape[0] == 12
+
+        # QSA leaves (o_proj/q_proj) are NOT in the GDN run-head table: still even
+        q = torch.arange(QH * HD * 2).unsqueeze(1).float()
+        assert s0.tensor("q_proj", q).shape[0] == QH * HD * 2 // 2
+    finally:
+        set_dense_shard_weights(None)
+    # registry cleared: the same cut is even again
+    s0 = tp_shard_for(_config(**cfg, linear_attention_group=lambda: group), 0, 2)
+    qkv = torch.arange(2 * 8 * GD + 16 * GD).unsqueeze(1).float()
+    assert s0.tensor("in_proj_qkv", qkv).shape[0] == qkv.shape[0] // 2

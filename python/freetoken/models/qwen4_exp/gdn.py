@@ -4,6 +4,13 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
+
+
+def _tp_rank() -> int:
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    return getattr(info, "rank", 0)
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
@@ -47,7 +54,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         tp_size = get_tp_info().size
         # The rank's local head/dim set; the state pool splits the same way (gdn_local_dims).
         (self.num_k_heads, self.num_v_heads, self.key_dim, self.value_dim, self.conv_dim) = (
-            gdn_local_dims(num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size)
+            gdn_local_dims(num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size,
+                           rank=_tp_rank())
         )
         self.full_key_dim = num_k_heads * head_k_dim
         self.full_value_dim = num_v_heads * head_v_dim
@@ -64,10 +72,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [full_conv_dim, self.full_value_dim], has_bias=False,
+                local_output_sizes=[self.conv_dim, self.value_dim],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self.num_v_heads, self.num_v_heads],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
@@ -75,6 +85,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             self.in_proj = LinearColParallelMerged(
                 hidden_size, [full_conv_dim, self.full_value_dim, num_v_heads, num_v_heads],
                 has_bias=False,
+                local_output_sizes=[
+                    self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads
+                ],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
@@ -87,6 +100,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         self.out_proj = LinearRowParallel(
             self.full_value_dim, hidden_size, has_bias=False,
+            local_input_size=self.value_dim,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 

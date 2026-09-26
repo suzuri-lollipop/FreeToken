@@ -18,21 +18,39 @@ class _DepthwiseConv1d(BaseOP):
         self.weight = torch.empty(conv_dim, 1, kernel)
 
 
+def _gdn_tp_rank() -> int:
+    from freetoken.distributed import try_get_tp_info
+
+    return getattr(try_get_tp_info(), "rank", 0)
+
+
 def gdn_local_dims(
-    num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int, tp_size: int
+    num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int, tp_size: int,
+    rank: int | None = None,
 ) -> tuple[int, int, int, int, int]:
     """The rank's ``(k_heads, v_heads, key_dim, value_dim, conv_dim)`` under tensor parallelism.
 
     Both GatedDeltaNet implementations and ``LinearStatePool._linear_local_dims`` derive the
     same conv layout from this head split; the fused ``in_proj`` slices whole heads, so this
     refuses the KV-style replication the pool would otherwise allow.
-    """
-    if num_k_heads % tp_size or num_v_heads % tp_size:
-        raise ValueError(
-            f"GatedDeltaNet needs the {num_k_heads} key / {num_v_heads} value heads to divide "
-            f"across {tp_size} ranks; pick a TP size that divides them"
-        )
-    k_heads, v_heads = num_k_heads // tp_size, num_v_heads // tp_size
+
+    ``rank`` + registered dense shard weights give the (opt-in) uneven head split that
+    moves dense work onto the rank whose decode all-reduce spin shows idle headroom;
+    the default stays the even split."""
+    k_heads = v_heads = None
+    if rank is not None:
+        from freetoken.layers.quantization.shard_balance import dense_local_heads
+
+        k_heads = dense_local_heads(num_k_heads, rank, tp_size)
+        if k_heads is not None:
+            v_heads = dense_local_heads(num_v_heads, rank, tp_size)
+    if k_heads is None:
+        if num_k_heads % tp_size or num_v_heads % tp_size:
+            raise ValueError(
+                f"GatedDeltaNet needs the {num_k_heads} key / {num_v_heads} value heads to divide "
+                f"across {tp_size} ranks; pick a TP size that divides them"
+            )
+        k_heads, v_heads = num_k_heads // tp_size, num_v_heads // tp_size
     key_dim, value_dim = k_heads * head_k_dim, v_heads * head_v_dim
     return k_heads, v_heads, key_dim, value_dim, 2 * key_dim + value_dim
 
@@ -63,7 +81,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         tp_size = get_tp_info().size
         # The rank's local head/dim set; the state pool splits the same way (gdn_local_dims).
         (self.num_k_heads, self.num_v_heads, self.key_dim, self.value_dim, self.conv_dim) = (
-            gdn_local_dims(num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size)
+            gdn_local_dims(num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size,
+                           rank=_gdn_tp_rank())
         )
         self.full_key_dim = num_k_heads * head_k_dim
         self.full_value_dim = num_v_heads * head_v_dim

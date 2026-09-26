@@ -24,9 +24,21 @@ def _linear_local_dims(
     group: LinearGatedDeltaGroupConfig, tp_size: int
 ) -> tuple[int, int, int]:
     """TP-local ``(n_layers, conv_dim, v_heads)`` for the GDN state tensors -- the single
-    source of the sharding math shared by the pool allocation and the byte estimate."""
-    local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
-    local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
+    source of the sharding math shared by the pool allocation and the byte estimate.
+
+    Honors the opt-in uneven dense head split (shard_balance); the state layout must
+    match what the GDN module's gdn_local_dims computes for the same rank."""
+    from freetoken.distributed import try_get_tp_info
+    from freetoken.layers.quantization.shard_balance import dense_local_heads
+
+    info = try_get_tp_info()
+    rank = getattr(info, "rank", 0)
+    local_k_heads = dense_local_heads(group.num_key_heads, rank, tp_size)
+    if local_k_heads is None:
+        local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
+        local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
+    else:
+        local_v_heads = dense_local_heads(group.num_value_heads, rank, tp_size)
     local_conv_dim = 2 * local_k_heads * group.key_head_dim + local_v_heads * group.value_head_dim
     return len(group.layer_ids), local_conv_dim, local_v_heads
 

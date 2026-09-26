@@ -196,3 +196,69 @@ def test_pack_slices_the_uneven_range_and_the_ranks_cover_the_expert():
     assert r0["gate_up_global"].shape == (1, 2 * 48)
     assert r1["gate_up_global"].shape == (1, 2 * 16)
     assert r0["down_global"].shape == (1, H)
+
+
+def test_dense_shard_registry_roundtrip():
+    from freetoken.layers.quantization.shard_balance import (
+        get_dense_shard_weights,
+        set_dense_shard_weights,
+    )
+
+    assert get_dense_shard_weights() is None or True  # other tests may set it
+    set_dense_shard_weights(None)
+    assert get_dense_shard_weights() is None
+    set_dense_shard_weights([0.375, 0.625])
+    assert get_dense_shard_weights() == (0.375, 0.625)
+    set_dense_shard_weights(None)
+    assert get_dense_shard_weights() is None
+
+
+def test_dense_head_split_math():
+    from freetoken.layers.quantization.shard_balance import (
+        dense_head_range,
+        dense_head_shares,
+        dense_local_heads,
+        set_dense_shard_weights,
+    )
+    from freetoken.models.qwen3_5_moe.gdn import gdn_local_dims
+
+    try:
+        set_dense_shard_weights(None)
+        assert dense_head_shares(16, 2) is None
+        assert dense_local_heads(16, 0, 2) is None
+        # even path unchanged, rank ignored
+        assert gdn_local_dims(16, 48, 128, 128, 2) == (8, 24, 1024, 3072, 5120)
+        assert gdn_local_dims(16, 48, 128, 128, 2, rank=1) == (8, 24, 1024, 3072, 5120)
+
+        set_dense_shard_weights((0.375, 0.625))
+        assert dense_head_shares(16, 2) == [6, 10]
+        assert dense_head_shares(48, 2) == [18, 30]
+        assert dense_head_shares(4, 2) == [2, 2]   # rounds to whole heads
+        assert dense_head_range(16, 0, 2) == (0, 6)
+        assert dense_head_range(16, 1, 2) == (6, 16)
+        assert gdn_local_dims(16, 48, 128, 128, 2, rank=0) == (6, 18, 768, 2304, 3840)
+        assert gdn_local_dims(16, 48, 128, 128, 2, rank=1) == (10, 30, 1280, 3840, 6400)
+
+        import pytest
+        set_dense_shard_weights((0.5, 0.5))
+        with pytest.raises(ValueError):
+            dense_head_shares(1, 2)  # cannot give both ranks >= 1 head
+    finally:
+        set_dense_shard_weights(None)
+
+
+def test_dense_head_split_rejects_odd_shares():
+    from freetoken.layers.quantization.shard_balance import (
+        dense_head_shares,
+        set_dense_shard_weights,
+    )
+
+    import pytest
+    try:
+        set_dense_shard_weights((0.42, 0.58))  # -> k heads 7/9 (odd): measured garbage
+        with pytest.raises(ValueError, match="odd head shares"):
+            dense_head_shares(16, 2)
+        set_dense_shard_weights((0.375, 0.625))  # -> 6/10, 18/30: supported
+        assert dense_head_shares(16, 2) == [6, 10]
+    finally:
+        set_dense_shard_weights(None)

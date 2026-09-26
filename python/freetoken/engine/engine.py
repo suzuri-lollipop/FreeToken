@@ -550,6 +550,7 @@ class Engine:
         # model is built: MoE configs are baked at layer construction and every bank,
         # slot-cache row and kernel shape derives from them.
         self._resolve_expert_shard_weights(config)
+        self._resolve_dense_shard_weights(config)
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -833,6 +834,40 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
+    def _resolve_dense_shard_weights(self, config: EngineConfig) -> None:
+        """Resolve the per-rank share of the dense (head-split) projections.
+
+        Opt-in via FREETOKEN_DENSE_SHARD_FRAC (comma-separated positive numbers,
+        one per rank, e.g. "0.375,0.625"): tilts the attention/GDN head split onto
+        the rank whose decode K2 spin shows idle headroom. Every rank must resolve
+        the SAME fractions, so the string is validated deterministically and the
+        default (unset) keeps the historical even split. Consumers snap to heads."""
+        from freetoken.layers.quantization.shard_balance import set_dense_shard_weights
+
+        set_dense_shard_weights(None)
+        env = os.getenv("FREETOKEN_DENSE_SHARD_FRAC", "").strip()
+        if not env or config.tp_info.size < 2:
+            return
+        try:
+            fracs = [float(x) for x in env.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError(
+                f"FREETOKEN_DENSE_SHARD_FRAC must be comma-separated positive "
+                f"numbers, got {env!r}"
+            ) from None
+        if len(fracs) != config.tp_info.size or any(f <= 0 for f in fracs):
+            raise ValueError(
+                f"FREETOKEN_DENSE_SHARD_FRAC needs {config.tp_info.size} positive "
+                f"entries, got {env!r}"
+            )
+        total = sum(fracs)
+        norm = [f / total for f in fracs]
+        set_dense_shard_weights(tuple(norm))
+        logger.info_rank0(
+            "dense head-split shard fractions: "
+            + ", ".join(f"rank{r}={f:.3f}" for r, f in enumerate(norm))
+        )
+
     def _resolve_expert_shard_weights(self, config: EngineConfig) -> None:
         """Resolve the per-rank share of each offloaded nvfp4 expert (uneven TP shard).
 
@@ -943,15 +978,16 @@ class Engine:
         # shared budget with the cross-rank MAX slot bytes and each rank then re-splits
         # the same bytes into its own (cheaper) slots; see resolve_moe_cache_auto.
         per_expert_ref = per_expert_bytes
+        fixed_ref = fixed_cache_size
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size(group=self.tp_cpu_group) > 1
         ):
-            ref = torch.tensor([per_expert_bytes], dtype=torch.int64)
+            ref = torch.tensor([per_expert_bytes, fixed_cache_size], dtype=torch.int64)
             torch.distributed.all_reduce(
                 ref, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
             )
-            per_expert_ref = int(ref.item())
+            per_expert_ref, fixed_ref = int(ref[0]), int(ref[1])
         # A --moe-cpu-layers split leaves the CPU-decoded experts unreachable in the slot
         # cache; without this cap the greedy fill spends the whole budget on dead slots
         # instead of KV, and asks the driver for one bank-sized contiguous allocation.
@@ -1009,6 +1045,7 @@ class Engine:
             fixed_cache_size=fixed_cache_size,
             per_expert_bytes=per_expert_bytes,
             per_expert_bytes_ref=per_expert_ref,
+            fixed_cache_size_ref=fixed_ref,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,

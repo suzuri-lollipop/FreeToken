@@ -899,3 +899,23 @@ def test_slot_budget_skew_tilts_local_slots_only():
     # the tilted plan fits its own tilted budget (and the base plan is untouched)
     assert plus_size * fat + pages * 4096 <= b + (512 << 20)
     assert base_size * fat + pages * 4096 <= b
+
+
+def test_fixed_cost_ref_keeps_pages_identical_and_resplits_slots(monkeypatch):
+    """Uneven dense head split: a rank with a cheaper GDN state pool must keep the
+    SAME KV geometry (planned from the cross-rank MAX fixed cost) and bank the
+    difference in its own slot count."""
+    monkeypatch.setenv("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "0")
+    common = dict(
+        baseline_free=20 << 30, weights_bytes=6 << 30, memory_ratio=0.85,
+        cache_per_page=4096, fixed_cache_size=1 << 30, per_expert_bytes=1_393_920,
+        num_experts=512, total_experts=24576, prefill_overlap=True,
+        kv_reserve_tokens=8192, page_size=64, max_slots=None,
+    )
+    big_size, big_pages, _ = resolve_moe_cache_auto(**common)
+    small_fixed = dict(common, fixed_cache_size=(1 << 30) - (200 << 20))
+    thin_size, thin_pages, _ = resolve_moe_cache_auto(
+        fixed_cache_size_ref=1 << 30, **small_fixed
+    )
+    assert thin_pages == big_pages           # shared KV geometry
+    assert thin_size > big_size              # cheaper fixed cost -> more local slots
