@@ -41,11 +41,16 @@ def _hf_indexer(seq: int, topk: int):
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
-    # transformers >= 5.17 dereferences attention_mask unconditionally in the indexer;
-    # GlmMoeDsaAttention always passes a causal mask (attention_mask[:, 0, :, :]), so
-    # replicate that here instead of None.
-    mask = torch.ones(1, seq, seq, dtype=torch.bool, device="cuda").tril()
-    ref_topk = idx(x, q_resid, (cos, sin), mask, pos[None])  # [1, S, topk]
+    # transformers >= 5.17 dereferences attention_mask.dtype unconditionally in the
+    # indexer, so None raises there. GlmMoeDsaAttention always hands the indexer a
+    # causal mask (attention_mask[:, 0, :, :]), and the indexer ADDS it to the scores:
+    # 0 keeps a position, the dtype min blocks it. Replicate that additive form (the
+    # attention layer's own None-path fallback) - a bool tril only shifts the allowed
+    # block by +1 and leaves future columns unmasked.
+    mask = x.new_zeros((1, 1, seq, seq))
+    upper = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device="cuda"), diagonal=1)
+    mask = mask.masked_fill(upper, torch.finfo(x.dtype).min)
+    ref_topk = idx(x, q_resid, (cos, sin), mask[:, 0], pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
 
