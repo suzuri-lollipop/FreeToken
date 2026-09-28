@@ -218,8 +218,24 @@ def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
         config.quantization_config = quant
 
 
+def _config_fingerprint(model_path: str) -> tuple:
+    """(mtime_ns, size) of every file ``_load_hf_config`` reads. The cache below keys on it
+    as well as the path: a path whose CONTENT changed must never be served a stale config,
+    and pytest's ``failed`` tmp retention hands a later test the numbered tmp dir of a
+    deleted passed test, so path-only keys collide within one session."""
+    sig = []
+    for name in ("config.json", "hf_quant_config.json"):
+        try:
+            st = os.stat(os.path.join(model_path, name))
+        except OSError:
+            sig.append(None)
+            continue
+        sig.append((st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
 @functools.cache
-def _load_hf_config(model_path: str) -> Any:
+def _load_hf_config_cached(model_path: str, fingerprint: tuple) -> Any:
     # trust_remote_code: checkpoints that ship a custom config class via ``auto_map``
     # (e.g. MiniMax-M2) refuse to load without it. FreeToken only reads config fields
     # (parse_config) and never instantiates the checkpoint's modeling code.
@@ -233,6 +249,14 @@ def _load_hf_config(model_path: str) -> Any:
         config = RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
     _merge_sidecar_quantization_config(config, model_path)
     return config
+
+
+def _load_hf_config(model_path: str) -> Any:
+    return _load_hf_config_cached(model_path, _config_fingerprint(model_path))
+
+
+# keep the cache-management API the functools.cache-decorated name used to have
+_load_hf_config.cache_clear = _load_hf_config_cached.cache_clear
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:

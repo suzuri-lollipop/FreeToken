@@ -38,3 +38,148 @@ def test_explicit_list_and_disabled_cases_are_untouched():
     # a small-machine default without an explicit max still caps by memory branch
     got = _determine_cuda_graph_bs(None, None, 3 * GB)
     assert got[:8] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+# ---------------------------------------------------------------------------
+# Dual-microbatch decode helpers (engine/graph.py): the host-side arithmetic
+# that slices one captured graph into two skewed half-batches. A wrong bound
+# here still replays a valid-looking graph -- it just reads the other half's
+# rows, so the expectations pin the row window and slot wiring directly.
+
+
+def _runner(**attrs):
+    from freetoken.engine.graph import GraphRunner
+
+    r = GraphRunner.__new__(GraphRunner)
+    r._dual_stream = attrs.pop("dual_stream", object())
+    r.attn_backend = attrs.pop("attn_backend", None)
+    r.moe_offload_cache = attrs.pop("moe_offload_cache", None)
+    r.dummy_req = attrs.pop("dummy_req", object())
+    r._dual_cu = attrs.pop("dual_cu", None)
+    for k, v in attrs.items():
+        setattr(r, k, v)
+    return r
+
+
+def _model(**attrs):
+    from types import SimpleNamespace
+
+    defaults = {"supports_dual_decode": True}
+    defaults.update(attrs)
+    return SimpleNamespace(**defaults)
+
+
+def _backend(**attrs):
+    from types import SimpleNamespace
+
+    defaults = {"stage_dual_replay": True, "dual_profile": True}
+    defaults.update(attrs)
+    return SimpleNamespace(**defaults)
+
+
+def test_dual_ok_rejects_small_or_odd_batches(monkeypatch):
+    import freetoken.engine.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "dual_ar_available", lambda: True)
+    r = _runner(attn_backend=_backend(), moe_offload_cache=object())
+    m = _model()
+    assert r._dual_ok(m, 3) is False  # below 4
+    assert r._dual_ok(m, 5) is False  # odd
+
+
+def test_dual_ok_requires_a_configured_stream(monkeypatch):
+    import freetoken.engine.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "dual_ar_available", lambda: True)
+    r = _runner(dual_stream=None, attn_backend=_backend(), moe_offload_cache=object())
+    assert r._dual_ok(_model(), 4) is False
+
+
+def test_dual_ok_gates_on_model_backend_and_ar(monkeypatch):
+    import freetoken.engine.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "dual_ar_available", lambda: False)
+    good = _runner(attn_backend=_backend(), moe_offload_cache=object())
+    assert good._dual_ok(_model(), 4) is False  # second AR instance missing
+
+    monkeypatch.setattr(graph_mod, "dual_ar_available", lambda: True)
+    assert good._dual_ok(_model(supports_dual_decode=False), 4) is False
+    assert good._dual_ok(_model(), 4) is True
+    assert _runner(attn_backend=_backend(), moe_offload_cache=None)._dual_ok(_model(), 4) is False
+    missing_stage = _backend()
+    del missing_stage.stage_dual_replay  # the attribute itself must be absent
+    assert _runner(
+        attn_backend=missing_stage, moe_offload_cache=object()
+    )._dual_ok(_model(), 4) is False
+
+
+def test_dual_ok_uses_the_decode_backend_when_present(monkeypatch):
+    import freetoken.engine.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "dual_ar_available", lambda: True)
+    decode = _backend()
+    r = _runner(attn_backend=_backend(decode_backend=decode), moe_offload_cache=object())
+    assert r._dual_ok(_model(), 4) is True
+    # a wrapper that advertises nothing but a capable decode backend still qualifies
+    r2 = _runner(
+        attn_backend=_backend(stage_dual_replay=None, dual_profile=None, decode_backend=decode),
+        moe_offload_cache=object(),
+    )
+    assert r2._dual_ok(_model(), 4) is True
+
+
+def test_build_dual_half_slices_the_row_window(monkeypatch):
+    import torch
+    from freetoken.engine.graph import GraphRunner
+
+    bs = 6
+    buffer = type(
+        "B",
+        (),
+        {
+            "input_ids": torch.arange(bs * 3, dtype=torch.int64).view(bs, 3),
+            "out_loc": torch.arange(bs * 2, dtype=torch.int64).view(bs, 2),
+            "positions": torch.arange(bs, dtype=torch.int32),
+            "mrope_positions": torch.arange(3 * bs, dtype=torch.int32).view(3, bs),
+            "table_idx": torch.arange(bs, dtype=torch.int64),
+        },
+    )()
+    r = _runner(
+        dual_cu=[torch.arange(4, dtype=torch.int32), torch.arange(5, dtype=torch.int32)],
+    )
+
+    monkeypatch.delenv("FREETOKEN_DUAL_SLOT0", raising=False)
+    half = r._build_dual_half(buffer, 2, 6, 1)
+
+    assert [half.padded_reqs[i] is r.dummy_req for i in range(4)] == [True] * 4
+    assert torch.equal(half.input_ids, buffer.input_ids[2:6])
+    assert torch.equal(half.out_loc, buffer.out_loc[2:6])
+    assert torch.equal(half.positions, buffer.positions[2:6])
+    assert torch.equal(half.mrope_positions, buffer.mrope_positions[:, 2:6])
+    assert torch.equal(half.linear_table_idx, buffer.table_idx[2:6])
+    assert torch.equal(half.fla_metadata.cu_seqlens, r._dual_cu[1][:5])
+    assert torch.equal(half.fla_metadata.cache_indices, buffer.table_idx[2:6])
+    assert half.ple_row_offset == 2
+    assert half.dual_slot == 1
+
+
+def test_build_dual_half_respects_the_slot0_probe_env(monkeypatch):
+    import torch
+
+    buffer = type(
+        "B",
+        (),
+        {
+            "input_ids": torch.arange(12, dtype=torch.int64).view(4, 3),
+            "out_loc": torch.arange(8, dtype=torch.int64).view(4, 2),
+            "positions": torch.zeros(4, dtype=torch.int32),
+            "mrope_positions": None,
+            "table_idx": torch.zeros(4, dtype=torch.int64),
+        },
+    )()
+    r = _runner(dual_cu=[torch.arange(3, dtype=torch.int32)] * 2)
+
+    monkeypatch.setenv("FREETOKEN_DUAL_SLOT0", "1")
+    half = r._build_dual_half(buffer, 0, 2, 1)
+    assert half.dual_slot == 0  # bisection probe routes BOTH halves to slot 0
+    assert half.mrope_positions is None  # non-mrope models carry no mrope slice

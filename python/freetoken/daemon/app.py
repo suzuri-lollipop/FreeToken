@@ -113,6 +113,55 @@ def _parse_ftbench(line: str) -> dict | None:
         return None
 
 
+async def _bench_run_stream(
+    argv: list[str],
+    env: dict[str, str],
+    spawn: Callable[..., Any] | None = None,
+):
+    """Run one ``ft bench bw`` child and stream its output as SSE events: ``progress``
+    per measured format, then a terminal ``result`` (the profile) or ``error``.
+
+    The child is killed in the ``finally``: a client that disconnects mid-stream
+    cancels this generator, and without the kill the bench would run to completion
+    on a GPU whose serve was already stopped for exclusivity, with nobody left who
+    can reach it. asyncio's child watcher reaps the corpse."""
+    spawn = spawn or asyncio.create_subprocess_exec
+    proc = None
+    try:
+        try:
+            proc = await spawn(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield _bench_sse("error", {"message": f"failed to spawn bench: {exc}"})
+            return
+        tail: collections.deque = collections.deque(maxlen=8)  # last non-progress lines (errors)
+        out_path: str | None = None
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            prog = _parse_ftbench(line)
+            if prog is not None:
+                yield _bench_sse("progress", prog)
+            elif line.startswith("FTBENCH_OUT "):
+                out_path = line[len("FTBENCH_OUT "):]
+            elif line:
+                tail.append(line)
+        rc = await proc.wait()
+        if rc != 0:
+            yield _bench_sse("error", {"message": "\n".join(tail) or f"bench exited {rc}"})
+            return
+        # the file this run wrote (an older engine prints no FTBENCH_OUT: newest file, as before)
+        prof = _read_bench_profile(out_path or _bench_profile_path(None))
+        if prof is None:
+            yield _bench_sse("error", {"message": "bench finished but no profile was written"})
+        else:
+            yield _bench_sse("result", prof)
+    finally:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+
+
 def build_app(
     *,
     manager,
@@ -348,35 +397,8 @@ def build_app(
         async def gen():
             env = {**os.environ, "FREETOKEN_BENCH_PROGRESS": "1"}
             argv = [sys.executable, "-m", "freetoken.cli", "bench", "bw", *body.args]
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
-                )
-            except Exception as exc:  # noqa: BLE001
-                yield _bench_sse("error", {"message": f"failed to spawn bench: {exc}"})
-                return
-            tail: collections.deque = collections.deque(maxlen=8)  # last non-progress lines (errors)
-            out_path: str | None = None
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip()
-                prog = _parse_ftbench(line)
-                if prog is not None:
-                    yield _bench_sse("progress", prog)
-                elif line.startswith("FTBENCH_OUT "):
-                    out_path = line[len("FTBENCH_OUT "):]
-                elif line:
-                    tail.append(line)
-            rc = await proc.wait()
-            if rc != 0:
-                yield _bench_sse("error", {"message": "\n".join(tail) or f"bench exited {rc}"})
-                return
-            # the file this run wrote (an older engine prints no FTBENCH_OUT: newest file, as before)
-            prof = _read_bench_profile(out_path or _bench_profile_path(None))
-            if prof is None:
-                yield _bench_sse("error", {"message": "bench finished but no profile was written"})
-            else:
-                yield _bench_sse("result", prof)
+            async for chunk in _bench_run_stream(argv, env):
+                yield chunk
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 

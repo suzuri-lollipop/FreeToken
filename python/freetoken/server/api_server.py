@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
+from .generation import send_tokenize_or_discard
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
@@ -137,6 +138,13 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    # uid -> monotonic ts of new_user(). A uid whose stream generator NEVER starts
+    # (client gone before starlette ran the response body: an unstarted async
+    # generator's finally/aclose is a no-op) has no cleanup path of its own, and
+    # listen() would append its whole token stream to the orphaned ack_map entry.
+    # wait_for_ack's prologue drops the marker once a consumer exists; anything
+    # still marked past the TTL is reaped by sweep_orphan_uids.
+    uid_created: Dict[int, float] = field(default_factory=dict)
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -240,6 +248,7 @@ class FrontendManager:
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
+        self.uid_created[uid] = time.monotonic()
         self.stats.on_new_user(uid)
         return uid
 
@@ -319,6 +328,7 @@ class FrontendManager:
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
             asyncio.create_task(self.listen())
+            asyncio.create_task(self.sweep_orphan_uids())
             self.initialized = True
 
     async def send_one(self, msg: BaseTokenizerMsg):
@@ -327,6 +337,10 @@ class FrontendManager:
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
+        # A consumer exists now, so this uid's cleanup is the finally's job; drop the
+        # orphan marker on the generator's FIRST step, before any await, so a cancel
+        # that races the start cannot leave the marker behind.
+        self.uid_created.pop(uid, None)
         # finally, not a trailing statement: every consumer breaks out of its `async for` at
         # the terminal ack, leaving this generator suspended at the yield. Cleanup written
         # after the loop would then only run on paths nobody takes, leaking both maps once
@@ -346,6 +360,7 @@ class FrontendManager:
         finally:
             self.ack_map.pop(uid, None)
             self.event_map.pop(uid, None)
+            self.uid_created.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -376,9 +391,45 @@ class FrontendManager:
             del self.ack_map[uid]
         if uid in self.event_map:
             del self.event_map[uid]
+        self.uid_created.pop(uid, None)
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
+
+    def discard_user(self, uid: int) -> None:
+        """Drop a uid whose TokenizeMsg never reached the backend (a send failure or a
+        cancel between new_user and send_one). No terminal reply can ever arrive for
+        it, so unlike abort_user this must not promise the backend an abort ack: just
+        forget the frontend-side state."""
+        self.uid_created.pop(uid, None)
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
+        self.stats.on_abort(uid)
+
+    async def reap_orphan_uids(self, ttl_s: float = 60.0) -> List[int]:
+        """Reap uids registered longer than ``ttl_s`` ago whose stream generator never
+        started: the client was gone before starlette ran the response body, so neither
+        wait_for_ack's finally nor abort_user could fire, and listen() has been appending
+        every sampled reply to a list nobody will ever read. Tell the backend to stop
+        generating for them (its abort ack is dropped by listen()'s membership check)."""
+        now = time.monotonic()
+        stale = [uid for uid, ts in list(self.uid_created.items()) if now - ts > ttl_s]
+        for uid in stale:
+            self.uid_created.pop(uid, None)
+            self.ack_map.pop(uid, None)
+            self.event_map.pop(uid, None)
+            self.stats.on_abort(uid)
+            logger.warning("Reaping request %s: client gone before its stream started", uid)
+            await self.send_one(AbortMsg(uid=uid))
+        return stale
+
+    async def sweep_orphan_uids(self, interval_s: float = 10.0, ttl_s: float = 60.0) -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await self.reap_orphan_uids(ttl_s)
+            except Exception:  # noqa: BLE001 -- a sweep failure must not kill the sweeper
+                logger.exception("orphan uid sweep failed")
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -854,7 +905,9 @@ async def generate(req: GenerateRequest, request: Request):
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
     uid = state.new_user()
-    await state.send_one(
+    await send_tokenize_or_discard(
+        state,
+        uid,
         TokenizeMsg(
             uid=uid,
             text=req.prompt,
@@ -862,7 +915,7 @@ async def generate(req: GenerateRequest, request: Request):
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
-        )
+        ),
     )
 
     return StreamingResponse(

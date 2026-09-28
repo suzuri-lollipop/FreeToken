@@ -38,6 +38,7 @@ from .generation import (
     prerender_prompt,
     render_messages,
     resolve_sampling,
+    send_tokenize_or_discard,
     submit_generation,
     with_keepalive,
 )
@@ -425,10 +426,12 @@ async def handle_completion(
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
-        await state.send_one(
+        await send_tokenize_or_discard(
+            state,
+            uid,
             TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
                 req, model_sampling, default_max_tokens=default_max_tokens
-            ))
+            )),
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -441,14 +444,16 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(
+        await send_tokenize_or_discard(
+            state,
+            uid,
             TokenizeMsg(
                 uid=uid,
                 text=prompt,
                 sampling_params=_resolve_sampling(
                     req, model_sampling, default_max_tokens=default_max_tokens
                 ),
-            )
+            ),
         )
         text = ""
         finish_reason = "stop"

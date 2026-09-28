@@ -7,8 +7,10 @@ in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
 
 | directory    | subsystem under test |
 |--------------|----------------------|
-| `daemon/`    | `freetoken.daemon` — torch-free supervisor (import safety, serve manager) |
+| `daemon/`    | `freetoken.daemon` — torch-free supervisor (import safety, serve manager, logfmt/logring, accounting receipts, pidfile, footprint metrics, /proc helpers) |
+| `utils/`     | `freetoken.utils` — numeric helpers, dtype/arch/HF plumbing, zmq queues |
 | `server/`    | `freetoken.server` — OpenAI/Anthropic/Responses APIs, streaming, parsers, accounting, maintenance state |
+| `attention/` | `freetoken.attention` — per-backend host-side layout arithmetic (fa metadata/capture, dsa kpool, backends) |
 | `scheduler/` | `freetoken.scheduler` — chunked prefill, cache manager, commit/window locking, status reporting, KV usage, cost accounting |
 | `kvcache/`   | `freetoken.kvcache` — paged pools (incl. DSV4's), rebuild, cache-cost accounting; the three prefix caches live in `kvcache/radix/` behind a shared reference model (see its README) |
 | `tokenizer/` | `freetoken.tokenizer` — tokenize/detokenize request plumbing, thinking-mode resolution |
@@ -35,6 +37,33 @@ uv run pytest tests/kvcache/         # one subsystem
 
 GPU-dependent tests skip themselves when CUDA is unavailable. Marlin NVFP4 tests
 skip unless `vllm` is importable (dedicated venv with `vllm>=0.14,<0.15`).
+
+### Temporary artifacts
+
+pytest puts every run's temp dirs (`tmp_path`, `tmp_path_factory`) under
+`/tmp/pytest-of-$USER/pytest-N`. `pyproject.toml` sets
+`tmp_path_retention_policy = "failed"`: a passing test's dir is deleted at
+session end, only failed tests keep theirs for inspection.
+
+On hosts where `/tmp` is a tmpfs (RAM-backed) those files are memory, not
+disk: neither process exit nor `drop_caches` reclaims them, so a suite that
+materializes checkpoint-scale fixtures leaves tens of GiB of RAM charged to
+the user session after the run. On such hosts point basetemp at a disk:
+
+```bash
+uv run pytest tests/ --basetemp=/home/$USER/pytest-tmp
+```
+
+To name the test that wrote a large artifact before cleaning it up:
+
+```bash
+du -h -d4 /tmp/pytest-of-$USER/pytest-current | sort -h | tail
+rm -rf /tmp/pytest-of-$USER        # safe: recreated on every run
+```
+
+A test that materializes a multi-GiB fixture should delete it in its own
+teardown instead of leaning on the retention policy, so the RAM is free
+while the rest of the suite still runs.
 
 `needs_weights`-marked tests skip unless the env var pointing at a real local
 checkpoint is set:

@@ -115,6 +115,8 @@ where = ["python"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["."]
+tmp_path_retention_policy = "failed"
 markers = [
     "slow: takes tens of seconds (big kernel sweeps, real-checkpoint reads); deselect with -m 'not slow'",
     "needs_weights: needs a real local checkpoint, gated behind an env var (see tests/README.md)",

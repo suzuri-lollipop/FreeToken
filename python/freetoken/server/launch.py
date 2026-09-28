@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from freetoken.distributed import DistributedInfo
 from freetoken.utils import init_logger
+from freetoken.utils.parent_watch import install_parent_watchdog
 
 if TYPE_CHECKING:
     from .args import ServerArgs
@@ -50,6 +51,7 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     """Module-level so it survives the spawn pickle; exists only to detach the group first."""
     if detach:
         _detach_process_group()
+    install_parent_watchdog()
     from freetoken.tokenizer import tokenize_worker
 
     tokenize_worker(**kwargs)
@@ -58,6 +60,7 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
+    install_parent_watchdog()
 
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu

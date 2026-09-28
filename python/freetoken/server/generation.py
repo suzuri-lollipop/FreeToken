@@ -290,6 +290,17 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
+async def send_tokenize_or_discard(state: Any, uid: int, msg: Any) -> None:
+    """``state.send_one`` with the submission hole closed: if the send itself fails or is
+    cancelled, the backend never saw this uid, so no terminal reply can ever clean its
+    frontend state -- discard it here instead of orphaning it until process exit."""
+    try:
+        await state.send_one(msg)
+    except BaseException:
+        state.discard_user(uid)
+        raise
+
+
 async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = None) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this -- it takes the neutral spec, not a wire request type. ``rendered`` is
@@ -300,7 +311,9 @@ async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = No
         rendered = None
     images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
-    await state.send_one(
+    await send_tokenize_or_discard(
+        state,
+        uid,
         TokenizeMsg(
             uid=uid,
             text=rendered if rendered is not None else spec.messages,
@@ -309,7 +322,7 @@ async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = No
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
             images=images,
-        )
+        ),
     )
     return uid
 
