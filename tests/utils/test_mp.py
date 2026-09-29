@@ -27,7 +27,6 @@ from freetoken.utils.mp import (
     ZmqPullQueue,
     ZmqPushQueue,
     ZmqSubQueue,
-    use_zmq_event_loop,
     zmq_tcp_ports,
 )
 
@@ -98,11 +97,15 @@ def test_stop_of_unconnected_socket_is_safe(tmp_path):
     q.stop()
 
 
-def test_async_pair_roundtrip_on_the_selected_loop(tmp_path):
-    """The frontend reads worker replies through zmq.asyncio, whose sockets register themselves
-    on ``loop.add_reader`` -- missing from the proactor loop Windows picks by default, which left
-    a Windows serve prefilling requests it could never answer. ``use_zmq_event_loop`` is the seam,
-    and this round-trip is what it exists to make work."""
+def test_async_pair_roundtrip_on_the_platform_loop(tmp_path):
+    """The frontend reads worker replies through zmq.asyncio, whose sockets wait on the running
+    loop. Windows has no add_reader on the loop asyncio picks there, so pyzmq needs tornado to
+    register the reader from a selector thread -- without it the socket raises at its first await,
+    the engine prefills the request, and the client hangs behind it.
+
+    This is that round trip on the default loop, so it fails on a Windows install missing the
+    dependency instead of only showing up as a serve that never answers.
+    """
     addr = _addr(tmp_path, "async")
 
     async def roundtrip():
@@ -115,17 +118,12 @@ def test_async_pair_roundtrip_on_the_selected_loop(tmp_path):
             send.stop()
             recv.stop()
 
-    use_zmq_event_loop()
     assert asyncio.run(roundtrip()) == 21
 
 
-@pytest.mark.skipif(os.name != "nt", reason="POSIX loops already have add_reader")
-def test_windows_loop_seam_drops_the_proactor_loop():
-    """Asserted by type, not by a round-trip: pyzmq can also shim the proactor loop when
-    tornado happens to be installed, and a green test must not rest on that accident."""
-    use_zmq_event_loop()
-    loop = asyncio.new_event_loop()
+@pytest.mark.skipif(os.name != "nt", reason="only the Windows loop needs the tornado shim")
+def test_windows_carries_the_shim_pyzmq_waits_with():
     try:
-        assert isinstance(loop, asyncio.SelectorEventLoop)
-    finally:
-        loop.close()
+        import tornado.platform.asyncio  # noqa: F401
+    except ImportError as exc:
+        pytest.fail(f"zmq.asyncio cannot wait on the proactor loop without tornado: {exc}")

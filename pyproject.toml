@@ -52,6 +52,9 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
+    # pyzmq's asyncio sockets wait through tornado on Windows: the proactor loop that platform's
+    # asyncio defaults to has no add_reader, and without this the frontend never reads a reply.
+    "tornado>=6.1; platform_system == 'Windows'",
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.

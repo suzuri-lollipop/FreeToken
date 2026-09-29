@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Callable, Dict, Generic, TypeVar
 
@@ -18,18 +17,6 @@ def zmq_endpoint(index: int, suffix: str, ports: tuple[int, ...] = ()) -> str:
     if os.name == "nt":
         return f"tcp://127.0.0.1:{ports[index]}"
     return f"ipc:///tmp/freetoken_{index}{suffix}"
-
-
-def use_zmq_event_loop() -> None:
-    """Give this process an event loop that zmq.asyncio can wait on.
-
-    Its sockets register through `loop.add_reader`, which the proactor loop Windows picks by
-    default does not implement: a frontend on that loop binds its queues and then never reads a
-    worker's reply. Only this process is touched, and the daemon -- which needs the proactor loop
-    for `asyncio.create_subprocess_exec` -- is a separate one.
-    """
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def zmq_tcp_ports(count: int) -> tuple[int, ...]:

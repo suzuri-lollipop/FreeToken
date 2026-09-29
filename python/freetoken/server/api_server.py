@@ -32,7 +32,6 @@ from freetoken.utils import (
     ZmqAsyncPushQueue,
     init_logger,
     load_generation_sampling,
-    use_zmq_event_loop,
 )
 from pydantic import BaseModel
 
@@ -1009,11 +1008,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
-
-    # the frontend's queues are pyzmq asyncio sockets, which wait through loop.add_reader; the
-    # proactor loop Windows picks by default does not implement it, so a worker reply would
-    # never be read. No-op on POSIX.
-    use_zmq_event_loop()
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)

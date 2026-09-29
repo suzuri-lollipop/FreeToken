@@ -22,7 +22,6 @@ from .mp import (
     ZmqPullQueue,
     ZmqPushQueue,
     ZmqSubQueue,
-    use_zmq_event_loop,
     zmq_endpoint,
     zmq_tcp_ports,
 )
@@ -59,7 +58,6 @@ __all__ = [
     "ZmqSubQueue",
     "ZmqAsyncPushQueue",
     "ZmqAsyncPullQueue",
-    "use_zmq_event_loop",
     "zmq_endpoint",
     "zmq_tcp_ports",
 ]
