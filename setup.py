@@ -18,10 +18,24 @@ ROOT = Path(__file__).parent
 # Windows has no lib64 and no GCC flag spelling; MSVC is the only host toolchain there.
 MSVC = sys.platform == "win32"
 
-# _cpu_moe's SIMD tiers are per-function __attribute__((target)) + __builtin_cpu_supports,
-# spellings MSVC does not have. Visual Studio ships clang-cl beside the toolset, and torch's
-# Windows ninja rule takes the compile driver from CXX while linking with MSVC's own link.exe,
-# so only the compiler swaps -- the object files stay MSVC-ABI and /MD.
+def _vs_install_dirs() -> list[Path]:
+    """VS installations on this machine, from the environment or from vswhere."""
+    dirs = []
+    vc = os.environ.get("VCINSTALLDIR")
+    if vc:
+        dirs.append(Path(vc).parent)
+    vswhere = (Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+               / "Microsoft Visual Studio" / "Installer" / "vswhere.exe")
+    if vswhere.is_file():
+        listing = subprocess.run([str(vswhere), "-products", "*", "-property", "installationPath"],
+                                 capture_output=True, text=True, check=False).stdout
+        dirs += [Path(line.strip()) for line in listing.splitlines() if line.strip()]
+    return dirs
+
+
+# _cpu_moe's SIMD tiers are per-function __attribute__((target)) with __builtin_cpu_supports
+# choosing between them, spellings cl does not have. VS ships clang-cl beside the toolset; only
+# the compiler moves, the link stays MSVC's (see _retarget_ninja and _clang_rt_ldflags).
 def _find_clang_cl() -> str | None:
     override = os.environ.get("FREETOKEN_CLANG_CL", "")
     if override:
@@ -29,22 +43,38 @@ def _find_clang_cl() -> str | None:
     found = shutil.which("clang-cl") or shutil.which("clang-cl.exe")
     if found:
         return found
-    roots = []
-    vc = os.environ.get("VCINSTALLDIR")
-    if vc:
-        roots.append(Path(vc) / "Tools" / "Llvm" / "x64" / "bin")
-    vswhere = (Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-               / "Microsoft Visual Studio" / "Installer" / "vswhere.exe")
-    if vswhere.is_file():
-        listing = subprocess.run([str(vswhere), "-products", "*", "-property", "installationPath"],
-                                 capture_output=True, text=True, check=False).stdout
-        roots += [Path(line.strip()) / "VC" / "Tools" / "Llvm" / "x64" / "bin"
-                  for line in listing.splitlines() if line.strip()]
-    for root in roots:
-        exe = root / "clang-cl.exe"
+    for install in _vs_install_dirs():
+        exe = install / "VC" / "Tools" / "Llvm" / "x64" / "bin" / "clang-cl.exe"
         if exe.is_file():
             return str(exe)
     return None
+
+
+def _activate_msvc_env() -> None:
+    """Set up the developer environment the extensions build needs, if the shell has none.
+
+    setuptools' own Visual Studio lookup fails in uv's isolated build environment on this box
+    ("Unable to find a compatible Visual Studio installation"), while vcvars64 from the same
+    install works, so run it and take its environment over. DISTUTILS_USE_SDK then stops
+    distutils from activating a prompt of its own; torch warns when a prompt is active without it.
+    """
+    if not MSVC or shutil.which("cl") or os.environ.get("INCLUDE"):
+        return
+    for install in _vs_install_dirs():
+        bat = install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        if not bat.is_file():
+            continue
+        env = subprocess.run(f'call "{bat}" >nul && set', shell=True, capture_output=True,
+                             text=True, check=False).stdout
+        imported = 0
+        for line in env.splitlines():
+            name, sep, value = line.partition("=")
+            if sep and name:
+                os.environ[name] = value
+                imported += 1
+        if imported:
+            os.environ.setdefault("DISTUTILS_USE_SDK", "1")
+            return
 
 
 def _clang_rt_ldflags(clang_cl: str) -> list[str]:
@@ -63,8 +93,9 @@ def _clang_rt_ldflags(clang_cl: str) -> list[str]:
 
 # torch's Windows ninja rule is what _retarget_ninja edits; without ninja the build falls back
 # to distutils, which would compile this one extension with cl and quietly produce the scalar
-# executor, so clang-cl alone is not enough to ask for it.
-CLANG_CL = _find_clang_cl() if MSVC and cpp_extension.is_ninja_available() else None
+# executor, so clang-cl alone is not enough to ask for it. Both questions are answered after
+# _activate_msvc_env(), which is what puts cl and ninja on PATH in a plain shell.
+CLANG_CL: str | None = None
 
 
 def _retarget_ninja(ninja_file: Path, driver: str) -> None:
@@ -167,7 +198,9 @@ def _build_ext_class():
 
 
 cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
+_activate_msvc_env()
 _check_toolchain()
+CLANG_CL = _find_clang_cl() if MSVC and cpp_extension.is_ninja_available() else None
 
 
 setup(
