@@ -29,12 +29,22 @@
 #include <thread>
 #include <vector>
 
+// windows.h arrives through cuda_runtime_api.h, and its min/max macros collide with the
+// std::min / std::max the tiling loops call.
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include <cuda_runtime_api.h>
 #include <torch/extension.h>
 
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#define CPU_MOE_HAS_AFFINITY 1
+#elif defined(_WIN32)
+#include <windows.h>
 #define CPU_MOE_HAS_AFFINITY 1
 #else
 #define CPU_MOE_HAS_AFFINITY 0
@@ -48,6 +58,22 @@
 #endif
 
 namespace {
+
+#if CPU_MOE_HAS_AFFINITY
+// Pin the calling thread to one logical CPU. The Windows mask is per processor group and
+// DWORD_PTR wide, so a CPU number outside that window is left to the scheduler.
+inline void pin_thread_to_cpu(int cpu) {
+#if defined(_WIN32)
+  if (cpu < 0 || cpu >= 8 * (int)sizeof(DWORD_PTR)) return;
+  SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(1) << cpu);
+#else
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#endif
+}
+#endif
 
 using bf16_t = uint16_t;
 
@@ -1527,11 +1553,7 @@ struct CpuMoeExecutor {
   void pin_self(int tid) {
 #if CPU_MOE_HAS_AFFINITY
     if (core_ids.empty()) return;
-    const int cpu = core_ids[tid % static_cast<int>(core_ids.size())];
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    pin_thread_to_cpu(core_ids[tid % static_cast<int>(core_ids.size())]);
 #else
     (void)tid;
 #endif
@@ -2005,12 +2027,7 @@ struct CpuMoeExecutor {
     coord_stop.store(false);
     coord_thread = std::thread([this, pin_core] {
 #if CPU_MOE_HAS_AFFINITY
-      if (pin_core >= 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(pin_core, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-      }
+      if (pin_core >= 0) pin_thread_to_cpu(pin_core);
 #endif
       coordinator_loop();
     });
