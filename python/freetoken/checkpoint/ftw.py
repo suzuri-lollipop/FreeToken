@@ -277,7 +277,9 @@ class FTWReader:
                 if entry is None:
                     fd = os.open(os.path.join(self.dir, file), os.O_RDONLY)
                     try:
-                        m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                        # ACCESS_READ is the portable spelling of a read-only map: the prot=
+                        # form has no Windows mmap equivalent (mmap.PROT_READ does not exist).
+                        m = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
                     finally:
                         os.close(fd)  # the mapping keeps its own reference to the file
                     try:
