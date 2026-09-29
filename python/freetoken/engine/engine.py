@@ -2439,17 +2439,43 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
+def _host_ram_bytes() -> int | None:
+    """Physical RAM: sysconf on POSIX, GlobalMemoryStatusEx on Windows (no sysconf there)."""
+    if os.name == "nt":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullTotalPhys)
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+    WDDM-backed CUDA caps pinning near half of RAM, shared across processes: WSL budgets 40%, native
+    Windows 45% (measured: the driver refused at 63 of 127 GiB). FREETOKEN_PIN_BUDGET_GB overrides
+    anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
+        return max(0, int(float(env) * 2**30) - reserved)
+    wsl = hasattr(os, "uname") and "microsoft" in os.uname().release.lower()  # WSL kernel tag
+    if os.name != "nt" and not wsl:
         return None
-    else:
-        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
-    return max(0, cap - reserved)
+    ram = _host_ram_bytes()
+    if ram is None:
+        return None
+    return max(0, int(ram * (0.45 if os.name == "nt" else 0.4)) - reserved)
 
 
 def _bank_bytes(config: EngineConfig, method=None) -> int | None:
@@ -2476,7 +2502,7 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
-            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
+            f"{budget / 2**30:.1f} GiB (WDDM caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
         )
 
 

@@ -814,8 +814,8 @@ def test_reserved_subtracts_from_the_cap(monkeypatch):
 
 def test_uncapped_platform_stays_uncapped(monkeypatch):
     monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
-    if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
-        pytest.skip("WSL caps pinning")
+    if os.name == "nt" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower()):
+        pytest.skip("WDDM caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
 
 
