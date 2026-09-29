@@ -236,7 +236,7 @@ class HostBank:
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
-        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
+        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK on POSIX, the working-set quota on Windows) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
             return
         global _os_lock_failed
@@ -256,7 +256,15 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
+    """Page-lock a bank without spending CUDA pin quota: mlock on POSIX, VirtualLock on Windows.
+
+    Both are bounded by a per-process ceiling -- RLIMIT_MEMLOCK there, the working set here --
+    so each branch tries to raise its own first and the refusal surfaces from the lock call.
+    """
     global _os_locked_total
+    if os.name == "nt":
+        _nt_lock(addr, nbytes)
+        return
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
@@ -277,6 +285,77 @@ def _os_lock(addr: int, nbytes: int) -> None:
             f"mlock({nbytes / 2**30:.1f} GiB): {os.strerror(err)} "
             f"(RLIMIT_MEMLOCK / `ulimit -l` caps OS-locked bytes; raise it or "
             f"shrink --moe-cpu-layers)",
+        )
+    _os_locked_total += nbytes
+
+
+_nt_quota_raised = False  # one quota raise per process; the ceiling stays where it was set
+_KERNEL32 = None
+
+
+def _kernel32():
+    """kernel32 with the working-set and VirtualLock prototypes pinned down.
+
+    The signatures are set explicitly because two things would otherwise go wrong: handles and
+    SIZE_T are 64-bit (GetCurrentProcess hands back the (HANDLE)-1 pseudo-handle, which ctypes
+    would truncate to an int), and GetProcessWorkingSetSizeEx takes a fifth argument -- the
+    out-flags pointer -- that GetProcessWorkingSetSize does not have. Passing four there faults.
+    """
+    global _KERNEL32
+    if _KERNEL32 is None:
+        size_t = ctypes.c_size_t
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.GetProcessWorkingSetSizeEx.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(size_t), ctypes.POINTER(size_t),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+        ]
+        k32.GetProcessWorkingSetSizeEx.restype = ctypes.c_int32
+        k32.SetProcessWorkingSetSizeEx.argtypes = [
+            ctypes.c_void_p, size_t, size_t, ctypes.c_uint32
+        ]
+        k32.SetProcessWorkingSetSizeEx.restype = ctypes.c_int32
+        k32.VirtualLock.argtypes = [ctypes.c_void_p, size_t]
+        k32.VirtualLock.restype = ctypes.c_int32
+        _KERNEL32 = k32
+    return _KERNEL32
+
+
+def _nt_raise_working_set_quota(want: int) -> None:
+    """Raise the process working-set maximum so VirtualLock can cover the bank.
+
+    Only the maximum moves (SeProfileSingleProcessPrivilege); the minimum is handed back
+    unchanged, as raising that needs a privilege a normal server process lacks. A no-op here
+    just means the VirtualLock below reports the real ceiling.
+    """
+    global _nt_quota_raised
+    if _nt_quota_raised:
+        return
+    kernel32 = _kernel32()
+    process = kernel32.GetCurrentProcess()
+    minimum, maximum, flags = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_uint32()
+    # docs say pdwFlags may be NULL; this SDK dereferences it anyway.
+    if not kernel32.GetProcessWorkingSetSizeEx(
+        process, ctypes.byref(minimum), ctypes.byref(maximum), ctypes.byref(flags), 0
+    ):
+        return
+    if maximum.value >= want:
+        return
+    if kernel32.SetProcessWorkingSetSizeEx(process, minimum.value, want, 0):
+        _nt_quota_raised = True
+
+
+def _nt_lock(addr: int, nbytes: int) -> None:
+    global _os_locked_total
+    _nt_raise_working_set_quota(_os_locked_total + nbytes + (256 << 20))
+    kernel32 = _kernel32()
+    if not kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
+        err = ctypes.get_last_error()
+        raise OSError(
+            err,
+            f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err} "
+            f"(ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right "
+            f"(secpol.msc, then re-login); without it --moe-cpu-layers layers stay pageable)",
         )
     _os_locked_total += nbytes
 

@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 
+import os
+
 import pytest
 import torch
 
@@ -1120,6 +1122,28 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="VirtualLock is the Windows branch of _os_lock")
+def test_windows_lock_reports_a_quota_not_an_import_failure(monkeypatch):
+    """The bug was silent: ``_os_lock`` raised ImportError from ``import resource``, ``lock()``
+    swallowed it, and every LOCKED layer settled PAGEABLE under a Linux quota message.
+
+    How much a host may page-lock is policy (the 'Lock pages in memory' right), so either answer
+    from the OS is fine here -- neither of them is an ImportError, which is why ``_os_lock`` is
+    called directly rather than through the swallowing ``lock()``.
+    """
+    import freetoken.moe.host_banks as hb
+
+    monkeypatch.setattr(hb, "_os_locked_total", 0)
+    bank = hb.HostBank((2 << 20,), torch.uint8)
+    bank.tensor.fill_(0)  # lock after fill, the order the loader keeps
+    try:
+        hb._os_lock(bank.addr, bank.nbytes)
+    except OSError as exc:
+        assert "Lock pages in memory" in str(exc)
+    else:
+        assert hb._os_locked_total == bank.nbytes
 
 
 # ---- --expert-load auto: the low-RAM veto is sized by the experts, not the whole checkpoint ----
