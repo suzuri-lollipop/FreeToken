@@ -1,7 +1,10 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
+// glibc-only, and nothing below needs it; MSVC has no sys/cdefs.h
+#ifndef _WIN32
 #include <sys/cdefs.h>
+#endif
 
 #include <cstddef>
 
