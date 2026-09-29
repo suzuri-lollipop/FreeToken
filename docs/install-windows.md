@@ -10,8 +10,13 @@ accelerator packages in `accel` are Linux-only wheels.
 - Windows 10/11 x64 with an NVIDIA GPU (RTX 30/40/50) and driver r580+ (CUDA 13)
 - CUDA 13.0 toolkit, found through `CUDA_PATH`, with `nvcc` matching torch's CUDA major
 - Visual Studio 2022 Build Tools with the *Desktop development with C++* workload
-  (MSVC toolset + Windows SDK). No developer shell is needed: `setuptools` locates MSVC
-  for the install-time extensions, and tvm-ffi activates the dev prompt for its JIT builds.
+  (MSVC toolset + Windows SDK). No developer shell is needed: `setup.py` finds the toolset
+  through `vswhere` and activates it for the install-time extensions, and tvm-ffi activates
+  the dev prompt for its JIT builds.
+- The *C++ Clang Compiler for Windows* component of that same install
+  (`VC\Tools\Llvm\x64\bin\clang-cl.exe`). Only the `_cpu_moe` extension needs it; without it
+  that one extension is skipped and `--moe-cpu-layers auto` becomes unavailable.
+  `setup.py` finds it through `vswhere`, or through `FREETOKEN_CLANG_CL=<path>`.
 - [uv](https://docs.astral.sh/uv/), Python 3.12 (what `install.sh` and the release wheels use)
 
 ## Install from source
@@ -59,13 +64,19 @@ never auto-selected, and `marlin` needs the separate `vllm` wheel). The GDN laye
 
 `freetoken-kernel-cache` ships Linux `.so` files, so on Windows the kernels under
 `python/freetoken/kernel/csrc` are JIT-compiled with nvcc + MSVC on first use, and all five
-of them (`radix`, `batch_memcpy`, `store`, `index`, `fast_index_copy`) build and load. Four
-platform branches carry that, none of which changes anything on Linux:
+of them (`radix`, `batch_memcpy`, `store`, `index`, `fast_index_copy`) build and load. The
+branches below carry that; none of them changes anything on Linux:
 
-- `utils.mp.zmq_endpoint`: the Windows `libzmq` wheels are built without the `ipc://`
-  transport (binding one fails with `Protocol not supported`), so the five control queues
-  take `tcp://127.0.0.1` with ports allocated by the process that builds the config and
-  carried to every worker with it; POSIX keeps its `/tmp` unix sockets.
+- `utils.mp.zmq_endpoint` and `utils.mp.use_zmq_event_loop`: the Windows `libzmq` wheels are
+  built without the `ipc://` transport (binding one answers `Protocol not supported` for a `/tmp`
+  path and for a native one alike), so the five control queues take `tcp://127.0.0.1` with ports
+  allocated by the process that builds the config and carried to every worker with it; POSIX keeps
+  its `/tmp` unix sockets. The frontend then also has to run on a selector event loop:
+  `zmq.asyncio` waits through `loop.add_reader`, which the proactor loop Windows picks by default
+  does not implement. Without the swap the engine prefills a request and never reads the reply --
+  the client hangs, and the only trace is one `RuntimeError` in the server log. pyzmq can also
+  shim a proactor loop when `tornado` happens to be installed; the engine switches the policy
+  instead of depending on that, so `tornado` is not a requirement here.
 - `kernel.utils._msvc_ninja_compat`: tvm-ffi (<= 0.1.14) writes its Windows CUDA rule as
   `-Xcompiler /std:c++17 /O2`. nvcc takes one comma-joined `-Xcompiler` argument, so that
   `/O2` reaches it as a second input file, and the forced `/std:c++17` makes MSVC's STL hide
@@ -78,13 +89,37 @@ platform branches carry that, none of which changes anything on Linux:
   context. It never meant what it looks like: the arg-taking overload discards its template
   pack and only rebinds the ref, so the ignored arguments are dropped here. The
   `with_device<Codes>(x)` and the zero-argument `with_device<Codes...>()` forms are kept.
-- `setup.py` skips `_cpu_moe` on Windows: its SIMD dispatch is GCC/Clang-only
-  (`__builtin_cpu_supports`, `__attribute__((target))`), and MSVC would build a scalar
-  executor that the viability probe still reports usable. The engine notices the missing
-  module and stays on the GPU executor. `_ple_store` (the default `--ple-backend disk`)
-  does build here: its three seams (`TableFile`, the `cumemop_*` driver lookup, the
-  aligned allocation) carry Win32 bodies, and the `pread` thread pool -- not io_uring --
-  is the reader, which is also the portable shape on Linux.
+- `setup.py` builds `_cpu_moe` (the CPU MoE executor behind `--moe-cpu-layers`) with clang-cl,
+  the component VS ships beside the toolset. Its SIMD tiers are per-function
+  `__attribute__((target))` with `__builtin_cpu_supports` selecting between them; cl has neither
+  spelling and would build the scalar executor while the viability probe still reported it usable.
+  torch's Windows compile rule hardcodes `cl /showIncludes`, so the generated `build.ninja` is
+  retargeted (`_retarget_ninja`), and the msvc dep scan plus MSVC's `/GL` whole-program codegen
+  leave with the compiler -- `deps = msvc` would be handed the other front-end's output and
+  `link.exe` would LTCG over clang objects. Only the compiler moves: `link.exe`, `/MD` and the
+  CRT stay MSVC's, and `clang_rt.builtins-x86_64.lib` comes in as an explicit library because
+  `__builtin_cpu_supports` lowers into it. That extension also builds at `/std:c++20`: MSVC's
+  `<atomic>` reaches the Interlocked intrinsics through the `winnt.h` prototypes that header
+  aliases onto those names, and clang calls the C++17 instantiation ambiguous
+  (`call to '_InterlockedAnd' is ambiguous`) where cl merges the two.
+  Thread pinning follows through `pin_thread_to_cpu`, whose Win32 branch is
+  `SetThreadAffinityMask`; a CPU id outside the thread's 64-bit group mask is left to the
+  scheduler.
+  `_ple_store` (the default `--ple-backend disk`) also builds here: its three seams (`TableFile`,
+  the `cumemop_*` driver lookup, the aligned allocation) carry Win32 bodies, and the `pread`
+  thread pool -- not io_uring -- is the reader, which is also the portable shape on Linux.
+- `kernel.gguf._host_compiler`: on POSIX it points nvcc's `-ccbin` (and `CXX`/`CC`, which it
+  writes into the environment) at clang++ or an older gcc, because a too-new gcc trips torch's
+  headers. Here that search matched the `clang++.EXE` inside VS -- a developer prompt has it on
+  `PATH` -- and nvcc then handed MSVC's `-nologo`/`/EHsc` spellings to a front-end that rejects
+  them; because the choice lands in `os.environ`, one GGUF build poisoned every later JIT in the
+  same process (the tvm-ffi kernels failed next, not the GGUF one alone). Windows keeps nvcc's
+  default host.
+- `moe/cpu_executor.physical_core_cpus` has no sysfs to read here, so it returns every logical
+  CPU rather than one per physical core, and the pool is as wide as `os.cpu_count()`. The ids it
+  returns do reach the workers: `pin_thread_to_cpu` binds each to one logical CPU through
+  `SetThreadAffinityMask`. Narrow the pool with `--moe-cpu-threads` if SMT siblings turn out to
+  contend for bandwidth on a given machine.
 - `moe/host_banks.py` owns the platform seam for direct I/O (`open_direct`, `pread_into`,
   `close_direct`, `drop_read_cache`): `os.O_DIRECT`/`os.preadv`/`os.posix_fadvise` on POSIX,
   `FILE_FLAG_NO_BUFFERING` + `ReadFile` at an explicit offset on Windows. `models/weight.py`'s
@@ -97,16 +132,21 @@ platform branches carry that, none of which changes anything on Linux:
 
 ## Building the extensions again after editing them
 
-`uv pip install -e ".[accel]"` rebuilds from scratch in an isolated environment and needs
-nothing special. The documented dev loop (`python setup.py build_ext --inplace`) runs in your
-shell, so start from a *Developer Prompt* and let distutils trust it:
+`setup.py build_ext --inplace` works from a plain PowerShell as well as
+`uv pip install -e ".[accel]"` does: when the shell has no compiler environment, `setup.py`
+runs `vcvars64.bat` from the VS install `vswhere` reports and takes its environment over
+(including the `ninja` that VS ships under `CommonExtensions\Microsoft\CMake`). Doing it by
+hand stays available and is what to do if you want the prompt for your own reasons:
 
 ```powershell
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 $env:DISTUTILS_USE_SDK = "1"   # without it torch's ABI check refuses the activated env
-uv pip install ninja           # optional: otherwise distutils compiles instead of ninja
 .venv\Scripts\python.exe setup.py build_ext --inplace
 ```
+
+`_cpu_moe` needs ninja because the clang-cl swap works by editing torch's generated ninja
+compile rule; where ninja is missing, `setup.py` drops the extension rather than quietly
+building the scalar executor with cl.
 
 ## The limit that actually binds: page-locked host memory
 
@@ -133,18 +173,55 @@ expert banks need 63.5 GiB of pinned host RAM but the pin budget is 57.1 GiB
 ```
 
 So the disk backend removes the PLE's 47.7 GiB entirely, and the expert banks alone still sit
-about 1.5 GiB over what this machine can lock. The last mile is `--moe-cpu-layers` (mlock those
-layers instead of pinning them), which needs the `_cpu_moe` module Windows does not build.
-`fused` is refused for NVFP4 experts, so it is not a way around the cap.
+about 1.5 GiB over what this machine can lock. The last mile is `--moe-cpu-layers auto`, which
+settles head+tail layers as LOCKED -- page-resident in ordinary RAM, no CUDA pin quota spent --
+and decodes them on the CPU executor. It resolves to five of the 48 MoE layers here:
+
+```
+--moe-cpu-layers auto: banks 63.46 GiB > pin budget 57.09 GiB; locking 5 head+tail MoE layers
+for CPU decode ([0, 1, 2, 46, 47])
+```
+
+`HostBank.lock()` had no Windows spelling until now: `_os_lock` opened with `import resource`,
+`lock()` caught that ImportError next to the OSError it expected, and every LOCKED layer settled
+PAGEABLE under an `ulimit -l` message. The Win32 branch raises the process working-set maximum --
+a raise to 96 GiB succeeds -- and calls `VirtualLock`. That is not the ceiling that binds: page
+locks have their own per-process quota, lifted by the "Lock pages in memory" right, which an
+Administrator token here does not hold (`AdjustTokenPrivileges` answers
+`ERROR_NOT_ALL_ASSIGNED`). Measured: a 16 MiB bank locks, a 5.3 GiB one comes back
+`ERROR_QUOTA_EXCEEDED` (1453), and the running server says so and carries on:
+
+```
+WARNING bank lock failed; leaving this and later banks pageable: [Errno 1453] VirtualLock(0.8 GiB):
+WinError 1453 (ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right
+(secpol.msc, then re-login); without it --moe-cpu-layers layers stay pageable)
+```
+
+The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
+executor reads those layers from pageable RAM exactly as it does on a WSL2 host whose
+`RLIMIT_MEMLOCK` refused the lock. To get them genuinely resident, grant the right (secpol.msc ->
+Local Policies -> User Rights Assignment -> Lock pages in memory) and start a new login session.
 
 - Tensor parallelism (`shm_ar`/`p2p_ar`) is untested on Windows; keep `--tp-size 1`. A
   `--tp-size 2` run of a model with `FULL` attention layers is refused at config time anyway,
   because the two TP-capable FULL backends (`fi`, `fa`) are the packages gated to Linux.
+- The vendored GGUF dequant kernels (`csrc/gguf/gguf_kernel.cu`, the q4_0 path) do not compile
+  here: nvcc hosts on cl, and `torch/csrc/dynamo/compiled_autograd.h` -- reached through the
+  `pybind11` block at the end of that file -- trips `error C2872: 'std': ambiguous symbol`. Moving
+  that include up next to `torch/all.h` changes nothing (measured), so the binding needs its own
+  host-only translation unit before a GGUF checkpoint can serve. `_cpu_moe`'s own q4_0 GEMV builds
+  and runs; the GPU reference kernel behind
+  `tests/moe/test_cpu_moe_q4_0.py::test_cpu_decode_q4_0_matches_ggml_mmvq` is what is missing.
 
 ## Verified on Windows (RTX PRO 6000 Blackwell, sm_120, driver 616.92, CUDA 13.0)
 
 - `uv pip install -e ".[accel]"` completes; `torch 2.11.0+cu130`, `triton 3.6.0`
-  (`triton-windows 3.6.0.post26`), `_pinned_tensor`, `_ple_store` and `_radix_tree` import.
+  (`triton-windows 3.6.0.post26`), and all four extensions import: `_pinned_tensor`,
+  `_ple_store`, `_radix_tree` from cl, `_cpu_moe` from clang-cl. The clang-cl build really is
+  compiling the SIMD tiers -- `dumpbin /DISASM` over its object file counts 305 uses of `zmm`
+  registers and 7 `vpdpbusd`/`vdpbf16ps`, and the running executor reports
+  `isa=avx512bf16+avx512vnni(nvfp4-w4a8)`, which is `__builtin_cpu_supports` answering through
+  the compiler-rt library the link pulls in.
 - `uv pip compile pyproject.toml --extra accel --python-platform linux` still resolves
   `flashinfer-python`, `sglang-kernel` and `triton==3.6.0`: the Linux set is unchanged.
 - The five tvm-ffi kernels compile and load; Triton paths run (`tests/kernels/test_rotary.py`).
@@ -158,16 +235,31 @@ layers instead of pinning them), which needs the `_cpu_moe` module Windows does 
   `iter_expert_tensors_parallel` returns the expert tensors byte-identical -- that reader is what
   qwen3_5_moe, qwen3_moe, qwen3_vl and the NVFP4 bank loader share.
 - `pytest tests/engine tests/models/qwen4_exp tests/kernels tests/moe tests/checkpoint tests/layers`:
-  878 passed, 67 skipped, 41 failed. Those 41 are only the CPU MoE executor (`_cpu_moe`, 27),
-  fixtures naming the `fi` backend (10) and `torch._scaled_mm` rowwise scaling unsupported in
-  this torch build (4) -- each needs a component Windows does not ship, and none is a Linux
+  905 passed, 67 skipped, 15 failed (from 878 / 67 / 41 before this section's `_cpu_moe`,
+  `VirtualLock` and event-loop work). The 15 are fixtures naming the `fi` backend (10),
+  `torch._scaled_mm` rowwise scaling unsupported in this torch build (4), and the GGUF kernel
+  compile named above -- each needs a component Windows does not ship, and none is a Linux
   regression.
 - `_pin_budget_bytes` gives 57.1 GiB here (45% of 126.9 GiB), so a 63.5 GiB bank set is refused
   before any disk read; `FREETOKEN_PIN_BUDGET_GB=64` lets the preflight pass when your machine's
   real ceiling is above that conservative default.
-- `ft serve --model nvidia/Qwen3.8-Flash-Next-NVFP4 --dummy-weight` resolves
+- `ft serve --model nvidia/Qwen3.8-Flash-Next-NVFP4 --dummy-weight --ple-backend disk
+  --moe-strategy offload --moe-cpu-layers auto --attention-backend qsa_sparse
+  --quant-backend moe.nvfp4=triton --max-seq-len-override 4096` boots: it resolves
   `attention_backend=qsa_sparse`, `page_size=64`, `moe_strategy=offload`, logs
-  `MoE experts: nvfp4 via triton`, and now stops at the pin-budget preflight quoted above
-  instead of crashing mid-load with the old "free host RAM" guess.
+  `MoE experts: nvfp4 via triton`, splits the residency, sizes the slot cache off the pinned
+  layers only, captures the decode graphs, and reports
+  `API server is ready to serve on 127.0.0.1:1919`. A chat completion comes back:
+
+  ```
+  latency 6.3s
+  finish: length
+  content: 'itetégetégetégetégetéget é'
+  usage: {'prompt_tokens': 53, 'completion_tokens': 9, 'total_tokens': 62}
+  ```
+
+  The text is meaningless because the weights are `--dummy-weight` -- it is the round trip that
+  is being claimed here: frontend, tokenizer, scheduler, Triton prefill, CUDA-graph decode over
+  both the pinned and the CPU-served expert layers, and the reply back over the TCP queues.
 
 
