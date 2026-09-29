@@ -3,7 +3,7 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -60,6 +60,7 @@ dependencies = [
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
     "triton==3.6.0; platform_system == 'Linux'",
+    "triton-windows>=3.6,<3.7; platform_system == 'Windows'",
     "uvicorn>=0.30,<1",
 ]
 
@@ -76,9 +77,9 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+fi = ["flashinfer-python[cu13]>=0.6,<0.7; platform_system == 'Linux'"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
-sgl = ["sglang-kernel==0.4.5"]
+sgl = ["sglang-kernel==0.4.5; platform_system == 'Linux'"]
 accel = ["freetoken[fi,sgl]"]
 # NOTE: the Marlin W4A16 NVFP4 expert-GEMM path (sm_80-99) borrows vLLM's AOT wheel
 # (vllm>=0.14,<0.15), which pins transformers>=4.56,<5 and so is INCOMPATIBLE with the
