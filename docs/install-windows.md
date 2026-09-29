@@ -67,16 +67,17 @@ never auto-selected, and `marlin` needs the separate `vllm` wheel). The GDN laye
 of them (`radix`, `batch_memcpy`, `store`, `index`, `fast_index_copy`) build and load. The
 branches below carry that; none of them changes anything on Linux:
 
-- `utils.mp.zmq_endpoint` and `utils.mp.use_zmq_event_loop`: the Windows `libzmq` wheels are
-  built without the `ipc://` transport (binding one answers `Protocol not supported` for a `/tmp`
-  path and for a native one alike), so the five control queues take `tcp://127.0.0.1` with ports
-  allocated by the process that builds the config and carried to every worker with it; POSIX keeps
-  its `/tmp` unix sockets. The frontend then also has to run on a selector event loop:
-  `zmq.asyncio` waits through `loop.add_reader`, which the proactor loop Windows picks by default
-  does not implement. Without the swap the engine prefills a request and never reads the reply --
-  the client hangs, and the only trace is one `RuntimeError` in the server log. pyzmq can also
-  shim a proactor loop when `tornado` happens to be installed; the engine switches the policy
-  instead of depending on that, so `tornado` is not a requirement here.
+- `utils.mp.zmq_endpoint`: the Windows `libzmq` wheels are built without the `ipc://` transport
+  (binding one answers `Protocol not supported` for a `/tmp` path and for a native one alike), so
+  the five control queues take `tcp://127.0.0.1` with ports allocated by the process that builds
+  the config and carried to every worker with it; POSIX keeps its `/tmp` unix sockets.
+- The frontend also needs `tornado`, which pyproject requires on Windows only. `zmq.asyncio`
+  waits through `loop.add_reader`, and the proactor loop Windows' asyncio picks by default has no
+  such method; pyzmq's own fallback registers the reader on a selector thread, but only when
+  tornado can be imported. Without it the engine prefills a request and the frontend never reads
+  the reply -- the client hangs, and one `RuntimeError` in the server log is the only trace. A
+  `WindowsSelectorEventLoopPolicy` is the other way in, but the swap has to reach the loop uvicorn
+  builds on its own thread, which it did not do here, so the dependency is the seam that holds.
 - `kernel.utils._msvc_ninja_compat`: tvm-ffi (<= 0.1.14) writes its Windows CUDA rule as
   `-Xcompiler /std:c++17 /O2`. nvcc takes one comma-joined `-Xcompiler` argument, so that
   `/O2` reaches it as a second input file, and the forced `/std:c++17` makes MSVC's STL hide
@@ -245,21 +246,24 @@ Local Policies -> User Rights Assignment -> Lock pages in memory) and start a ne
   real ceiling is above that conservative default.
 - `ft serve --model nvidia/Qwen3.8-Flash-Next-NVFP4 --dummy-weight --ple-backend disk
   --moe-strategy offload --moe-cpu-layers auto --attention-backend qsa_sparse
-  --quant-backend moe.nvfp4=triton --max-seq-len-override 4096` boots: it resolves
+  --quant-backend moe.nvfp4=triton --max-seq-len-override 4096` loads: it resolves
   `attention_backend=qsa_sparse`, `page_size=64`, `moe_strategy=offload`, logs
   `MoE experts: nvfp4 via triton`, splits the residency, sizes the slot cache off the pinned
-  layers only, captures the decode graphs, and reports
-  `API server is ready to serve on 127.0.0.1:1919`. A chat completion comes back:
+  layers only (`--moe-cache-auto resolved moe_cache_size=22528`), builds the CPU executor
+  (`CPU MoE executor ready: threads=15 ... isa=avx512bf16+avx512vnni(nvfp4-w4a8) fmt=nvfp4`),
+  warms prefill, captures the four decode graphs, logs
+  `API server is ready to serve on 127.0.0.1:1919`, and answers a chat completion:
 
   ```
-  latency 6.3s
+  latency 2.8 s
   finish: length
-  content: 'itetégetégetégetégetéget é'
-  usage: {'prompt_tokens': 53, 'completion_tokens': 9, 'total_tokens': 62}
+  usage: {'prompt_tokens': 53, 'completion_tokens': 7, 'total_tokens': 60}
   ```
 
-  The text is meaningless because the weights are `--dummy-weight` -- it is the round trip that
-  is being claimed here: frontend, tokenizer, scheduler, Triton prefill, CUDA-graph decode over
-  both the pinned and the CPU-served expert layers, and the reply back over the TCP queues.
+  What comes back is empty text with seven tokens accounted for, which is what a `--dummy-weight`
+  engine produces; the claim here is the round trip -- frontend, tokenizer, scheduler, Triton
+  prefill, CUDA-graph decode across both the pinned and the CPU-served expert layers, and the
+  reply returning over the TCP queues. Before the event-loop seam above, the same request prefilled
+  and then hung forever.
 
 
