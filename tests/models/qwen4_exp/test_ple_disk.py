@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -453,6 +454,7 @@ def test_rows_gated_follows_the_shm_ar_interlock(monkeypatch):
 
     store = DiskRowTable.__new__(DiskRowTable)  # no __init__: the predicate touches only these
     store._wait_sync = True
+    monkeypatch.setattr(os, "name", "posix")   # the platform guard is its own case below
 
     monkeypatch.setattr(shm_ar, "_ACTIVE", None)
     assert not store._rows_gated(1)
@@ -475,6 +477,23 @@ def test_rows_gated_follows_the_shm_ar_interlock(monkeypatch):
     store._wait_sync = False
     monkeypatch.setattr(shm_ar, "_ACTIVE", _Fake())
     assert not store._rows_gated(4)          # explicit gate mode: call sites branch on _wait_sync
+
+
+def test_windows_gates_bs2_graphs_without_the_shm_interlock(monkeypatch):
+    """Native Windows blocks a bs>=2 wait-sync graph at its next launch even with no
+    shm reducer live to key the interlock on (tp_size 1: GPU idle, engine parked), so
+    the guard applies by platform there while bs1 keeps the faster wait-sync path."""
+    from freetoken.distributed import shm_ar
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    store = DiskRowTable.__new__(DiskRowTable)
+    store._wait_sync = True
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(shm_ar, "_ACTIVE", None)
+
+    assert not store._rows_gated(1)          # bs1 stays wait-sync
+    assert store._rows_gated(2)
+    assert store._rows_gated(8)
 
 
 @requires_cuda

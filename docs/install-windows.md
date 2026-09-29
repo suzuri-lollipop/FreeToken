@@ -195,7 +195,7 @@ Administrator token here does not hold (`AdjustTokenPrivileges` answers
 ```
 WARNING bank lock failed; leaving this and later banks pageable: [Errno 1453] VirtualLock(0.8 GiB):
 WinError 1453 (ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right
-(secpol.msc, then re-login); without it --moe-cpu-layers layers stay pageable)
+(secpol.msc, then re-login); without it every host-locked layer stays pageable)
 ```
 
 The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
@@ -203,9 +203,26 @@ executor reads those layers from pageable RAM exactly as it does on a WSL2 host 
 `RLIMIT_MEMLOCK` refused the lock. To get them genuinely resident, grant the right (secpol.msc ->
 Local Policies -> User Rights Assignment -> Lock pages in memory) and start a new login session.
 
+The same cap has a GPU-side answer that keeps every layer on the GPU: `--moe-flat-residency`. Flat
+residency gives each expert a permanent slot and fills them in one pass of ordinary host->device
+copies at startup, so afterwards no bank needs a device address, nothing is gathered per token and
+no layer runs on the CPU executor. Because the copy needs no pin, a boot whose banks exceed the pin
+budget host-locks all of them instead of splitting the model across CPU (`--moe-flat-residency:
+banks ... > pin budget ...; host-locking all 48 MoE layers`). It requires VRAM for every expert
+beside the KV pool -- here 48 layers x 512 experts = 24576 slots; where that does not fit, the
+plan refuses with `flat residency needs one slot per expert` and `--moe-cpu-layers auto` is the
+fallback.
+
 - Tensor parallelism (`shm_ar`/`p2p_ar`) is untested on Windows; keep `--tp-size 1`. A
   `--tp-size 2` run of a model with `FULL` attention layers is refused at config time anyway,
   because the two TP-capable FULL backends (`fi`, `fa`) are the packages gated to Linux.
+- At `--tp-size 1` there is no shm all-reduce to key the PLE graph protocol on, so a `bs>=2`
+  decode graph captured with the wait-sync WAIT memops blocks its next `cudaGraphLaunch` here
+  (GPU idles at 0%, the engine thread parks, no error -- measured with 4 concurrent requests).
+  `ple_disk._rows_gated` therefore gates `bs>=2` graphs on Windows as well as under the AR
+  interlock, and keeps `bs1` on wait-sync (measured ~9% faster single-stream). The startup line
+  reads `wait-sync bs1, launch-gating bs>=2 (Windows graph-launch guard)`; `FREETOKEN_PLE_SYNC=wait`
+  reproduces the hang on purpose, `gate` forces gating at every size.
 - The vendored GGUF dequant kernels (`csrc/gguf/gguf_kernel.cu`, the q4_0 path) do not compile
   here: nvcc hosts on cl, and `torch/csrc/dynamo/compiled_autograd.h` -- reached through the
   `pybind11` block at the end of that file -- trips `error C2872: 'std': ambiguous symbol`. Moving
@@ -265,5 +282,38 @@ Local Policies -> User Rights Assignment -> Lock pages in memory) and start a ne
   prefill, CUDA-graph decode across both the pinned and the CPU-served expert layers, and the
   reply returning over the TCP queues. Before the event-loop seam above, the same request prefilled
   and then hung forever.
+
+## No-CPU decode over the pin cap: `--moe-flat-residency`
+
+`ft serve --model <checkpoint dir> --moe-strategy offload --moe-flat-residency --ple-backend disk`
+is the shape this cap allows when the GPU has room for every expert. It logs
+
+```
+--moe-flat-residency: banks 63.46 GiB > pin budget 57.09 GiB; host-locking all 48 MoE layers
+instead of pinning (the startup copy needs no device address, so no layer decodes on the CPU)
+```
+
+loads the banks as ordinary RAM (the `VirtualLock` quota still refuses here, so all 48 layers echo
+PAGEABLE and that costs nothing), plans `--moe-cache-auto resolved moe_cache_size=24576` -- one slot
+per expert instead of the 22528 a `--moe-cpu-layers` split allows -- and moves them in
+`MoE flat residency: 24576 experts (63.46 GiB) into fixed GPU slots in 7.99s`. No
+`CPU MoE executor ready` line appears; the KV pool takes the remainder (397120 tokens, 9.38 GiB,
+beside the 621056 tokens the split-residency plan reserves).
+
+Measured on this box with the same checkpoint, one client
+(`python benchmarks/bench_token_speed.py --server http://127.0.0.1:1919 --concurrency 1
+--decode 256 --requests 4 --warmup 2 --prompt-words 64`):
+
+| | `--moe-cpu-layers auto` | `--moe-flat-residency` |
+|---|---|---|
+| decode per stream | 30.28 tok/s (ITL p50 37.5 / p95 95.4 ms) | 104.65 tok/s (p50 9.2 / p95 10.8 ms) |
+| TTFT (143 prompt tokens) | 2203 ms | 278 ms |
+| aggregate output | 24.01 tok/s | 94.23 tok/s |
+
+The five CPU-decoded layers put a host round trip on every step, and split residency disables prefill
+overlap, so each prefill chunk re-streams whole layers out of pageable RAM -- that is the 2.2 s TTFT.
+Flat residency removes both, and lands at 104.65 tok/s against the 110 tok/s reported for the same
+hardware under Linux. What is left of that gap is the flashinfer/sgl-kernel fallbacks listed above
+(norms, activations, RoPE, `causal_conv1d`, sampling), not CPU decode.
 
 

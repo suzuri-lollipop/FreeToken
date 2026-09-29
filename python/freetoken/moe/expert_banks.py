@@ -433,10 +433,13 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
         labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
         downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
         if downgraded:
+            # a flat-residency boot labels every layer locked, so name the count when the
+            # list would run to the whole model
+            shown = downgraded if len(downgraded) <= 12 else f"{len(downgraded)} layers"
             logger.warning_rank0(
-                f"--moe-cpu-layers: layers {downgraded} settled pageable instead of "
-                f"OS-locked (lock failed); they still decode on the CPU executor but "
-                f"may swap under memory pressure"
+                f"host-locked banks: {shown} settled pageable instead of "
+                f"OS-locked (the page-lock quota refused them); their bytes stay resident "
+                f"only as long as the OS does not reclaim them"
             )
         return dataclasses.replace(banks, layer_residency=labels)
     from freetoken.moe.host_banks import HostResidency

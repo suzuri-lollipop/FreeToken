@@ -338,7 +338,7 @@ def _nt_lock(addr: int, nbytes: int) -> None:
             err,
             f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err} "
             f"(ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right "
-            f"(secpol.msc, then re-login); without it --moe-cpu-layers layers stay pageable)",
+            f"(secpol.msc, then re-login); without it every host-locked layer stays pageable)",
         )
     _os_locked_total += nbytes
 

@@ -808,6 +808,43 @@ def test_flat_residency_rejects_cpu_decode():
         )
 
 
+def test_flat_residency_streams_unpinned_banks_into_their_slots():
+    """The WDDM/WSL shape: the pin budget cannot hold the banks, and flat residency does not
+    need a device address -- materialize_flat is an ordinary host->device copy."""
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        flat_residency=True,
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.LOCKED.value, HostResidency.PAGEABLE.value],
+    )
+
+    assert cache._unpinned_layers == frozenset({0, 1})
+    assert cache._copy_fused_ok is False  # no per-token gather plan may exist
+
+    moved = cache.materialize_flat()
+    gate_up, down = cache.bank_views_flat(1)
+    assert torch.equal(gate_up, sources["gate_up"][1])
+    assert torch.equal(down, sources["down"][1])
+    assert moved == sum(
+        t.numel() * t.element_size() for layers in cache.bank_sources.values() for t in layers
+    )
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+    with pytest.raises(AssertionError, match="flat residency"):
+        cache.copy_missing()
+
+
 def test_materialize_flat_loads_every_expert_into_its_permanent_slot():
     cache = _make_flat_cache()
     moved = cache.materialize_flat()
