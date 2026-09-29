@@ -57,6 +57,88 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+# O_DIRECT's Windows counterpart is FILE_FLAG_NO_BUFFERING, which asks for the same three
+# alignments (sector-aligned offset, length and buffer) that _BLK already enforces here. A
+# positioned read is os.preadv on POSIX and ReadFile with an OVERLAPPED offset on Windows.
+# Shared with models/weight.py's parallel shard reader, so these four are public.
+_POSIX_DIRECT = os.name != "nt"
+
+if _POSIX_DIRECT:
+
+    def open_direct(path: str) -> int:
+        return os.open(path, os.O_RDONLY | os.O_DIRECT)
+
+    def pread_into(fd: int, view: memoryview, offset: int) -> int:
+        return os.preadv(fd, [view], offset)
+
+    def close_direct(fd: int) -> None:
+        os.close(fd)
+
+    def drop_read_cache(path: str, offset: int = 0, length: int = 0) -> None:
+        # never fail a load over a page-cache hint
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+else:
+    import ctypes.wintypes as _wt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _GENERIC_READ = 0x80000000
+    _SHARE_ALL = 0x1 | 0x2 | 0x4
+    _OPEN_EXISTING = 3
+    _NO_BUFFERING = 0x20000000  # not 0x40000000, which is FILE_FLAG_OVERLAPPED
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _kernel32.CreateFileW.restype = ctypes.c_void_p
+    _kernel32.CreateFileW.argtypes = [_wt.LPCWSTR, _wt.DWORD, _wt.DWORD, ctypes.c_void_p,
+                                      _wt.DWORD, _wt.DWORD, ctypes.c_void_p]
+    _kernel32.ReadFile.restype = _wt.BOOL
+    _kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _wt.DWORD,
+                                   ctypes.POINTER(_wt.DWORD), ctypes.c_void_p]
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _logged_buffer_fallback = False
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [("internal", ctypes.c_ulonglong), ("internal_high", ctypes.c_ulonglong),
+                    ("offset", _wt.DWORD), ("offset_high", _wt.DWORD), ("key", ctypes.c_void_p)]
+
+    def open_direct(path: str):
+        """A NO_BUFFERING handle, or a buffered one where the volume refuses direct I/O."""
+        global _logged_buffer_fallback
+        for flags in (_NO_BUFFERING, _FILE_ATTRIBUTE_NORMAL):
+            handle = _kernel32.CreateFileW(path, _GENERIC_READ, _SHARE_ALL, None,
+                                           _OPEN_EXISTING, flags, None)
+            if handle is not None and handle != _INVALID_HANDLE:
+                if flags == _FILE_ATTRIBUTE_NORMAL and not _logged_buffer_fallback:
+                    _logged_buffer_fallback = True
+                    logger.warning("direct I/O unavailable on this volume; reading %s through "
+                                   "the page cache (slower, and nothing evicts it afterwards)",
+                                   path)
+                return handle
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def pread_into(handle, view: memoryview, offset: int) -> int:
+        overlapped = _Overlapped()
+        overlapped.offset = offset & 0xFFFFFFFF
+        overlapped.offset_high = offset >> 32
+        got = _wt.DWORD(0)
+        buffer = ctypes.addressof(ctypes.c_char.from_buffer(view))
+        if not _kernel32.ReadFile(handle, buffer, len(view), ctypes.byref(got),
+                                  ctypes.byref(overlapped)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return got.value
+
+    def close_direct(handle) -> None:
+        _kernel32.CloseHandle(handle)
+
+    def drop_read_cache(path: str, offset: int = 0, length: int = 0) -> None:
+        pass  # unbuffered reads never populate the cache, and there is no fadvise here
+
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
     v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
@@ -385,20 +467,15 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
+        drop_read_cache(path)
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = open_direct(path)
     offs = list(range(0, size, chunk))
 
     def rd(o):
         want = min(chunk, len(mv) - o)
         want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        pread_into(fd, mv[o:o + want], o)
 
     try:
         if len(offs) <= 1:
@@ -408,17 +485,17 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, offs))
     finally:
-        os.close(fd)
+        close_direct(fd)
     return size
 
 
-def _preadv_all(fd: int, dst: memoryview, offset: int, need: int) -> None:
-    """preadv into ``dst`` until ``need`` bytes have landed; O_DIRECT may return a short count."""
+def _preadv_all(fd, dst: memoryview, offset: int, need: int) -> None:
+    """Positioned read into ``dst`` until ``need`` bytes have landed; direct I/O may return a short count."""
     done = 0
     while done < need:
         if done % _BLK:  # a continuation read has to stay block-aligned on both sides
             raise OSError(f"unaligned short O_DIRECT read: {done} of {need} bytes at {offset}")
-        got = os.preadv(fd, [dst[done:]], offset + done)
+        got = pread_into(fd, dst[done:], offset + done)
         if got <= 0:
             raise OSError(f"short O_DIRECT read: {done} of {need} bytes at {offset}")
         done += got
@@ -436,13 +513,8 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        drop_read_cache(path, file_offset, nbytes)
+    fd = open_direct(path)
     scratch = threading.local()
 
     def rd(i: int) -> None:
@@ -469,7 +541,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, offs))
     finally:
-        os.close(fd)
+        close_direct(fd)
     return nbytes
 
 
@@ -481,7 +553,11 @@ __all__ = [
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "close_direct",
+    "drop_read_cache",
+    "open_direct",
     "pin_banks",
+    "pread_into",
     "read_file_into",
     "read_range_into",
     "requested_residency",

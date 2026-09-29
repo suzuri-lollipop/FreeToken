@@ -48,13 +48,15 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     asize = ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK
     buf = mmap.mmap(-1, asize)
     mv = memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    from freetoken.moe.host_banks import close_direct, open_direct, pread_into
+
+    fd = open_direct(path)
     offs = list(range(0, size, chunk))
 
     def rd(o):
         want = min(chunk, asize - o)
         want = min(want, ((size - o + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        pread_into(fd, mv[o:o + want], o)
 
     try:
         if len(offs) <= 1:
@@ -64,7 +66,7 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, offs))
     finally:
-        os.close(fd)
+        close_direct(fd)
     return buf
 
 
@@ -90,7 +92,7 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
-    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.models.loader import drop_page_cache, safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)
@@ -110,12 +112,7 @@ def iter_expert_tensors_parallel(
             for shard in shard_list:
                 path = os.path.join(model_path, shard)
                 if drop_cache:
-                    try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
-                    except OSError:
-                        pass
+                    drop_page_cache(path)
                 buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
                 hdr = json.loads(bytes(buf[8:8 + n]))
