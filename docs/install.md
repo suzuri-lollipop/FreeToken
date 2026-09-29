@@ -5,6 +5,7 @@
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
 - Python >= 3.10, with [uv](https://docs.astral.sh/uv/) recommended (plain
   `pip` + `venv` works too)
+- Windows without WSL: [install-windows.md](install-windows.md)
 
 ## Method 1: Install from PyPI
 
