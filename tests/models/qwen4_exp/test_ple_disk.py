@@ -432,9 +432,13 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
         torch.cuda.synchronize()
         assert _bitwise_equal(out, oracle.lookup(ids)), "forward_host_ctx deferred (python fill)"
 
-    # gate mode: the hook fills inline and returns no deferred
+    # gate mode: the hook fills inline and returns no deferred. Built in its own directory
+    # because Windows refuses to rebuild a checkpoint in place while the first table's reader
+    # still holds it open (the fixture is seeded, so both directories hold the same bytes).
     monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")
-    gated, _, _ = _make_table(tmp_path)
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    gated, _, _ = _make_table(gate_dir)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
 
