@@ -101,6 +101,20 @@ else:
     _kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _wt.DWORD,
                                    ctypes.POINTER(_wt.DWORD), ctypes.c_void_p]
     _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    # the working-set queries take and return 64-bit sizes; GetCurrentProcess hands back the
+    # (HANDLE)-1 pseudo-handle, which ctypes would truncate to an int
+    _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    _kernel32.GetProcessWorkingSetSizeEx.restype = ctypes.c_int
+    _kernel32.GetProcessWorkingSetSizeEx.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+    ]
+    _kernel32.SetProcessWorkingSetSizeEx.restype = ctypes.c_int
+    _kernel32.SetProcessWorkingSetSizeEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32,
+    ]
+    _kernel32.VirtualLock.restype = ctypes.c_int
+    _kernel32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     _logged_buffer_fallback = False
 
     class _Overlapped(ctypes.Structure):
@@ -258,8 +272,9 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 def _os_lock(addr: int, nbytes: int) -> None:
     """Page-lock a bank without spending CUDA pin quota: mlock on POSIX, VirtualLock on Windows.
 
-    Both are bounded by a per-process ceiling -- RLIMIT_MEMLOCK there, the working set here --
-    so each branch tries to raise its own first and the refusal surfaces from the lock call.
+    Both are bounded by a per-process ceiling that needs a privilege to lift -- RLIMIT_MEMLOCK
+    there, the page-lock quota here -- so each branch tries its own raise first and the refusal
+    surfaces from the lock call itself.
     """
     global _os_locked_total
     if os.name == "nt":
@@ -290,66 +305,34 @@ def _os_lock(addr: int, nbytes: int) -> None:
 
 
 _nt_quota_raised = False  # one quota raise per process; the ceiling stays where it was set
-_KERNEL32 = None
-
-
-def _kernel32():
-    """kernel32 with the working-set and VirtualLock prototypes pinned down.
-
-    The signatures are set explicitly because two things would otherwise go wrong: handles and
-    SIZE_T are 64-bit (GetCurrentProcess hands back the (HANDLE)-1 pseudo-handle, which ctypes
-    would truncate to an int), and GetProcessWorkingSetSizeEx takes a fifth argument -- the
-    out-flags pointer -- that GetProcessWorkingSetSize does not have. Passing four there faults.
-    """
-    global _KERNEL32
-    if _KERNEL32 is None:
-        size_t = ctypes.c_size_t
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.GetCurrentProcess.restype = ctypes.c_void_p
-        k32.GetProcessWorkingSetSizeEx.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(size_t), ctypes.POINTER(size_t),
-            ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
-        ]
-        k32.GetProcessWorkingSetSizeEx.restype = ctypes.c_int32
-        k32.SetProcessWorkingSetSizeEx.argtypes = [
-            ctypes.c_void_p, size_t, size_t, ctypes.c_uint32
-        ]
-        k32.SetProcessWorkingSetSizeEx.restype = ctypes.c_int32
-        k32.VirtualLock.argtypes = [ctypes.c_void_p, size_t]
-        k32.VirtualLock.restype = ctypes.c_int32
-        _KERNEL32 = k32
-    return _KERNEL32
 
 
 def _nt_raise_working_set_quota(want: int) -> None:
-    """Raise the process working-set maximum so VirtualLock can cover the bank.
+    """Raise the process working-set maximum so locked pages have somewhere to live.
 
     Only the maximum moves (SeProfileSingleProcessPrivilege); the minimum is handed back
-    unchanged, as raising that needs a privilege a normal server process lacks. A no-op here
-    just means the VirtualLock below reports the real ceiling.
+    unchanged, as raising that needs a privilege a normal server process lacks. This is the
+    working set, not the page-lock quota -- the latter is what refuses a big bank below.
     """
     global _nt_quota_raised
     if _nt_quota_raised:
         return
-    kernel32 = _kernel32()
-    process = kernel32.GetCurrentProcess()
+    process = _kernel32.GetCurrentProcess()
     minimum, maximum, flags = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_uint32()
-    # docs say pdwFlags may be NULL; this SDK dereferences it anyway.
-    if not kernel32.GetProcessWorkingSetSizeEx(
+    if not _kernel32.GetProcessWorkingSetSizeEx(
         process, ctypes.byref(minimum), ctypes.byref(maximum), ctypes.byref(flags), 0
     ):
         return
     if maximum.value >= want:
         return
-    if kernel32.SetProcessWorkingSetSizeEx(process, minimum.value, want, 0):
+    if _kernel32.SetProcessWorkingSetSizeEx(process, minimum.value, want, 0):
         _nt_quota_raised = True
 
 
 def _nt_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
     _nt_raise_working_set_quota(_os_locked_total + nbytes + (256 << 20))
-    kernel32 = _kernel32()
-    if not kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
+    if not _kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
         err = ctypes.get_last_error()
         raise OSError(
             err,
