@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Callable, Dict, Generic, TypeVar
 
 import msgpack
 import zmq
 import zmq.asyncio
+
+if os.name == "nt":
+    # pyzmq waits on the proactor loop uvicorn builds through tornado's selector thread (the seam
+    # the Windows-only tornado dependency buys); this RuntimeWarning describes that working
+    # fallback, so it is noise on every frontend start.
+    warnings.filterwarnings(
+        "ignore",
+        message="Proactor event loop does not implement add_reader",
+        category=RuntimeWarning,
+    )
 
 T = TypeVar("T")
 
