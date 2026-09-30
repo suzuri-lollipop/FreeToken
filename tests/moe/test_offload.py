@@ -1199,6 +1199,22 @@ def test_windows_quota_request_covers_the_live_working_set():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_request_is_sized_on_the_planned_footprint():
+    """The working set at the first lock is a snapshot of a load still in progress, not the footprint.
+
+    Seen on a 63 GiB boot: the first bank settled at 2% read, so the raise asked 8.0 GiB -- enough for
+    that one bank, and the next would be refused once the experts were in. What the run says it will
+    hold therefore floors the ask."""
+    from freetoken.moe.host_banks import _nt_quota_request
+
+    GiB = 1 << 30
+    early = 6 * GiB  # resident when the first bank settles, against a 64 GiB bank set
+    want = _nt_quota_request(nbytes=1 * GiB, locked_total=0, working_set=early, planned=64 * GiB)
+    assert want > 60 * GiB, "sized on the snapshot, the next bank is refused once the load finishes"
+    assert _nt_quota_request(1 * GiB, 0, 65 * GiB, 64 * GiB) == _nt_quota_request(1 * GiB, 0, 65 * GiB)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
 def test_windows_refusal_names_the_granted_ceiling(monkeypatch):
     """A refusal must say how much was granted against how much the resident banks need."""
     import freetoken.moe.host_banks as hb
@@ -1249,7 +1265,7 @@ def test_advisory_page_lock_refusal_does_not_warn(monkeypatch):
     monkeypatch.setattr(hb, "_os_lock", refuse)
     monkeypatch.setattr(hb, "_os_lock_failed", False)
     monkeypatch.setattr(hb, "_os_lock_refusal_reason", None)
-    monkeypatch.setattr(hb, "_lock_advisory", False)
+    monkeypatch.setattr(hb, "_lock_plan", (0, False))
 
     bank = hb.HostBank((1 << 12,), torch.uint8)
     bank.tensor.fill_(0)
@@ -1258,7 +1274,8 @@ def test_advisory_page_lock_refusal_does_not_warn(monkeypatch):
 
     calls.clear()
     monkeypatch.setattr(hb, "_os_lock_failed", False)  # a fresh boot that asked for advisory locking
-    hb.set_lock_advisory(True)
+    hb.set_lock_plan(resident_bytes=64 << 30, advisory=True)
+    assert hb._lock_plan == (64 << 30, True), "the plan is what the raise will be sized on"
     bank.lock()
     assert [kind for kind, _ in calls] == ["info"]
     assert "no quota left" in hb.os_lock_refusal()

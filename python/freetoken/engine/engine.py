@@ -1199,13 +1199,17 @@ class Engine:
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
         if split_residency:
-            from freetoken.moe.host_banks import HostResidency
+            from freetoken.moe.host_banks import HostResidency, set_lock_plan
 
             requested_residency = [
                 HostResidency.LOCKED.value if i in cpu_layer_ids
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+            # pinned and locked banks both stay resident, so both spend the page-lock quota the raise buys
+            bank_bytes = _bank_bytes(config, method)
+            if bank_bytes:
+                set_lock_plan(resident_bytes=bank_bytes)
         elif config.moe_flat_residency:
             # Over a pin budget, flat residency keeps every layer on the GPU and simply stops
             # pinning the banks; --moe-cpu-layers stays empty, so no CPU executor is built.
@@ -2601,7 +2605,7 @@ def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=N
     and gathers nothing per token, so banks over the pin budget may stay OS-locked: a device
     address is only needed by the streaming paths, and pinning is exactly what WDDM/WSL cap.
     """
-    from freetoken.moe.host_banks import HostResidency, set_lock_advisory
+    from freetoken.moe.host_banks import HostResidency, set_lock_plan
 
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
@@ -2613,7 +2617,7 @@ def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=N
         "MoE layers instead of pinning (the startup copy needs no device address, so no "
         "layer decodes on the CPU)"
     )
-    set_lock_advisory()  # the copy reads each bank once, so a refused lock costs this run nothing
+    set_lock_plan(resident_bytes=bank_bytes, advisory=True)  # one read each, then nothing gathers from them
     return [HostResidency.LOCKED.value] * config.model_config.num_moe_layers
 
 

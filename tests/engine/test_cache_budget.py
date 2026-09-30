@@ -853,16 +853,23 @@ def _flat_cfg(**overrides):
 
 def test_flat_residency_host_locks_banks_over_the_pin_budget(monkeypatch):
     from freetoken.engine import engine as eng
+    from freetoken.moe import host_banks as hb
     from freetoken.moe.host_banks import HostResidency
 
+    plans = []
+    monkeypatch.setattr(hb, "set_lock_plan", lambda **kw: plans.append(kw))
     monkeypatch.setattr(eng, "_pin_budget_bytes", lambda reserved=0: 57 * 2**30)
     monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None: 63 * 2**30)
     assert eng._flat_residency_request(_flat_cfg()) == [HostResidency.LOCKED.value] * 48
+    # the raise is sized on the whole bank set, not the few GiB resident when the first bank settles
+    assert plans == [{"resident_bytes": 63 * 2**30, "advisory": True}]
 
     # inside the budget the default stays "pin everything": flat residency changes the
     # runtime movement pattern, not the wish to have registered banks
+    plans.clear()
     monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None: 50 * 2**30)
     assert eng._flat_residency_request(_flat_cfg()) is None
+    assert plans == [], "a run that pins its banks has nothing to size a lock raise on"
 
 
 def test_pin_budget_check_lets_a_flat_boot_through(monkeypatch):
