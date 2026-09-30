@@ -78,8 +78,9 @@ def iter_nvfp4_expert_pieces(
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
     fp16) companions, straight from the safetensors shards.
 
-    Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
-    way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+    Serial reads walk the shards in order; ``parallel`` uses the chunked unbuffered reader
+    (``O_DIRECT`` on POSIX, ``FILE_FLAG_NO_BUFFERING`` on Windows). Either way tensors of one
+    expert may span shards, so they are grouped by (layer, expert) as they land.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map

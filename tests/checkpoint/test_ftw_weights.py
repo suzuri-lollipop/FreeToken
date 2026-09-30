@@ -47,6 +47,39 @@ def test_load_weight_text_only_skips_the_tower(tmp_path):
     assert [n for n, _ in load_weight(str(tmp_path), cpu)] == names
 
 
+def test_unbuffered_read_matches_the_mmap_fallback(tmp_path):
+    """The two FTW read paths have to land identical bytes: the unbuffered one (``os.O_DIRECT`` on
+    POSIX, ``FILE_FLAG_NO_BUFFERING`` through the ``moe/host_banks`` seam on Windows) is the
+    default and mmap is the fallback. Entries are sized to cover the three job shapes
+    ``read_into`` builds: one chunk inside one shard, several chunks, and one chunk spanning
+    shards -- plus a padded tail, which is what a short read used to trip over."""
+    writer = FTWWriter(str(tmp_path), shard_limit=2 << 20)
+    tensors = {
+        "model.tail.weight": torch.randn(1000, dtype=torch.bfloat16),  # 2000 B -> one padded chunk
+        "model.span.weight": torch.randn(4 << 20, dtype=torch.bfloat16),  # 8 MiB over 4 shards
+        "model.chunked.weight": torch.randn(8 << 20, dtype=torch.bfloat16),  # 16 MiB, 4 chunks
+    }
+    for name, tensor in tensors.items():
+        writer.add_tensor(name, tensor)
+    writer.finalize({})
+
+    reader = FTWReader(str(tmp_path))
+    assert reader._direct, "the reader must try the unbuffered path on every platform"
+    reader.close()
+
+    got = dict(iter_ftw_weights(str(tmp_path), chunk=4 << 20))
+    for name, tensor in tensors.items():
+        assert torch.equal(got[name], tensor), name
+
+    fallback = FTWReader(str(tmp_path))
+    fallback._direct = False
+    entry = fallback.tensors["model.chunked.weight"]
+    dest = bytearray(-(-entry["nbytes"] // 4096) * 4096)
+    fallback.read_into(memoryview(dest), entry)
+    fallback.close()
+    assert bytes(dest[: entry["nbytes"]]) == got["model.chunked.weight"].view(torch.int16).numpy().tobytes()
+
+
 def test_ftw_lacks_vision(tmp_path):
     _write_ftw(tmp_path / "text", ["model.a.weight"])
     _write_ftw(tmp_path / "vl", ["model.a.weight", "visual.b.weight"])

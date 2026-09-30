@@ -1286,6 +1286,52 @@ def test_expert_key_matcher_is_best_effort():
     assert expert_key_matcher("a/path", SimpleNamespace(architectures=["NoSuchArch"]), QuantKind.NVFP4) is None
 
 
+def test_parallel_reader_gate_is_the_direct_read_seam(monkeypatch):
+    """The gate asks the host_banks seam whether an unbuffered read exists, not the platform for
+    its POSIX spelling. Windows has neither ``os.O_DIRECT`` nor ``os.preadv`` and still reads
+    scattered experts in parallel, which the old ``hasattr`` gate silently denied it."""
+    import importlib
+
+    import freetoken.moe.expert_banks as eb
+    from freetoken.moe import host_banks
+
+    for name in ("O_DIRECT", "preadv"):
+        monkeypatch.delattr(os, name, raising=False)
+    importlib.reload(eb)
+    try:
+        assert eb._PARALLEL_READER_SUPPORTED is host_banks.DIRECT_READ_SUPPORTED is True
+    finally:
+        importlib.reload(eb)
+
+
+def test_mem_available_bytes_answers_where_proc_meminfo_is_absent():
+    """The auto expert-load guard read /proc/meminfo and gave up elsewhere, so the OOM veto was
+    silently off on Windows; GlobalMemoryStatusEx answers there. The value is re-read through a
+    hand-built MEMORYSTATUSEX because a mistyped struct layout shows up as garbage, not an error."""
+    from freetoken.moe.host_banks import mem_available_bytes
+
+    avail = mem_available_bytes()
+    assert avail is not None and avail > 0
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        assert ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx(ctypes.byref(status))
+        assert 0 < avail < status.ullTotalPhys
+        assert abs(status.ullAvailPhys - avail) < max(1 << 20, status.ullAvailPhys // 10)
+
+
 def test_auto_expert_load_sizes_the_experts_the_reader_opens(tmp_path, monkeypatch):
     import freetoken.moe.expert_banks as eb
     from freetoken.models.weight import EXPERT_PREFETCH_SHARDS, expert_storage

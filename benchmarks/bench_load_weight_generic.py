@@ -152,7 +152,11 @@ def _model_config(model_path: str):
 def _evict_cache(model_path: str) -> int:
     """Drop the page cache for this dir's weight files (fadvise DONTNEED, no root needed) so
     a read measures real disk, not RAM. Needed for baseline (mmap can hit warm cache);
-    parallel/ftw use O_DIRECT and are cold anyway, but evicting also frees the RAM baseline left."""
+    parallel/ftw read unbuffered and are cold anyway, but evicting also frees the RAM baseline
+    left. Returns the files touched -- 0 where the platform has no fadvise (Windows), so there
+    every mode may read a partly warm cache, which flatters the serial baseline, not the fix."""
+    if not hasattr(os, "posix_fadvise"):
+        return 0
     n = 0
     for name in os.listdir(model_path):
         if name.endswith((".safetensors", ".ftw", ".gguf")):

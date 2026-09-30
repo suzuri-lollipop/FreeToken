@@ -121,15 +121,29 @@ branches below carry that; none of them changes anything on Linux:
   returns do reach the workers: `pin_thread_to_cpu` binds each to one logical CPU through
   `SetThreadAffinityMask`. Narrow the pool with `--moe-cpu-threads` if SMT siblings turn out to
   contend for bandwidth on a given machine.
-- `moe/host_banks.py` owns the platform seam for direct I/O (`open_direct`, `pread_into`,
-  `close_direct`, `drop_read_cache`): `os.O_DIRECT`/`os.preadv`/`os.posix_fadvise` on POSIX,
-  `FILE_FLAG_NO_BUFFERING` + `ReadFile` at an explicit offset on Windows. `models/weight.py`'s
-  parallel expert reader -- the one qwen3_5_moe, qwen3_moe, qwen3_vl and the NVFP4 bank loader
-  share -- goes through it too, so it keeps bypassing the page cache here instead of degrading.
-  `checkpoint/ftw.py` needs nothing: it already probes `getattr(os, "O_DIRECT", 0)` and takes
-  its mmap fallback when the flag is absent -- that fallback itself needed one fix, since
-  `mmap.mmap(fd, 0, prot=mmap.PROT_READ)` has no Windows spelling (`mmap.PROT_READ` doesn't
-  exist); `access=mmap.ACCESS_READ` is equivalent on POSIX.
+- `moe/host_banks.py` owns the platform seam for direct I/O (`open_direct`, `open_direct_ex`,
+  `pread_into`, `close_direct`, `drop_read_cache`, plus the `DIRECT_READ_SUPPORTED` capability and
+  `mem_available_bytes`): `os.O_DIRECT`/`os.preadv`/`os.posix_fadvise` on POSIX,
+  `FILE_FLAG_NO_BUFFERING` + `ReadFile` at an explicit offset on Windows. Anything that wants an
+  unbuffered read asks the seam for the capability rather than the platform for the flag, so it is
+  not a POSIX-only option: `models/weight.py`'s parallel expert reader -- the one qwen3_5_moe,
+  qwen3_moe, qwen3_vl and the NVFP4 bank loader share -- and `checkpoint/ftw.py` both go through
+  it. `ftw.py` keeps its mmap fallback for a volume that refuses `NO_BUFFERING`, because a whole
+  shard mapping plus kernel readahead copies faster than chunked buffered reads; that fallback
+  itself needed one fix, since `mmap.mmap(fd, 0, prot=mmap.PROT_READ)` has no Windows spelling
+  (`mmap.PROT_READ` doesn't exist) -- `access=mmap.ACCESS_READ` is equivalent on POSIX.
+- Nothing evicts the page cache here: `drop_read_cache` is a no-op, there being no
+  `posix_fadvise`. Unbuffered reads never filled the cache anyway, but the serial path's mmap
+  pages wait for Windows to trim them, and a benchmark cannot force a cold read --
+  `benchmarks/bench_load_weight_generic.py::_evict_cache` returns 0 on this platform, so every
+  mode may read a partly warm cache, which flatters the serial baseline rather than the fix.
+- `--expert-load parallel` works here now. `expert_banks._PARALLEL_READER_SUPPORTED` used to be
+  `hasattr(os, "O_DIRECT") and hasattr(os, "preadv")`, both absent on Windows, so `auto` and an
+  explicit `parallel` both silently became the serial build and only the
+  `expert banks: slow path (serial build)` line showed it. It now reads
+  `host_banks.DIRECT_READ_SUPPORTED`. `--expert-load auto`'s low-RAM veto also works here for the
+  first time -- it went through `/proc/meminfo`, so the answer used to be "unknowable", which auto
+  treats as "go ahead". See "What the expert read costs" for the measured trade-off.
 
 ## Building the extensions again after editing them
 
@@ -315,5 +329,60 @@ overlap, so each prefill chunk re-streams whole layers out of pageable RAM -- th
 Flat residency removes both, and lands at 104.65 tok/s against the 110 tok/s reported for the same
 hardware under Linux. What is left of that gap is the flashinfer/sgl-kernel fallbacks listed above
 (norms, activations, RoPE, `causal_conv1d`, sampling), not CPU decode.
+
+## What the expert read costs, and what `--expert-load parallel` buys
+
+Measured on the routed experts of `RadixArk/Qwen3.8-Flash-Next-NVFP4` -- 192 shards, 63.32 GiB,
+337.7 MiB average -- reading only: no bank placement, no pinning, with a server holding its 65.6 GiB
+of banks and 84 GiB of VRAM at the time. `safe_open(...).get_tensor()` over the shard's expert
+tensors is what `--expert-load serial` does; `_read_shard_odirect_parallel` (8 threads, 8 MiB
+chunks, `NO_BUFFERING`) is what `parallel` does.
+
+| | GiB/s | over the 63.32 GiB |
+|---|---|---|
+| serial, shard cold in the cache (the one cold sample, layer 6) | 0.52 | 122 s |
+| serial, shards already cached (7 of 8 in the second run) | 12 - 16 | 4 - 6 s |
+| parallel, 8 shards | 1.97 (per shard 1.80 - 2.03) | 32 s |
+| parallel, 4 shards | 2.07 | 31 s |
+| plain sequential buffered read of the same files | 2.0 cold, 4.2 warm | 17 - 31 s |
+
+`NO_BUFFERING` gives up the page cache and so reads at disk rate every time -- about 2 GiB/s here,
+and steady shard to shard, which the other two are not. Against a cold mmap read that is ~4x. Where
+the shards are still cached (restarting a server on a box that has not forgotten them) the mmap read
+runs past 10 GiB/s and nothing that bypasses the cache follows it; `--expert-load serial` is the
+override for that one case.
+
+The `expert banks: slow path (serial build)` load logged on this box for those same 63.32 GiB took
+379 s -- 0.167 GiB/s, below even the cold mmap read -- so a good part of it is placement and pinning
+rather than `read()`, and the end-to-end gain from `parallel` comes out under the 4x above. The
+larger structural win is FTW: one contiguous region read in order, with no per-tensor repack.
+`checkpoint/ftw.py` now reads unbuffered on this platform too, so an FTW load here keeps the
+page-cache-free behaviour it has on Linux, and
+`tests/checkpoint/test_ftw_weights.py::test_unbuffered_read_matches_the_mmap_fallback` holds it to
+the same bytes as the mmap fallback.
+
+`--expert-load auto`'s other half -- veto parallel when free RAM cannot cover the banks plus three
+shards in flight -- read `/proc/meminfo` and therefore never fired here. `mem_available_bytes()`
+answers through `GlobalMemoryStatusEx` now, which is the conservative number (`ullAvailPhys` does not
+credit the standby list the way Linux's `MemAvailable` credits reclaimable cache), so auto vetoes
+sooner here than on the same box under Linux: with a server already up this one reports ~51 GiB
+available against the 64.5 GiB the parallel build wants, and falls back to serial -- correctly, since
+those banks are the running server's; with nothing else running the 64.5 GiB fits in 126.9 GiB.
+
+Still unmeasured, because both want the RAM a running server is holding. With the server stopped --
+and remembering `_evict_cache` above, so the baseline may read a partly warm cache:
+
+```powershell
+# baseline always runs first as the reference; --ftw-dir has no usable default on Windows
+.venv\Scripts\python.exe benchmarks\bench_load_weight_generic.py --model RadixArk/Qwen3.8-Flash-Next-NVFP4 --modes parallel
+.venv\Scripts\python.exe benchmarks\bench_load_weight_generic.py --model RadixArk/Qwen3.8-Flash-Next-NVFP4 --modes build,ftw --ftw-dir $env:TEMP\ftw-qwen38-nvfp4 --keep-ftw
+```
+
+Each prints `load_s` / `gibps` / `peak_rss_gib` per mode and checks the bank checksums against the
+baseline; the conversion writes ~115 GiB (63.5 GiB of experts plus a 47.7 GiB dense/PLE side file).
+Either way the engine should log `expert banks: slow path (parallel build)` rather than
+`(serial build)`, or `expert banks: fast path (FTW, ...)` when `--model` names the converted
+directory.
+
 
 

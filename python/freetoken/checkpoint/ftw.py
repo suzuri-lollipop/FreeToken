@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from freetoken.moe.host_banks import DIRECT_READ_SUPPORTED, close_direct, open_direct_ex
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -67,18 +68,31 @@ def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
     return f"{bank_name}#L{layer_id:05d}"
 
 
-def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
-    """POSIX positional read into ``mv`` at ``offset``, looping over any short preadv.
+_PREADV = hasattr(os, "preadv")
 
-    preadv may return short (a signal, or the EOF-adjacent tail); the loop resumes
-    at the running offset, which stays O_DIRECT-legal: the writer pads every tensor
+
+def _pread(handle, mv: memoryview, offset: int) -> int:
+    """One positioned read: ``os.preadv`` on POSIX, ``ReadFile`` at an OVERLAPPED offset on
+    Windows (the seam in :mod:`freetoken.moe.host_banks`, whose alignment contract FTW satisfies)."""
+    if _PREADV:
+        return os.preadv(handle, [mv], offset)
+    from freetoken.moe.host_banks import pread_into
+
+    return pread_into(handle, mv, offset)
+
+
+def _pread_into(handle, mv: memoryview, offset: int) -> None:
+    """Unbuffered positional read into ``mv`` at ``offset``, looping over any short read.
+
+    A positioned read may return short (a signal, or the EOF-adjacent tail); the loop resumes
+    at the running offset, which stays direct-IO-legal: the writer pads every tensor
     to ALIGN and cuts shards at ALIGN boundaries, so direct-IO short reads land on
     block boundaries. EOF before the buffer is filled raises ``OSError`` — a
     truncated shard must not silently load garbage weights."""
     done = 0
     total = len(mv)
     while done < total:
-        n = os.preadv(fd, [mv[done:]], offset + done)
+        n = _pread(handle, mv[done:], offset + done)
         if n == 0:
             raise OSError(
                 f"unexpected EOF reading FTW: got {done}/{total} bytes at offset {offset}"
@@ -209,10 +223,11 @@ class FTWReader:
     """Random-access reader over an FTW checkpoint.
 
     Maps a tensor's logical byte range to one-or-more shard-file ranges (split at shard
-    boundaries) and reads each piece with chunked multi-threaded O_DIRECT directly into the
-    destination buffer. Offsets/lengths are all 4096-aligned (lengths rounded up into the
-    rounded-up destination), so O_DIRECT is always legal -- including the tail of a tensor
-    (the rounding reads into the region's padding, which is discarded by the tensor view)."""
+    boundaries) and reads each piece with chunked multi-threaded unbuffered I/O directly into
+    the destination buffer. Offsets/lengths are all 4096-aligned (lengths rounded up into the
+    rounded-up destination), so O_DIRECT (POSIX) and FILE_FLAG_NO_BUFFERING (Windows) are both
+    always legal -- including the tail of a tensor (the rounding reads into the region's
+    padding, which is discarded by the tensor view)."""
 
     def __init__(self, path: str):
         with open(os.path.join(path, INDEX_NAME)) as f:
@@ -221,15 +236,17 @@ class FTWReader:
         self.dir = path
         self.shards = sorted(self.index["shards"], key=lambda s: s["global_off"])
         self.tensors = {t["name"]: t for t in self.index["tensors"]}
-        self._fds: dict[str, int] = {}
+        # An unbuffered read (DMA straight from disk, past the page cache) is the fast path but a
+        # perf choice, not a correctness one. POSIX spells it os.O_DIRECT, and some filesystems
+        # reject that at open with EINVAL (tmpfs, many overlay/network mounts). Windows has no
+        # such flag -- its FILE_FLAG_NO_BUFFERING asks for the same three alignments, FTW writes
+        # every region at ALIGN, and moe/host_banks.py owns that seam -- so the shards read
+        # unbuffered here too. Where neither works, the fallback is mmap (below), NOT chunked
+        # buffered reads: a whole-shard mapping + kernel readahead copies far faster than
+        # per-chunk page-cache reads. False here means "unbuffered read unavailable -> mmap".
+        self._direct = bool(getattr(os, "O_DIRECT", 0)) or DIRECT_READ_SUPPORTED
+        self._handles: dict[str, object] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
-        # O_DIRECT (DMA straight from disk, bypassing the page cache) is the fast path but a
-        # perf choice, not a correctness one. Some filesystems reject it at open with EINVAL
-        # (tmpfs, many overlay/network mounts) and the flag is Linux-only; when it's absent
-        # we fall back to mmap (below), NOT to chunked buffered preadv -- a whole-shard
-        # mapping + kernel readahead copies far faster than per-chunk page-cache reads.
-        # 0 here means "O_DIRECT unavailable -> use the mmap path".
-        self._direct = getattr(os, "O_DIRECT", 0)
         self._probed = False
         self._lock = threading.Lock()  # load_ftw_banks calls read_into concurrently
 
@@ -241,7 +258,7 @@ class FTWReader:
         return [t for t in self.index["tensors"] if not keep or t["kind"] in keep]
 
     def _ensure_mode(self) -> None:
-        """Resolve the read backend once: keep O_DIRECT if the filesystem accepts it, else
+        """Resolve the read backend once: keep the unbuffered read if the volume accepts it, else
         drop to the mmap fallback. Thread-safe -- ``_probed`` is published only after
         ``_direct`` is final, so a concurrent reader never races onto a stale direct path."""
         if self._probed:
@@ -251,23 +268,36 @@ class FTWReader:
                 return
             if self._direct and self.shards:
                 try:
-                    os.close(os.open(os.path.join(self.dir, self.shards[0]["file"]),
-                                     os.O_RDONLY | self._direct))
-                except OSError:
-                    self._direct = 0
-                    logger.warning("O_DIRECT unsupported on %s; using mmap fallback for "
-                                   "FTW load", self.dir)
+                    close_direct(self._open_handle(self.shards[0]["file"]))
+                except OSError as exc:
+                    self._direct = False
+                    logger.warning("unbuffered read unavailable on %s (%s); using mmap fallback "
+                                   "for FTW load", self.dir, exc)
             self._probed = True
 
-    def _fd(self, file: str) -> int:
-        fd = self._fds.get(file)
-        if fd is None:
-            with self._lock:  # first-open only; chunk reads reuse the cached fd lock-free
-                fd = self._fds.get(file)
-                if fd is None:
-                    fd = os.open(os.path.join(self.dir, file), os.O_RDONLY | self._direct)
-                    self._fds[file] = fd
-        return fd
+    def _open_handle(self, file: str):
+        """An unbuffered read handle for ``file``: an O_DIRECT fd on POSIX, a NO_BUFFERING handle
+        through the host_banks seam on Windows. Raises OSError where the volume refuses unbuffered
+        I/O -- the seam's own buffered handle is deliberately not accepted here, since mmap streams
+        faster than chunked buffered reads."""
+        path = os.path.join(self.dir, file)
+        if getattr(os, "O_DIRECT", 0):
+            return os.open(path, os.O_RDONLY | os.O_DIRECT)
+        handle, unbuffered = open_direct_ex(path)
+        if not unbuffered:
+            close_direct(handle)
+            raise OSError(f"{path} refuses FILE_FLAG_NO_BUFFERING")
+        return handle
+
+    def _fd(self, file: str):
+        handle = self._handles.get(file)
+        if handle is None:
+            with self._lock:  # first-open only; chunk reads reuse the cached handle lock-free
+                handle = self._handles.get(file)
+                if handle is None:
+                    handle = self._open_handle(file)
+                    self._handles[file] = handle
+        return handle
 
     def _map(self, file: str) -> memoryview:
         entry = self._maps.get(file)
@@ -291,9 +321,9 @@ class FTWReader:
         return entry[1]
 
     def close(self) -> None:
-        for fd in self._fds.values():
-            os.close(fd)
-        self._fds.clear()
+        for handle in self._handles.values():
+            close_direct(handle)
+        self._handles.clear()
         for m, mv in self._maps.values():
             mv.release()
             m.close()

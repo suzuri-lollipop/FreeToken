@@ -60,13 +60,22 @@ _LIVE_BUFFERS: list[mmap.mmap] = []
 # O_DIRECT's Windows counterpart is FILE_FLAG_NO_BUFFERING, which asks for the same three
 # alignments (sector-aligned offset, length and buffer) that _BLK already enforces here. A
 # positioned read is os.preadv on POSIX and ReadFile with an OVERLAPPED offset on Windows.
-# Shared with models/weight.py's parallel shard reader, so these four are public.
+# Shared with models/weight.py's parallel shard reader and checkpoint/ftw.py, so these are
+# public -- and since both spellings exist, an unbuffered read is not a POSIX-only option.
 _POSIX_DIRECT = os.name != "nt"
+# Whether this platform can open a file for unbuffered positioned reads at all. Callers gate
+# their fast (page-cache-bypassing) read path on this, NOT on the presence of os.O_DIRECT.
+DIRECT_READ_SUPPORTED = True
 
 if _POSIX_DIRECT:
 
     def open_direct(path: str) -> int:
         return os.open(path, os.O_RDONLY | os.O_DIRECT)
+
+    def open_direct_ex(path: str) -> tuple[int, bool]:
+        """``(handle, really unbuffered)`` -- what ``open_direct`` returns, plus the answer a
+        caller needs on a platform that hands back a buffered handle when direct I/O is refused."""
+        return os.open(path, os.O_RDONLY | os.O_DIRECT), True
 
     def pread_into(fd: int, view: memoryview, offset: int) -> int:
         return os.preadv(fd, [view], offset)
@@ -84,6 +93,19 @@ if _POSIX_DIRECT:
                 os.close(fd)
         except OSError:
             pass
+
+    def _avail_phys_bytes() -> int | None:
+        # MemAvailable, not MemFree: it counts the reclaimable page cache a load could take
+        # back, which is the figure that decides whether a fill OOMs (MemFree alone reads
+        # "no room" on any box that has been reading files all day).
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return None
 else:
     import ctypes.wintypes as _wt
 
@@ -121,20 +143,25 @@ else:
         _fields_ = [("internal", ctypes.c_ulonglong), ("internal_high", ctypes.c_ulonglong),
                     ("offset", _wt.DWORD), ("offset_high", _wt.DWORD), ("key", ctypes.c_void_p)]
 
-    def open_direct(path: str):
-        """A NO_BUFFERING handle, or a buffered one where the volume refuses direct I/O."""
+    def open_direct_ex(path: str):
+        """``(handle, unbuffered)``: a NO_BUFFERING handle, or a buffered one plus ``False``
+        where the volume refuses direct I/O."""
         global _logged_buffer_fallback
         for flags in (_NO_BUFFERING, _FILE_ATTRIBUTE_NORMAL):
             handle = _kernel32.CreateFileW(path, _GENERIC_READ, _SHARE_ALL, None,
                                            _OPEN_EXISTING, flags, None)
             if handle is not None and handle != _INVALID_HANDLE:
-                if flags == _FILE_ATTRIBUTE_NORMAL and not _logged_buffer_fallback:
+                direct = flags == _NO_BUFFERING
+                if not direct and not _logged_buffer_fallback:
                     _logged_buffer_fallback = True
                     logger.warning("direct I/O unavailable on this volume; reading %s through "
                                    "the page cache (slower, and nothing evicts it afterwards)",
                                    path)
-                return handle
+                return handle, direct
         raise ctypes.WinError(ctypes.get_last_error())
+
+    def open_direct(path: str):
+        return open_direct_ex(path)[0]
 
     def pread_into(handle, view: memoryview, offset: int) -> int:
         overlapped = _Overlapped()
@@ -152,6 +179,35 @@ else:
 
     def drop_read_cache(path: str, offset: int = 0, length: int = 0) -> None:
         pass  # unbuffered reads never populate the cache, and there is no fadvise here
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dw_length", _wt.DWORD), ("dw_memory_load", _wt.DWORD),
+            ("ull_total_phys", ctypes.c_ulonglong), ("ull_avail_phys", ctypes.c_ulonglong),
+            ("ull_total_page_file", ctypes.c_ulonglong), ("ull_avail_page_file", ctypes.c_ulonglong),
+            ("ull_total_virtual", ctypes.c_ulonglong), ("ull_avail_virtual", ctypes.c_ulonglong),
+            ("ull_avail_extended_virtual", ctypes.c_ulonglong),
+        ]
+
+    _kernel32.GlobalMemoryStatusEx.restype = _wt.BOOL
+    _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+
+    def _avail_phys_bytes() -> int | None:
+        status = _MemoryStatusEx()
+        status.dw_length = ctypes.sizeof(status)
+        if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ull_avail_phys)
+
+
+def mem_available_bytes() -> int | None:
+    """Bytes of RAM a load could realistically take, or ``None`` where the platform cannot say.
+
+    The two spellings are not the same number: Linux's ``MemAvailable`` credits the reclaimable
+    page cache, Windows' ``ullAvailPhys`` does not credit the standby list, so the Windows figure
+    is the conservative one -- it calls a box tight sooner than the Linux one would."""
+    return _avail_phys_bytes()
+
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -612,12 +668,15 @@ __all__ = [
     "HostResidency",
     "LayerCompletionTracker",
     "PinPipeline",
+    "DIRECT_READ_SUPPORTED",
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
     "close_direct",
     "drop_read_cache",
+    "mem_available_bytes",
     "open_direct",
+    "open_direct_ex",
     "pin_banks",
     "pread_into",
     "read_file_into",
