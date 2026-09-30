@@ -6,6 +6,7 @@ import gc
 import math
 import os
 import time
+import warnings
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -2270,6 +2271,32 @@ def _fused_resident_ok(model_config) -> bool:
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
 
 
+def _set_allocator_settings(value: str) -> None:
+    """Set the allocator config through whatever spelling this torch build exports.
+
+    ``torch.cuda.memory._set_allocator_settings`` became a FutureWarning-emitting shim over
+    ``torch._C._accelerator_setAllocatorSettings`` in torch 2.11; both take the same
+    ``PYTORCH_ALLOC_CONF``-shaped string."""
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None:  # pragma: no cover - torch < 2.11
+        torch.cuda.memory._set_allocator_settings(value)
+    else:
+        setter(value)
+
+
+# torch builds compiled without the CUDA driver API (the native Windows wheel among them) accept
+# the setting and then ignore it, warning once from the allocator config itself.
+_UNSUPPORTED_ALLOCATOR_WARNING = "not supported on this platform"
+
+
+def _allocator_setting_ignored(caught: list) -> bool:
+    """Whether the captured probe warnings say this build took the setting and dropped it."""
+    return any(
+        _UNSUPPORTED_ALLOCATOR_WARNING in str(w.message) and "expandable_segments" in str(w.message)
+        for w in caught
+    )
+
+
 def _ensure_expandable_segments(device: torch.device) -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -2290,25 +2317,40 @@ def _ensure_expandable_segments(device: torch.device) -> None:
     VMM API, which some stacks (notably WSL2) do not implement -- without the probe the
     first real allocation dies with an opaque cudaErrorUnknown deep in model construction.
     A failed probe leaves the context usable, so re-setting the default allocator is a
-    clean in-process fallback.
+    clean in-process fallback. A build compiled without the CUDA driver API (the native
+    Windows one) never reaches the probe: it takes the setting, warns that the platform does
+    not support it, and keeps the default allocator, so that warning is what settles it.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        _set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
+    caught: list = []
     try:
-        probe = torch.empty(1 << 20, dtype=torch.uint8, device=device)
-        del probe
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            probe = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+            del probe
     except Exception as exc:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        _set_allocator_settings("expandable_segments:False")
         logger.warning_rank0(
             f"expandable_segments is unavailable here (probe allocation failed: {exc}); the "
             f"CUDA VMM API is not implemented by this stack (e.g. WSL2) - using the default allocator"
         )
         return
+    if _allocator_setting_ignored(caught):
+        _set_allocator_settings("expandable_segments:False")
+        logger.info_rank0(
+            "expandable_segments is compiled out of this torch build (no CUDA driver API), so the "
+            "default caching allocator stays in charge and a fragmented run can reserve past its "
+            "peak - PYTORCH_ALLOC_CONF=backend:cudaMallocAsync is this platform's alternative"
+        )
+        return
+    for w in caught:  # whatever else the probe warned about keeps its normal filters
+        warnings.warn(str(w.message), w.category or UserWarning)
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
 
