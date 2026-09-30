@@ -106,6 +106,10 @@ if _POSIX_DIRECT:
         except OSError:
             pass
         return None
+
+    def _working_set_bytes() -> int | None:
+        return None  # there the lock ceiling is RLIMIT_MEMLOCK, which no resident byte count feeds
+
 else:
     import ctypes.wintypes as _wt
 
@@ -198,6 +202,38 @@ else:
         if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
             return None
         return int(status.ull_avail_phys)
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        # the documented 10 fields; the tail is unread but part of the size the API checks
+        _fields_ = [
+            ("cb", _wt.DWORD), ("page_fault_count", _wt.DWORD),
+            ("peak_working_set", ctypes.c_size_t), ("working_set", ctypes.c_size_t),
+            ("quota_peak_paged", ctypes.c_size_t), ("quota_peak_nonpaged", ctypes.c_size_t),
+            ("quota_paged", ctypes.c_size_t), ("quota_nonpaged", ctypes.c_size_t),
+            ("pagefile_usage", ctypes.c_size_t), ("peak_pagefile_usage", ctypes.c_size_t),
+        ]
+
+    # kernel32 exports the working-set queries but not the memory counters on this build, and
+    # psapi.dll is the documented forwarder for exactly that one call
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    _psapi.GetProcessMemoryInfo.restype = _wt.BOOL
+    _psapi.GetProcessMemoryInfo.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCounters), _wt.DWORD,
+    ]
+
+    def _working_set_bytes() -> int | None:
+        """Bytes currently in this process' working set -- what VirtualLock's quota is spent on.
+
+        The page-lock quota is the working set itself, so a bank of 0.8 GiB is refused by a
+        1 GiB maximum no matter that nothing is locked yet; sizing the raise without this
+        number is what made that look like a missing privilege."""
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not _psapi.GetProcessMemoryInfo(
+            _kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return None
+        return int(counters.working_set)
 
 
 def mem_available_bytes() -> int | None:
@@ -309,13 +345,14 @@ class HostBank:
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK on POSIX, the working-set quota on Windows) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
             return
-        global _os_lock_failed
+        global _os_lock_failed, _os_lock_refusal_reason
         if _os_lock_failed:
             return  # the quota is exhausted for good; skip the syscall spam
         try:
             _os_lock(self.addr, len(self._buf))
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
+            _os_lock_refusal_reason = str(exc)
             logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
@@ -323,14 +360,23 @@ class HostBank:
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
 _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
+_os_lock_refusal_reason: str | None = None  # what the first refusal said, read by the residency echo
+
+
+def os_lock_refusal() -> str | None:
+    """The first page-lock refusal of this run, or ``None`` while nothing has been refused.
+
+    Lets the log that echoes residency back distinguish 'this platform will not let us lock, and
+    that was reported once already' from a bank that settled pageable for some other reason."""
+    return _os_lock_refusal_reason
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
     """Page-lock a bank without spending CUDA pin quota: mlock on POSIX, VirtualLock on Windows.
 
-    Both are bounded by a per-process ceiling that needs a privilege to lift -- RLIMIT_MEMLOCK
-    there, the page-lock quota here -- so each branch tries its own raise first and the refusal
-    surfaces from the lock call itself.
+    Both are bounded by a per-process ceiling the caller cannot see from the address alone --
+    RLIMIT_MEMLOCK there, the process working set here -- so each branch tries its own raise
+    first and the refusal surfaces from the lock call itself, named by its real ceiling.
     """
     global _os_locked_total
     if os.name == "nt":
@@ -360,42 +406,84 @@ def _os_lock(addr: int, nbytes: int) -> None:
     _os_locked_total += nbytes
 
 
-_nt_quota_raised = False  # one quota raise per process; the ceiling stays where it was set
+_NT_LOCK_HEADROOM = 1 << 30  # the raise covers one more bank plus room to grow, not just its bytes
+_WS_MAX_LIMITED = 0x2  # GetProcessWorkingSetSizeEx: the maximum is imposed (job, or an earlier Ex call)
+
+_nt_quota_ceiling = 0  # working-set maximum the OS actually granted, read back after the last raise
+_nt_quota_job_capped = False
 
 
-def _nt_raise_working_set_quota(want: int) -> None:
-    """Raise the process working-set maximum so locked pages have somewhere to live.
+def _nt_quota_request(nbytes: int, locked_total: int, working_set: int) -> int:
+    """The working-set maximum that makes one more lock of ``nbytes`` grantable.
 
-    Only the maximum moves (SeProfileSingleProcessPrivilege); the minimum is handed back
-    unchanged, as raising that needs a privilege a normal server process lacks. This is the
-    working set, not the page-lock quota -- the latter is what refuses a big bank below.
-    """
-    global _nt_quota_raised
-    if _nt_quota_raised:
-        return
+    VirtualLock charges its quota against the whole working set, not against the bytes locked so
+    far, so a server holding 65 GiB resident needs the maximum above 65 GiB before its first bank
+    locks. Sizing the raise on the locked bytes alone refuses that first bank and blames the
+    privilege, which is the dead end this used to report."""
+    return working_set + locked_total + nbytes + _NT_LOCK_HEADROOM
+
+
+def _nt_working_set_limits() -> tuple[int, int, int] | None:
+    """This process' working-set (minimum, maximum, flags), or ``None`` when the OS won't say."""
     process = _kernel32.GetCurrentProcess()
     minimum, maximum, flags = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_uint32()
     if not _kernel32.GetProcessWorkingSetSizeEx(
         process, ctypes.byref(minimum), ctypes.byref(maximum), ctypes.byref(flags), 0
     ):
-        return
-    if maximum.value >= want:
-        return
-    if _kernel32.SetProcessWorkingSetSizeEx(process, minimum.value, want, 0):
-        _nt_quota_raised = True
+        return None
+    return int(minimum.value), int(maximum.value), int(flags.value)
+
+
+def _nt_set_working_set_max(minimum: int, maximum: int) -> bool:
+    """Ask for a new working-set range; only the maximum is ever moved by us."""
+    return bool(_kernel32.SetProcessWorkingSetSizeEx(_kernel32.GetCurrentProcess(), minimum, maximum, 0))
+
+
+def _nt_raise_working_set_quota(want: int) -> int:
+    """Raise the working-set maximum toward ``want`` and return the ceiling the OS granted.
+
+    Only the maximum moves (SeProfileSingleProcessPrivilege); the minimum is handed back
+    unchanged, as raising that needs a privilege a normal server process lacks. The read-back
+    value is the quota the lock then faces, and a job object can hold it below ``want``, so the
+    request is only worth what the grant says."""
+    global _nt_quota_ceiling, _nt_quota_job_capped
+    limits = _nt_working_set_limits()
+    if limits is None:
+        return _nt_quota_ceiling
+    minimum, maximum, flags = limits
+    if maximum < want and _nt_set_working_set_max(minimum, want):
+        reread = _nt_working_set_limits()
+        if reread is not None:
+            minimum, maximum, flags = reread
+    _nt_quota_ceiling = maximum
+    _nt_quota_job_capped = bool(flags & _WS_MAX_LIMITED)
+    return _nt_quota_ceiling
+
+
+def _nt_lock_refusal(err: int, nbytes: int, ceiling: int, want: int) -> str:
+    """Why VirtualLock said no, in terms of the two ceilings that can be behind it."""
+    msg = f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err}"
+    if ceiling and ceiling < want:
+        capped = " (imposed by the job this process runs in)" if _nt_quota_job_capped else ""
+        msg += (
+            f": the page-lock quota is the process working set, and the OS granted "
+            f"{ceiling / 2**30:.1f} GiB of the {want / 2**30:.1f} GiB the resident banks need"
+            f"{capped}"
+        )
+    return msg + (
+        " - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc -> Local "
+        "Policies -> User Rights Assignment, then a new login session); without it every "
+        "host-locked layer stays pageable"
+    )
 
 
 def _nt_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
-    _nt_raise_working_set_quota(_os_locked_total + nbytes + (256 << 20))
+    want = _nt_quota_request(nbytes, _os_locked_total, _working_set_bytes() or 0)
+    ceiling = _nt_raise_working_set_quota(want)
     if not _kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
         err = ctypes.get_last_error()
-        raise OSError(
-            err,
-            f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err} "
-            f"(ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right "
-            f"(secpol.msc, then re-login); without it every host-locked layer stays pageable)",
-        )
+        raise OSError(err, _nt_lock_refusal(err, nbytes, ceiling, want))
     _os_locked_total += nbytes
 
 

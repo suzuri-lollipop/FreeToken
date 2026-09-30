@@ -1183,6 +1183,66 @@ def test_windows_lock_reports_a_quota_not_an_import_failure(monkeypatch):
         assert hb._os_locked_total == bank.nbytes
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_request_covers_the_live_working_set():
+    """VirtualLock charges its quota against the whole working set, not the bytes locked so far.
+
+    The old sizing (locked bytes + one bank) let a server that is already tens of GiB resident
+    ask for a maximum barely above a bank, which is the refusal that read as a missing privilege.
+    """
+    from freetoken.moe.host_banks import _nt_quota_request
+
+    GiB = 1 << 30
+    want = _nt_quota_request(nbytes=1 * GiB, locked_total=2 * GiB, working_set=65 * GiB)
+    assert want >= 68 * GiB, "a bank-sized raise can never cover a resident model"
+    assert _nt_quota_request(1 * GiB, 0, 0) > 1 * GiB, "the raise needs headroom, not the exact bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_refusal_names_the_granted_ceiling(monkeypatch):
+    """A refusal must say how much was granted against how much the resident banks need."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    monkeypatch.setattr(hb, "_nt_quota_job_capped", True)
+    msg = hb._nt_lock_refusal(1453, nbytes=1 * GiB, ceiling=1 * GiB, want=80 * GiB)
+    assert "WinError 1453" in msg
+    assert "1.0 GiB of the 80.0 GiB" in msg
+    assert "imposed by the job" in msg
+    assert "Lock pages in memory" in msg
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_raise_reports_what_the_os_granted(monkeypatch):
+    """A job object can hold the maximum below the request, so the grant is what must be reported."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    granted = [2 * GiB]  # the job caps us far below the 68 GiB ask
+
+    def limits():
+        return 0, granted[0], 0x2 | 0x8  # maximum valid, and held down by a job object
+
+    def set_max(minimum, maximum):
+        granted[0] = min(maximum, 4 * GiB)  # the job refuses the rest
+        return True
+
+    monkeypatch.setattr(hb, "_nt_working_set_limits", limits)
+    monkeypatch.setattr(hb, "_nt_set_working_set_max", set_max)
+    monkeypatch.setattr(hb, "_nt_quota_ceiling", 0)
+    assert hb._nt_raise_working_set_quota(68 * GiB) == 4 * GiB
+    assert hb._nt_quota_job_capped is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the counters come from psapi")
+def test_working_set_query_answers_on_windows():
+    """A wrong PROCESS_MEMORY_COUNTERS layout is refused with ERROR_INSUFFICIENT_BUFFER, and a
+    None here quietly downgrades the whole quota sizing to 'assume nothing is resident'."""
+    import freetoken.moe.host_banks as hb
+
+    assert hb._working_set_bytes() > 0
+
+
 # ---- --expert-load auto: the low-RAM veto is sized by the experts, not the whole checkpoint ----
 
 

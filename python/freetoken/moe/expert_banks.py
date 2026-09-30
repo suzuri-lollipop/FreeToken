@@ -436,11 +436,18 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
             # a flat-residency boot labels every layer locked, so name the count when the
             # list would run to the whole model
             shown = downgraded if len(downgraded) <= 12 else f"{len(downgraded)} layers"
-            logger.warning_rank0(
-                f"host-locked banks: {shown} settled pageable instead of "
-                f"OS-locked (the page-lock quota refused them); their bytes stay resident "
-                f"only as long as the OS does not reclaim them"
+            msg = (
+                f"host-locked banks: {shown} settled pageable instead of OS-locked; their bytes "
+                f"stay resident only as long as the OS does not reclaim them"
             )
+            from freetoken.moe.host_banks import os_lock_refusal
+
+            # the refusal above already names the ceiling behind it, and no retry of any other
+            # bank changes that answer -- so the echo reports it at info, not twice as a warning
+            if os_lock_refusal():
+                logger.info_rank0(msg)
+            else:
+                logger.warning_rank0(f"{msg} (the page-lock quota refused them)")
         return dataclasses.replace(banks, layer_residency=labels)
     from freetoken.moe.host_banks import HostResidency
 
