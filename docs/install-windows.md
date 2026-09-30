@@ -47,9 +47,13 @@ the upstream one; `triton-windows` installs as `triton`), and both extensions im
 
 ## What `[accel]` does and does not do here
 
-`sglang-kernel` and `flashinfer-python` publish `manylinux` wheels only, so on Windows the
-`fi`/`sgl` extras are marker-disabled and `[accel]` installs nothing extra. Nothing is lost
-for the models whose hot path is Triton: every call site probes
+Neither accelerator package resolves on Windows, so the `fi`/`sgl` extras carry a
+`platform_system == 'Linux'` marker and `[accel]` installs nothing extra there. `sglang-kernel`
+publishes `manylinux` wheels only; `flashinfer-python` publishes a `py3-none-any` wheel that is
+only the JIT driver, and what it needs alongside -- `nccl4py` and `nccl-extensions` (NCCL has no
+Windows build), `nvidia-cutlass-dsl`, `nvidia-cudnn-frontend`, and its prebuilt kernels from the
+Linux-only `flashinfer.ai/whl/cu*` index -- is Linux-only. Nothing is lost for the models whose
+hot path is Triton: every call site probes
 `is_flashinfer_installed()` / `is_sgl_kernel_installed()` in `freetoken.kernel.backend` and
 falls back to `freetoken.kernel.triton`, and the type x backend matrix in `engine.engine`
 only offers `fi`/`fa`/`trtllm` when those packages exist.
@@ -334,10 +338,15 @@ line.
   qwen3_5_moe, qwen3_moe, qwen3_vl and the NVFP4 bank loader share.
 - `pytest tests/engine tests/models/qwen4_exp tests/kernels tests/moe tests/checkpoint tests/layers`:
   905 passed, 67 skipped, 15 failed (from 878 / 67 / 41 before this section's `_cpu_moe`,
-  `VirtualLock` and event-loop work). The 15 are fixtures naming the `fi` backend (10),
+  `VirtualLock` and event-loop work). The 15 were fixtures naming the `fi` backend (10),
   `torch._scaled_mm` rowwise scaling unsupported in this torch build (4), and the GGUF kernel
   compile named above -- each needs a component Windows does not ship, and none is a Linux
-  regression.
+  regression. Those ten fixtures asked for a backend none of them asserts on, so they ask for
+  `triton` now and the gate under test speaks again; `fi` resolution itself stays covered by
+  `tests/engine/test_attention_backend_matrix.py` and `test_tensor_parallel_gate.py`, which patch
+  the probe rather than import the package.
+- `pytest tests/engine tests/moe tests/server -m "not slow"`: 1031 passed, 6 skipped, 1 failed --
+  `tests/server/test_orphan_uid_reap.py`, which fails the same way with these edits stashed.
 - `_pin_budget_bytes` gives 57.1 GiB here (45% of 126.9 GiB), so a 63.5 GiB bank set is refused
   before any disk read; `FREETOKEN_PIN_BUDGET_GB=64` lets the preflight pass when your machine's
   real ceiling is above that conservative default.

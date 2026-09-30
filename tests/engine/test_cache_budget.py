@@ -282,7 +282,8 @@ def test_adjust_config_resolves_num_tokens_generic():
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
-        attention_backend = "fi"
+        # triton, not fi: the flashinfer probe must not answer before the page sizing does.
+        attention_backend = "triton"
         num_page_override = None
         num_token_override = 5000
 
@@ -680,7 +681,8 @@ def test_adjust_config_keeps_an_explicit_slot_cache_pinned():
 
 def _offload_engine_config(**overrides):
     """A frozen EngineConfig for a quantized-experts MoE checkpoint in the bare-invocation state
-    (moe_strategy="auto") unless overridden — the shared fixture for the _adjust_config tests."""
+    (moe_strategy="auto") unless overridden — the shared fixture for the _adjust_config tests.
+    The attention backend is triton, so a missing flashinfer does not refuse the config first."""
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
@@ -688,7 +690,7 @@ def _offload_engine_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
+        attention_backend="triton",
         **overrides,
     )
     object.__setattr__(

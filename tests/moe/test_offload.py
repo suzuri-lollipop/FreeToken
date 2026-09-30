@@ -468,11 +468,12 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     # running the suite (GB10 reports cudaDevAttrIntegrated=1).
     monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
 
+    # triton: the flashinfer probe must not refuse the config ahead of the sizing gate.
     config = EngineConfig(
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -912,6 +913,9 @@ def test_flat_rebuild_reloads_every_expert_and_rejects_a_shrink():
 
 
 def _moe_flat_config(**overrides):
+    """An EngineConfig for a MoE checkpoint asked to run --moe-flat-residency. The attention
+    backend is triton: these tests assert on the residency gate, and a missing flashinfer would
+    refuse the config long before that gate is reached."""
     from types import SimpleNamespace
 
     from freetoken.distributed import DistributedInfo
@@ -921,7 +925,7 @@ def _moe_flat_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_strategy="offload",
         moe_cache_size=80,
         moe_flat_residency=True,

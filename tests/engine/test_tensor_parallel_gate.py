@@ -77,9 +77,12 @@ def test_tp_one_is_never_gated():
     assert _preflight(config) is None
 
 
-def test_family_without_a_tp_reader_is_rejected():
+def test_family_without_a_tp_reader_is_rejected(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 
+    # The backend matrix resolves before the TP preflight, so a machine with no sharding backend
+    # left reports that instead of the weight-reader gate this test is about.
+    _patch_env(monkeypatch, major=10)
     config = _config(tp=2, spec=SimpleNamespace(tp_supported=False))
     with pytest.raises(ValueError, match="does not shard its checkpoint"):
         _adjust_config(config)
