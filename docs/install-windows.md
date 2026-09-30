@@ -199,23 +199,41 @@ for CPU decode ([0, 1, 2, 46, 47])
 
 `HostBank.lock()` had no Windows spelling until now: `_os_lock` opened with `import resource`,
 `lock()` caught that ImportError next to the OSError it expected, and every LOCKED layer settled
-PAGEABLE under an `ulimit -l` message. The Win32 branch raises the process working-set maximum --
-a raise to 96 GiB succeeds -- and calls `VirtualLock`. That is not the ceiling that binds: page
-locks have their own per-process quota, lifted by the "Lock pages in memory" right, which an
-Administrator token here does not hold (`AdjustTokenPrivileges` answers
-`ERROR_NOT_ALL_ASSIGNED`). Measured: a 16 MiB bank locks, a 5.3 GiB one comes back
-`ERROR_QUOTA_EXCEEDED` (1453), and the running server says so and carries on:
+PAGEABLE under an `ulimit -l` message. The Win32 branch raises the process working-set maximum and
+then calls `VirtualLock`, and the raise is sized against the *resident* working set
+(`psapi.GetProcessMemoryInfo`) plus the banks locked so far plus one more bank plus 1 GiB: the
+page-lock quota is the working set itself, so the first cut of this branch (locked bytes plus one
+bank) asked a server holding 65 GiB resident for a 1 GiB maximum and took the refusal as a missing
+privilege. What the two ceilings look like on this box:
+
+| | |
+|---|---|
+| job object | `IsProcessInJob` = 1, and the working set starts at min 0 / **max 1 MiB** with flags `0xa` -- `GetProcessWorkingSetSizeEx` reports the maximum as an imposed one |
+| what the raise achieves | a request for 96 GiB is granted and reads back as 96 GiB, so the maximum does move |
+| "Lock pages in memory" | absent from an Administrator token: `LookupPrivilegeValueW` resolves the LUID, `AdjustTokenPrivileges` answers `ERROR_NOT_ALL_ASSIGNED` |
+
+and `VirtualLock` is still refused `ERROR_QUOTA_EXCEEDED` (1453) at 256 MiB with a granted 2.09 GiB
+maximum and 600 MiB resident, so here it is the job plus the missing right that bind -- which is
+what the one line the server prints now says:
 
 ```
 WARNING bank lock failed; leaving this and later banks pageable: [Errno 1453] VirtualLock(0.8 GiB):
-WinError 1453 (ERROR_QUOTA_EXCEEDED unless the account holds the 'Lock pages in memory' right
-(secpol.msc, then re-login); without it every host-locked layer stays pageable)
+WinError 1453 - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc -> Local
+Policies -> User Rights Assignment, then a new login session); without it every host-locked layer
+stays pageable
 ```
 
+Where it is the maximum that will not stretch, the same line carries the arithmetic instead --
+`the OS granted 1.0 GiB of the 71.4 GiB the resident banks need (imposed by the job this process
+runs in)` -- and that is the number to raise in the job or the launcher rather than in the policy.
+The refusal is recorded (`host_banks.os_lock_refusal()`), so the residency echo that follows
+reports the settled layers at info instead of repeating the refusal as a second warning, and the
+first refusal keeps every later bank off the syscall path -- one line per boot, not two per layer.
 The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
 executor reads those layers from pageable RAM exactly as it does on a WSL2 host whose
 `RLIMIT_MEMLOCK` refused the lock. To get them genuinely resident, grant the right (secpol.msc ->
-Local Policies -> User Rights Assignment -> Lock pages in memory) and start a new login session.
+Local Policies -> User Rights Assignment -> Lock pages in memory) and start a new login session;
+that right lifts the quota outright and is the one ceiling no in-process raise moves.
 
 The same cap has a GPU-side answer that keeps every layer on the GPU: `--moe-flat-residency`. Flat
 residency gives each expert a permanent slot and fills them in one pass of ordinary host->device
@@ -244,6 +262,38 @@ fallback.
   host-only translation unit before a GGUF checkpoint can serve. `_cpu_moe`'s own q4_0 GEMV builds
   and runs; the GPU reference kernel behind
   `tests/moe/test_cpu_moe_q4_0.py::test_cpu_decode_q4_0_matches_ggml_mmvq` is what is missing.
+
+## What a start-up prints here that is not a problem
+
+`ft serve --model RadixArk/Qwen3.8-Flash-Next-NVFP4 --moe-strategy offload --moe-cache-auto
+--moe-cpu-layers auto --attention-backend triton --tp-size 1` prints a handful of lines that read
+worse than the run is. None of them stops the server; two are gone, the rest are the platform:
+
+- `--moe-backend is deprecated, use --moe-strategy`: both flags name the same value, so the
+  deprecated one in an old command line is pure duplication. Drop `--moe-backend`.
+- `torch.cuda._set_allocator_settings is deprecated` beside `expandable_segments not supported on
+  this platform`: the Windows cu130 wheel is built without the CUDA driver API, and expandable
+  segments ride on it. `engine.engine._ensure_expandable_segments` now calls
+  `torch._C._accelerator_setAllocatorSettings` (the non-deprecated spelling), treats that warning
+  as the answer to its probe, undoes the setting and logs one info line saying the build compiled
+  it out -- rather than logging `Enabled expandable_segments` and leaving the two warnings to
+  contradict it. What that costs: the offload prefill's variable-sized NVFP4 blocks fragment the
+  default caching allocator, so a long run can reserve well past its peak here where Linux does
+  not. `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` is the alternative on this platform, unmeasured.
+- `Proactor event loop does not implement add_reader, registering self on the default executor`:
+  pyzmq's working fallback, the one the tornado bullet above buys. `utils.mp` filters that single
+  message on Windows; the loop-policy swap is still not the answer, see that bullet.
+- `[W socket.cpp:764] [c10d] The client socket has failed to connect to [<hostname>]:<port>
+  (system error: 10049 ...)`: the single-rank gloo rendezvous every engine worker starts
+  (`engine.engine._init_communication`) resolves the machine name first, and on this box that
+  answers a link-local address Windows refuses (`WSAEADDRNOTAVAIL`), after which the same call
+  reaches the literal loopback and completes -- measured 0.01 s to a working `world_size=1` group.
+  It comes from C++ before any Python filter exists, so it stays in the log; the line after it is
+  the engine coming up.
+
+What is left is the real content of a healthy boot: the pin-budget and `--moe-cpu-layers auto`
+lines, the `expert banks:` load line, the single page-lock refusal above, and the uvicorn listen
+line.
 
 ## Verified on Windows (RTX PRO 6000 Blackwell, sm_120, driver 616.92, CUDA 13.0)
 
