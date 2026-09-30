@@ -212,23 +212,29 @@ privilege. What the two ceilings look like on this box:
 | what the raise achieves | a request for 96 GiB is granted and reads back as 96 GiB, so the maximum does move |
 | "Lock pages in memory" | absent from an Administrator token: `LookupPrivilegeValueW` resolves the LUID, `AdjustTokenPrivileges` answers `ERROR_NOT_ALL_ASSIGNED` |
 
-and `VirtualLock` is still refused `ERROR_QUOTA_EXCEEDED` (1453) at 256 MiB with a granted 2.09 GiB
-maximum and 600 MiB resident, so here it is the job plus the missing right that bind -- which is
-what the one line the server prints now says:
+and `VirtualLock` is refused `ERROR_QUOTA_EXCEEDED` (1453) even after that raise: 64 MiB locked
+against 667 MiB resident with a granted 1.71 GiB maximum, refused anyway. The flags still report the
+maximum as imposed at that point, so they say 'at its allowed limit', not 'below what we need' --
+which is why the line keys off the size and not the flag, and why the right is the binder here:
 
 ```
 WARNING bank lock failed; leaving this and later banks pageable: [Errno 1453] VirtualLock(0.8 GiB):
-WinError 1453 - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc -> Local
-Policies -> User Rights Assignment, then a new login session); without it every host-locked layer
-stays pageable
+WinError 1453: the working-set quota was raised to 72.0 GiB, at or past the 71.4 GiB this run needs,
+so no quota refused this - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc ->
+Local Policies -> User Rights Assignment, then a new login session); without it every host-locked
+layer stays pageable
 ```
 
-Where it is the maximum that will not stretch, the same line carries the arithmetic instead --
-`the OS granted 1.0 GiB of the 71.4 GiB the resident banks need (imposed by the job this process
-runs in)` -- and that is the number to raise in the job or the launcher rather than in the policy.
-The refusal is recorded (`host_banks.os_lock_refusal()`), so the residency echo that follows
-reports the settled layers at info instead of repeating the refusal as a second warning, and the
-first refusal keeps every later bank off the syscall path -- one line per boot, not two per layer.
+The granted ceiling is named whichever way the raise went, which is what makes the line readable as
+advice: where the maximum will not stretch, the same slot instead reads `the OS granted 1.0 GiB of
+the 71.4 GiB the resident banks need (imposed by the job this process runs in)` -- the number to
+raise in the job or the launcher rather than in the policy. Under `--moe-flat-residency` the refusal
+is an info rather than a warning (`host_banks.set_lock_advisory()`, called from
+`engine.engine._flat_residency_request`), because the flat copy reads each bank once into its GPU
+slot and gathers nothing from it afterwards. Either way the refusal is recorded
+(`host_banks.os_lock_refusal()`), so the residency echo that follows reports the settled layers at
+info instead of repeating the refusal as a second warning, and the first refusal keeps every later
+bank off the syscall path -- one line per boot, not two per layer.
 The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
 executor reads those layers from pageable RAM exactly as it does on a WSL2 host whose
 `RLIMIT_MEMLOCK` refused the lock. To get them genuinely resident, grant the right (secpol.msc ->
@@ -285,11 +291,12 @@ worse than the run is. None of them stops the server; two are gone, the rest are
   message on Windows; the loop-policy swap is still not the answer, see that bullet.
 - `[W socket.cpp:764] [c10d] The client socket has failed to connect to [<hostname>]:<port>
   (system error: 10049 ...)`: the single-rank gloo rendezvous every engine worker starts
-  (`engine.engine._init_communication`) resolves the machine name first, and on this box that
-  answers a link-local address Windows refuses (`WSAEADDRNOTAVAIL`), after which the same call
-  reaches the literal loopback and completes -- measured 0.01 s to a working `world_size=1` group.
-  It comes from C++ before any Python filter exists, so it stays in the log; the line after it is
-  the engine coming up.
+  (`engine.engine._init_communication`) binds `--port` + 1 (`server.args.ServerArgs.distributed_addr`
+  -- 1920 for the `--port 1919` above, so keep that one free), and resolves the machine name first;
+  on this box that answers a link-local address Windows refuses (`WSAEADDRNOTAVAIL`), after which
+  the same call reaches the literal loopback and completes -- measured 0.01 s to a working
+  `world_size=1` group. It comes from C++ before any Python filter exists, so it stays in the log;
+  the line after it is the engine coming up.
 
 What is left is the real content of a healthy boot: the pin-budget and `--moe-cpu-layers auto`
 lines, the `expert banks:` load line, the single page-lock refusal above, and the uvicorn listen
