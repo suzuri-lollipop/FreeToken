@@ -353,7 +353,10 @@ class HostBank:
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
             _os_lock_refusal_reason = str(exc)
-            logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
+            if _lock_advisory:
+                logger.info(f"bank lock failed; nothing here reads a locked bank again: {exc}")
+            else:
+                logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
 
@@ -369,6 +372,19 @@ def os_lock_refusal() -> str | None:
     Lets the log that echoes residency back distinguish 'this platform will not let us lock, and
     that was reported once already' from a bank that settled pageable for some other reason."""
     return _os_lock_refusal_reason
+
+
+_lock_advisory = False  # set once the run's plan guarantees no locked bank is ever read again
+
+
+def set_lock_advisory(advisory: bool = True) -> None:
+    """Report a refused page lock at info instead of warning, because this run never needs the lock.
+
+    ``--moe-flat-residency`` asks for LOCKED residency only to dodge the CUDA pin budget and then
+    copies every bank into a GPU slot once, so a pageable bank costs it nothing. Everywhere else the
+    refusal stays a warning: a CPU-executor layer whose pages the OS reclaims is a real fault."""
+    global _lock_advisory
+    _lock_advisory = bool(advisory)
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
@@ -461,15 +477,24 @@ def _nt_raise_working_set_quota(want: int) -> int:
 
 
 def _nt_lock_refusal(err: int, nbytes: int, ceiling: int, want: int) -> str:
-    """Why VirtualLock said no, in terms of the two ceilings that can be behind it."""
+    """Why VirtualLock said no, in terms of the two ceilings that can be behind it.
+
+    The ceiling is named whichever way it went: saying the raise succeeded is the only way a reader
+    can tell a job-capped maximum apart from a refusal that is purely the missing right."""
     msg = f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err}"
-    if ceiling and ceiling < want:
-        capped = " (imposed by the job this process runs in)" if _nt_quota_job_capped else ""
-        msg += (
-            f": the page-lock quota is the process working set, and the OS granted "
-            f"{ceiling / 2**30:.1f} GiB of the {want / 2**30:.1f} GiB the resident banks need"
-            f"{capped}"
-        )
+    if ceiling:
+        if ceiling < want:
+            capped = " (imposed by the job this process runs in)" if _nt_quota_job_capped else ""
+            msg += (
+                f": the page-lock quota is the process working set, and the OS granted "
+                f"{ceiling / 2**30:.1f} GiB of the {want / 2**30:.1f} GiB the resident banks need"
+                f"{capped}"
+            )
+        else:
+            msg += (
+                f": the working-set quota was raised to {ceiling / 2**30:.1f} GiB, at or past the "
+                f"{want / 2**30:.1f} GiB this run needs, so no quota refused this"
+            )
     return msg + (
         " - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc -> Local "
         "Policies -> User Rights Assignment, then a new login session); without it every "

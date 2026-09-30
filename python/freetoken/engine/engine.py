@@ -2601,7 +2601,7 @@ def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=N
     and gathers nothing per token, so banks over the pin budget may stay OS-locked: a device
     address is only needed by the streaming paths, and pinning is exactly what WDDM/WSL cap.
     """
-    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.host_banks import HostResidency, set_lock_advisory
 
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
@@ -2613,6 +2613,7 @@ def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=N
         "MoE layers instead of pinning (the startup copy needs no device address, so no "
         "layer decodes on the CPU)"
     )
+    set_lock_advisory()  # the copy reads each bank once, so a refused lock costs this run nothing
     return [HostResidency.LOCKED.value] * config.model_config.num_moe_layers
 
 

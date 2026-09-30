@@ -1213,6 +1213,58 @@ def test_windows_refusal_names_the_granted_ceiling(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_refusal_names_the_ceiling_after_a_successful_raise(monkeypatch):
+    """A refusal that only says 'missing privilege' leaves the reader guessing whether the raise ran.
+
+    Reporting the granted maximum even when it is the request or larger is what separates a job
+    object that will not stretch from a box whose only problem is the right."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    monkeypatch.setattr(hb, "_nt_quota_job_capped", True)  # imposed, yet no longer the binding limit
+    msg = hb._nt_lock_refusal(1453, nbytes=1 * GiB, ceiling=72 * GiB, want=72 * GiB)
+    assert "raised to 72.0 GiB" in msg
+    assert "imposed by the job" not in msg
+
+
+def test_advisory_page_lock_refusal_does_not_warn(monkeypatch):
+    """Flat residency copies every bank into a GPU slot once, so a refused lock is not a fault.
+
+    The refusal must still be recorded: the residency echo reads it to report the settled layers."""
+    import freetoken.moe.host_banks as hb
+
+    calls = []
+
+    class _Recorder:
+        def warning(self, msg):
+            calls.append(("warning", msg))
+
+        def info(self, msg):
+            calls.append(("info", msg))
+
+    def refuse(addr, nbytes):
+        raise OSError(1, "no quota left")
+
+    monkeypatch.setattr(hb, "logger", _Recorder())
+    monkeypatch.setattr(hb, "_os_lock", refuse)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setattr(hb, "_os_lock_refusal_reason", None)
+    monkeypatch.setattr(hb, "_lock_advisory", False)
+
+    bank = hb.HostBank((1 << 12,), torch.uint8)
+    bank.tensor.fill_(0)
+    bank.lock()
+    assert [kind for kind, _ in calls] == ["warning"]
+
+    calls.clear()
+    monkeypatch.setattr(hb, "_os_lock_failed", False)  # a fresh boot that asked for advisory locking
+    hb.set_lock_advisory(True)
+    bank.lock()
+    assert [kind for kind, _ in calls] == ["info"]
+    assert "no quota left" in hb.os_lock_refusal()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
 def test_windows_quota_raise_reports_what_the_os_granted(monkeypatch):
     """A job object can hold the maximum below the request, so the grant is what must be reported."""
     import freetoken.moe.host_banks as hb
