@@ -219,22 +219,26 @@ which is why the line keys off the size and not the flag, and why the right is t
 
 ```
 WARNING bank lock failed; leaving this and later banks pageable: [Errno 1453] VirtualLock(0.8 GiB):
-WinError 1453: the working-set quota was raised to 72.0 GiB, at or past the 71.4 GiB this run needs,
-so no quota refused this - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc ->
-Local Policies -> User Rights Assignment, then a new login session); without it every host-locked
-layer stays pageable
+WinError 1453: the working-set quota was raised to 65.3 GiB, at or past the 65.3 GiB this run will
+hold, so no quota refused this - the 'Lock pages in memory' right lifts that quota entirely
+(secpol.msc -> Local Policies -> User Rights Assignment, then a new login session); without it every
+host-locked layer stays pageable
 ```
 
 The granted ceiling is named whichever way the raise went, which is what makes the line readable as
 advice: where the maximum will not stretch, the same slot instead reads `the OS granted 1.0 GiB of
-the 71.4 GiB the resident banks need (imposed by the job this process runs in)` -- the number to
-raise in the job or the launcher rather than in the policy. Under `--moe-flat-residency` the refusal
-is an info rather than a warning (`host_banks.set_lock_advisory()`, called from
-`engine.engine._flat_residency_request`), because the flat copy reads each bank once into its GPU
-slot and gathers nothing from it afterwards. Either way the refusal is recorded
-(`host_banks.os_lock_refusal()`), so the residency echo that follows reports the settled layers at
-info instead of repeating the refusal as a second warning, and the first refusal keeps every later
-bank off the syscall path -- one line per boot, not two per layer.
+the 65.3 GiB the resident banks need (imposed by the job this process runs in)` -- the number to
+raise in the job or the launcher rather than in the policy. The ask is sized on the footprint the
+engine hands the lock path (`host_banks.set_lock_plan(resident_bytes=...)`, from
+`engine.engine._flat_residency_request` on a flat boot and from the `--moe-cpu-layers` branch
+otherwise), not on the working set as it happens to stand when the first bank settles: banks settle
+while the loader is still reading, and a 63.46 GiB boot that sized itself at 2% read asked for 8.0 GiB
+-- right for that one bank, and the next would have been refused once the experts were in. Under
+`--moe-flat-residency` the refusal is an info rather than a warning (the same seam's `advisory` flag),
+because the flat copy reads each bank once into its GPU slot and gathers nothing from it afterwards.
+Either way the refusal is recorded (`host_banks.os_lock_refusal()`), so the residency echo that
+follows reports the settled layers at info instead of repeating the refusal as a second warning, and
+the first refusal keeps every later bank off the syscall path -- one line per boot, not two per layer.
 The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
 executor reads those layers from pageable RAM exactly as it does on a WSL2 host whose
 `RLIMIT_MEMLOCK` refused the lock. To get them genuinely resident, grant the right (secpol.msc ->
@@ -273,7 +277,8 @@ fallback.
 
 `ft serve --model RadixArk/Qwen3.8-Flash-Next-NVFP4 --moe-strategy offload --moe-cache-auto
 --moe-cpu-layers auto --attention-backend triton --tp-size 1` prints a handful of lines that read
-worse than the run is. None of them stops the server; two are gone, the rest are the platform:
+worse than the run is. None of them stops the server; the two allocator lines and the pyzmq one are
+gone, the rest are the platform:
 
 - `--moe-backend is deprecated, use --moe-strategy`: both flags name the same value, so the
   deprecated one in an old command line is pure duplication. Drop `--moe-backend`.
@@ -286,6 +291,10 @@ worse than the run is. None of them stops the server; two are gone, the rest are
   contradict it. What that costs: the offload prefill's variable-sized NVFP4 blocks fragment the
   default caching allocator, so a long run can reserve well past its peak here where Linux does
   not. `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` is the alternative on this platform, unmeasured.
+- `Page size is overridden to 64 for the qsa_sparse backend`: that backend addresses attention in
+  whole blocks, so `--page-size 1` cannot survive it -- `engine.engine` raises the warning while
+  resolving the backend and the KV pool is sized in blocks afterwards. Forcing the page size back
+  only gets it overridden again, and it costs nothing: the block size is what the kernel needs.
 - `Proactor event loop does not implement add_reader, registering self on the default executor`:
   pyzmq's working fallback, the one the tornado bullet above buys. `utils.mp` filters that single
   message on Windows; the loop-policy swap is still not the answer, see that bullet.
