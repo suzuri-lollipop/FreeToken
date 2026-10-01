@@ -1585,3 +1585,49 @@ def test_slot_direct_prefill_gemm_matches_position_id_reference():
     hits0, misses0 = cache._promote_acc.tolist()
     n_touched = int(torch.unique(ids).numel())
     assert (hits0, misses0) == (n_touched, 0), f"expected ({n_touched},0), got {(hits0, misses0)}"
+
+
+def test_miss_route_mask_unions_the_k_split_plans(monkeypatch):
+    """The fetch-overlap miss mask must flag exactly the routes whose slots the
+    (possibly chunked) ensure just staged for fetch: first occurrence of each new
+    expert in chunk order, across BOTH plan buffers; a warm cache masks nothing."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the GPU offload cache kernel")
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    torch.manual_seed(5)
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=64, cache_size=128, device=torch.device("cuda"),
+        decode_fetch_overlap=True,  # the --no-decode-fetch-overlap knob's default
+    )
+    cache.ensure_dual_plans(2)                 # plan-1 buffers for the K-split ensure
+    cache.reset()
+    ids = torch.randint(0, 64, (8, 10), dtype=torch.int32, device="cuda")
+    orig = ids.clone()                         # ensure rewrites ids -> slots in place
+
+    cache.ensure_experts(0, ids[:5], plan=0)   # K-split chunk 0 -> plan 0
+    cache.ensure_experts(0, ids[5:], plan=1)   # chunk 1 -> plan 1
+    mask = cache.miss_route_mask(ids, (0, 1))
+
+    # the mask is per-SLOT: EVERY occurrence of a just-staged expert flags True (the
+    # complementary GEMV passes zero by route weight, so duplicates of a miss must ride
+    # the miss pass -- their slot's bytes are still in flight during the hit pass).
+    # an expert missed iff it was new at its first occurrence (cold cache: all of
+    # them), and every occurrence inherits that verdict
+    first_new = set()
+    seen2 = set()
+    for row in ids.tolist():
+        for eid in row:
+            if eid not in seen2:
+                first_new.add(eid)
+            seen2.add(eid)
+    expected = [[eid in first_new for eid in row] for row in ids.tolist()]
+    assert mask.tolist() == expected
+
+    # warm: a second ensure of the same layer finds every expert resident (the slots
+    # are stamped even without the payload copy), so nothing is staged and the mask
+    # is empty -- the graph-replay steady state for a repeated route set.
+    ids2 = orig.clone()
+    cache.ensure_experts(0, ids2[:5], plan=0)
+    cache.ensure_experts(0, ids2[5:], plan=1)
+    assert not cache.miss_route_mask(ids2, (0, 1)).any()

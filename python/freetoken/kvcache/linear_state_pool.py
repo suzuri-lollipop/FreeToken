@@ -205,6 +205,33 @@ class LinearStatePool:
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
+    def _slot_tensors(self) -> list[torch.Tensor]:
+        """The per-slot tensors in stash/restore byte order."""
+        return [self.conv_states, self.recurrent_states, *self.slot_states.values()]
+
+    def stash_to(self, host: torch.Tensor, offset: int, slot: int) -> None:
+        """D2H a whole-slot snapshot's bytes into ``host`` (a pinned uint8 buffer) at
+        ``offset`` (bytes), issuing the copies on the current stream with
+        ``non_blocking=True``. Both writer and reader of ``host`` run on the engine
+        stream, so non-synchronizing reuse stays ordered."""
+        for t in self._slot_tensors():
+            view = host[offset : offset + t[:, slot].numel() * t.element_size()].view(
+                t.dtype
+            ).view(t[:, slot].shape)
+            view.copy_(t[:, slot].detach(), non_blocking=True)
+            offset += t[:, slot].numel() * t.element_size()
+
+    def restore_from(self, host: torch.Tensor, offset: int, slot: int) -> None:
+        """H2D a whole-slot snapshot's bytes from ``host`` at ``offset`` into ``slot``
+        (same stream ordering contract as ``stash_to``)."""
+        for t in self._slot_tensors():
+            n = t[:, slot].numel() * t.element_size()
+            t[:, slot].copy_(
+                host[offset : offset + n].view(t.dtype).view(t[:, slot].shape),
+                non_blocking=True,
+            )
+            offset += n
+
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
 
@@ -289,25 +316,42 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     return per_req * slots
 
 
+def _linear_pp_reserve(config) -> int:
+    """Shared ping-pong reserve for the hybrid-radix pool.
+
+    The chunk-track pair is only held WHILE a request prefills: the decode
+    transition returns it (scheduler/cache.py ``_cache_req_hybrid``), so the pool
+    needs pairs for a handful of CONCURRENT chunked prefills plus the best-effort
+    tool-call anchor borrows -- not two permanently parked slots per running
+    request. At 57+ MiB per slot on hybrid models, per-request parking is what
+    starves the expert slot cache at high --max-running-requests."""
+    return max(6, config.max_running_req // 2)
+
+
 def _linear_pool_num_slots(config) -> int:
-    """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
-    (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
-    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
+    """LinearStatePool slot count. Hybrid-radix steady-state peak is 2 slots per running
+    request (1 live + 1 committed snapshot locked through decode); the chunk-track
+    ping-pong pair rides a shared reserve sized by _linear_pp_reserve (returned at the
+    decode transition), plus a cross-request snapshot cache and a padding sink. Naive GDN
+    keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    return 2 * mr + _linear_pp_reserve(config) + n_cache + 1
 
 
 def _linear_pool_min_slots(config) -> int:
-    """Floor on LinearStatePool slots that still runs: the non-evictable working set with a
-    zero snapshot cache. Hybrid-radix needs 4 per running request (1 live + 2 ping-pong + 1
-    committed snapshot locked through decode) + the padding sink; naive needs 1 per request +
-    padding. Below this, a full max_running_req batch can't get its slots and admission
-    deadlocks -- so a runtime rebuild rejects a smaller request."""
+    """Floor on LinearStatePool slots that still runs: every running request's live +
+    committed snapshot slots (2 each), one admission set (live + a ping-pong pair = 3)
+    for the prefill in flight, and the padding sink. Chunk-commit replacement allocs
+    stay deadlock-free without further headroom: a commit donates its frozen snapshot
+    (tree-evictable) BEFORE it allocates, so progress never waits on a parked slot.
+    Naive needs 1 per request + padding. Below this, a full max_running_req batch can't
+    get its slots and admission deadlocks -- so a runtime rebuild rejects a smaller
+    request."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1
-    return 4 * mr + 1
+    return 2 * mr + 4

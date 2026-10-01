@@ -155,6 +155,7 @@ def _decode_nvfp4_marlin_kernel(
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    SKIP_W0: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
@@ -171,7 +172,13 @@ def _decode_nvfp4_marlin_kernel(
 
     The e2m1 codes share one fp8 block scale per 16 k-values (== 2 words), applied per
     word. Mirrors the fast kernel's route/tile mapping and epilogue so it is a drop-in
-    decode GEMV (CUDA-graph safe: fixed shapes, no host sync)."""
+    decode GEMV (CUDA-graph safe: fixed shapes, no host sync).
+
+    ``SKIP_W0`` exits a route's blocks after zero-storing its output tile, without
+    reading the slot's weight bytes: the fetch-overlap decode runs the GEMV twice with
+    complementary zero-masked weights (hits while the misses stream in on a side
+    stream, then the misses), and the skipped half must neither cost GEMV time nor
+    read slots whose bytes the concurrent copy is mid-write."""
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
     token_id = route_id // TOP_K
@@ -179,6 +186,14 @@ def _decode_nvfp4_marlin_kernel(
 
     offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     n_mask = offs_n < N
+
+    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    if SKIP_W0:
+        w0 = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        if w0 == 0.0:
+            tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=compute_type),
+                     mask=(route_id < total_routes) & n_mask)
+            return
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
     a_row = route_id if A_ROW_IS_ROUTE else token_id
@@ -223,7 +238,6 @@ def _decode_nvfp4_marlin_kernel(
         weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
         accumulator = accumulator * weight
 
-    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 

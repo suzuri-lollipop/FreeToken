@@ -66,7 +66,10 @@ def _decode_gemm(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    skip_w0: bool = False,
 ) -> None:
+    if skip_w0:
+        raise NotImplementedError("SKIP_W0 is only implemented for the marlin decode GEMV")
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -104,6 +107,7 @@ def _decode_gemm_marlin(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    skip_w0: bool = False,
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
@@ -134,6 +138,7 @@ def _decode_gemm_marlin(
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        SKIP_W0=skip_w0,
         compute_type=_tl_dtype(c.dtype),
         num_warps=_DECODE_MARLIN_WARPS,
     )
@@ -154,10 +159,13 @@ def _fused_experts_decode_nvfp4(
     apply_router_weight_on_input: bool,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    skip_w0: bool = False,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`_decode_gemm_marlin`) or the original LUT-gather
-    GEMV (:func:`_decode_gemm`), both with the same calling convention."""
+    GEMV (:func:`_decode_gemm`), both with the same calling convention. ``skip_w0``
+    makes both GEMVs zero-store (not read the slot for) zero-weighted routes -- the
+    fetch-overlap decode's two complementary passes rely on it."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -167,14 +175,14 @@ def _fused_experts_decode_nvfp4(
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
+        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False, skip_w0,
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
-        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
+        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True, skip_w0,
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
@@ -195,6 +203,7 @@ def fused_experts_decode_nvfp4_marlin(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    skip_w0: bool = False,
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
@@ -202,7 +211,7 @@ def fused_experts_decode_nvfp4_marlin(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        act_alpha, act_limit, skip_w0,
     )
 
 

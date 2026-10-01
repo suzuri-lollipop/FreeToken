@@ -152,7 +152,7 @@ def test_w8a16_finalize_replaces_weight_and_matches_reference(monkeypatch):
     # W8A8 path production already accepts for in_proj/qkv (weight AND activation fp8),
     # and far inside this NVFP4-expert checkpoint's noise budget.
     ref = w_bf16.float()
-    for M in (1, 4, 8, 16):  # decode kernel path
+    for M in (1, 4, 8, 16, 24, 32):  # decode kernel path (BLOCK_M 16 then 32)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         y = layer.forward(x)
         rel = ((y.float() - x.float() @ ref.T).norm() / (x.float() @ ref.T).norm()).item()
@@ -178,3 +178,40 @@ def test_w8a16_disabled_keeps_bf16(monkeypatch):
     assert layer.weight is not None and getattr(layer, "_w8a16_weight", None) is None
     x = torch.randn(2, IN, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(layer.forward(x), F.linear(x, w))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="W8A16 kernel needs a GPU")
+def test_lm_head_w8a16_replaces_untied_head_only(monkeypatch):
+    """The vocab-parallel lm_head opts into W8A16: it is the largest bf16 decode
+    read per rank, and the freed VRAM goes to the expert slot cache. A tied head
+    shares the input embedding's weight and must stay bf16."""
+    from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.layers.quantization.linear.unquantized import w8a16_decode_candidate
+
+    head = ParallelLMHead(4096, 1024, quant_config=NoQuantConfig(), prefix="lm_head")
+    assert head.w8a16_decode_ok
+    assert w8a16_decode_candidate(head)
+
+    embed = VocabParallelEmbedding(4096, 1024)
+    tied = ParallelLMHead(4096, 1024, tie_word_embeddings=True,
+                          tied_embedding=embed, prefix="lm_head")
+    assert not tied.w8a16_decode_ok
+
+    monkeypatch.setenv("FREETOKEN_W8A16_LM_HEAD", "0")
+    off = ParallelLMHead(4096, 1024, quant_config=NoQuantConfig(), prefix="lm_head")
+    assert not off.w8a16_decode_ok
+
+    # finalize swaps in the per-channel fp8 weight; the decode kernel (M=20 -> the
+    # BLOCK_M=32 path) tracks the bf16 reference within weight-only fp8 error.
+    torch.manual_seed(7)
+    w_bf16 = (torch.randn(4096, 1024) * 0.02).to(torch.bfloat16).cuda()
+    head.weight = w_bf16.clone()
+    head.quant_method.finalize(head)
+    assert head.weight is None
+    assert head._w8a16_weight.dtype == torch.float8_e4m3fn
+    x = torch.randn(20, 1024, device="cuda", dtype=torch.bfloat16)
+    y = head.quant_method.apply(head, x)
+    ref = x.float() @ w_bf16.float().T
+    rel = ((y.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, rel

@@ -795,6 +795,44 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--no-decode-fetch-overlap",
+        action="store_false",
+        dest="decode_fetch_overlap",
+        default=ServerArgs.decode_fetch_overlap,
+        help=(
+            "Disable the hit/miss decode fetch overlap: by default each MoE layer's "
+            "missed-expert H2D gather streams on a side stream while the cache-resident "
+            "routes' GEMV computes (pure GPU overlap, no CPU inference); disabling "
+            "serializes fetch and GEMV per layer."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-embed-fp8",
+        action="store_false",
+        dest="embed_fp8",
+        default=ServerArgs.embed_fp8,
+        help=(
+            "Keep the input-embedding table in bf16. By default it is replaced by its "
+            "per-row fp8-e4m3 form at load (halving its VRAM into the MoE expert slot "
+            "cache); the decode gather dequantizes on the fly, so this only trades a "
+            "small weight-precision change for cache slots."
+        ),
+    )
+
+    parser.add_argument(
+        "--mamba-host-cache-mb",
+        type=int,
+        default=ServerArgs.mamba_host_cache_mb,
+        help=(
+            "Pinned-host budget (MiB) for the hybrid GDN snapshot tier: evicted GDN "
+            "snapshots survive in host RAM and a prefix re-hit restores them over H2D "
+            "instead of re-prefilling the recurrence (measured -85% multi-turn turn-2 "
+            "TTFT on this rig). 0 disables the tier."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-special-token-ckpt",
         action="store_true",
         dest="special_token_ckpt",

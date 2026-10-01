@@ -264,8 +264,8 @@ class CppHybridRadixCache(_CppTreeMixin):
         self.mamba_protected = c[5]
 
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
-        kv, cached_len, mamba_value, node = self._tree.match_hybrid(input_ids)
-        return HybridMatch(kv, int(cached_len), mamba_value, node)
+        kv, cached_len, mamba_value, node, host_id = self._tree.match_hybrid(input_ids)
+        return HybridMatch(kv, int(cached_len), mamba_value, node, host_id)
 
     def insert(
         self, input_ids: torch.Tensor, kv_indices: torch.Tensor, mamba_value: int
@@ -283,14 +283,14 @@ class CppHybridRadixCache(_CppTreeMixin):
         self._sync()
 
     def evict_full(self, num_tokens: int) -> EvictResult:
-        kv, mamba = self._tree.evict_full_hybrid(num_tokens)
+        kv, mamba, host = self._tree.evict_full_hybrid(num_tokens)
         self._sync()
-        return EvictResult(kv, list(mamba))
+        return EvictResult(kv, list(mamba), list(host))
 
     def evict_mamba(self, num: int) -> EvictResult:
-        kv, mamba = self._tree.evict_mamba(num)
+        kv, mamba, host = self._tree.evict_mamba(num)
         self._sync()
-        return EvictResult(kv, list(mamba))
+        return EvictResult(kv, list(mamba), list(host))
 
     @property
     def full_evictable_size(self) -> int:

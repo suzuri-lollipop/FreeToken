@@ -77,6 +77,14 @@ def finalize_quant(root: Any) -> int:
         if method is not None:
             method.finalize(op)
             count += 1
+        else:
+            # Ops without a quant_method that still own a weight finalize (the input
+            # embedding's W8A16 quantization): call their no-arg finalize. This must
+            # NOT use the quant_method-bearing branch -- those call method.finalize
+            # directly, and re-calling their op.finalize would double-quantize.
+            finalize = getattr(op, "finalize", None)
+            if finalize is not None:
+                finalize()
         for value in vars(op).values():
             if isinstance(value, BaseOP):
                 walk(value)

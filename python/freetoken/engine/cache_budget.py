@@ -140,6 +140,66 @@ def required_bytes(
     return moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 
 
+def padded_graph_rows(bs: int) -> int:
+    """The decode-graph size a ``bs``-row batch pads up to.
+
+    Mirrors engine/graph.py's default capture candidates (1..8 exact, then stride 4
+    to 32 and stride 8 above) so budget planning charges the dummy rows' expert
+    demand. An explicit --cuda-graph-bs list can differ; this is a planning
+    estimate, not a promise."""
+    if bs <= 8:
+        return max(1, bs)
+    if bs <= 32:
+        return -(-bs // 4) * 4
+    return -(-bs // 8) * 8
+
+
+def expert_working_set_slots(
+    num_layers: int,
+    num_experts: int,
+    top_k: int,
+    batch_rows: int,
+    factor: float,
+) -> int:
+    """Expert slots the decode LRU wants at ``batch_rows`` concurrent rows.
+
+    One step touches ``num_experts * (1 - ((E-k)/E)^rows)`` distinct experts per
+    layer (uniform-routing upper bound; measured routing is more concentrated).
+    LRU's miss-rate knee sits near 1.5-2x that per-step working set -- at ~1.0x
+    the reuse distance equals the capacity and every step re-misses most of it --
+    so ``factor`` scales the claim the expert cache makes on the shared budget."""
+    if batch_rows <= 0 or num_experts <= 0:
+        return 0
+    untouched = ((num_experts - min(top_k, num_experts)) / num_experts) ** batch_rows
+    distinct_per_layer = num_experts * (1.0 - untouched)
+    return int(factor * num_layers * distinct_per_layer)
+
+
+def plan_linear_state_slots(
+    *,
+    slots_desired: int,
+    slots_floor: int,
+    bytes_per_slot: int,
+    poolable_bytes: int,
+    expert_slots_target: int,
+    per_expert_bytes: int,
+) -> int:
+    """GDN state-pool slot count that protects the decode expert working set.
+
+    ``poolable_bytes`` is what remains for the GDN pool + the expert slot cache
+    after the (fixed) KV geometry. The expert cache claims up to
+    ``expert_slots_target`` slots -- the high-batch decode working-set knee --
+    and the pool's cross-request SNAPSHOT cache yields its ratio-sized wish
+    before the per-request working-set floor (live + ping-pong + committed
+    slots, below which admission deadlocks) is touched. Returns a slot count in
+    ``[slots_floor, slots_desired]``; callers must agree on it cross-rank."""
+    assert bytes_per_slot > 0 and per_expert_bytes > 0
+    assert slots_floor <= slots_desired, "floor above desired: sizing formulas disagree"
+    gdn_bytes = poolable_bytes - expert_slots_target * per_expert_bytes
+    slots = gdn_bytes // bytes_per_slot
+    return max(slots_floor, min(slots_desired, slots))
+
+
 def plan_cache_budget(
     budget_bytes: int,
     per_expert_bytes: int,

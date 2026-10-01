@@ -622,3 +622,34 @@ def test_triton_nvfp4_single_rank_banks_the_whole_expert():
     assert torch.equal(banks["down"], pieces["down"])
     assert banks["down_scale"].shape == (E, H, I // 16)
 
+
+
+@cuda
+def test_skip_w0_complementary_passes_match_the_single_pass():
+    """Fetch-overlap contract: two SKIP_W0 passes with complementary zeroed weights
+    reproduce the single-pass output. Per-route partials are independent, so each
+    pass's kept routes are bit-identical to the single pass's; the merge only adds
+    exact zeros (bf16 double-rounding bounds the merged-vs-single delta to ~2 ulp)."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    device = torch.device("cuda")
+    cache, _ = _triton_cache(device)
+    torch.manual_seed(23)
+    M = 3
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    ids = torch.tensor([[1, 6], [2, 3], [5, 1]], dtype=torch.int32, device=device)
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+    banks = cache.bank_views()
+    full = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
+    mask = torch.tensor([[True, False], [False, True], [True, True]], device=device)
+    w_hits = torch.where(mask, topk_weights, topk_weights.new_zeros(()))
+    w_miss = torch.where(mask, topk_weights.new_zeros(()), topk_weights)
+    a = fused_experts_decode_nvfp4_marlin(hidden, *banks, w_hits, ids, "silu", False, skip_w0=True)
+    b = fused_experts_decode_nvfp4_marlin(hidden, *banks, w_miss, ids, "silu", False, skip_w0=True)
+    torch.testing.assert_close((a + b).float(), full.float(), rtol=2e-2, atol=2e-2)
+    # an all-hit mask makes the hit pass the whole computation: bit-identical to single
+    w_all = torch.where(torch.ones_like(mask), topk_weights, topk_weights.new_zeros(()))
+    c = fused_experts_decode_nvfp4_marlin(hidden, *banks, w_all, ids, "silu", False, skip_w0=True)
+    torch.testing.assert_close(c.float(), full.float(), rtol=0, atol=0)

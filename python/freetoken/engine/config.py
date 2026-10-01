@@ -49,6 +49,19 @@ class EngineConfig:
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
+    # Hit/miss decode fetch overlap (--no-decode-fetch-overlap): each layer's missed-expert
+    # H2D gather runs on a side stream while the cache-resident routes' GEMV computes, then
+    # the misses' GEMV merges the partials. A pure-GPU overlap (no CPU inference involved);
+    # measured +25% aggregate decode at bs16 on this rig's offload profile.
+    decode_fetch_overlap: bool = True
+    # W8A16 for the input embedding (--no-embed-fp8): the bf16 vocab table is replaced by
+    # its per-row fp8-e4m3 form at load, freeing half its VRAM into the expert slot cache
+    # (measured +169-302 slots on this rig). The decode gather dequantizes on the fly.
+    embed_fp8: bool = True
+    # Pinned-host budget (MiB) for the hybrid GDN snapshot tier (--mamba-host-cache-mb).
+    # Evicted snapshots survive here and restore over H2D instead of re-prefilling the
+    # GDN recurrence on a prefix re-hit; 0 disables the tier.
+    mamba_host_cache_mb: int = 2048
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.

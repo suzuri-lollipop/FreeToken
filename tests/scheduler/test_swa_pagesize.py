@@ -133,7 +133,13 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     pt = torch.zeros(4, 128, dtype=torch.int32)
     cm = CacheManager(16, ps, pt, "hybrid_radix", linear_state_pool=pool)
 
-    req = _req(3 * ps + 3, 1)
+    # a MID-prefill continuation (ChunkedReq): it keeps the pair for the next chunk's
+    # track; a plain Req here would be the final commit and return the pair instead
+    from freetoken.scheduler.prefill import ChunkedReq
+    req = ChunkedReq(input_ids=torch.arange(1, 3 * ps + 4, dtype=torch.int32), table_idx=0,
+                     cached_len=0, output_len=1, uid=0,
+                     sampling_params=SamplingParams(), cache_handle=None)
+    req.input_len = 3 * ps + 3
     h = cm.match_req(SimpleNamespace(input_ids=req.input_ids, input_len=req.input_len,
                                      )).cuda_handle
     req.cache_handle = h

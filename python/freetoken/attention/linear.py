@@ -129,7 +129,9 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             continue
         off = int(cu_host[i])
         boundary = r.cached_len + c * CHUNK_SIZE
-        dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
+        # modulo: a borrowed single-slot pair (decode-time tool-call anchor) must
+        # never IndexError if the request somehow re-enters a prefill extend
+        dst.append(r.mamba_ping_pong[r.mamba_next_track_idx % len(r.mamba_ping_pong)])
         h_row.append(boh[i] + c)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
         boundary_rows.append(off + c * CHUNK_SIZE)

@@ -526,6 +526,7 @@ class Engine:
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        self._init_free_memory = init_free_memory  # reused by the GDN-pool budget settle
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         # Whole-device VRAM this process may plan against. --memory-ratio caps the TOTAL
         # footprint against it (weights + pools + overhead), so the ratio stays meaningful
@@ -554,6 +555,11 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
+        # Embedding W8A16 default: the embedding layers read a module-level flag at
+        # construction (they have no config handle), so resolve the CLI knob first.
+        from freetoken.layers.embedding import set_w8a16_embed_default
+
+        set_w8a16_embed_default(config.embed_fp8)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         # Pre-weight gate: refuse before materializing a byte when the physical device
@@ -728,6 +734,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            max_running_req=config.max_running_req,
         )
         # Warm the prefill path for all attention backends: Triton kernels
         # (FLA/GDN, MoE, sampling) need JIT compilation regardless of which
@@ -953,6 +960,124 @@ class Engine:
             + ", ".join(f"rank{i}={v:.1f} GB/s" for i, v in enumerate(vals))
         )
         return vals
+
+    def _settle_gdn_pool_budget(self, config: EngineConfig, banks) -> None:
+        """Shrink the GDN snapshot cache under VRAM pressure to protect the expert slots.
+
+        A high --max-running-requests inflates the hybrid-radix GDN pool (2 slots per
+        running request + the shared ping-pong reserve + a linear_state_cache_ratio-
+        sized snapshot cache), each slot
+        tens of MiB, and every one of those bytes comes off the expert slot cache's
+        hide. Once the slot cache can no longer hold ~1.5x the full-batch decode
+        working set (distinct experts touched per step), the LRU miss rate explodes
+        -- at ~1.0x the reuse distance equals the capacity and every step re-misses
+        most of it (measured on the 2x24GB NVFP4 rig at bs20: 62% miss at 1.04x vs
+        20% at 1.5x) -- and every miss is a PCIe fetch inside the decode critical
+        path. The snapshot cache is evictable by design (losing one costs a GDN
+        prefill recompute when that conversation resumes), so it yields slots before
+        the per-request working-set floor is touched. Settled HERE, before
+        --moe-cache-auto resolves, and latched into config.linear_state_cache_ratio
+        so every later consumer (the resolver's fixed cost, the KV-init subtraction,
+        the pool allocation, runtime rebuilds) sees the same geometry.
+        """
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            expert_working_set_slots,
+            padded_graph_rows,
+            plan_linear_state_slots,
+        )
+        from freetoken.kvcache.linear_state_pool import (
+            _linear_pp_reserve,
+            linear_state_bytes_per_req,
+        )
+
+        if not (config.moe_cache_auto and not self._moe_sizing_explicit):
+            return  # freed bytes only reach the expert cache under auto sizing
+        if getattr(config, "num_token_override", None) is None:
+            return  # an uncapped KV pool would absorb the freed bytes instead
+        linear_group = config.model_config.linear_attention_group()
+        if linear_group is None or config.cache_type != "hybrid_radix":
+            return  # the naive GDN pool is already mr+1; nothing to yield
+        mr = config.max_running_req
+        desired = _linear_pool_num_slots(config)
+        snapshot_floor = max(4, mr // 4)  # keep some resume points under pressure
+        floor = 2 * mr + _linear_pp_reserve(config) + snapshot_floor + 1
+        if desired <= floor:
+            return
+        per_slot = linear_state_bytes_per_req(
+            linear_group,
+            config.tp_info.size,
+            config.dtype,
+            getattr(config.model_config, "slot_states", ()),
+        )
+        # Mirror what the KV init sees later: the same budget formula and readings,
+        # with the DESIRED pool subtracted so the KV geometry stays untouched and
+        # only the GDN-vs-expert split moves.
+        new_free = self._sync_get_memory()[1]
+        available = _startup_kv_budget(
+            config.memory_ratio,
+            self._init_free_memory,
+            new_free,
+            device_total=self._device_total,
+            nonpool_overhead_bytes=self._nonpool_overhead_floor,
+            weights_bytes=self._weights_bytes,
+        )
+        kv_pages = self._pool_cls.solve_num_pages(
+            config, available - desired * per_slot
+        )
+        cache_per_page = self._pool_cls.kv_cost(config)[0]
+        poolable = available - kv_pages * cache_per_page
+        try:
+            factor = float(os.environ.get("FREETOKEN_GDN_SLOT_TARGET_WS_FACTOR", "1.5"))
+        except ValueError:
+            logger.warning_rank0(
+                "ignoring malformed FREETOKEN_GDN_SLOT_TARGET_WS_FACTOR; using 1.5"
+            )
+            factor = 1.5
+        mc = config.model_config
+        target = expert_working_set_slots(
+            mc.num_moe_layers,
+            mc.num_experts,
+            mc.num_experts_per_tok,
+            padded_graph_rows(mr),
+            factor,
+        )
+        chosen = plan_linear_state_slots(
+            slots_desired=desired,
+            slots_floor=floor,
+            bytes_per_slot=per_slot,
+            poolable_bytes=poolable,
+            expert_slots_target=target,
+            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+        )
+        # The scheduler runs redundantly per rank: a divergent pool size would
+        # diverge admission. MIN-agree so every rank allocates the same geometry.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=self.tp_cpu_group) > 1
+        ):
+            t = torch.tensor([chosen], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            chosen = int(t[0])
+        if chosen >= desired:
+            return
+        pp_reserve = _linear_pp_reserve(config)
+        n_cache = chosen - (2 * mr + pp_reserve + 1)
+        # +0.5 keeps int() truncation off the float edge of the sizing formula's
+        # max(4, int(ratio * mr)).
+        object.__setattr__(config, "linear_state_cache_ratio", (n_cache + 0.5) / mr)
+        settled = _linear_pool_num_slots(config)
+        assert settled == chosen, (
+            f"GDN ratio override did not round-trip: {settled} != {chosen}"
+        )
+        logger.info_rank0(
+            f"GDN state pool under VRAM pressure: {desired} -> {settled} slots "
+            f"(snapshot cache {desired - 2 * mr - pp_reserve - 1} -> {n_cache}; "
+            f"{mem_GB((desired - settled) * per_slot)} freed to the expert slot "
+            f"cache, working-set target {target} slots)"
+        )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -1214,6 +1339,7 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        self._settle_gdn_pool_budget(config, banks)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
             object.__setattr__(config, "moe_cache_size", size)
@@ -1270,6 +1396,7 @@ class Engine:
             cache_policy=config.moe_cache_policy,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
+            decode_fetch_overlap=config.decode_fetch_overlap,
             flat_residency=config.moe_flat_residency,
             quant_format=banks.quant_format,
             decode_target=decode_target,
@@ -1748,6 +1875,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            max_running_req=config.max_running_req,
         )
 
     def run_pending_host_fill(self) -> None:

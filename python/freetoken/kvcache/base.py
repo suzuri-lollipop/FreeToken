@@ -208,6 +208,9 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
+    # Host-tiered GDN backup buffer id: set when the snapshot SLOT died (tombstoned) but its
+    # bytes survive in the pinned host cache; the restore is then an H2D instead of a slot COW.
+    mamba_host_id: int | None = None
     # TODO: support HiCache
 
 

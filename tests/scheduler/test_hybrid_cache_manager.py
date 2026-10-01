@@ -29,6 +29,8 @@ def _pend(ids):
 
 
 def test_hybrid_cache_manager_donate_then_hit():
+    from freetoken.scheduler.prefill import ChunkedReq
+
     pool = _pool()
     page_table = torch.zeros(4, 64, dtype=torch.int32)
     cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
@@ -38,12 +40,13 @@ def test_hybrid_cache_manager_donate_then_hit():
     mr = cm.match_req(_pend([1, 2, 3, 4, 5]))
     assert mr.cuda_handle.cached_len == 0 and mr.mamba_value is None
 
-    # admit req A: allocate live + ping-pong, stage KV pages, mark a ×N snapshot at boundary 4
+    # admit req A (MID-prefill: a ChunkedReq keeps its pair for the next chunk's track):
+    # allocate live + ping-pong, stage KV pages, mark a ×N snapshot at boundary 4
     live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
     page_table[0, :4] = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
-    reqA = Req(input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), table_idx=0,
-               cached_len=4, output_len=1, uid=0, sampling_params=SamplingParams(),
-               cache_handle=mr.cuda_handle)
+    reqA = ChunkedReq(input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), table_idx=0,
+                      cached_len=4, output_len=1, uid=0, sampling_params=SamplingParams(),
+                      cache_handle=mr.cuda_handle)
     reqA.linear_slot_idx, reqA.mamba_ping_pong = live, pp
     reqA.mamba_next_track_idx = 1            # flipped from 0 in build_fla_metadata; frozen = pp[0]
     reqA.mamba_last_track_seqlen = 4
@@ -60,6 +63,85 @@ def test_hybrid_cache_manager_donate_then_hit():
     assert mrB.cuda_handle.cached_len == 4
     assert mrB.mamba_value == pp[0]
     assert mrB.cuda_handle.get_matched_indices().tolist() == [100, 101, 102, 103]
+
+
+def test_final_prefill_commit_returns_the_pair_to_the_reserve():
+    """The FINAL chunk (plain Req) is the decode transition: donate the frozen track,
+    then return the rest of the pair -- no replacement alloc, no parked slots."""
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+
+    mr = cm.match_req(_pend([1, 2, 3, 4, 5]))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    page_table[0, :4] = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
+    req = Req(input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), table_idx=0,
+              cached_len=4, output_len=1, uid=0, sampling_params=SamplingParams(),
+              cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.mamba_next_track_idx = 1             # frozen = pp[0]
+    req.mamba_last_track_seqlen = 4
+    cm.lock(mr.cuda_handle)
+
+    free_before = pool.num_free_slots
+    cm.cache_req(req, finished=False)        # final commit: donate + return the pair
+    assert req.mamba_ping_pong is None       # nothing parked through decode
+    assert pool.num_free_slots == free_before + 1   # pp[1] back; pp[0] tree-owned; no alloc
+
+    # the donated snapshot is a tree hit for a prefix-sharing request
+    mrB = cm.match_req(_pend([1, 2, 3, 4, 9]))
+    assert mrB.mamba_value == pp[0]
+
+    # an untracked final commit (no ×64 boundary crossed) returns the whole pair
+    mr2 = cm.match_req(_pend([6, 7, 8, 9]))
+    live2, pp2 = pool.alloc(1)[0], tuple(pool.alloc(2))
+    req2 = Req(input_ids=torch.tensor([6, 7, 8, 9], dtype=torch.int32), table_idx=2,
+               cached_len=3, output_len=1, uid=2, sampling_params=SamplingParams(),
+               cache_handle=mr2.cuda_handle)
+    req2.linear_slot_idx, req2.mamba_ping_pong = live2, pp2
+    cm.lock(mr2.cuda_handle)
+    free2 = pool.num_free_slots
+    cm.cache_req(req2, finished=False)
+    assert req2.mamba_ping_pong is None
+    assert pool.num_free_slots == free2 + 2  # both slots back
+
+
+def test_toolcall_anchor_borrows_a_single_slot_and_skips_when_tight():
+    """Decode-time anchors borrow one slot from the shared reserve (a pending freeze
+    is single-slot by design); a tight pool skips the borrow like the old None path."""
+    pool = _pool(num_slots=12)
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    live = pool.alloc(1)[0]
+    req = Req(input_ids=torch.arange(8, dtype=torch.int32), table_idx=0, cached_len=6,
+              output_len=2, uid=0, sampling_params=SamplingParams(), cache_handle=None)
+    req.linear_slot_idx = live
+    req.mamba_ping_pong = None               # pair returned at the decode transition
+    req.toolcall_anchor_len = 6              # anchor == cached_len: freeze now
+    pool.conv_states[:, live] = 7.0          # distinctive live state to verify the copy
+
+    cm.snapshot_toolcall_anchor([req])
+    assert req.mamba_ping_pong is not None and len(req.mamba_ping_pong) == 1
+    borrowed = req.mamba_ping_pong[0]
+    assert req.mamba_last_track_seqlen == 6
+    assert torch.all(pool.conv_states[:, borrowed] == 7.0)   # state frozen into the borrow
+
+    # a second anchor while one is pending is a no-op (single pending freeze)
+    before = pool.num_free_slots
+    cm.snapshot_toolcall_anchor([req])
+    assert pool.num_free_slots == before
+
+    # tight pool: the borrow must not starve the admission gate's 3-slot set
+    req2 = Req(input_ids=torch.arange(8, dtype=torch.int32), table_idx=1, cached_len=6,
+               output_len=2, uid=1, sampling_params=SamplingParams(), cache_handle=None)
+    req2.linear_slot_idx = pool.alloc(1)[0]
+    req2.toolcall_anchor_len = 6
+    held = []
+    while pool.num_free_slots > 3:
+        held.append(pool.alloc(1)[0])
+    cm.snapshot_toolcall_anchor([req2])
+    assert req2.mamba_ping_pong is None      # skipped gracefully
+    pool.free(held)
 
 
 def test_hybrid_finish_donates_live_slot():
@@ -153,14 +235,22 @@ def test_naive_cache_does_not_align_prefill_chunks():
     assert adder.try_add_one(pending).extend_len == 100
 
 
-def test_pool_sizing_covers_4mr_floor():
-    """C6: pool must reserve the 4-slot-per-request non-evictable floor even at a tiny ratio."""
+def test_pool_sizing_covers_the_admission_floor():
+    """C6: pool must reserve the deadlock floor (2 slots per running request for
+    live+committed, one 3-slot admission set, the padding sink) even at a tiny
+    ratio -- the chunk-track pair rides a shared reserve now, returned at the
+    decode transition."""
     from types import SimpleNamespace
-    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+    from freetoken.kvcache.linear_state_pool import (
+        _linear_pool_min_slots,
+        _linear_pool_num_slots,
+    )
     for mr in (1, 8, 64):
         c = SimpleNamespace(max_running_req=mr, cache_type="hybrid_radix",
                             linear_state_cache_ratio=0.1)
-        assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
+        assert _linear_pool_min_slots(c) == 2 * mr + 4
+        assert _linear_pool_num_slots(c) >= _linear_pool_min_slots(c), (
+            mr, _linear_pool_num_slots(c))
 
 
 if __name__ == "__main__":
@@ -256,3 +346,146 @@ def test_allocate_paged_record_and_release_roundtrip():
     assert info2 == info and len(cm.free_slots) == free_before - 2
     cm.release_paged(info2)
     assert len(cm.free_slots) == free_before
+
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Host-tiered GDN snapshots (insurance backups): a tombstoned snapshot keeps a
+# resumable boundary via the pinned host cache instead of dying.
+# ---------------------------------------------------------------------------
+
+def _host_cm(pool, budget_mb=64, backend="cpp"):
+    from freetoken.kvcache.linear_state_host import LinearStateHostCache
+
+    import os
+    os.environ["FREETOKEN_RADIX_BACKEND"] = backend
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+    cm.host_cache = LinearStateHostCache(pool, torch.device("cpu"), budget_mb)
+    return cm
+
+
+@pytest.mark.parametrize("backend", ["cpp", "py"])
+def test_host_backup_survives_tombstone_and_restores(backend):
+    pool = _pool(num_slots=8)
+    cm = _host_cm(pool, backend=backend)
+
+    ids4 = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    kv4 = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
+    S = pool.alloc(1)[0]
+    pool.conv_states[:, S] = 3.0
+    pool.recurrent_states[:, S] = 5.0
+    conv_ref, rec_ref = pool.conv_states[:, S].clone(), pool.recurrent_states[:, S].clone()
+
+    _, exist = cm.prefix_cache.insert(ids4, kv4, S)
+    assert not exist
+    cm._stash_snapshot_insurance(ids4, S)
+    m = cm.prefix_cache.match_prefix(ids4)
+    assert m.mamba_value == S
+    assert m.node.mamba_host_id is not None, "backup buffer parked on the node"
+
+    # a longer shared path makes the boundary node INTERNAL (the tombstone case)
+    ids5 = torch.tensor([1, 2, 3, 4, 9], dtype=torch.int32)
+    kv5 = torch.tensor([100, 101, 102, 103, 200], dtype=torch.int32)
+    T = pool.alloc(1)[0]
+    _, exist = cm.prefix_cache.insert(ids5, kv5, T)
+    assert not exist
+
+    # pool pressure tombstones the OLDER boundary snapshot; the host backup stays
+    free_before = pool.num_free_slots
+    cm.ensure_mamba_slots(free_before + 1)
+    assert pool.num_free_slots == free_before + 1
+    m2 = cm.prefix_cache.match_prefix(ids4)
+    assert m2.mamba_value is None
+    assert m2.mamba_host_id is not None, "tombstone must keep the host backup"
+
+    # match_req plumbing carries the host id to the admission path
+    mr = cm.match_req(_pend([1, 2, 3, 4, 7]))
+    assert mr.cuda_handle.cached_len == 4
+    assert mr.mamba_value is None and mr.mamba_host_id == m2.mamba_host_id
+
+    # the backup restores the exact bytes the donate captured
+    D = pool.alloc(1)[0]
+    cm.host_cache.restore_from(m2.mamba_host_id, D)
+    assert torch.equal(pool.conv_states[:, D], conv_ref)
+    assert torch.equal(pool.recurrent_states[:, D], rec_ref)
+
+
+@pytest.mark.parametrize("backend", ["cpp", "py"])
+def test_leaf_with_backup_tombstones_keeps_kv_and_full_evict_releases(backend):
+    pool = _pool(num_slots=8)
+    cm = _host_cm(pool, backend=backend)
+
+    ids3 = torch.tensor([1, 2, 3], dtype=torch.int32)
+    kv3 = torch.tensor([10, 11, 12], dtype=torch.int32)
+    S = pool.alloc(1)[0]
+    _, exist = cm.prefix_cache.insert(ids3, kv3, S)
+    assert not exist
+    cm._stash_snapshot_insurance(ids3, S)
+    first_buf = cm.prefix_cache.match_prefix(ids3).node.mamba_host_id
+    assert first_buf is not None
+
+    # GDN-slot pressure: a backup-carrying LEAF tombstones (slot freed, KV + backup kept)
+    free_before = pool.num_free_slots
+    cm.ensure_mamba_slots(free_before + 1)
+    assert pool.num_free_slots == free_before + 1
+    m = cm.prefix_cache.match_prefix(ids3)
+    assert m.cached_len == 3 and m.mamba_value is None
+    assert m.mamba_host_id == first_buf, "tombstoned leaf resumes from its backup"
+
+    # KV-pressure eviction deletes the node: the backup buffer returns to the free list.
+    # Drive it through the real CM `_allocate` path (empty the KV free-list first) so the
+    # release handling is what production runs.
+    cm.free_slots = cm.free_slots[:0]
+    cm._allocate(1)
+    assert cm.prefix_cache.match_prefix(ids3).cached_len == 0
+
+    # the released buffer is reusable by a later stash
+    ids2 = torch.tensor([7, 8], dtype=torch.int32)
+    kv2 = torch.tensor([20, 21], dtype=torch.int32)
+    S2 = pool.alloc(1)[0]
+    _, exist = cm.prefix_cache.insert(ids2, kv2, S2)
+    assert not exist
+    cm._stash_snapshot_insurance(ids2, S2)
+    assert cm.prefix_cache.match_prefix(ids2).node.mamba_host_id == first_buf
+
+
+@pytest.mark.parametrize("backend", ["cpp", "py"])
+def test_leaf_without_backup_still_deletes_on_eviction(backend):
+    pool = _pool(num_slots=8)
+    cm = _host_cm(pool, backend=backend)
+
+    ids3 = torch.tensor([1, 2, 3], dtype=torch.int32)
+    kv3 = torch.tensor([10, 11, 12], dtype=torch.int32)
+    S = pool.alloc(1)[0]
+    _, exist = cm.prefix_cache.insert(ids3, kv3, S)
+    assert not exist
+    # no stash: the historical leaf-deletion path must stay intact
+    free_before = pool.num_free_slots
+    cm.ensure_mamba_slots(free_before + 1)
+    assert pool.num_free_slots == free_before + 1
+    assert cm.prefix_cache.match_prefix(ids3).cached_len == 0
+
+
+@pytest.mark.parametrize("backend", ["cpp", "py"])
+def test_stash_skips_gracefully_when_host_full(backend):
+    pool = _pool(num_slots=8)
+    # 1-MiB budget against a ~16.8-MiB slot: exactly one buffer
+    cm = _host_cm(pool, budget_mb=1, backend=backend)
+
+    ids_a = torch.tensor([1, 2], dtype=torch.int32)
+    kv_a = torch.tensor([10, 11], dtype=torch.int32)
+    Sa = pool.alloc(1)[0]
+    assert not cm.prefix_cache.insert(ids_a, kv_a, Sa)[1]
+    cm._stash_snapshot_insurance(ids_a, Sa)
+    assert cm.prefix_cache.match_prefix(ids_a).node.mamba_host_id is not None
+
+    ids_b = torch.tensor([3, 4], dtype=torch.int32)
+    kv_b = torch.tensor([20, 21], dtype=torch.int32)
+    Sb = pool.alloc(1)[0]
+    assert not cm.prefix_cache.insert(ids_b, kv_b, Sb)[1]
+    cm._stash_snapshot_insurance(ids_b, Sb)
+    # buffer pool exhausted: B's snapshot skips the backup and stays slot-only
+    mb = cm.prefix_cache.match_prefix(ids_b)
+    assert mb.mamba_host_id is None and mb.mamba_value == Sb

@@ -160,7 +160,8 @@ def _config(page_size=16, max_running_req=4, cache_type="hybrid_radix", num_expe
 def test_floors_hybrid_moe_model():
     # KV floor = one page's tokens (rebuild rejects num_pages <= 0); MoE floor = one layer's
     # experts (_require_offload_cache_size); mamba floor = _linear_pool_min_slots - 1 usable
-    # (hybrid_radix: 4 slots per running request non-evictable, padding sink excluded).
+    # (hybrid_radix: 2 slots per running request live+committed, one admission set of 3
+    # for the prefill in flight, padding sink excluded).
     eng = SimpleNamespace(
         config=_config(),
         moe_offload_cache=object(),
@@ -170,7 +171,7 @@ def test_floors_hybrid_moe_model():
     assert compute_cache_floors(eng) == {
         "kv_tokens": 16,
         "moe_experts": 128,
-        "mamba_slots": 4 * 4,  # 4*max_running_req + 1 physical -> -1 padding = 16 usable
+        "mamba_slots": 2 * 4 + 3,  # (2*mr + 4) physical -> -1 padding = 11 usable
         "swa_tokens": 0,  # not a radix-SWA model (cache_type=hybrid_radix, no has_swa_attention)
     }
 

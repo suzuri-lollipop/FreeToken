@@ -53,10 +53,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_MAX_BYTES = 32 * 1024
-_BLOCK = 16384  # bf16 elements per CTA pass; n <= 16384 -> single pass
-# Host block layout: [R0 R1][ctr pad][data0 (2 x 32KB parity slots... )]
+_MAX_BYTES = 160 * 1024
+_BLOCK = 16384  # bf16 elements per CTA pass; larger n loops in BLOCK chunks
+# Host block layout: [R0 R1][ctr pad][data0 (2 x _MAX_BYTES parity slots) data1 (...)]
 # flags at word 0/1; the device seq counter is a separate cudaMalloc'd word.
+# 160 KiB covers decode all-reduces up to bs32 (32 x 2560 x 2B); above it (prefill
+# chunks) the caller falls back to NCCL. The block stays tiny pinned host memory.
 _R_OFF = 0            # int64 words: R0 at +0, R1 at +8
 _DATA_OFF = 4096
 _SHM_SIZE = _DATA_OFF + 4 * _MAX_BYTES  # 2 ranks x 2 parity slots
@@ -65,17 +67,28 @@ _SHM_SIZE = _DATA_OFF + 4 * _MAX_BYTES  # 2 ranks x 2 parity slots
 @triton.jit
 def _shm_ar_stage_kernel(
     x_ptr, data_addr, r_addr, ctr_addr, n,
-    slot_bytes: tl.constexpr, BLOCK: tl.constexpr,
+    slot_bytes: tl.constexpr, BLOCK: tl.constexpr, MULTI: tl.constexpr,
 ):
-    """Single CTA: bump seq, stage x into my_data[seq%2], release-signal R_me=seq."""
+    """Single CTA: bump seq, stage x into my_data[seq%2], release-signal R_me=seq.
+
+    MULTI=False compiles to the straight-line single-pass kernel (payloads up to
+    one BLOCK: every decode graph up to bs6, and the historical <=32KiB reducer);
+    the chunk loop only materializes for the larger payloads that need it."""
     seq = tl.load(ctr_addr.to(tl.pointer_type(tl.int64))) + 1
     tl.store(ctr_addr.to(tl.pointer_type(tl.int64)), seq)
     slot = (seq % 2) * slot_bytes
     dst = (data_addr + slot).to(tl.pointer_type(tl.bfloat16))
-    offs = tl.arange(0, BLOCK)
-    m = offs < n
-    v = tl.load(x_ptr + offs, mask=m)
-    tl.store(dst + offs, v, mask=m)
+    if MULTI:
+        for start in range(0, n, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            m = offs < n
+            v = tl.load(x_ptr + offs, mask=m)
+            tl.store(dst + offs, v, mask=m)
+    else:
+        offs = tl.arange(0, BLOCK)
+        m = offs < n
+        v = tl.load(x_ptr + offs, mask=m)
+        tl.store(dst + offs, v, mask=m)
     # CTA-wide ordering, then one system-scope release publish of the seq flag
     tl.debug_barrier()
     lane0 = tl.arange(0, 1)
@@ -86,7 +99,7 @@ def _shm_ar_stage_kernel(
 @triton.jit
 def _shm_ar_sum_kernel(
     x_ptr, peer_data_addr, r_peer_addr, ctr_addr, n,
-    slot_bytes: tl.constexpr, BLOCK: tl.constexpr,
+    slot_bytes: tl.constexpr, BLOCK: tl.constexpr, MULTI: tl.constexpr,
 ):
     """Single CTA: wait for the peer's seq, then out = x + peer_data[seq%2]."""
     seq = tl.load(ctr_addr.to(tl.pointer_type(tl.int64)))
@@ -95,11 +108,19 @@ def _shm_ar_sum_kernel(
         pass
     slot = (seq % 2) * slot_bytes
     peer = (peer_data_addr + slot).to(tl.pointer_type(tl.bfloat16))
-    offs = tl.arange(0, BLOCK)
-    m = offs < n
-    x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
-    y = tl.load(peer + offs, mask=m, other=0.0).to(tl.float32)
-    tl.store(x_ptr + offs, (x + y).to(tl.bfloat16), mask=m)
+    if MULTI:
+        for start in range(0, n, BLOCK):
+            offs = start + tl.arange(0, BLOCK)
+            m = offs < n
+            x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
+            y = tl.load(peer + offs, mask=m, other=0.0).to(tl.float32)
+            tl.store(x_ptr + offs, (x + y).to(tl.bfloat16), mask=m)
+    else:
+        offs = tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m).to(tl.float32)
+        y = tl.load(peer + offs, mask=m, other=0.0).to(tl.float32)
+        tl.store(x_ptr + offs, (x + y).to(tl.bfloat16), mask=m)
 
 
 class ShmOneShotAllReducer:
@@ -178,8 +199,10 @@ class ShmOneShotAllReducer:
             # gating mode (fill before launch, no WAIT nodes), leaving K2 alone in
             # those execs; bs1 keeps the wait-sync PLE protocol (its <= 5 KiB K2
             # mix is production-proven). FREETOKEN_SHM_AR_MAX_KIB <= 5 restores the
-            # historical all-wait-sync PLE protocol automatically.
-            kib = int(os.getenv("FREETOKEN_SHM_AR_MAX_KIB", "20") or "20")
+            # historical all-wait-sync PLE protocol automatically. The 160 KiB
+            # default keeps every decode graph up to bs32 off NCCL (bs>4 decode
+            # payloads are 10-160 KiB; NCCL LL costs ~78us+ per call there).
+            kib = int(os.getenv("FREETOKEN_SHM_AR_MAX_KIB", "160") or "160")
             local.max_bytes = min(_MAX_BYTES, max(4, kib) * 1024)
             local.max_elems = local.max_bytes // 2
         except Exception as exc:  # noqa: BLE001
@@ -209,8 +232,11 @@ class ShmOneShotAllReducer:
         # ---- collective 3: rank0's flag init visible before any probe op
         torch.distributed.barrier(group=tp_cpu_group)
 
-        # ---- functional probe: two real rounds (parity alternation), deadline-
-        # bounded, host-verified. A protocol stall must degrade, not hang boot.
+        # ---- functional probe: real rounds (parity alternation), deadline-bounded,
+        # host-verified. Two payload shapes: the single-pass size and, when the
+        # negotiated max_bytes allows, a BLOCK+128-element payload that exercises
+        # the multi-chunk loop decode graphs use above bs6. A protocol stall must
+        # degrade, not hang boot.
         ok = False
         stalled = False
         try:
@@ -218,12 +244,16 @@ class ShmOneShotAllReducer:
             side.wait_stream(torch.cuda.current_stream())
             done = torch.cuda.Event()
             xs = []
+            widths = [128]
+            if local.max_bytes >= (_BLOCK + 128) * 2:
+                widths.append(_BLOCK + 128)
             with torch.cuda.stream(side):
                 for v in (1.0, 2.0):
-                    x = torch.full((1, 128), v, dtype=torch.bfloat16,
-                                   device=f"cuda:{device}") * (rank + 1)
-                    local.all_reduce_(x)
-                    xs.append((x, v * 3.0))
+                    for w in widths:
+                        x = torch.full((1, w), v, dtype=torch.bfloat16,
+                                       device=f"cuda:{device}") * (rank + 1)
+                        local.all_reduce_(x)
+                        xs.append((x, v * 3.0))
                 done.record(side)
             deadline = time.monotonic() + 15.0
             while not done.query():
@@ -279,13 +309,14 @@ class ShmOneShotAllReducer:
         my_data = base + _DATA_OFF + self.rank * 2 * _MAX_BYTES
         peer_data = base + _DATA_OFF + peer * 2 * _MAX_BYTES
         ctr = self._counter
+        multi = n > _BLOCK
         _shm_ar_stage_kernel[(1,)](
             x, my_data, base + _R_OFF + 8 * self.rank, ctr.data_ptr(), n,
-            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, num_warps=32,
+            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, MULTI=multi, num_warps=32,
         )
         _shm_ar_sum_kernel[(1,)](
             x, peer_data, base + _R_OFF + 8 * peer, ctr.data_ptr(), n,
-            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, num_warps=32,
+            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, MULTI=multi, num_warps=32,
         )
         return x
 

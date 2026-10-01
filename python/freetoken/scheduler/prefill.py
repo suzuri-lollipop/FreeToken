@@ -130,7 +130,7 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, mr.mamba_host_id
 
     def _add_one_req(
         self,
@@ -142,6 +142,7 @@ class PrefillAdder:
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
         restore_src: int | None = None,
+        restore_host: int | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
@@ -225,6 +226,7 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
+        req.mamba_restore_host = restore_host
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -246,7 +248,7 @@ class PrefillAdder:
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -256,6 +258,7 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                restore_host=restore_host,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its

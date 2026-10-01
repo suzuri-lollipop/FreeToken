@@ -39,11 +39,13 @@ def _round(x, host, ctr, rank=0, peer=0):
     n = x.numel()
     _shm_ar_stage_kernel[(1,)](
         x, base + _DATA_OFF + rank * 2 * _MAX_BYTES, base + _R_OFF + 8 * rank,
-        ctr.data_ptr(), n, slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, num_warps=32,
+        ctr.data_ptr(), n, slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, MULTI=n > _BLOCK,
+        num_warps=32,
     )
     _shm_ar_sum_kernel[(1,)](
         x, base + _DATA_OFF + peer * 2 * _MAX_BYTES, base + _R_OFF + 8 * peer,
-        ctr.data_ptr(), n, slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, num_warps=32,
+        ctr.data_ptr(), n, slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, MULTI=n > _BLOCK,
+        num_warps=32,
     )
 
 
@@ -80,7 +82,7 @@ def test_seq_flag_blocks_until_published():
     with torch.cuda.stream(stream):
         _shm_ar_sum_kernel[(1,)](
             x, base + _DATA_OFF, base + _R_OFF, ctr.data_ptr(), n,
-            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, num_warps=32,
+            slot_bytes=_MAX_BYTES, BLOCK=_BLOCK, MULTI=n > _BLOCK, num_warps=32,
         )
     import time
 
@@ -160,3 +162,48 @@ def test_ar_instance_routes_to_the_dual_impl():
     # all_gather never routes to the dual instance (the vocab AG stays on the
     # primary/NCCL path, single-instance ordering)
     assert impl_mod._AR_INSTANCE == 0
+
+
+@CUDA
+def test_multi_chunk_payload_covers_every_chunk():
+    """bs>6 decode payloads exceed one BLOCK: the chunk loops must stage and sum
+    the whole n -- a short loop would silently leave the tail chunks unsynced."""
+    host, ctr = _rig()
+    x = torch.randn(24, 2560, dtype=torch.bfloat16, device="cuda")
+    assert x.numel() > 3 * _BLOCK  # the bs24 decode payload spans 4 chunks
+    x0 = x.clone()
+    for it in range(3):
+        _round(x, host, ctr)
+        torch.cuda.synchronize()
+        x0 = (x0.float() * 2).to(torch.bfloat16)
+        assert torch.equal(x, x0), it
+    # the exact-max payload (bs32 decode) fills the last parity slot to the byte
+    big = torch.full((1, _MAX_BYTES // 2), 0.5, dtype=torch.bfloat16, device="cuda")
+    _round(big, host, ctr)
+    torch.cuda.synchronize()
+    assert torch.equal(big, torch.full_like(big, 1.0))
+
+
+@CUDA
+def test_multi_chunk_graph_capture_replays():
+    """The chunked kernels stay graph-capturable (runtime-trip-count loops)."""
+    host, ctr = _rig()
+    x = torch.randn(24, 2560, dtype=torch.bfloat16, device="cuda")
+    _round(x, ctr=ctr, host=host)  # eager warm (compiles + primes)
+    torch.cuda.synchronize()
+    x0 = x.clone()
+    graph = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        with torch.cuda.graph(graph):
+            _round(x, host, ctr)
+    torch.cuda.current_stream().wait_stream(s)
+    x.copy_(x0)
+    ctr.fill_(1)
+    for i in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        x0 = (x0.float() * 2).to(torch.bfloat16)
+        assert torch.equal(x, x0), i
+        assert int(ctr) == 2 + i

@@ -30,6 +30,8 @@ import triton.language as tl
 from .e4m3_compat import e4m3_kernel_view, e4m3_native_cx, e4m3_u8_to_f32
 
 _BLOCK_M = 16  # tl.dot's floor; decode M <= 8 pads
+_BLOCK_M_WIDE = 32  # second m-tile for decode graphs above bs16 (still weight-read bound)
+_MAX_DECODE_M = 32  # w8a16_linear_decode's contract; larger M is the dequantize path's
 _WS: dict[tuple, torch.Tensor] = {}
 
 
@@ -165,30 +167,42 @@ def w8a16_linear_decode(
     """y = x @ (w_fp8 * scale[:, None]).T + bias for tiny-M decode batches."""
     M, K = x.shape
     N = w_fp8.shape[0]
+    assert M <= _MAX_DECODE_M, (
+        f"w8a16_linear_decode covers M <= {_MAX_DECODE_M} (got {M}); larger batches "
+        "belong to the on-the-fly dequantize path"
+    )
     y = torch.empty((M, N), device=x.device, dtype=x.dtype)
     block_n, block_k, split_k, warps, stages = _config(M, N, K)
+    # M in (16, 32] runs one 32-row m-tile: same single-pass weight stream, the
+    # padded rows only cost activation-side lanes. M <= 16 keeps the historical
+    # BLOCK_M=16 codegen bit-for-bit.
+    block_m = _BLOCK_M if M <= _BLOCK_M else _BLOCK_M_WIDE
     w_view = e4m3_kernel_view(w_fp8)
     if split_k == 1:
         _w8a16_main_kernel[(triton.cdiv(N, block_n), 1)](
             x, w_view, scale, bias if bias is not None else x, y, x,
             M, N, K, x.stride(0), w_fp8.stride(0),
             BIAS=bias is not None, SPLIT_K=1, FUSED=True,
-            BLOCK_M=_BLOCK_M, BLOCK_N=block_n, BLOCK_K=block_k,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
             num_warps=warps, num_stages=stages,
         )
         return y
-    ws = _workspace((x.device.index, N, _WS_SLOT), (split_k * _BLOCK_M, N), x.device)
+    # Allocate at the WIDE plane size whatever M is: graph captures bake the ws
+    # address, so a later larger-M call must never regrow (and thereby move) a
+    # workspace an earlier capture already referenced. Planes below the allocated
+    # size are stride-consistent (PLANE = block_m * N <= _BLOCK_M_WIDE * N).
+    ws = _workspace((x.device.index, N, _WS_SLOT), (split_k * _BLOCK_M_WIDE, N), x.device)
     _w8a16_main_kernel[(triton.cdiv(N, block_n), split_k)](
         x, w_view, scale, bias if bias is not None else x, y, ws,
         M, N, K, x.stride(0), w_fp8.stride(0),
         BIAS=bias is not None, SPLIT_K=split_k, FUSED=False,
-        BLOCK_M=_BLOCK_M, BLOCK_N=block_n, BLOCK_K=block_k,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=warps, num_stages=stages,
     )
     block = 1024
     _w8a16_epilogue_kernel[(triton.cdiv(M * N, block),)](
         ws, scale, bias if bias is not None else scale, y, M, N,
-        SPLIT_K=split_k, PLANE=_BLOCK_M * N, BIAS=bias is not None, BLOCK=block,
+        SPLIT_K=split_k, PLANE=block_m * N, BIAS=bias is not None, BLOCK=block,
         num_warps=4,
     )
     return y

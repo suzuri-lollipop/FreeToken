@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
@@ -11,8 +12,19 @@ from freetoken.utils import div_ceil, nvtx_annotate
 from .base import BaseOP
 from .quantization import LayerKind, QuantConfig, quant_method_for
 
+_EMBED_LOGGED = [False]  # one-shot latch for the fp8-embed startup line
+
+
+def set_w8a16_embed_default(enabled: bool) -> None:
+    """Resolve --no-embed-fp8 into the default new embeddings read at construction."""
+    VocabParallelEmbedding._W8A16_EMBED_DEFAULT = bool(enabled)
+
 
 class VocabParallelEmbedding(BaseOP):
+    # Module-level W8A16 default, resolved from --no-embed-fp8 by the engine before the
+    # model is built (embeddings have no config handle to consult).
+    _W8A16_EMBED_DEFAULT = True
+
     def __init__(
         self,
         num_embeddings: int,
@@ -36,16 +48,66 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
+        # W8A16-in for the INPUT embedding (opt-in, default OFF pending quality A/B):
+        # the bf16 table (vocab/tp x hidden, 1.27 GiB total here) is REPLACED by its
+        # per-row fp8-e4m3 form at finalize, freeing half its VRAM straight into the
+        # expert slot cache. The decode gather then reads one fp8 row per token and
+        # dequantizes on the fly -- the absolute byte saving per token is tiny (2 rows'
+        # worth), so this is a MISS-byte / slot-capacity lever, not an embed-read lever.
+        self.w8a16_embed_ok = VocabParallelEmbedding._W8A16_EMBED_DEFAULT
+        self._w8a16_weight: torch.Tensor | None = None
+        self._w8a16_scale: torch.Tensor | None = None
+        self._w8a16_dtype: torch.dtype = torch.bfloat16
+
+    def finalize(self) -> None:
+        """Quantize the input-embedding table to per-row fp8-e4m3 and drop the bf16 master.
+
+        Reuses the linear W8A16 quantizer: for a [vocab, hidden] table the per-row axis is
+        the hidden dim, exactly matching its per-output-channel semantics. Prefill gathers
+        also dequantize on the fly (the whole table is rewritten only once at load)."""
+        if not self.w8a16_embed_ok or self.weight is None or not self.weight.is_cuda:
+            return
+        from freetoken.kernel.triton.w8a16_linear import quantize_weight_w8a16
+        from freetoken.utils import init_logger
+
+        if not _EMBED_LOGGED[0]:
+            _EMBED_LOGGED[0] = True
+            init_logger(__name__).info_rank0("W8A16 embed: input-embedding table quantized to fp8")
+        self._w8a16_dtype = self.weight.dtype
+        w8, scale = quantize_weight_w8a16(self.weight)
+        self._w8a16_weight = w8
+        self._w8a16_scale = scale  # [V] fp32, gathered 1-D then unsqueezed in forward
+        self.weight = None
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel import indexing
 
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
+        if self._w8a16_weight is not None:
+            # Gather the fp8 rows, then dequantize with the per-row scale. The scale is
+            # gathered 1-D with plain torch indexing (the JIT `indexing` kernel rejects
+            # 4-byte rows); its vocab_range mask mirrors index.cu's, then it is unsqueezed
+            # to broadcast against the row gather.
+            w8 = indexing(
+                weights=self._w8a16_weight,
+                indices=x,
+                vocab_range=self.vocab_range if self.tp_size > 1 else None,
+            )
+            if self.tp_size > 1 and self.vocab_range is not None:
+                start, length = self.vocab_range
+                local = x.long() - start
+                valid = (local >= 0) & (local < length)
+                s = self._w8a16_scale[local.clamp(0, self._w8a16_scale.shape[0] - 1)]
+                s = s.masked_fill(~valid, 0.0)
+            else:
+                s = self._w8a16_scale[x.long()]
+            y = (w8.float() * s[:, None]).to(self._w8a16_dtype)
+        else:
+            y = indexing(
+                weights=self.weight,
+                indices=x,
+                vocab_range=self.vocab_range if self.tp_size > 1 else None,
+            )
 
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
@@ -84,6 +146,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.out_features = self.num_embeddings_tp
         self.output_sizes = (self.num_embeddings_tp,)
         self.quant_method = None
+        # W8A16 opt-in for the UNTIED head: it is the largest bf16 decode read on the
+        # rank (vocab/tp x hidden), and its fp8 replacement frees ~0.3 GiB straight
+        # into the expert slot cache. Forward only ever sees M <= running requests
+        # (prefill logits are gathered to last positions), so the decode kernel's
+        # M <= 32 window covers every captured graph. A tied head shares the input
+        # embedding's weight and keeps bf16 (quant_method is None there anyway).
+        self.w8a16_decode_ok = (
+            tied_embedding is None
+            and os.environ.get("FREETOKEN_W8A16_LM_HEAD", "1") == "1"
+        )
         if tied_embedding is None:
             self.quant_method = quant_method_for(quant_config, self, prefix)
             self.quant_method.create_weights(self)

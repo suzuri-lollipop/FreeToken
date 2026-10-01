@@ -85,6 +85,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
     # The prefill grouped GEMM can read expert rows straight from their LRU slots
     # through a [E] id->slot map (skips the per-chunk double-buffer D2D staging).
     supports_slot_direct_prefill = True
+    supports_skip_w0 = True  # _decode_nvfp4_marlin_kernel zero-stores w==0 routes unread
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
@@ -135,7 +136,11 @@ class TritonNvfp4MoEKernel(MoEKernel):
             # view.slots carries the [E] id->LRU-slot map on the slot-direct prefill
             # path (None on the double-buffer path: position == expert id).
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit, slot_map=view.slots)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+        # _moe_skip_w0 is a capture-time transient set by the fetch-overlap decode
+        # (layers/moe.py): both complementary GEMV passes zero-store the other
+        # half's routes without reading their slots.
+        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+                                                skip_w0=getattr(layer, "_moe_skip_w0", False))
 
 
 # ---------------------------------------------------------------------------

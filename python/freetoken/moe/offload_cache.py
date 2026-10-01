@@ -173,6 +173,11 @@ class OffloadMoeCache:
     # CPU absorbs the overflow misses, then the partials merge. The CPU executor is
     # attached (set_cpu_executor) for cpu/hybrid, set whenever >=1 layer decodes on the CPU.
     decode_target: str = "gpu"
+    # Pure-GPU decode fetch overlap (--no-decode-fetch-overlap): stream the misses' H2D
+    # on a side stream while the hit routes' GEMV runs, then the miss routes' GEMV after
+    # the join (see layers/moe.py _decode_fetch_overlap). Measured on the 2x24GB NVFP4
+    # rig at bs16: aggregate +25% (greedy, paired), det16 bit-identical to the serial path.
+    decode_fetch_overlap: bool = True
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
@@ -267,6 +272,22 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        # Pure-GPU decode fetch overlap (see layers/moe.py _decode_fetch_overlap): stream
+        # the misses' H2D on a side stream while the hit routes' GEMV runs, then run the
+        # miss routes' GEMV after the join. The flag is the --no-decode-fetch-overlap
+        # CLI knob (dataclass field, resolved by the engine).
+        self.decode_copy_stream: torch.cuda.Stream | None = None
+        # Narrow side-stream gather: 1-2 blocks/bank still saturate this rig's PCIe
+        # links (measured 6.62/20.4 GB/s vs the wide default's 6.63/20.7) while leaving
+        # ~90% of the SMs to the concurrent hit GEMV; the wide 8-blocks/bank launch is
+        # what made the first A/B of this split a wash at bs>=2 (SM contention).
+        try:
+            self.decode_overlap_gather_bpb = int(
+                os.environ.get("FREETOKEN_OVERLAP_GATHER_BPB", "2")
+            )
+        except ValueError:
+            self.decode_overlap_gather_bpb = 2
+        self._alloc_miss_scratch()
         # Measurement probe (FREETOKEN_TOUCH_OVERLAP_PROBE=1): per-layer cross-chunk
         # touched-expert overlap -- the go/no-go number for ANY cross-chunk expert reuse
         # scheme (promote family). Pure measurement: staging behavior is untouched.
@@ -481,6 +502,13 @@ class OffloadMoeCache:
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
         if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
+            if self.device.type == "cuda" and self.banks:
+                # Per-bank copies silently serialize the in-stream batch gather; log the
+                # fallback so a degraded copy is visible in the startup log.
+                logger.warning_rank0(
+                    "MoE fused multi-bank copy disabled; copy_missing falls back to the "
+                    "per-bank path (alignment or FREETOKEN_FUSED_COPY=0)"
+                )
             return
         for name in self.bank_schema:
             cache = self.bank_caches[name]
@@ -627,6 +655,7 @@ class OffloadMoeCache:
         if self.evict_slots2 is not None:
             self.evict_slots2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
             self.src_indices2 = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self._alloc_miss_scratch()  # cache_size/plan-shaped fetch-overlap scratch
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -1350,6 +1379,38 @@ class OffloadMoeCache:
             return self.src_indices2, self.evict_slots2, self.num_indices2
         return self.src_indices, self.evict_slots, self.num_indices
 
+    def _alloc_miss_scratch(self) -> None:
+        """(Re)allocate the fetch-overlap miss-mask scratch for the current cache_size.
+
+        The mask is a slot->flag scatter table (+1 sentinel row for the plan's unused
+        tail, whose evict_slots bytes are uninitialized and must not flag real slots).
+        """
+        if not self.decode_fetch_overlap:
+            self._miss_flags = None
+            self._miss_arange = None
+            self._miss_sentinel = None
+            return
+        self._miss_flags = torch.zeros(self.cache_size + 1, dtype=torch.int8, device=self.device)
+        self._miss_arange = torch.arange(
+            self.evict_slots.numel(), dtype=torch.int64, device=self.device
+        )
+        self._miss_sentinel = torch.full((1,), self.cache_size, dtype=torch.int64, device=self.device)
+
+    def miss_route_mask(self, topk_ids: torch.Tensor, plans=(0,)) -> torch.Tensor:
+        """[M, top_k] bool: True where the route's slot is one ``ensure_experts`` just
+        staged for fetch (its bytes land via ``copy_missing``). Device-side fixed-shape
+        (scatter through a sentinel row for each plan's unused tail), so it is CUDA-graph
+        safe. Call BETWEEN the ensure(s) and the copies: it reads their shared plan state.
+        ``plans`` covers the K-split admission's per-chunk plan buffers."""
+        self._miss_flags.zero_()
+        for plan in plans:
+            _, evict_slots, num_indices = self._plan_buffers(plan)
+            valid = self._miss_arange < num_indices
+            idx = torch.where(valid, evict_slots.to(torch.int64), self._miss_sentinel)
+            self._miss_flags.scatter_(0, idx, valid.to(torch.int8))
+        flat = self._miss_flags[topk_ids.reshape(-1).to(torch.int64)]
+        return flat.view(topk_ids.shape).bool()
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, plan: int = 0) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
@@ -1364,6 +1425,28 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         ensure_experts(self, layer_id, expert_ids, plan=plan)
+
+    def ensure_experts_chunked(
+        self, layer_id: int, expert_ids: torch.Tensor, max_k: int, plan: int = 0
+    ) -> int:
+        """ensure+copy per row-chunk so no lru_ensure call sees K > ``max_k``.
+
+        The phase-1 dedup block is [K, K] in registers and spills hard above
+        K~128 (flashlib cost model + measured ~198us/call at K=200 on sm120 =
+        ~9.5ms of pure admission overhead per bs20 step). Chunking keeps every
+        call in the flat cost region; correctness rides stream order (each
+        chunk's gather consumes the plan buffer before the next ensure restages
+        it) and LRU usage stamps (a chunk's admits and hits carry the current
+        step's stamp, so the next chunk's eviction -- argmin over usage -- can
+        never pick them while older slots exist). Returns the chunk count."""
+        rows, top_k = expert_ids.shape
+        rows_chunk = max(1, max_k // top_k)
+        n = 0
+        for a in range(0, rows, rows_chunk):
+            self.ensure_experts(layer_id, expert_ids[a : a + rows_chunk], plan=plan)
+            self.copy_missing(plan=plan)
+            n += 1
+        return n
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.

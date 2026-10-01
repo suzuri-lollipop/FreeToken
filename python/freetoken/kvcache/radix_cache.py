@@ -33,6 +33,10 @@ class RadixTreeNode:
         # whose end boundary is unchanged. Forward-compat seam for SWA.
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
+        # Host-tiered GDN snapshot: the snapshot's bytes live in a pinned host buffer owned by
+        # the CacheManager's LinearStateHostCache; the buffer id sits here when mamba_value is
+        # None. A node holds exactly one of the two at any time.
+        self.mamba_host_id: int | None = None
 
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is

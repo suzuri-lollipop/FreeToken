@@ -127,6 +127,7 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
+            mamba_host_cache_mb=config.mamba_host_cache_mb,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
@@ -889,12 +890,22 @@ class Scheduler(SchedulerIOMixin):
     def _restore_linear_states(self, batch) -> None:
         """COW-restore a hybrid prefix hit's GDN snapshot into its freshly-allocated live slot
         (first chunk only). MUST run on the ENGINE stream so it is program-ordered after the
-        prior batch's snapshot writes and before this forward reads the live slot."""
+        prior batch's snapshot writes and before this forward reads the live slot.
+        Host-tiered snapshots restore through a pinned H2D copy instead of the slot COW."""
         pool = self.engine.linear_state_pool
         if pool is None or not batch.is_prefill:
             return
+        host_cache = self.cache_manager.host_cache
         for req in batch.reqs:
-            if req.mamba_restore_src is not None:
+            if req.mamba_restore_host is not None:
+                assert host_cache is not None
+                host_cache.restore_from(req.mamba_restore_host, req.linear_slot_idx)
+                logger.info_rank0(
+                    f"GDN host restore: buffer {req.mamba_restore_host} -> slot "
+                    f"{req.linear_slot_idx}"
+                )
+                req.mamba_restore_host = None  # consumed: restore exactly once
+            elif req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 

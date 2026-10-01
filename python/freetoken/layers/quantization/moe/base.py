@@ -234,6 +234,10 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # Fetch-overlap decode (layers/moe.py _decode_fetch_overlap) runs two complementary
+    # GEMV passes; the kernel must zero-store (never READ) zero-weighted routes so the
+    # hit pass cannot touch slots the concurrent side-stream copy is mid-write.
+    supports_skip_w0: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

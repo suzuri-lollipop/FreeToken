@@ -81,6 +81,7 @@ def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
+    max_running_req: int = 0,
 ) -> List[int]:
     if cuda_graph_bs is not None:
         return cuda_graph_bs
@@ -91,6 +92,12 @@ def _determine_cuda_graph_bs(
             cuda_graph_max_bs = 256
         else:
             cuda_graph_max_bs = 160
+        # A decode batch can never exceed max_running_req (the table manager caps
+        # it), so default captures above that are dead weight: ~37MB and ~0.4s
+        # per size, taken from the same headroom the largest prefill chunk's
+        # activations need. An explicit --cuda-graph-max-bs still wins.
+        if max_running_req > 0:
+            cuda_graph_max_bs = min(cuda_graph_max_bs, max_running_req)
 
     if cuda_graph_max_bs < 1:
         return []
@@ -100,10 +107,17 @@ def _determine_cuda_graph_bs(
     # [1, 2, 4] list a bs=3 decode ran the bs=4 graph (dummy row's fetch/GEMM
     # work, only 3 tokens delivered: measured ~the same step time as bs=4, so
     # conc-3 per-user throughput came out BELOW conc-4). Capture is ~0.4s and
-    # ~37MB per size here, so 1..8 dense is cheap; above 8, stride by 8 to bound
-    # startup time and memory at large maxes (bs 9..15 pad to 16 as before).
+    # ~37MB per size here, so 1..8 dense is cheap. 9..11 pad to 12; from 12 the
+    # stride is 4 up to 32 (above bs8 the dummy rows' padding cost outweighs the
+    # capture time: bs20 padded to 24 spends 20% of its GDN/attn/GEMM rows for
+    # nothing) and 8 above that, bounding startup at large maxes.
     dense_stop = min(cuda_graph_max_bs, 8)
-    candidates = list(range(1, dense_stop + 1)) + list(range(16, cuda_graph_max_bs + 1, 8))
+    mid_stop = min(cuda_graph_max_bs, 32)
+    candidates = (
+        list(range(1, dense_stop + 1))
+        + list(range(12, mid_stop + 1, 4))
+        + list(range(40, cuda_graph_max_bs + 1, 8))
+    )
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]
 
 
@@ -126,11 +140,13 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        max_running_req: int = 0,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
+            max_running_req=max_running_req,
         )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
@@ -245,6 +261,13 @@ class GraphRunner:
                 f"(half = bs/2, {n_layers} layers; per-size eligibility still "
                 f"needs the second shm AR instance)"
             )
+        elif self.moe_offload_cache is not None and getattr(
+            self.moe_offload_cache, "decode_fetch_overlap", False
+        ):
+            # The fetch-overlap decode's K-split ensure stages into BOTH plan buffers;
+            # materialize them (and the per-layer dual events it never records on)
+            # before the warm run, never during capture.
+            self.moe_offload_cache.ensure_dual_plans(len(model.model.layers.op_list))
         pool = None
         for bs in pbar:
             free_memory = get_free_memory(self.device)

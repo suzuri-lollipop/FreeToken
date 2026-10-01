@@ -30,6 +30,23 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 # the SMs to the concurrent half's dense/attention work.
 _DUAL_GATHER_BPB = int(os.getenv("FREETOKEN_DUAL_GATHER_BPB", "2") or "2")
 
+# lru_ensure's phase-1 dedup is a [K, K] register block over the query (K = rows *
+# top_k): flat to K=128, then it spills hard (flashlib cost model: +55us at K=256;
+# measured ~198us/call at K=200 on sm120 = ~9.5ms/step of pure admission overhead
+# at bs20). Splitting the per-layer ensure into row chunks of <= this many query
+# ids keeps every call in the flat region; the chunks chain ensure->copy on one
+# stream (stream order protects the plan buffer, and same-step LRU usage stamps
+# protect a chunk's admits from the next chunk's eviction). 0 keeps the
+# single-call path. Measured on the 2x24GB NVFP4 rig: aggregate +6-8% at bs16-20
+# (K=160-200), no change below the threshold.
+_LRU_ENSURE_MAX_K = int(os.getenv("FREETOKEN_LRU_ENSURE_MAX_K", "128") or "128")
+
+# Fetch-overlap decode (FREETOKEN_DECODE_FETCH_OVERLAP=1): minimum batch rows to run
+# the hit/miss split. The two-pass GEMV's fixed overhead only pays once the hit
+# routes' GEMV is wide enough to hide the miss gather under (measured a wash at
+# bs4 on this rig's agent4 campaign; the window grows ~linearly with rows).
+_FETCH_OVERLAP_MIN_ROWS = int(os.getenv("FREETOKEN_FETCH_OVERLAP_MIN_ROWS", "2") or "2")
+
 # The CPU side of a prefill chunk pays routes-per-expert (~num_tokens * top_k / touched),
 # while its PCIe side pays a flat per-expert row: the T=150 balance measurement behind
 # prefill_fetch_fraction does NOT extrapolate to full chunks. Measured on a 2x24GB rig
@@ -380,15 +397,44 @@ class OffloadMoELayer(MoELayer):
                 is_prefill=False,
             )
         try:
-            dual_slot = getattr(get_global_ctx().batch, "dual_slot", -1)
+            ctx_batch = get_global_ctx().batch
+            dual_slot = getattr(ctx_batch, "dual_slot", -1)
         except AssertionError:
+            ctx_batch = None
             dual_slot = -1  # unit harnesses decode without a global ctx
         if dual_slot >= 0 and cache.dual_events is not None:
             return self._decode_dual_moe(
                 cache, hidden_states, topk_weights, topk_ids, dual_slot
             )
-        cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        if (
+            cache.decode_fetch_overlap
+            and ctx_batch is not None
+            and not _is_spec_batch(ctx_batch)
+            and topk_ids.dim() == 2
+            and hidden_states.shape[0] >= _FETCH_OVERLAP_MIN_ROWS
+            and getattr(
+                getattr(self.quant_method, "kernel", None), "supports_skip_w0", False
+            )
+        ):
+            # The union miss-mask covers the two plan buffers the K-split ensure uses;
+            # beyond two chunks fall back to the serial (chunked) path.
+            k = topk_ids.numel()
+            mk = _LRU_ENSURE_MAX_K if _LRU_ENSURE_MAX_K > 0 else k
+            if mk <= 0 or -(-k // mk) <= 2:
+                out = self._decode_fetch_overlap(
+                    cache, hidden_states, topk_weights, topk_ids
+                )
+                if out is not None:
+                    return out
+        if (
+            _LRU_ENSURE_MAX_K > 0
+            and topk_ids.dim() == 2
+            and topk_ids.numel() > _LRU_ENSURE_MAX_K
+        ):
+            cache.ensure_experts_chunked(self.layer_id, topk_ids, _LRU_ENSURE_MAX_K)
+        else:
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
         from freetoken.moe import _debug_stats
 
         dbg = _debug_stats.probe()
@@ -404,6 +450,93 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_fetch_overlap(
+        self,
+        cache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Pure-GPU fetch overlap: run the hit routes' GEMV on the compute stream while
+        the missing experts' H2D gather runs on a side stream, join, then run the
+        complementary miss routes' GEMV and merge the partials.
+
+        Both passes run the full decode pipeline over ALL routes with complementary
+        zero-masked weights. The kernel's SKIP_W0 (gated by supports_skip_w0) makes each
+        pass zero-store -- never READ -- the other half's slots, which is what makes the
+        concurrency safe: a hit-pass read of a slot the copy is mid-write could pick up
+        torn scale bytes, decode them as NaN, and 0 * NaN would poison the token's whole
+        output row. Skip-W0 also keeps the total GEMV work ~1x (each pass computes only
+        its own routes), and since each route's partial is computed independently and
+        merged as x + 0.0 == x, the split is bit-identical to the serial single pass.
+
+        The side-stream gather runs NARROW (few blocks per bank): measured on this rig's
+        PCIe links, 1-2 blocks/bank still saturate both gen4 x4 (6.62 vs 6.63 GB/s) and
+        gen5 x16 (20.4 vs 20.7), so the copy no longer occupies the SMs the concurrent
+        hit GEMV needs. Admission stays K-split (the lru_ensure [K,K] dedup spill above
+        K~128): the chunks stage into the two plan buffers, and the miss mask is their
+        union.
+
+        Mask construction, fork and join are all device-side / fixed-shape, so the split
+        captures into the decode CUDA graph (multi-stream fork/join via events).
+        Returns None when the second plan buffer is missing and the K-split needs it
+        (the caller falls back to the serial path).
+        """
+        from freetoken.moe import _debug_stats
+
+        rows, top_k = topk_ids.shape
+        mk = _LRU_ENSURE_MAX_K if _LRU_ENSURE_MAX_K > 0 else rows * top_k
+        rows_chunk = max(1, mk // top_k) if mk > 0 else rows
+        starts = list(range(0, rows, rows_chunk))[:2]
+        if len(starts) > 1 and cache.src_indices2 is None:
+            # K-split needs the second plan buffer (the graph runner materializes it
+            # before capture; a graphs-disabled eager run may not have it): fall back
+            # to the caller's serial path rather than overwriting plan 0 mid-flight.
+            return None
+        for i, a in enumerate(starts):
+            cache.ensure_experts(
+                self.layer_id, topk_ids[a : a + rows_chunk], plan=i
+            )
+        miss = cache.miss_route_mask(topk_ids, tuple(range(len(starts))))
+        w_hits = torch.where(miss, topk_weights.new_zeros(()), topk_weights)
+        w_miss = torch.where(miss, topk_weights, topk_weights.new_zeros(()))
+        dbg = _debug_stats.probe()
+        if dbg is not None:
+            dbg.decode_step(topk_ids, None)
+        if cache.decode_copy_stream is None:
+            cache.decode_copy_stream = torch.cuda.Stream(device=hidden_states.device)
+        side = cache.decode_copy_stream
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)  # orders the copies after this layer's ensure_experts
+        side.wait_event(fork)
+        with torch.cuda.stream(side):
+            for i in range(len(starts)):
+                cache.copy_missing(
+                    plan=i, blocks_per_bank=cache.decode_overlap_gather_bpb
+                )
+        join = torch.cuda.Event()
+        join.record(side)
+        views = cache.bank_views()
+        alphas = cache.alphas_for_slots(self.layer_id)
+        # Per-call transient read by the nvfp4 kernel's apply (SKIP_W0 for both GEMVs).
+        self._moe_skip_w0 = True
+        try:
+            out_hits = self._expert_gemm(
+                cache, hidden_states, w_hits, topk_ids,
+                views=views, n=None, alphas=alphas, is_prefill=False,
+            )
+            # The miss pass reads the fetched slot bytes; the next layer's ensure_experts
+            # also re-stages the plan arrays the copy reads -- the join orders both.
+            main.wait_event(join)
+            out_miss = self._expert_gemm(
+                cache, hidden_states, w_miss, topk_ids,
+                views=views, n=None, alphas=alphas, is_prefill=False,
+            )
+        finally:
+            self._moe_skip_w0 = False
+        return out_hits + out_miss
 
     def _decode_dual_moe(
         self,

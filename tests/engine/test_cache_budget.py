@@ -919,3 +919,65 @@ def test_fixed_cost_ref_keeps_pages_identical_and_resplits_slots(monkeypatch):
     )
     assert thin_pages == big_pages           # shared KV geometry
     assert thin_size > big_size              # cheaper fixed cost -> more local slots
+
+
+def test_padded_graph_rows_mirrors_the_capture_list():
+    from freetoken.engine.cache_budget import padded_graph_rows
+
+    assert padded_graph_rows(1) == 1
+    assert padded_graph_rows(8) == 8
+    assert padded_graph_rows(9) == 12   # 9..11 pad to 12
+    assert padded_graph_rows(20) == 20  # exact: no bs20->24 dummy-row tax
+    assert padded_graph_rows(21) == 24
+    assert padded_graph_rows(33) == 40  # stride 8 above 32
+
+
+def test_expert_working_set_slots_uniform_upper_bound():
+    from freetoken.engine.cache_budget import expert_working_set_slots
+
+    # one row touches exactly top_k distinct experts per layer
+    assert expert_working_set_slots(2, 512, 10, 1, 1.0) == 20
+    # uniform-routing bound: 512 * (1 - (502/512)^20) ~ 166.7 distinct/layer
+    ws = expert_working_set_slots(48, 512, 10, 20, 1.5)
+    assert 11500 < ws < 12500
+    assert expert_working_set_slots(48, 512, 10, 0, 1.5) == 0
+
+
+def test_plan_linear_state_slots_clamps_between_floor_and_desired():
+    from freetoken.engine.cache_budget import plan_linear_state_slots
+
+    kw = dict(
+        slots_desired=121, slots_floor=86, bytes_per_slot=58 << 20,
+        per_expert_bytes=1_600_000,
+    )
+    # roomy: the snapshot cache keeps its full wish
+    assert plan_linear_state_slots(
+        poolable_bytes=24 << 30, expert_slots_target=4944, **kw) == 121
+    # experts claim the budget: the pool lands on its floor, never below
+    assert plan_linear_state_slots(
+        poolable_bytes=8 << 30, expert_slots_target=4944, **kw) == 86
+    # an interior landing point divides exactly on slot boundaries
+    got = plan_linear_state_slots(
+        poolable_bytes=(100 * 58 << 20) + (4944 * 1_600_000), expert_slots_target=4944, **kw)
+    assert got == 100
+
+
+def test_gdn_ratio_override_round_trips_through_the_sizing_formula():
+    """The engine latches a shrunk snapshot cache as linear_state_cache_ratio;
+    int() truncation must reproduce the exact slot count for any mr/n_cache pair."""
+    from freetoken.kvcache.linear_state_pool import (
+        _linear_pool_num_slots,
+        _linear_pp_reserve,
+    )
+
+    for mr in (4, 12, 20, 24):
+        for n_cache in (4, 5, mr // 4 if mr >= 16 else 4, 2 * mr):
+            if n_cache < 4:
+                continue
+            c = SimpleNamespace(
+                max_running_req=mr, cache_type="hybrid_radix",
+                linear_state_cache_ratio=(n_cache + 0.5) / mr,
+            )
+            assert _linear_pool_num_slots(c) == (
+                2 * mr + _linear_pp_reserve(c) + n_cache + 1
+            ), (mr, n_cache)

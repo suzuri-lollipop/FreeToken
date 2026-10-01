@@ -69,6 +69,7 @@ struct Node {
   int64_t stamp = 0;          // LRU timestamp (logical clock)
   int32_t mamba_value = -1;   // hybrid: GDN snapshot slot; -1 is Python's None
   int32_t mamba_ref = 0;
+  int32_t mamba_host_id = -1;  // hybrid: host backup buffer id (insurance copy); -1 is None
   bool swa_tomb = false;      // swa: window KV freed, full KV survives
   int32_t swa_ref = 0;
   int64_t swa_uuid = -1;      // swa: window-boundary lock handle; -1 is None
@@ -396,19 +397,24 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
     IdsBuf b = ids_buf(ids);
     auto [slot, plen] = walk(b.ptr, b.n);
     (void)plen;
-    // Walk up to the deepest node whose END boundary owns a LIVE snapshot.
+    // Walk up to the deepest node whose END boundary owns a resumable snapshot
+    // (live slot or host backup; the slot wins when a node holds both).
     int32_t cur = slot;
     int64_t end_len = path_len(slot);
     while (cur != root_) {
       Node &cn = nodes_[cur];
       if (cn.mamba_value != -1) {
         return py::make_tuple(path_kv(cur), end_len, (int64_t)cn.mamba_value,
-                              ref(make_id(cur, cn.gen)));
+                              ref(make_id(cur, cn.gen)), py::none());
+      }
+      if (cn.mamba_host_id != -1) {
+        return py::make_tuple(path_kv(cur), end_len, py::none(),
+                              ref(make_id(cur, cn.gen)), (int64_t)cn.mamba_host_id);
       }
       end_len -= (int64_t)cn.key.size();
       cur = cn.parent;
     }
-    return py::make_tuple(empty_, (int64_t)0, py::none(), ref(root_id()));
+    return py::make_tuple(empty_, (int64_t)0, py::none(), ref(root_id()), py::none());
   }
 
   py::tuple insert_hybrid(const torch::Tensor &ids, const torch::Tensor &kv,
@@ -432,7 +438,7 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
       return py::make_tuple(plen, true);
     }
     Node &n = nodes_[slot];
-    if (n.mamba_value != -1) {
+    if (n.mamba_value != -1 || n.mamba_host_id != -1) {
       return py::make_tuple(plen, true);  // dedup: caller frees the donated slot
     }
     n.mamba_value = (int32_t)mamba_slot;  // fills a fresh node or a tombstone
@@ -471,6 +477,7 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
     collect_unlocked_leaves(heap);
     std::vector<torch::Tensor> kv;
     std::vector<int64_t> mamba;
+    std::vector<int64_t> host;
     std::vector<int32_t> unlinked;
     int64_t freed = 0;
     while (freed < num_tokens && !heap.empty()) {
@@ -482,7 +489,7 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
       freed += (int64_t)n.key.size();
       kv.push_back(n.value);
       evictable_ -= (int64_t)n.key.size();
-      free_node_mamba(n, mamba);
+      free_node_mamba(n, mamba, &host);
       int32_t parent = n.parent;
       unlink(slot, unlinked);
       auto [survivor, casc] = cascade_mamba_tombstone_leaves(parent, kv, unlinked);
@@ -492,7 +499,7 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
       }
     }
     finish_unlinked(unlinked);
-    return py::make_tuple(cat_or_empty(kv), mamba);
+    return py::make_tuple(cat_or_empty(kv), mamba, host);
   }
 
   py::tuple evict_mamba(int64_t num) {
@@ -503,6 +510,7 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
     }
     std::vector<torch::Tensor> kv;
     std::vector<int64_t> mamba;
+    std::vector<int64_t> host;
     std::vector<int32_t> unlinked;
     int64_t freed = 0;
     while (freed < num && !heap.empty()) {
@@ -511,28 +519,29 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
       (void)stamp;
       Node &n = nodes_[slot];
       if (n.dead || n.mamba_value == -1 || n.mamba_ref != 0 || slot == root_) continue;
-      if (is_leaf(slot) && n.ref_count == 0) {
+      if (is_leaf(slot) && n.ref_count == 0 && n.mamba_host_id == -1) {
         kv.push_back(n.value);
         evictable_ -= (int64_t)n.key.size();
-        free_node_mamba(n, mamba);
+        free_node_mamba(n, mamba, &host);
         freed += 1;
         int32_t parent = n.parent;
         unlink(slot, unlinked);
         cascade_mamba_tombstone_leaves(parent, kv, unlinked);
       } else {
-        free_node_mamba(n, mamba);  // tombstone internal (or locked-KV) node
+        // tombstone internal / KV-locked / backup-carrying leaf: host survives
+        free_node_mamba(n, mamba, nullptr, /*keep_host=*/true);
         freed += 1;
       }
     }
     finish_unlinked(unlinked);
-    return py::make_tuple(cat_or_empty(kv), mamba);
+    return py::make_tuple(cat_or_empty(kv), mamba, host);
   }
 
   std::string check_integrity_hybrid() {
     for (int32_t s = 1; s < (int32_t)nodes_.size(); ++s) {
       Node &n = nodes_[s];
       if (n.dead) continue;
-      if (n.mamba_value != -1 && (n.mamba_ref < 0 || n.ref_count < 0)) {
+      if ((n.mamba_value != -1 || n.mamba_host_id != -1) && (n.mamba_ref < 0 || n.ref_count < 0)) {
         return "snapshot node with negative refs";
       }
       if (n.ref_count < 0) return "negative full ref count";
@@ -886,22 +895,28 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
     }
   }
 
-  void free_node_mamba(Node &n, std::vector<int64_t> &out) {
+  void free_node_mamba(Node &n, std::vector<int64_t> &out,
+                        std::vector<int64_t> *host = nullptr, bool keep_host = false) {
     if (n.mamba_value != -1) {
       out.push_back(n.mamba_value);
       n.mamba_value = -1;
       if (n.mamba_ref == 0) mamba_evictable_ -= 1;
     }
+    if (!keep_host && n.mamba_host_id != -1) {
+      if (host) host->push_back(n.mamba_host_id);
+      n.mamba_host_id = -1;
+    }
   }
 
   // After a leaf unlink, eagerly reclaim the exposed KV-only tombstone leaves
-  // upward (hybrid: mamba_value None -- a leaf always carries a live snapshot).
-  // Returns (highest surviving ancestor, freed tokens).
+  // upward (hybrid: no slot AND no host backup -- a leaf always carries a
+  // resumable snapshot). Returns (highest surviving ancestor, freed tokens).
   std::pair<int32_t, int64_t> cascade_mamba_tombstone_leaves(
       int32_t parent, std::vector<torch::Tensor> &kv, std::vector<int32_t> &unlinked) {
     int64_t freed = 0;
     int32_t p = parent;
-    while (p != root_ && !nodes_[p].dead && nodes_[p].mamba_value == -1 && is_leaf(p) &&
+    while (p != root_ && !nodes_[p].dead && nodes_[p].mamba_value == -1 &&
+           nodes_[p].mamba_host_id == -1 && is_leaf(p) &&
            nodes_[p].ref_count == 0) {
       Node &pn = nodes_[p];
       kv.push_back(pn.value);
@@ -1051,7 +1066,12 @@ class TreeCore : public std::enable_shared_from_this<TreeCore> {
   std::vector<int64_t> node_fields(int64_t id) {
     Node &n = node(id);
     return {n.ref_count, n.mamba_value, n.mamba_ref, (int64_t)n.swa_tomb, n.swa_ref,
-            n.swa_uuid, n.uuid};
+            n.swa_uuid, n.uuid, n.mamba_host_id};
+  }
+  void node_set_mamba_host(int64_t id, int64_t v) {
+    Node &n = node(id);
+    TORCH_CHECK(v >= -1, "radix: mamba_host_id must be >= 0 or -1 (None)");
+    n.mamba_host_id = (int32_t)v;
   }
   bool node_is_root(int64_t id) { return node(id).parent < 0; }
   bool node_is_leaf(int64_t id) {
@@ -1166,6 +1186,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       })
       .def_property_readonly("uuid",
                              [](const NodeRef &n) { return n.tree()->node_fields(n.id())[6]; })
+      .def_property(
+          "mamba_host_id",
+          [](const NodeRef &n) -> py::object {
+            int64_t v = n.tree()->node_fields(n.id())[7];
+            return v < 0 ? py::object(py::none()) : py::object(py::int_(v));
+          },
+          [](NodeRef &n, py::object v) {
+            if (v.is_none()) {
+              n.tree()->node_set_mamba_host(n.id(), -1);
+              return;
+            }
+            n.tree()->node_set_mamba_host(n.id(), py::cast<int64_t>(v));
+          })
       .def_property_readonly("_parent", [](const NodeRef &n) -> py::object {
         int64_t p = n.tree()->node_parent(n.id());
         return p < 0 ? py::none() : n.tree()->ref(p);

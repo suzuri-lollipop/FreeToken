@@ -18,11 +18,21 @@ def test_small_max_covers_every_batch_size_natively():
     assert _determine_cuda_graph_bs(None, 8, 3 * GB) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
-def test_large_max_is_dense_below_eight_then_strides_by_eight():
+def test_large_max_is_dense_below_eight_then_strides_by_four_then_eight():
     got = _determine_cuda_graph_bs(None, 160, 3 * GB)
     assert got[:8] == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert got[8:] == list(range(16, 161, 8))
+    assert got[8:] == list(range(12, 33, 4)) + list(range(40, 161, 8))
     assert 3 in got and 160 in got
+    assert 20 in got  # bs20 must not pad to 24: dummy rows cost 20% of the step
+
+
+def test_default_max_clamps_to_max_running_req():
+    # a decode batch can never exceed max_running_req; captures above it are dead
+    got = _determine_cuda_graph_bs(None, None, 3 * GB, max_running_req=20)
+    assert got == [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20]
+    # an explicit --cuda-graph-max-bs still wins over the clamp
+    got = _determine_cuda_graph_bs(None, 160, 3 * GB, max_running_req=20)
+    assert got[-1] == 160
 
 
 def test_h200_default_max_uses_the_same_shape():

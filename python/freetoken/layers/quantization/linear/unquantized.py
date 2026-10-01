@@ -38,7 +38,12 @@ _FP8_ENABLED = os.environ.get("FREETOKEN_FP8_DECODE_LINEAR", "0") == "1"
 # W8A16 decode settings (weight-only fp8; the bf16 master copy is dropped)
 _W8A16_ENABLED = os.environ.get("FREETOKEN_W8A16_DECODE_LINEAR", "1") == "1"
 _W8A16_MIN_ELEMENTS = int(os.environ.get("FREETOKEN_W8A16_MIN_ELEMENTS", "2000000"))
-_W8A16_MAX_BATCH = int(os.environ.get("FREETOKEN_W8A16_MAX_BATCH", "16"))
+# Keep the ceiling in sync with kernel/triton/w8a16_linear._MAX_DECODE_M: the
+# kernel asserts above it, so a larger env value is clamped instead of honored.
+_W8A16_KERNEL_MAX_M = 32
+_W8A16_MAX_BATCH = min(
+    int(os.environ.get("FREETOKEN_W8A16_MAX_BATCH", "32")), _W8A16_KERNEL_MAX_M
+)
 
 # One-shot log latches. Activation used to be invisible and the per-call fallback
 # silent, so a broken fp8 path was indistinguishable from a disabled one.
