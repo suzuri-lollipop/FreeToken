@@ -827,10 +827,12 @@ def parse_args(
         "--mamba-host-cache-mb",
         type=int,
         default=ServerArgs.mamba_host_cache_mb,
+        # argparse interpolates every help string with %, so a literal percent must be doubled:
+        # a bare one raises out of --help and takes the whole usage listing down.
         help=(
             "Pinned-host budget (MiB) for the hybrid GDN snapshot tier: evicted GDN "
             "snapshots survive in host RAM and a prefix re-hit restores them over H2D "
-            "instead of re-prefilling the recurrence (measured -85% multi-turn turn-2 "
+            "instead of re-prefilling the recurrence (measured -85%% multi-turn turn-2 "
             "TTFT on this rig). 0 disables the tier."
         ),
     )
