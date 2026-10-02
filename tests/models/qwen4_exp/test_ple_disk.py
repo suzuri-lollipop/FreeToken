@@ -33,11 +33,11 @@ def _bitwise_equal(got: torch.Tensor, want: torch.Tensor) -> bool:
     return torch.equal(got.view(torch.int16), want.view(torch.int16))
 
 
-def _make_store(tmp_path, *, write=True, use_io_uring=True, **store_kw):
+def _make_store(tmp_path, *, write=True, use_io_uring=True, cols=None, **store_kw):
     args = parse_config(toy_hf_config()).qwen4_args
     multipliers, sizes, offsets = hash_constants(args)
     total_rows = int(offsets[-1] + sizes[-1])
-    cols = args.ngram_head_dim
+    cols = cols or args.ngram_head_dim  # widening it makes rows straddle pages
     gen = torch.Generator().manual_seed(5)
     table = torch.randint(0, 256, (total_rows, cols), dtype=torch.uint8, generator=gen)
     path = tmp_path / "ple-table.bin"
@@ -60,9 +60,10 @@ def _make_store(tmp_path, *, write=True, use_io_uring=True, **store_kw):
     return store, table, args
 
 
-def _fill(store, args, window, tokens):
+def _fill(store, args, window, tokens, row_bytes=None):
     ctx = torch.tensor([window[0], window[1], *tokens], dtype=torch.int64)
-    staging = torch.empty(len(tokens) * args.num_ngram_heads * args.ngram_head_dim, dtype=torch.uint8)
+    row_bytes = row_bytes or args.ngram_head_dim
+    staging = torch.empty(len(tokens) * args.num_ngram_heads * row_bytes, dtype=torch.uint8)
     store.stage(ctx.data_ptr(), len(tokens), staging.data_ptr())
     store.flush(0)
     return staging
@@ -80,7 +81,7 @@ def _write_checkpoint(tmp_path, table, n_shards):
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
-def _make_table(tmp_path):
+def _make_table(tmp_path, use_mmap=False):
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
     args = parse_config(toy_hf_config()).qwen4_args
@@ -97,7 +98,7 @@ def _make_table(tmp_path):
         "per_head_offsets": offsets.tolist(),
         "eos_token_id": EOS,
     }
-    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
+    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants, use_mmap=use_mmap)
     oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125)
     return disk, oracle, args
 
@@ -210,6 +211,46 @@ def test_row_cache_disabled_reads_every_fill(tmp_path):
     assert _bitwise_equal(a, b)
     hits, misses, _, slots, _ = store.cache_stats()
     assert slots == 0 and hits == 0 and misses > 0
+
+
+def test_swapped_store_serves_rows_off_the_mapping(tmp_path):
+    """--ple-backend swap: a row comes off a read-only mapping of the shard instead of a pread,
+    so every fill must return exactly what the disk path returns, and the row LRU on top of it
+    must keep its contract."""
+    mapped, table, args = _make_store(tmp_path, use_mmap=True, row_cache_mb=1)
+    disk, _, _ = _make_store(tmp_path, write=False)  # the same file, read the old way
+    assert "mmap" in mapped.io_backend(), mapped.io_backend()
+    assert "mmap" not in disk.io_backend(), disk.io_backend()
+
+    emb = _embedding()
+    seq = list(range(100, 500))
+    got = _fill(mapped, args, (EOS, EOS), seq)
+    ids = emb.row_ids(_meta([seq], [[EOS, EOS]])).reshape(-1)
+    assert torch.equal(got, table[ids].reshape(-1)), "mapped vs oracle"
+    assert torch.equal(got, _fill(disk, args, (EOS, EOS), seq)), "mapped vs pread bytes"
+
+    # a refill served from RAM still queues no disk reads on top of the mapping
+    before = mapped.cache_stats()
+    assert torch.equal(_fill(mapped, args, (EOS, EOS), seq), got)
+    hits, misses, evicts, slots, _ = mapped.cache_stats()
+    assert slots > 0 and evicts == 0 and misses == before[1] and hits > before[0]
+
+
+def test_swapped_store_reads_page_straddling_rows(tmp_path):
+    """A row that crosses a page boundary is one memcpy off the mapping but an aligned-span pread
+    otherwise, so a stride no page divides is what would catch a wrong mapping offset."""
+    cols = 3000  # under a quarter of rows at this stride fit inside one page
+    mapped, table, args = _make_store(tmp_path, cols=cols, use_mmap=True)
+    disk, _, _ = _make_store(tmp_path, cols=cols, write=False)
+    emb = _embedding()
+
+    seq = list(range(100, 500))
+    ids = emb.row_ids(_meta([seq], [[EOS, EOS]])).reshape(-1)
+    straddlers = int(((((ids * cols) % 4096) + cols) > 4096).sum())
+    assert straddlers > 100, f"geometry must cover straddling rows, got {straddlers}"
+    got = _fill(mapped, args, (EOS, EOS), seq, row_bytes=cols)
+    assert torch.equal(got, table[ids].reshape(-1)), "straddling rows vs oracle"
+    assert torch.equal(got, _fill(disk, args, (EOS, EOS), seq, row_bytes=cols)), "mapped vs pread"
 
 
 def test_fill_decode_graph_matches_python_row_build(tmp_path):
@@ -376,6 +417,36 @@ def test_disk_table_matches_oracle(tmp_path):
     disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
+
+
+@requires_cuda
+def test_swapped_table_matches_the_disk_table(tmp_path):
+    """Residency only: --ple-backend swap must leave the served bytes exactly where the disk
+    backend put them, so the captured graph and the fingerprint cannot move."""
+    swap_dir, disk_dir = tmp_path / "swap", tmp_path / "disk"
+    swap_dir.mkdir(), disk_dir.mkdir()
+    swapped, oracle, args = _make_table(swap_dir, use_mmap=True)
+    disk, _, _ = _make_table(disk_dir)
+    assert swapped.backend == "swap" and disk.backend == "disk"
+    emb = _embedding()
+
+    seqs = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14]]
+    for table in (swapped, disk):
+        table.fill(
+            [torch.tensor([EOS, EOS, *seqs[0]]), torch.tensor([21, 22, *seqs[1]])], graph=False
+        )
+    row_ids = emb.row_ids(_meta(seqs, [[EOS, EOS], [21, 22]])).cuda()
+    assert _bitwise_equal(swapped.lookup(row_ids), oracle.lookup(row_ids)), "prefill vs oracle"
+    assert _bitwise_equal(swapped.lookup(row_ids), disk.lookup(row_ids)), "swap vs disk prefill"
+
+    older, newer = 41, EOS
+    for token in (7, 9, 13):
+        for table in (swapped, disk):
+            table.fill([torch.tensor([older, newer, token])], graph=False)
+        ids = emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda()
+        assert _bitwise_equal(swapped.lookup(ids), oracle.lookup(ids)), f"decode {token}"
+        assert _bitwise_equal(swapped.lookup(ids), disk.lookup(ids)), f"swap vs disk {token}"
+        older, newer = newer, token
 
 
 @requires_cuda

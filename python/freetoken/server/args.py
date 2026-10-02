@@ -676,10 +676,13 @@ def parse_args(
     parser.add_argument(
         "--ple-backend",
         default=ServerArgs.ple_backend,
-        choices=["pinned", "disk"],
+        choices=["pinned", "disk", "swap"],
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+            "checkpoint files; 'swap' maps those files read-only and lets the OS page cache hold "
+            "the hot rows, so a fill costs a memory copy instead of a device read once they are "
+            "resident (for hosts where per-fill reads are slow, e.g. a mounted volume under "
+            "Docker on Windows); 'pinned' preloads the whole table into page-locked host RAM."
         ),
     )
 
