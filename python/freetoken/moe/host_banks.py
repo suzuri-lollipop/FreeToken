@@ -57,6 +57,194 @@ _DEFAULT_CHUNK = 8 << 20
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
 
+# O_DIRECT's Windows counterpart is FILE_FLAG_NO_BUFFERING, which asks for the same three
+# alignments (sector-aligned offset, length and buffer) that _BLK already enforces here. A
+# positioned read is os.preadv on POSIX and ReadFile with an OVERLAPPED offset on Windows.
+# Shared with models/weight.py's parallel shard reader and checkpoint/ftw.py, so these are
+# public -- and since both spellings exist, an unbuffered read is not a POSIX-only option.
+_POSIX_DIRECT = os.name != "nt"
+# Whether this platform can open a file for unbuffered positioned reads at all. Callers gate
+# their fast (page-cache-bypassing) read path on this, NOT on the presence of os.O_DIRECT.
+DIRECT_READ_SUPPORTED = True
+
+if _POSIX_DIRECT:
+
+    def open_direct(path: str) -> int:
+        return os.open(path, os.O_RDONLY | os.O_DIRECT)
+
+    def open_direct_ex(path: str) -> tuple[int, bool]:
+        """``(handle, really unbuffered)`` -- what ``open_direct`` returns, plus the answer a
+        caller needs on a platform that hands back a buffered handle when direct I/O is refused."""
+        return os.open(path, os.O_RDONLY | os.O_DIRECT), True
+
+    def pread_into(fd: int, view: memoryview, offset: int) -> int:
+        return os.preadv(fd, [view], offset)
+
+    def close_direct(fd: int) -> None:
+        os.close(fd)
+
+    def drop_read_cache(path: str, offset: int = 0, length: int = 0) -> None:
+        # never fail a load over a page-cache hint
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+    def _avail_phys_bytes() -> int | None:
+        # MemAvailable, not MemFree: it counts the reclaimable page cache a load could take
+        # back, which is the figure that decides whether a fill OOMs (MemFree alone reads
+        # "no room" on any box that has been reading files all day).
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return None
+
+    def _working_set_bytes() -> int | None:
+        return None  # there the lock ceiling is RLIMIT_MEMLOCK, which no resident byte count feeds
+
+else:
+    import ctypes.wintypes as _wt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _GENERIC_READ = 0x80000000
+    _SHARE_ALL = 0x1 | 0x2 | 0x4
+    _OPEN_EXISTING = 3
+    _NO_BUFFERING = 0x20000000  # not 0x40000000, which is FILE_FLAG_OVERLAPPED
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _kernel32.CreateFileW.restype = ctypes.c_void_p
+    _kernel32.CreateFileW.argtypes = [_wt.LPCWSTR, _wt.DWORD, _wt.DWORD, ctypes.c_void_p,
+                                      _wt.DWORD, _wt.DWORD, ctypes.c_void_p]
+    _kernel32.ReadFile.restype = _wt.BOOL
+    _kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _wt.DWORD,
+                                   ctypes.POINTER(_wt.DWORD), ctypes.c_void_p]
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    # the working-set queries take and return 64-bit sizes; GetCurrentProcess hands back the
+    # (HANDLE)-1 pseudo-handle, which ctypes would truncate to an int
+    _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    _kernel32.GetProcessWorkingSetSizeEx.restype = ctypes.c_int
+    _kernel32.GetProcessWorkingSetSizeEx.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+    ]
+    _kernel32.SetProcessWorkingSetSizeEx.restype = ctypes.c_int
+    _kernel32.SetProcessWorkingSetSizeEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32,
+    ]
+    _kernel32.VirtualLock.restype = ctypes.c_int
+    _kernel32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _logged_buffer_fallback = False
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [("internal", ctypes.c_ulonglong), ("internal_high", ctypes.c_ulonglong),
+                    ("offset", _wt.DWORD), ("offset_high", _wt.DWORD), ("key", ctypes.c_void_p)]
+
+    def open_direct_ex(path: str):
+        """``(handle, unbuffered)``: a NO_BUFFERING handle, or a buffered one plus ``False``
+        where the volume refuses direct I/O."""
+        global _logged_buffer_fallback
+        for flags in (_NO_BUFFERING, _FILE_ATTRIBUTE_NORMAL):
+            handle = _kernel32.CreateFileW(path, _GENERIC_READ, _SHARE_ALL, None,
+                                           _OPEN_EXISTING, flags, None)
+            if handle is not None and handle != _INVALID_HANDLE:
+                direct = flags == _NO_BUFFERING
+                if not direct and not _logged_buffer_fallback:
+                    _logged_buffer_fallback = True
+                    logger.warning("direct I/O unavailable on this volume; reading %s through "
+                                   "the page cache (slower, and nothing evicts it afterwards)",
+                                   path)
+                return handle, direct
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def open_direct(path: str):
+        return open_direct_ex(path)[0]
+
+    def pread_into(handle, view: memoryview, offset: int) -> int:
+        overlapped = _Overlapped()
+        overlapped.offset = offset & 0xFFFFFFFF
+        overlapped.offset_high = offset >> 32
+        got = _wt.DWORD(0)
+        buffer = ctypes.addressof(ctypes.c_char.from_buffer(view))
+        if not _kernel32.ReadFile(handle, buffer, len(view), ctypes.byref(got),
+                                  ctypes.byref(overlapped)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return got.value
+
+    def close_direct(handle) -> None:
+        _kernel32.CloseHandle(handle)
+
+    def drop_read_cache(path: str, offset: int = 0, length: int = 0) -> None:
+        pass  # unbuffered reads never populate the cache, and there is no fadvise here
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dw_length", _wt.DWORD), ("dw_memory_load", _wt.DWORD),
+            ("ull_total_phys", ctypes.c_ulonglong), ("ull_avail_phys", ctypes.c_ulonglong),
+            ("ull_total_page_file", ctypes.c_ulonglong), ("ull_avail_page_file", ctypes.c_ulonglong),
+            ("ull_total_virtual", ctypes.c_ulonglong), ("ull_avail_virtual", ctypes.c_ulonglong),
+            ("ull_avail_extended_virtual", ctypes.c_ulonglong),
+        ]
+
+    _kernel32.GlobalMemoryStatusEx.restype = _wt.BOOL
+    _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+
+    def _avail_phys_bytes() -> int | None:
+        status = _MemoryStatusEx()
+        status.dw_length = ctypes.sizeof(status)
+        if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ull_avail_phys)
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        # the documented 10 fields; the tail is unread but part of the size the API checks
+        _fields_ = [
+            ("cb", _wt.DWORD), ("page_fault_count", _wt.DWORD),
+            ("peak_working_set", ctypes.c_size_t), ("working_set", ctypes.c_size_t),
+            ("quota_peak_paged", ctypes.c_size_t), ("quota_peak_nonpaged", ctypes.c_size_t),
+            ("quota_paged", ctypes.c_size_t), ("quota_nonpaged", ctypes.c_size_t),
+            ("pagefile_usage", ctypes.c_size_t), ("peak_pagefile_usage", ctypes.c_size_t),
+        ]
+
+    # kernel32 exports the working-set queries but not the memory counters on this build, and
+    # psapi.dll is the documented forwarder for exactly that one call
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    _psapi.GetProcessMemoryInfo.restype = _wt.BOOL
+    _psapi.GetProcessMemoryInfo.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_ProcessMemoryCounters), _wt.DWORD,
+    ]
+
+    def _working_set_bytes() -> int | None:
+        """Bytes currently in this process' working set -- what VirtualLock's quota is spent on.
+
+        The page-lock quota is the working set itself, so a bank of 0.8 GiB is refused by a
+        1 GiB maximum no matter that nothing is locked yet; sizing the raise without this
+        number is what made that look like a missing privilege."""
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not _psapi.GetProcessMemoryInfo(
+            _kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return None
+        return int(counters.working_set)
+
+
+def mem_available_bytes() -> int | None:
+    """Bytes of RAM a load could realistically take, or ``None`` where the platform cannot say.
+
+    The two spellings are not the same number: Linux's ``MemAvailable`` credits the reclaimable
+    page cache, Windows' ``ullAvailPhys`` does not credit the standby list, so the Windows figure
+    is the conservative one -- it calls a box tight sooner than the Linux one would."""
+    return _avail_phys_bytes()
+
+
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
     v = os.environ.get("FREETOKEN_BANK_CUDA_ALLOC", "").strip().lower()
@@ -154,27 +342,64 @@ class HostBank:
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
-        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
+        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK on POSIX, the working-set quota on Windows) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
             return
-        global _os_lock_failed
+        global _os_lock_failed, _os_lock_refusal_reason
         if _os_lock_failed:
             return  # the quota is exhausted for good; skip the syscall spam
         try:
             _os_lock(self.addr, len(self._buf))
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
-            logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
+            _os_lock_refusal_reason = str(exc)
+            if _lock_plan[1]:
+                logger.info(f"bank lock failed; nothing here reads a locked bank again: {exc}")
+            else:
+                logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
 
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
 _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
+_os_lock_refusal_reason: str | None = None  # what the first refusal said, read by the residency echo
+
+
+def os_lock_refusal() -> str | None:
+    """The first page-lock refusal of this run, or ``None`` while nothing has been refused.
+
+    Lets the log that echoes residency back distinguish 'this platform will not let us lock, and
+    that was reported once already' from a bank that settled pageable for some other reason."""
+    return _os_lock_refusal_reason
+
+
+_lock_plan = (0, False)  # (bytes this run will keep host-resident, whether a refusal is advisory)
+
+
+def set_lock_plan(*, resident_bytes: int = 0, advisory: bool = False) -> None:
+    """Tell the lock path how much this run will hold in RAM, and whether refusing the lock costs it anything.
+
+    ``resident_bytes`` sizes the working-set raise: banks settle while later banks are still being read,
+    so the working set at the first lock is a fraction of the footprint -- sized on the live number, the
+    first bank locks and the second is refused once the model is in. ``advisory`` reports a refusal at
+    info, which ``--moe-flat-residency`` earns by copying every bank into a GPU slot once and gathering
+    nothing afterwards; elsewhere a refusal stays a warning, as a reclaimed CPU-executor layer faults."""
+    global _lock_plan
+    _lock_plan = (max(0, int(resident_bytes)), bool(advisory))
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
+    """Page-lock a bank without spending CUDA pin quota: mlock on POSIX, VirtualLock on Windows.
+
+    Both are bounded by a per-process ceiling the caller cannot see from the address alone --
+    RLIMIT_MEMLOCK there, the process working set here -- so each branch tries its own raise
+    first and the refusal surfaces from the lock call itself, named by its real ceiling.
+    """
     global _os_locked_total
+    if os.name == "nt":
+        _nt_lock(addr, nbytes)
+        return
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
@@ -196,6 +421,98 @@ def _os_lock(addr: int, nbytes: int) -> None:
             f"(RLIMIT_MEMLOCK / `ulimit -l` caps OS-locked bytes; raise it or "
             f"shrink --moe-cpu-layers)",
         )
+    _os_locked_total += nbytes
+
+
+_NT_LOCK_HEADROOM = 1 << 30  # the raise covers one more bank plus room to grow, not just its bytes
+_WS_MAX_LIMITED = 0x2  # GetProcessWorkingSetSizeEx: the maximum is imposed (job, or an earlier Ex call)
+
+_nt_quota_ceiling = 0  # working-set maximum the OS actually granted, read back after the last raise
+_nt_quota_job_capped = False
+
+
+def _nt_quota_request(nbytes: int, locked_total: int, working_set: int, planned: int = 0) -> int:
+    """The working-set maximum that makes one more lock of ``nbytes`` grantable.
+
+    VirtualLock charges its quota against the whole working set, not against the bytes locked so
+    far, so a server holding 65 GiB resident needs the maximum above 65 GiB before its first bank
+    locks. Sizing the raise on the locked bytes alone refuses that first bank and blames the
+    privilege, which is the dead end this used to report. The live working set is itself only a
+    snapshot -- banks settle while the loader is still reading, so ``planned``, what the run will
+    hold once the experts are in, sets the floor the snapshot cannot go below."""
+    return max(working_set, planned) + locked_total + nbytes + _NT_LOCK_HEADROOM
+
+
+def _nt_working_set_limits() -> tuple[int, int, int] | None:
+    """This process' working-set (minimum, maximum, flags), or ``None`` when the OS won't say."""
+    process = _kernel32.GetCurrentProcess()
+    minimum, maximum, flags = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_uint32()
+    if not _kernel32.GetProcessWorkingSetSizeEx(
+        process, ctypes.byref(minimum), ctypes.byref(maximum), ctypes.byref(flags), 0
+    ):
+        return None
+    return int(minimum.value), int(maximum.value), int(flags.value)
+
+
+def _nt_set_working_set_max(minimum: int, maximum: int) -> bool:
+    """Ask for a new working-set range; only the maximum is ever moved by us."""
+    return bool(_kernel32.SetProcessWorkingSetSizeEx(_kernel32.GetCurrentProcess(), minimum, maximum, 0))
+
+
+def _nt_raise_working_set_quota(want: int) -> int:
+    """Raise the working-set maximum toward ``want`` and return the ceiling the OS granted.
+
+    Only the maximum moves (SeProfileSingleProcessPrivilege); the minimum is handed back
+    unchanged, as raising that needs a privilege a normal server process lacks. The read-back
+    value is the quota the lock then faces, and a job object can hold it below ``want``, so the
+    request is only worth what the grant says."""
+    global _nt_quota_ceiling, _nt_quota_job_capped
+    limits = _nt_working_set_limits()
+    if limits is None:
+        return _nt_quota_ceiling
+    minimum, maximum, flags = limits
+    if maximum < want and _nt_set_working_set_max(minimum, want):
+        reread = _nt_working_set_limits()
+        if reread is not None:
+            minimum, maximum, flags = reread
+    _nt_quota_ceiling = maximum
+    _nt_quota_job_capped = bool(flags & _WS_MAX_LIMITED)
+    return _nt_quota_ceiling
+
+
+def _nt_lock_refusal(err: int, nbytes: int, ceiling: int, want: int) -> str:
+    """Why VirtualLock said no, in terms of the two ceilings that can be behind it.
+
+    The ceiling is named whichever way it went: saying the raise succeeded is the only way a reader
+    can tell a job-capped maximum apart from a refusal that is purely the missing right."""
+    msg = f"VirtualLock({nbytes / 2**30:.1f} GiB): WinError {err}"
+    if ceiling:
+        if ceiling < want:
+            capped = " (imposed by the job this process runs in)" if _nt_quota_job_capped else ""
+            msg += (
+                f": the page-lock quota is the process working set, and the OS granted "
+                f"{ceiling / 2**30:.1f} GiB of the {want / 2**30:.1f} GiB the resident banks need"
+                f"{capped}"
+            )
+        else:
+            msg += (
+                f": the working-set quota was raised to {ceiling / 2**30:.1f} GiB, at or past the "
+                f"{want / 2**30:.1f} GiB this run will hold, so no quota refused this"
+            )
+    return msg + (
+        " - the 'Lock pages in memory' right lifts that quota entirely (secpol.msc -> Local "
+        "Policies -> User Rights Assignment, then a new login session); without it every "
+        "host-locked layer stays pageable"
+    )
+
+
+def _nt_lock(addr: int, nbytes: int) -> None:
+    global _os_locked_total
+    want = _nt_quota_request(nbytes, _os_locked_total, _working_set_bytes() or 0, _lock_plan[0])
+    ceiling = _nt_raise_working_set_quota(want)
+    if not _kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
+        err = ctypes.get_last_error()
+        raise OSError(err, _nt_lock_refusal(err, nbytes, ceiling, want))
     _os_locked_total += nbytes
 
 
@@ -385,20 +702,15 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
+        drop_read_cache(path)
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = open_direct(path)
     offs = list(range(0, size, chunk))
 
     def rd(o):
         want = min(chunk, len(mv) - o)
         want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        pread_into(fd, mv[o:o + want], o)
 
     try:
         if len(offs) <= 1:
@@ -408,17 +720,17 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, offs))
     finally:
-        os.close(fd)
+        close_direct(fd)
     return size
 
 
-def _preadv_all(fd: int, dst: memoryview, offset: int, need: int) -> None:
-    """preadv into ``dst`` until ``need`` bytes have landed; O_DIRECT may return a short count."""
+def _preadv_all(fd, dst: memoryview, offset: int, need: int) -> None:
+    """Positioned read into ``dst`` until ``need`` bytes have landed; direct I/O may return a short count."""
     done = 0
     while done < need:
         if done % _BLK:  # a continuation read has to stay block-aligned on both sides
             raise OSError(f"unaligned short O_DIRECT read: {done} of {need} bytes at {offset}")
-        got = os.preadv(fd, [dst[done:]], offset + done)
+        got = pread_into(fd, dst[done:], offset + done)
         if got <= 0:
             raise OSError(f"short O_DIRECT read: {done} of {need} bytes at {offset}")
         done += got
@@ -436,13 +748,8 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        drop_read_cache(path, file_offset, nbytes)
+    fd = open_direct(path)
     scratch = threading.local()
 
     def rd(i: int) -> None:
@@ -469,7 +776,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(rd, offs))
     finally:
-        os.close(fd)
+        close_direct(fd)
     return nbytes
 
 
@@ -478,10 +785,17 @@ __all__ = [
     "HostResidency",
     "LayerCompletionTracker",
     "PinPipeline",
+    "DIRECT_READ_SUPPORTED",
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "close_direct",
+    "drop_read_cache",
+    "mem_available_bytes",
+    "open_direct",
+    "open_direct_ex",
     "pin_banks",
+    "pread_into",
     "read_file_into",
     "read_range_into",
     "requested_residency",

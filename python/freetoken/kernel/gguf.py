@@ -30,7 +30,13 @@ def _host_compiler() -> str | None:
     decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
     with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
     to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+
+    Windows keeps its default host: nvcc there drives cl, and the clang++ that ships
+    inside VS (on PATH in a developer prompt) would be picked up by the search below and
+    reject the MSVC spellings torch passes -- `-ccbin clang++` then fails on `-nologo`.
     """
+    if os.name == "nt":
+        return None
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override

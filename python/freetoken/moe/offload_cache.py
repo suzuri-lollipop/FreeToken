@@ -440,7 +440,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them. Flat residency is the exception: ``materialize_flat`` is the only copy it ever makes and an ordinary host->device copy needs no device address.
         """
         from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
@@ -458,11 +458,12 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            if not (self.flat_residency or unpinned <= self.cpu_layer_ids):
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
-                    f"cpu_layer_ids: a layer without a device address can only decode on "
-                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are neither "
+                    f"in cpu_layer_ids nor served by flat residency: a layer without a device "
+                    f"address can only decode on the CPU executor (set cache.cpu_layer_ids "
+                    f"before set_bank_sources) or own a permanent slot (--moe-flat-residency)"
                 )
             if self.prefill_overlap:
                 raise ValueError(
@@ -501,8 +502,10 @@ class OffloadMoeCache:
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
-        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
-            if self.device.type == "cuda" and self.banks:
+        # A flat-residency cache has no per-token gather, so the per-bank fallback contract
+        # (128-byte rows) is not a requirement it must be checked against.
+        if self._copy_fused_ok or self.flat_residency or self.device.type != "cuda" or not self.banks:
+            if not self._copy_fused_ok and self.device.type == "cuda" and self.banks:
                 # Per-bank copies silently serialize the in-stream batch gather; log the
                 # fallback so a degraded copy is visible in the startup log.
                 logger.warning_rank0(
@@ -537,6 +540,10 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
+        if self.flat_residency:
+            # Flat residency streams every expert into its permanent slot once
+            # (materialize_flat); a per-token gather plan must never exist for it.
+            return
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -1613,6 +1620,11 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer2 if plan else self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.flat_residency:
+            raise AssertionError(
+                "flat residency owns one permanent slot per expert, so nothing may stage "
+                "rows at runtime; the decode and prefill paths must not reach copy_missing"
+            )
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

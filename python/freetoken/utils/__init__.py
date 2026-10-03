@@ -22,6 +22,8 @@ from .mp import (
     ZmqPullQueue,
     ZmqPushQueue,
     ZmqSubQueue,
+    zmq_endpoint,
+    zmq_tcp_ports,
 )
 from .registry import Registry
 from .torch_utils import nvtx_annotate, torch_dtype
@@ -56,4 +58,6 @@ __all__ = [
     "ZmqSubQueue",
     "ZmqAsyncPushQueue",
     "ZmqAsyncPullQueue",
+    "zmq_endpoint",
+    "zmq_tcp_ports",
 ]

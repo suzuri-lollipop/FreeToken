@@ -34,6 +34,7 @@ def slot_cache_expert_cap(
     layer_residency: "list[str] | None",
     *,
     prefill_overlap: bool,
+    flat_residency: bool = False,
 ) -> int:
     """Slots the GPU expert cache can ever fill, given each host bank layer's residency.
 
@@ -46,10 +47,15 @@ def slot_cache_expert_cap(
     ``layer_residency is None`` is a loader that settles banks without per-layer labels
     (see ``moe.expert_banks._echo_residency``): report the whole-model ceiling rather
     than shrink a residency we cannot see.
+
+    Flat residency fills every slot with one host->device copy at startup and gathers
+    nothing per token, so the device-address rule does not apply to it.
     """
     from freetoken.moe.host_banks import HostResidency
 
     total_experts = num_layers * num_experts
+    if flat_residency:
+        return total_experts
     if not layer_residency or len(layer_residency) != num_layers:
         return total_experts
     staging = (2 if prefill_overlap else 1) * num_experts

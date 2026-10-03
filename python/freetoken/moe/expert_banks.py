@@ -19,13 +19,17 @@ from freetoken.distributed import try_get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
-from .host_banks import alloc_layer_banks
+from .host_banks import DIRECT_READ_SUPPORTED, alloc_layer_banks, mem_available_bytes
 from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
-# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
-_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+# Whether the chunked, page-cache-bypassing shard reader can run here. This used to ask whether
+# os.O_DIRECT and os.preadv exist, which Windows lacks -- pinning every Windows box to the serial
+# read even though host_banks opens the same unbuffered positioned read through
+# FILE_FLAG_NO_BUFFERING + ReadFile. Ask the seam for the capability, not the platform for the
+# symbol. Kept as a module attribute so tests can force either build.
+_PARALLEL_READER_SUPPORTED = DIRECT_READ_SUPPORTED
 
 # most intra-op threads one rank uses while it fills banks; measured as fast as the full pool on
 # the big stacked pieces and faster on the small per-expert ones
@@ -237,21 +241,17 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
 
 
 def _mem_available_bytes() -> int | None:
-    """MemAvailable -- the OOM-relevant figure, since it counts reclaimable page cache.
-    None when the platform has no /proc/meminfo."""
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return None
+    """Free RAM for the OOM guard, read the platform's way (see
+    :func:`freetoken.moe.host_banks.mem_available_bytes`). Windows has no /proc/meminfo, which
+    used to leave this guard silently disabled there: auto picked parallel on boxes with no room
+    for the reader's in-flight buffers."""
+    return mem_available_bytes()
 
 
 def _auto_pick_parallel(model_path: str, model_config, method, dummy: bool) -> bool:
-    """``--expert-load auto``: read scattered experts with the parallel chunked O_DIRECT reader,
-    drop to the serial build when host RAM can't hold the result.
+    """``--expert-load auto``: read scattered experts with the chunked unbuffered reader
+    (``O_DIRECT`` / ``FILE_FLAG_NO_BUFFERING``), drop to the serial build when host RAM can't hold
+    the result.
 
     The parallel reader keeps whole shards in flight as ANONYMOUS (non-reclaimable) buffers on top
     of the bank-sized resident set, so a memory-tight box OOMs there where the serial path
@@ -390,8 +390,8 @@ def load_expert_banks(
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(
-            "expert banks: parallel O_DIRECT reader unsupported on this platform "
-            "(no os.O_DIRECT/preadv) -> serial build"
+            "expert banks: no unbuffered read seam on this platform (neither O_DIRECT nor "
+            "FILE_FLAG_NO_BUFFERING) -> serial build"
         )
         parallel = False
 
@@ -433,11 +433,21 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
         labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
         downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
         if downgraded:
-            logger.warning_rank0(
-                f"--moe-cpu-layers: layers {downgraded} settled pageable instead of "
-                f"OS-locked (lock failed); they still decode on the CPU executor but "
-                f"may swap under memory pressure"
+            # a flat-residency boot labels every layer locked, so name the count when the
+            # list would run to the whole model
+            shown = downgraded if len(downgraded) <= 12 else f"{len(downgraded)} layers"
+            msg = (
+                f"host-locked banks: {shown} settled pageable instead of OS-locked; their bytes "
+                f"stay resident only as long as the OS does not reclaim them"
             )
+            from freetoken.moe.host_banks import os_lock_refusal
+
+            # the refusal above already names the ceiling behind it, and no retry of any other
+            # bank changes that answer -- so the echo reports it at info, not twice as a warning
+            if os_lock_refusal():
+                logger.info_rank0(msg)
+            else:
+                logger.warning_rank0(f"{msg} (the page-lock quota refused them)")
         return dataclasses.replace(banks, layer_residency=labels)
     from freetoken.moe.host_banks import HostResidency
 

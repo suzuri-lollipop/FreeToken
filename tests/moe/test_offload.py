@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 
+import os
+
 import pytest
 import torch
 
@@ -466,11 +468,12 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     # running the suite (GB10 reports cudaDevAttrIntegrated=1).
     monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
 
+    # triton: the flashinfer probe must not refuse the config ahead of the sizing gate.
     config = EngineConfig(
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -806,6 +809,43 @@ def test_flat_residency_rejects_cpu_decode():
         )
 
 
+def test_flat_residency_streams_unpinned_banks_into_their_slots():
+    """The WDDM/WSL shape: the pin budget cannot hold the banks, and flat residency does not
+    need a device address -- materialize_flat is an ordinary host->device copy."""
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        flat_residency=True,
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.LOCKED.value, HostResidency.PAGEABLE.value],
+    )
+
+    assert cache._unpinned_layers == frozenset({0, 1})
+    assert cache._copy_fused_ok is False  # no per-token gather plan may exist
+
+    moved = cache.materialize_flat()
+    gate_up, down = cache.bank_views_flat(1)
+    assert torch.equal(gate_up, sources["gate_up"][1])
+    assert torch.equal(down, sources["down"][1])
+    assert moved == sum(
+        t.numel() * t.element_size() for layers in cache.bank_sources.values() for t in layers
+    )
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+    with pytest.raises(AssertionError, match="flat residency"):
+        cache.copy_missing()
+
+
 def test_materialize_flat_loads_every_expert_into_its_permanent_slot():
     cache = _make_flat_cache()
     moved = cache.materialize_flat()
@@ -873,6 +913,9 @@ def test_flat_rebuild_reloads_every_expert_and_rejects_a_shrink():
 
 
 def _moe_flat_config(**overrides):
+    """An EngineConfig for a MoE checkpoint asked to run --moe-flat-residency. The attention
+    backend is triton: these tests assert on the residency gate, and a missing flashinfer would
+    refuse the config long before that gate is reached."""
     from types import SimpleNamespace
 
     from freetoken.distributed import DistributedInfo
@@ -882,7 +925,7 @@ def _moe_flat_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_strategy="offload",
         moe_cache_size=80,
         moe_flat_residency=True,
@@ -1122,6 +1165,157 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
 
 
+@pytest.mark.skipif(os.name != "nt", reason="VirtualLock is the Windows branch of _os_lock")
+def test_windows_lock_reports_a_quota_not_an_import_failure(monkeypatch):
+    """The bug was silent: ``_os_lock`` raised ImportError from ``import resource``, ``lock()``
+    swallowed it, and every LOCKED layer settled PAGEABLE under a Linux quota message.
+
+    How much a host may page-lock is policy (the 'Lock pages in memory' right), so either answer
+    from the OS is fine here -- neither of them is an ImportError, which is why ``_os_lock`` is
+    called directly rather than through the swallowing ``lock()``.
+    """
+    import freetoken.moe.host_banks as hb
+
+    monkeypatch.setattr(hb, "_os_locked_total", 0)
+    bank = hb.HostBank((2 << 20,), torch.uint8)
+    bank.tensor.fill_(0)  # lock after fill, the order the loader keeps
+    try:
+        hb._os_lock(bank.addr, bank.nbytes)
+    except OSError as exc:
+        assert "Lock pages in memory" in str(exc)
+    else:
+        assert hb._os_locked_total == bank.nbytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_request_covers_the_live_working_set():
+    """VirtualLock charges its quota against the whole working set, not the bytes locked so far.
+
+    The old sizing (locked bytes + one bank) let a server that is already tens of GiB resident
+    ask for a maximum barely above a bank, which is the refusal that read as a missing privilege.
+    """
+    from freetoken.moe.host_banks import _nt_quota_request
+
+    GiB = 1 << 30
+    want = _nt_quota_request(nbytes=1 * GiB, locked_total=2 * GiB, working_set=65 * GiB)
+    assert want >= 68 * GiB, "a bank-sized raise can never cover a resident model"
+    assert _nt_quota_request(1 * GiB, 0, 0) > 1 * GiB, "the raise needs headroom, not the exact bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_request_is_sized_on_the_planned_footprint():
+    """The working set at the first lock is a snapshot of a load still in progress, not the footprint.
+
+    Seen on a 63 GiB boot: the first bank settled at 2% read, so the raise asked 8.0 GiB -- enough for
+    that one bank, and the next would be refused once the experts were in. What the run says it will
+    hold therefore floors the ask."""
+    from freetoken.moe.host_banks import _nt_quota_request
+
+    GiB = 1 << 30
+    early = 6 * GiB  # resident when the first bank settles, against a 64 GiB bank set
+    want = _nt_quota_request(nbytes=1 * GiB, locked_total=0, working_set=early, planned=64 * GiB)
+    assert want > 60 * GiB, "sized on the snapshot, the next bank is refused once the load finishes"
+    assert _nt_quota_request(1 * GiB, 0, 65 * GiB, 64 * GiB) == _nt_quota_request(1 * GiB, 0, 65 * GiB)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_refusal_names_the_granted_ceiling(monkeypatch):
+    """A refusal must say how much was granted against how much the resident banks need."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    monkeypatch.setattr(hb, "_nt_quota_job_capped", True)
+    msg = hb._nt_lock_refusal(1453, nbytes=1 * GiB, ceiling=1 * GiB, want=80 * GiB)
+    assert "WinError 1453" in msg
+    assert "1.0 GiB of the 80.0 GiB" in msg
+    assert "imposed by the job" in msg
+    assert "Lock pages in memory" in msg
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_refusal_names_the_ceiling_after_a_successful_raise(monkeypatch):
+    """A refusal that only says 'missing privilege' leaves the reader guessing whether the raise ran.
+
+    Reporting the granted maximum even when it is the request or larger is what separates a job
+    object that will not stretch from a box whose only problem is the right."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    monkeypatch.setattr(hb, "_nt_quota_job_capped", True)  # imposed, yet no longer the binding limit
+    msg = hb._nt_lock_refusal(1453, nbytes=1 * GiB, ceiling=72 * GiB, want=72 * GiB)
+    assert "raised to 72.0 GiB" in msg
+    assert "imposed by the job" not in msg
+
+
+def test_advisory_page_lock_refusal_does_not_warn(monkeypatch):
+    """Flat residency copies every bank into a GPU slot once, so a refused lock is not a fault.
+
+    The refusal must still be recorded: the residency echo reads it to report the settled layers."""
+    import freetoken.moe.host_banks as hb
+
+    calls = []
+
+    class _Recorder:
+        def warning(self, msg):
+            calls.append(("warning", msg))
+
+        def info(self, msg):
+            calls.append(("info", msg))
+
+    def refuse(addr, nbytes):
+        raise OSError(1, "no quota left")
+
+    monkeypatch.setattr(hb, "logger", _Recorder())
+    monkeypatch.setattr(hb, "_os_lock", refuse)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setattr(hb, "_os_lock_refusal_reason", None)
+    monkeypatch.setattr(hb, "_lock_plan", (0, False))
+
+    bank = hb.HostBank((1 << 12,), torch.uint8)
+    bank.tensor.fill_(0)
+    bank.lock()
+    assert [kind for kind, _ in calls] == ["warning"]
+
+    calls.clear()
+    monkeypatch.setattr(hb, "_os_lock_failed", False)  # a fresh boot that asked for advisory locking
+    hb.set_lock_plan(resident_bytes=64 << 30, advisory=True)
+    assert hb._lock_plan == (64 << 30, True), "the plan is what the raise will be sized on"
+    bank.lock()
+    assert [kind for kind, _ in calls] == ["info"]
+    assert "no quota left" in hb.os_lock_refusal()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the quota is the Windows page-lock ceiling")
+def test_windows_quota_raise_reports_what_the_os_granted(monkeypatch):
+    """A job object can hold the maximum below the request, so the grant is what must be reported."""
+    import freetoken.moe.host_banks as hb
+
+    GiB = 1 << 30
+    granted = [2 * GiB]  # the job caps us far below the 68 GiB ask
+
+    def limits():
+        return 0, granted[0], 0x2 | 0x8  # maximum valid, and held down by a job object
+
+    def set_max(minimum, maximum):
+        granted[0] = min(maximum, 4 * GiB)  # the job refuses the rest
+        return True
+
+    monkeypatch.setattr(hb, "_nt_working_set_limits", limits)
+    monkeypatch.setattr(hb, "_nt_set_working_set_max", set_max)
+    monkeypatch.setattr(hb, "_nt_quota_ceiling", 0)
+    assert hb._nt_raise_working_set_quota(68 * GiB) == 4 * GiB
+    assert hb._nt_quota_job_capped is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the counters come from psapi")
+def test_working_set_query_answers_on_windows():
+    """A wrong PROCESS_MEMORY_COUNTERS layout is refused with ERROR_INSUFFICIENT_BUFFER, and a
+    None here quietly downgrades the whole quota sizing to 'assume nothing is resident'."""
+    import freetoken.moe.host_banks as hb
+
+    assert hb._working_set_bytes() > 0
+
+
 # ---- --expert-load auto: the low-RAM veto is sized by the experts, not the whole checkpoint ----
 
 
@@ -1223,6 +1417,52 @@ def test_expert_key_matcher_is_best_effort():
     assert expert_key_matcher("a/path", SimpleNamespace(architectures=["Qwen4Exp"]), QuantKind.NONE) is None
     # an unresolvable family must not raise out of a sizing heuristic
     assert expert_key_matcher("a/path", SimpleNamespace(architectures=["NoSuchArch"]), QuantKind.NVFP4) is None
+
+
+def test_parallel_reader_gate_is_the_direct_read_seam(monkeypatch):
+    """The gate asks the host_banks seam whether an unbuffered read exists, not the platform for
+    its POSIX spelling. Windows has neither ``os.O_DIRECT`` nor ``os.preadv`` and still reads
+    scattered experts in parallel, which the old ``hasattr`` gate silently denied it."""
+    import importlib
+
+    import freetoken.moe.expert_banks as eb
+    from freetoken.moe import host_banks
+
+    for name in ("O_DIRECT", "preadv"):
+        monkeypatch.delattr(os, name, raising=False)
+    importlib.reload(eb)
+    try:
+        assert eb._PARALLEL_READER_SUPPORTED is host_banks.DIRECT_READ_SUPPORTED is True
+    finally:
+        importlib.reload(eb)
+
+
+def test_mem_available_bytes_answers_where_proc_meminfo_is_absent():
+    """The auto expert-load guard read /proc/meminfo and gave up elsewhere, so the OOM veto was
+    silently off on Windows; GlobalMemoryStatusEx answers there. The value is re-read through a
+    hand-built MEMORYSTATUSEX because a mistyped struct layout shows up as garbage, not an error."""
+    from freetoken.moe.host_banks import mem_available_bytes
+
+    avail = mem_available_bytes()
+    assert avail is not None and avail > 0
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        assert ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx(ctypes.byref(status))
+        assert 0 < avail < status.ullTotalPhys
+        assert abs(status.ullAvailPhys - avail) < max(1 << 20, status.ullAvailPhys // 10)
 
 
 def test_auto_expert_load_sizes_the_experts_the_reader_opens(tmp_path, monkeypatch):

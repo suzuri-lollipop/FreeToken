@@ -176,7 +176,10 @@ class DiskRowTable:
         )
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         if self._wait_sync and self._rows_gated(2):
-            sync = "wait-sync bs1, launch-gating bs>=2 (shm one-shot AR interlock)"
+            from freetoken.distributed.shm_ar import large_shm_ar_active
+
+            why = "shm one-shot AR interlock" if large_shm_ar_active() else "Windows graph-launch guard"
+            sync = f"wait-sync bs1, launch-gating bs>=2 ({why})"
         logger.info_rank0(
             f"PLE disk backend: {self._store.io_backend()}, {sync}"
             + (", cpp fill" if self._cpp_fill else "")
@@ -213,12 +216,17 @@ class DiskRowTable:
         without the WAIT memop. bs1 keeps wait-sync: its K2 payload stays <= 5 KiB
         and that mix is production-proven. The reducer state is collective, so every
         rank resolves the same protocol for the same graph.
+
+        Native Windows hits the same driver-level blockage with no interlock to key on:
+        at tp_size 1 there is no shm reducer, yet a bs>=2 wait-sync graph parks on its
+        next launch (GPU idle, engine blocked, no error). Gate those graphs by platform
+        too, and keep bs1 on the wait-sync path that measures ~9% faster.
         """
         if rows < 2 or not self._wait_sync:
             return False
         from freetoken.distributed.shm_ar import large_shm_ar_active
 
-        return large_shm_ar_active()
+        return large_shm_ar_active() or os.name == "nt"
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 

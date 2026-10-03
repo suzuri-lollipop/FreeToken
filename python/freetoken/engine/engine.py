@@ -6,6 +6,7 @@ import gc
 import math
 import os
 import time
+import warnings
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -1121,6 +1122,7 @@ class Engine:
             num_experts,
             getattr(banks, "layer_residency", None),
             prefill_overlap=config.moe_prefill_overlap,
+            flat_residency=getattr(config, "moe_flat_residency", False),
         )
         max_slots = method.slot_limit() if method is not None else None
         if slot_cap < total_experts:
@@ -1161,7 +1163,7 @@ class Engine:
             skew = min(parts[rank] * (1 << 20), max(0, headroom_est - floor))
         elif rank < len(parts):
             skew = parts[rank] * (1 << 20)
-        return resolve_moe_cache_auto(
+        size, pages, overlap = resolve_moe_cache_auto(
             slot_budget_skew_bytes=skew,
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -1180,6 +1182,11 @@ class Engine:
             device_total=self._device_total,
             nonpool_overhead_bytes=self._nonpool_overhead_floor,
         )
+        if getattr(config, "moe_flat_residency", False):
+            # Every slot is permanent, so the two-layer double buffer is never built; report
+            # the flag as the cache holds it instead of letting the config claim overlap.
+            overlap = False
+        return size, pages, overlap
 
     def _grow_moe_cache_into_headroom(self, config: EngineConfig, post_free_memory: int) -> int:
         """--moe-cache-auto: grow the expert slot cache up to the --memory-ratio ceiling.
@@ -1317,13 +1324,23 @@ class Engine:
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
         if split_residency:
-            from freetoken.moe.host_banks import HostResidency
+            from freetoken.moe.host_banks import HostResidency, set_lock_plan
 
             requested_residency = [
                 HostResidency.LOCKED.value if i in cpu_layer_ids
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+            # pinned and locked banks both stay resident, so both spend the page-lock quota the raise buys
+            bank_bytes = _bank_bytes(config, method)
+            if bank_bytes:
+                set_lock_plan(resident_bytes=bank_bytes)
+        elif config.moe_flat_residency:
+            # Over a pin budget, flat residency keeps every layer on the GPU and simply stops
+            # pinning the banks; --moe-cpu-layers stays empty, so no CPU executor is built.
+            requested_residency = _flat_residency_request(
+                config, reserved=self._host_tables_bytes, method=method
+            )
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -2386,6 +2403,32 @@ def _fused_resident_ok(model_config) -> bool:
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
 
 
+def _set_allocator_settings(value: str) -> None:
+    """Set the allocator config through whatever spelling this torch build exports.
+
+    ``torch.cuda.memory._set_allocator_settings`` became a FutureWarning-emitting shim over
+    ``torch._C._accelerator_setAllocatorSettings`` in torch 2.11; both take the same
+    ``PYTORCH_ALLOC_CONF``-shaped string."""
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None:  # pragma: no cover - torch < 2.11
+        torch.cuda.memory._set_allocator_settings(value)
+    else:
+        setter(value)
+
+
+# torch builds compiled without the CUDA driver API (the native Windows wheel among them) accept
+# the setting and then ignore it, warning once from the allocator config itself.
+_UNSUPPORTED_ALLOCATOR_WARNING = "not supported on this platform"
+
+
+def _allocator_setting_ignored(caught: list) -> bool:
+    """Whether the captured probe warnings say this build took the setting and dropped it."""
+    return any(
+        _UNSUPPORTED_ALLOCATOR_WARNING in str(w.message) and "expandable_segments" in str(w.message)
+        for w in caught
+    )
+
+
 def _ensure_expandable_segments(device: torch.device) -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -2406,25 +2449,40 @@ def _ensure_expandable_segments(device: torch.device) -> None:
     VMM API, which some stacks (notably WSL2) do not implement -- without the probe the
     first real allocation dies with an opaque cudaErrorUnknown deep in model construction.
     A failed probe leaves the context usable, so re-setting the default allocator is a
-    clean in-process fallback.
+    clean in-process fallback. A build compiled without the CUDA driver API (the native
+    Windows one) never reaches the probe: it takes the setting, warns that the platform does
+    not support it, and keeps the default allocator, so that warning is what settles it.
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        _set_allocator_settings("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
+    caught: list = []
     try:
-        probe = torch.empty(1 << 20, dtype=torch.uint8, device=device)
-        del probe
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            probe = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+            del probe
     except Exception as exc:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        _set_allocator_settings("expandable_segments:False")
         logger.warning_rank0(
             f"expandable_segments is unavailable here (probe allocation failed: {exc}); the "
             f"CUDA VMM API is not implemented by this stack (e.g. WSL2) - using the default allocator"
         )
         return
+    if _allocator_setting_ignored(caught):
+        _set_allocator_settings("expandable_segments:False")
+        logger.info_rank0(
+            "expandable_segments is compiled out of this torch build (no CUDA driver API), so the "
+            "default caching allocator stays in charge and a fragmented run can reserve past its "
+            "peak - PYTORCH_ALLOC_CONF=backend:cudaMallocAsync is this platform's alternative"
+        )
+        return
+    for w in caught:  # whatever else the probe warned about keeps its normal filters
+        warnings.warn(str(w.message), w.category or UserWarning)
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
 
 
@@ -2567,17 +2625,43 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
+def _host_ram_bytes() -> int | None:
+    """Physical RAM: sysconf on POSIX, GlobalMemoryStatusEx on Windows (no sysconf there)."""
+    if os.name == "nt":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullTotalPhys)
+    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+
+
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
+    WDDM-backed CUDA caps pinning near half of RAM, shared across processes: WSL budgets 40%, native
+    Windows 45% (measured: the driver refused at 63 of 127 GiB). FREETOKEN_PIN_BUDGET_GB overrides
+    anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        cap = int(float(env) * 2**30)
-    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
+        return max(0, int(float(env) * 2**30) - reserved)
+    wsl = hasattr(os, "uname") and "microsoft" in os.uname().release.lower()  # WSL kernel tag
+    if os.name != "nt" and not wsl:
         return None
-    else:
-        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
-    return max(0, cap - reserved)
+    ram = _host_ram_bytes()
+    if ram is None:
+        return None
+    return max(0, int(ram * (0.45 if os.name == "nt" else 0.4)) - reserved)
 
 
 def _bank_bytes(config: EngineConfig, method=None) -> int | None:
@@ -2591,7 +2675,9 @@ def _pin_hint(reserved: int) -> str:
         return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
     return (
         "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "
-        "or --moe-cpu-layers <count|fraction|ids> to choose them yourself"
+        "or --moe-cpu-layers <count|fraction|ids> to choose them yourself; on a GPU with room "
+        "for every expert, --moe-flat-residency decodes them all on the GPU and host-locks the "
+        "banks instead of pinning them"
     )
 
 
@@ -2599,12 +2685,17 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
+    if config.moe_flat_residency:
+        # Flat residency host-locks the over-budget banks instead (_flat_residency_request):
+        # the streaming gather that needs a device address never runs, so a pin cap is not a
+        # reason to refuse the boot.
+        return
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
-            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
+            f"{budget / 2**30:.1f} GiB (WDDM caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
         )
 
 
@@ -2633,6 +2724,29 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int
         f"({sorted(ids)})"
     )
     return ids
+
+
+def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=None) -> "list[str] | None":
+    """Per-layer host residency a ``--moe-flat-residency`` boot asks the loader for, or ``None`` to pin everything.
+
+    Flat residency copies every expert into its permanent GPU slot once (``materialize_flat``)
+    and gathers nothing per token, so banks over the pin budget may stay OS-locked: a device
+    address is only needed by the streaming paths, and pinning is exactly what WDDM/WSL cap.
+    """
+    from freetoken.moe.host_banks import HostResidency, set_lock_plan
+
+    budget = _pin_budget_bytes(reserved)
+    bank_bytes = _bank_bytes(config, method) if budget is not None else None
+    if not bank_bytes or bank_bytes <= budget:
+        return None
+    logger.info_rank0(
+        f"--moe-flat-residency: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
+        f"{budget / 2**30:.2f} GiB; host-locking all {config.model_config.num_moe_layers} "
+        "MoE layers instead of pinning (the startup copy needs no device address, so no "
+        "layer decodes on the CPU)"
+    )
+    set_lock_plan(resident_bytes=bank_bytes, advisory=True)  # one read each, then nothing gathers from them
+    return [HostResidency.LOCKED.value] * config.model_config.num_moe_layers
 
 
 # MoE-only knobs and the value each resolves to on a dense model. moe_strategy is handled

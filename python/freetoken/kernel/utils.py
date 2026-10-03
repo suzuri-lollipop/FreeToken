@@ -17,10 +17,69 @@ DISABLE_KERNEL_CACHE_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE"
 DISABLE_KERNEL_CACHE_VERSION_CHECK_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE_VERSION_CHECK"
 DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+# tvm-ffi's Windows branch is built for a C++17 toolchain and knows only the MSVC spellings,
+# so the same flag lists cannot be shared; see _msvc_ninja_compat for the -Xcompiler rewrite.
+MSVC = os.name == "nt"
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
-DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+DEFAULT_CFLAGS = ["/std:c++20", "-D__always_inline=__forceinline__"] if MSVC else ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+if MSVC:
+    # __always_inline is a GCC keyword with no MSVC spelling; CUDA's own forceinline works in
+    # both the device and the host pass.
+    DEFAULT_CUDA_CFLAGS = DEFAULT_CUDA_CFLAGS + ["-D__always_inline=__forceinline__"]
 DEFAULT_LDFLAGS = []
+
+
+def _msvc_cuda_ldflags() -> List[str]:
+    """The Linux toolchain links libcudart for a CUDA build; tvm-ffi's Windows branch does not,
+    so the runtime import library is added here (kernel host code calls cudaGetDevice & co)."""
+    if not MSVC:
+        return []
+    cuda_home = os.getenv("CUDA_PATH") or os.getenv("CUDA_HOME") or ""
+    lib = pathlib.Path(cuda_home) / "lib" / "x64" if cuda_home else None
+    if lib is None or not lib.is_dir():
+        return []
+    return [f'/LIBPATH:"{lib}"', "cudart.lib"]
+
+
+_XCOMPILER_RUN = re.compile(r"-Xcompiler((?:\s+/[^\s]+)+)")
+
+
+def _msvc_ninja_compat(build_dir: str) -> None:
+    """Repair the build.ninja tvm-ffi <= 0.1.14 generates on Windows before ninja runs it:
+    nvcc takes ONE comma-joined -Xcompiler argument (the space run makes its /O2 a stray input
+    file), and its hardcoded /std:c++17 overrides the C++20 the kernels require. tvm-ffi offers
+    no flag hook for either, and the file is only written when absent, so this stays idempotent.
+    """
+    ninja_path = pathlib.Path(build_dir) / "build.ninja"
+    if not ninja_path.is_file():
+        return
+    text = ninja_path.read_text(encoding="utf-8").replace("/std:c++17", "")
+    text = _XCOMPILER_RUN.sub(lambda m: "-Xcompiler=" + ",".join(m.group(1).split()), text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    ninja_path.write_text(text, encoding="utf-8")
+
+
+_NINJA_PATCH_FLAG = "_freetoken_msvc_ninja_compat"
+
+
+def _patch_tvm_ffi_msvc() -> None:
+    if not MSVC:
+        return
+    from tvm_ffi.cpp import extension
+
+    if getattr(extension.build_ninja, _NINJA_PATCH_FLAG, False):
+        return
+
+    original = extension.build_ninja
+
+    def build_ninja(build_dir: str) -> None:
+        _msvc_ninja_compat(build_dir)
+        original(build_dir)
+
+    setattr(build_ninja, _NINJA_PATCH_FLAG, True)
+    extension.build_ninja = build_ninja
+
 
 
 ARCH_LIST_ENV = "TVM_FFI_CUDA_ARCH_LIST"
@@ -244,6 +303,7 @@ def load_aot(
         return prebuilt
 
     _ensure_ninja_on_path()
+    _patch_tvm_ffi_msvc()
 
     arch_list: List[str] = []
     if cuda_files:
@@ -259,6 +319,8 @@ def load_aot(
     extra_cflags = extra_cflags or []
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
+    if cuda_files:
+        extra_ldflags = extra_ldflags + _msvc_cuda_ldflags()
     extra_include_paths = extra_include_paths or []
 
     cpp_files = [str((KERNEL_PATH / "src" / f).resolve()) for f in cpp_files]
@@ -295,6 +357,7 @@ def load_jit(
         return prebuilt
 
     _ensure_ninja_on_path()
+    _patch_tvm_ffi_msvc()
 
     arch_list: List[str] = []
     if cuda_files or cuda_wrappers:
@@ -312,6 +375,8 @@ def load_jit(
     extra_cflags = extra_cflags or []
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
+    if cuda_files or cuda_wrappers:
+        extra_ldflags = extra_ldflags + _msvc_cuda_ldflags()
     extra_include_paths = extra_include_paths or []
 
     # include cpp files
