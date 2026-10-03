@@ -145,14 +145,6 @@ def test_slot_cache_expert_cap_counts_only_reachable_layers():
     assert slot_cache_expert_cap(4, 4, _residency({0}, 4), prefill_overlap=False) == 8
 
 
-def test_slot_cache_expert_cap_of_a_flat_cache_is_the_whole_model():
-    # Flat residency copies every expert in once and gathers nothing per token, so a bank
-    # without a device address is not a reason to shrink the cache (the WDDM/WSL pin-cap shape).
-    assert slot_cache_expert_cap(
-        48, 512, _residency(set(), 48), prefill_overlap=False, flat_residency=True
-    ) == 24576
-
-
 def test_slot_cache_expert_cap_adds_the_overlap_double_buffer():
     assert slot_cache_expert_cap(4, 4, _residency({0}, 4), prefill_overlap=True) == 12
 
@@ -416,7 +408,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs(monkeypatch):
 
 
 def _auto_plan_stub(num_layers=4, *, layer_residency="unset", num_page_override=None,
-                    moe_prefill_overlap=False, moe_flat_residency=False):
+                    moe_prefill_overlap=False):
     from freetoken.engine.engine import Engine
     from freetoken.kvcache.mha_pool import MHAKVCache
     from freetoken.models.config import KVCacheGroupSpec
@@ -451,7 +443,6 @@ def _auto_plan_stub(num_layers=4, *, layer_residency="unset", num_page_override=
 
     Config.moe_prefill_overlap = moe_prefill_overlap
     Config.num_page_override = num_page_override
-    Config.moe_flat_residency = moe_flat_residency
 
     class Banks:
         sources = {
@@ -505,17 +496,6 @@ def test_auto_plan_of_the_reported_wsl2_run_caches_one_layer_not_the_model():
     assert slot_cache_expert_cap(
         48, 512, _residency({24}, 48), prefill_overlap=False
     ) == 1024
-
-
-def test_auto_plan_of_a_flat_boot_plans_every_expert_over_unpinned_banks(monkeypatch):
-    monkeypatch.setenv("FREETOKEN_SLOT_BUDGET_SKEW_MIB", "0")
-    # The same unpinned banks as the capped plan above, but --moe-flat-residency: every
-    # expert must own a slot, and the startup copy can read them from pageable RAM.
-    engine, config, banks = _auto_plan_stub(
-        layer_residency=_residency(set(), 4), moe_flat_residency=True
-    )
-    size, pages, _ = engine._resolve_auto_moe_cache_size(config, banks)
-    assert (size, pages) == (16, 2)  # 4 layers x 4 experts, the whole model
 
 
 # ------------------------------------------------- memory_ratio as a total-footprint cap
@@ -839,50 +819,6 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if os.name == "nt" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower()):
         pytest.skip("WDDM caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
-
-
-def _flat_cfg(**overrides):
-    from types import SimpleNamespace
-
-    cfg = SimpleNamespace(
-        moe_strategy="offload", moe_cpu_layers=None, moe_flat_residency=True,
-        model_config=SimpleNamespace(num_moe_layers=48),
-    )
-    for key, value in overrides.items():
-        setattr(cfg, key, value)
-    return cfg
-
-
-def test_flat_residency_host_locks_banks_over_the_pin_budget(monkeypatch):
-    from freetoken.engine import engine as eng
-    from freetoken.moe import host_banks as hb
-    from freetoken.moe.host_banks import HostResidency
-
-    plans = []
-    monkeypatch.setattr(hb, "set_lock_plan", lambda **kw: plans.append(kw))
-    monkeypatch.setattr(eng, "_pin_budget_bytes", lambda reserved=0: 57 * 2**30)
-    monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None: 63 * 2**30)
-    assert eng._flat_residency_request(_flat_cfg()) == [HostResidency.LOCKED.value] * 48
-    # the raise is sized on the whole bank set, not the few GiB resident when the first bank settles
-    assert plans == [{"resident_bytes": 63 * 2**30, "advisory": True}]
-
-    # inside the budget the default stays "pin everything": flat residency changes the
-    # runtime movement pattern, not the wish to have registered banks
-    plans.clear()
-    monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None: 50 * 2**30)
-    assert eng._flat_residency_request(_flat_cfg()) is None
-    assert plans == [], "a run that pins its banks has nothing to size a lock raise on"
-
-
-def test_pin_budget_check_lets_a_flat_boot_through(monkeypatch):
-    from freetoken.engine import engine as eng
-
-    monkeypatch.setattr(eng, "_pin_budget_bytes", lambda reserved=0: 57 * 2**30)
-    monkeypatch.setattr(eng, "_bank_bytes", lambda config, method=None: 63 * 2**30)
-
-    eng._check_pin_budget(_flat_cfg(), reserved=0)  # must not raise: no bank needs pinning
-    with pytest.raises(ValueError, match="pin budget"):
-        eng._check_pin_budget(_flat_cfg(moe_flat_residency=False), reserved=0)
 
 
 def test_uneven_shard_keeps_kv_geometry_and_resplits_local_slots():

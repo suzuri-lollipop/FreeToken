@@ -151,11 +151,6 @@ class OffloadMoeCache:
     # ~15k experts and thrashes the LRU (no accumulation), and promoting everything
     # binds to the slower rank's link. Default 0.0 = historical stream-and-discard.
     prefill_promote_fraction: float = 0.0
-    # Flat residency: every expert of every layer owns a permanent slot
-    # (``layer * num_experts + expert``) instead of an LRU one. Needs one cache slot per
-    # expert and GPU decode; drops the prefill double buffers, so after the single load in
-    # :meth:`materialize_flat` neither prefill nor decode moves an expert byte.
-    flat_residency: bool = False
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -218,16 +213,6 @@ class OffloadMoeCache:
             "cache, so cache_size must be at least 2 * num_experts "
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
-        if self.flat_residency:
-            # Nothing may borrow slots (the double buffers alias slots < 2 * num_experts,
-            # which are permanent here) and the CPU executor reads host banks, not slots.
-            if self.decode_target != "gpu":
-                raise ValueError(
-                    f"flat residency serves experts from GPU slots; decode_target="
-                    f"{self.decode_target!r} computes them on the CPU executor instead"
-                )
-            self.prefill_overlap = False
-            self.prefill_hit_d2d = False
         self.cache_policy_id = policy_ids[self.cache_policy]
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
@@ -440,7 +425,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them. Flat residency is the exception: ``materialize_flat`` is the only copy it ever makes and an ordinary host->device copy needs no device address.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
         """
         from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
@@ -458,12 +443,11 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not (self.flat_residency or unpinned <= self.cpu_layer_ids):
+            if not unpinned <= self.cpu_layer_ids:
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are neither "
-                    f"in cpu_layer_ids nor served by flat residency: a layer without a device "
-                    f"address can only decode on the CPU executor (set cache.cpu_layer_ids "
-                    f"before set_bank_sources) or own a permanent slot (--moe-flat-residency)"
+                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
+                    f"cpu_layer_ids: a layer without a device address can only decode on "
+                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
                 )
             if self.prefill_overlap:
                 raise ValueError(
@@ -502,9 +486,7 @@ class OffloadMoeCache:
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
-        # A flat-residency cache has no per-token gather, so the per-bank fallback contract
-        # (128-byte rows) is not a requirement it must be checked against.
-        if self._copy_fused_ok or self.flat_residency or self.device.type != "cuda" or not self.banks:
+        if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
             if not self._copy_fused_ok and self.device.type == "cuda" and self.banks:
                 # Per-bank copies silently serialize the in-stream batch gather; log the
                 # fallback so a degraded copy is visible in the startup log.
@@ -540,10 +522,6 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
-        if self.flat_residency:
-            # Flat residency streams every expert into its permanent slot once
-            # (materialize_flat); a per-token gather plan must never exist for it.
-            return
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
@@ -597,12 +575,6 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
-        if self.flat_residency and cache_size < self.total_experts:
-            raise ValueError(
-                f"flat residency needs one slot per expert: cache_size={cache_size} < "
-                f"{self.num_layers} layers * {self.num_experts} experts = {self.total_experts} "
-                "(raise moe_cache_size, or drop --moe-flat-residency to cache experts)"
-            )
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
         if self.max_slots is not None and cache_size > self.max_slots:
@@ -682,11 +654,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
-        # 5. Flat residency is a permanent mapping, not cache state: the reallocated
-        # slots are empty, so reload every expert and restore the identity slot map.
-        if self.flat_residency:
-            self.materialize_flat()
-        # 6. Re-evaluate prefill overlap against the new size.
+        # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
             logger.warning(
                 f"Disabling MoE prefill overlap on rebuild: cache_size {cache_size} "
@@ -765,46 +733,6 @@ class OffloadMoeCache:
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
-
-    @property
-    def total_experts(self) -> int:
-        """Slots flat residency needs: one per (layer, expert)."""
-        return self.num_layers * self.num_experts
-
-    def flat_slot_base(self, layer_id: int) -> int:
-        """First slot of ``layer_id``'s permanent block (flat residency). Adding it to a
-        raw expert id yields the slot id the decode kernels index the cache with."""
-        return layer_id * self.num_experts
-
-    def bank_views_flat(self, layer_id: int) -> tuple[torch.Tensor, ...]:
-        """Per-bank views of one layer's permanent slot block, rows in expert-id order
-        (flat residency) -- the same contract the prefill double buffer hands the GEMM,
-        minus the copy."""
-        assert self.banks, "set_bank_sources must register the banks first"
-        lo = self.flat_slot_base(layer_id)
-        return tuple(cache[lo : lo + self.num_experts] for _, cache in self.banks)
-
-    def materialize_flat(self) -> int:
-        """Flat residency setup: stream EVERY expert into its permanent slot.
-
-        Slot ``layer * num_experts + expert`` holds that expert for the life of the
-        process, so ``slot_for_id`` / ``id_of_slot`` become identity maps and the forward
-        paths never reach ``ensure_experts`` / ``copy_missing`` again. Runs once at
-        startup and again after a rebuild; returns the bytes moved.
-        """
-        assert self.flat_residency, "materialize_flat requires flat_residency"
-        assert self.banks, "set_bank_sources must register the banks first"
-        moved = 0
-        for per_layer, cache in self.banks:
-            for layer_id, source in enumerate(per_layer):
-                lo = self.flat_slot_base(layer_id)
-                cache[lo : lo + self.num_experts].copy_(source)
-                moved += source.numel() * source.element_size()
-        identity = torch.arange(self.total_experts, dtype=torch.int32, device=self.device)
-        self.slot_for_id.view(-1).copy_(identity)
-        self.id_of_slot.fill_(-1)
-        self.id_of_slot[: self.total_experts].copy_(identity)
-        return moved
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -1620,11 +1548,6 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer2 if plan else self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if self.flat_residency:
-            raise AssertionError(
-                "flat residency owns one permanent slot per expert, so nothing may stage "
-                "rows at runtime; the decode and prefill paths must not reach copy_missing"
-            )
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

@@ -5,7 +5,6 @@ import errno
 import gc
 import math
 import os
-import time
 import warnings
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -1122,7 +1121,6 @@ class Engine:
             num_experts,
             getattr(banks, "layer_residency", None),
             prefill_overlap=config.moe_prefill_overlap,
-            flat_residency=getattr(config, "moe_flat_residency", False),
         )
         max_slots = method.slot_limit() if method is not None else None
         if slot_cap < total_experts:
@@ -1182,10 +1180,6 @@ class Engine:
             device_total=self._device_total,
             nonpool_overhead_bytes=self._nonpool_overhead_floor,
         )
-        if getattr(config, "moe_flat_residency", False):
-            # Every slot is permanent, so the two-layer double buffer is never built; report
-            # the flag as the cache holds it instead of letting the config claim overlap.
-            overlap = False
         return size, pages, overlap
 
     def _grow_moe_cache_into_headroom(self, config: EngineConfig, post_free_memory: int) -> int:
@@ -1211,7 +1205,7 @@ class Engine:
         group and hang the scheduler's next broadcast.
         """
         cache = self.moe_offload_cache
-        if cache is None or cache.flat_residency or self.device.type != "cuda":
+        if cache is None or self.device.type != "cuda":
             return post_free_memory
         from freetoken.engine.cache_budget import expert_bytes_per_slot, growth_cap_bytes
 
@@ -1335,12 +1329,6 @@ class Engine:
             bank_bytes = _bank_bytes(config, method)
             if bank_bytes:
                 set_lock_plan(resident_bytes=bank_bytes)
-        elif config.moe_flat_residency:
-            # Over a pin budget, flat residency keeps every layer on the GPU and simply stops
-            # pinning the banks; --moe-cpu-layers stays empty, so no CPU executor is built.
-            requested_residency = _flat_residency_request(
-                config, reserved=self._host_tables_bytes, method=method
-            )
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -1384,14 +1372,9 @@ class Engine:
                 )
             layout = method.layout()
             max_slots = method.slot_limit()
-        if config.moe_flat_residency and config.moe_prefill_overlap:
-            # The double buffers borrow the cache's first two expert layers, which flat
-            # residency hands to permanent experts; prefill reads slots directly anyway.
-            object.__setattr__(config, "moe_prefill_overlap", False)
         if (
             not config.moe_prefill_hit_d2d
             and config.moe_prefill_overlap
-            and not config.moe_flat_residency
             and config.moe_cache_size > 2 * config.model_config.num_experts
         ):
             # Auto-enable the prefill hit/miss split whenever it can pay: cache-resident
@@ -1414,7 +1397,6 @@ class Engine:
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             decode_fetch_overlap=config.decode_fetch_overlap,
-            flat_residency=config.moe_flat_residency,
             quant_format=banks.quant_format,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -1423,12 +1405,6 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        if cache.flat_residency and cpu_layer_ids:
-            raise ValueError(
-                f"--moe-flat-residency cannot serve CPU-decoded layers {sorted(cpu_layer_ids)} "
-                "(they read the host banks, not GPU slots); drop --moe-cpu-layers or the "
-                "flat residency flag"
-            )
         try:
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         except torch.OutOfMemoryError as exc:
@@ -1448,7 +1424,6 @@ class Engine:
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if (
             cache.prefill_overlap
-            and not cache.flat_residency
             and cache._copy_fused_ok
             and not cache._unpinned_layers
             and self.device.type == "cuda"
@@ -1517,18 +1492,6 @@ class Engine:
                             f"{cache.prefill_promote_fraction:.1%} of each layer's missing "
                             "experts for cross-request reuse"
                         )
-        if cache.flat_residency:
-            # One pass over PCIe for the whole model, replacing the per-chunk full-layer
-            # copies of the LRU path. Must complete before CUDA graph capture replays a
-            # MoE forward off these slots.
-            started = time.perf_counter()
-            moved = cache.materialize_flat()
-            logger.info_rank0(
-                f"MoE flat residency: {cache.total_experts} experts "
-                f"({moved / 2**30:.2f} GiB) into fixed GPU slots in "
-                f"{time.perf_counter() - started:.2f}s; prefill and decode now move "
-                "no expert weights"
-            )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
             # Under TP each rank runs its own CPU executor over a shared RAM pool, and the
@@ -2675,20 +2638,13 @@ def _pin_hint(reserved: int) -> str:
         return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
     return (
         "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "
-        "or --moe-cpu-layers <count|fraction|ids> to choose them yourself; on a GPU with room "
-        "for every expert, --moe-flat-residency decodes them all on the GPU and host-locks the "
-        "banks instead of pinning them"
+        "or --moe-cpu-layers <count|fraction|ids> to choose them yourself"
     )
 
 
 def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> None:
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
-        return
-    if config.moe_flat_residency:
-        # Flat residency host-locks the over-budget banks instead (_flat_residency_request):
-        # the streaming gather that needs a device address never runs, so a pin cap is not a
-        # reason to refuse the boot.
         return
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
@@ -2726,29 +2682,6 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int
     return ids
 
 
-def _flat_residency_request(config: EngineConfig, *, reserved: int = 0, method=None) -> "list[str] | None":
-    """Per-layer host residency a ``--moe-flat-residency`` boot asks the loader for, or ``None`` to pin everything.
-
-    Flat residency copies every expert into its permanent GPU slot once (``materialize_flat``)
-    and gathers nothing per token, so banks over the pin budget may stay OS-locked: a device
-    address is only needed by the streaming paths, and pinning is exactly what WDDM/WSL cap.
-    """
-    from freetoken.moe.host_banks import HostResidency, set_lock_plan
-
-    budget = _pin_budget_bytes(reserved)
-    bank_bytes = _bank_bytes(config, method) if budget is not None else None
-    if not bank_bytes or bank_bytes <= budget:
-        return None
-    logger.info_rank0(
-        f"--moe-flat-residency: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; host-locking all {config.model_config.num_moe_layers} "
-        "MoE layers instead of pinning (the startup copy needs no device address, so no "
-        "layer decodes on the CPU)"
-    )
-    set_lock_plan(resident_bytes=bank_bytes, advisory=True)  # one read each, then nothing gathers from them
-    return [HostResidency.LOCKED.value] * config.model_config.num_moe_layers
-
-
 # MoE-only knobs and the value each resolves to on a dense model. moe_strategy is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
@@ -2760,7 +2693,6 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
-    "moe_flat_residency": False,
     "expert_load": "auto",
 }
 
@@ -3134,21 +3066,6 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
-
-    if is_moe and getattr(config, "moe_flat_residency", False):
-        # Flat residency is the LRU-free mode: every expert owns a GPU slot, so the
-        # strategies that compute experts on the CPU (or keep no slot cache at all)
-        # cannot serve it. The slot-count floor is checked where the size is final.
-        if config.moe_strategy != "offload":
-            raise ValueError(
-                "--moe-flat-residency requires --moe-strategy offload (got "
-                f"{config.moe_strategy!r}): every expert must own a GPU slot"
-            )
-        if config.moe_cpu_layers:
-            raise ValueError(
-                "--moe-flat-residency cannot be combined with --moe-cpu-layers: "
-                "CPU-decoded layers read the host banks, not GPU slots"
-            )
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)

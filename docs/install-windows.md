@@ -233,14 +233,12 @@ The granted ceiling is named whichever way the raise went, which is what makes t
 advice: where the maximum will not stretch, the same slot instead reads `the OS granted 1.0 GiB of
 the 65.3 GiB the resident banks need (imposed by the job this process runs in)` -- the number to
 raise in the job or the launcher rather than in the policy. The ask is sized on the footprint the
-engine hands the lock path (`host_banks.set_lock_plan(resident_bytes=...)`, from
-`engine.engine._flat_residency_request` on a flat boot and from the `--moe-cpu-layers` branch
-otherwise), not on the working set as it happens to stand when the first bank settles: banks settle
-while the loader is still reading, and a 63.46 GiB boot that sized itself at 2% read asked for 8.0 GiB
--- right for that one bank, and the next would have been refused once the experts were in. Under
-`--moe-flat-residency` the refusal is an info rather than a warning (the same seam's `advisory` flag),
-because the flat copy reads each bank once into its GPU slot and gathers nothing from it afterwards.
-Either way the refusal is recorded (`host_banks.os_lock_refusal()`), so the residency echo that
+engine hands the lock path (`host_banks.set_lock_plan(resident_bytes=...)`, set by the
+`--moe-cpu-layers` split-residency branch), not on the working set as it happens to stand when the
+first bank settles: banks settle while the loader is still reading, and a 63.46 GiB boot that sized
+itself at 2% read asked for 8.0 GiB -- right for that one bank, and the next would have been refused
+once the experts were in. Either way the refusal is recorded (`host_banks.os_lock_refusal()`), so the
+residency echo that
 follows reports the settled layers at info instead of repeating the refusal as a second warning, and
 the first refusal keeps every later bank off the syscall path -- one line per boot, not two per layer.
 The existing downgrade then takes over -- the echoed residency reports PAGEABLE and the CPU
@@ -249,15 +247,12 @@ executor reads those layers from pageable RAM exactly as it does on a WSL2 host 
 Local Policies -> User Rights Assignment -> Lock pages in memory) and start a new login session;
 that right lifts the quota outright and is the one ceiling no in-process raise moves.
 
-The same cap has a GPU-side answer that keeps every layer on the GPU: `--moe-flat-residency`. Flat
-residency gives each expert a permanent slot and fills them in one pass of ordinary host->device
-copies at startup, so afterwards no bank needs a device address, nothing is gathered per token and
-no layer runs on the CPU executor. Because the copy needs no pin, a boot whose banks exceed the pin
-budget host-locks all of them instead of splitting the model across CPU (`--moe-flat-residency:
-banks ... > pin budget ...; host-locking all 48 MoE layers`). It requires VRAM for every expert
-beside the KV pool -- here 48 layers x 512 experts = 24576 slots; where that does not fit, the
-plan refuses with `flat residency needs one slot per expert` and `--moe-cpu-layers auto` is the
-fallback.
+The pin cap has no GPU-side answer: a layer without a device address cannot feed the slot cache, so
+over-budget banks stay host-resident and the over-budget layers move to the CPU executor. That is
+what `--moe-cpu-layers auto` plans -- it locks just enough head+tail layers for the pinned share to
+fit the budget, and the locked layers decode on the CPU over the same host banks. Where that split is
+not wanted, the only alternatives are host RAM the quota can actually lock (the user right, above)
+or a smaller model.
 
 - Tensor parallelism (`shm_ar`/`p2p_ar`) is untested on Windows; keep `--tp-size 1`. A
   `--tp-size 2` run of a model with `FULL` attention layers is refused at config time anyway,
@@ -371,39 +366,6 @@ line.
   prefill, CUDA-graph decode across both the pinned and the CPU-served expert layers, and the
   reply returning over the TCP queues. Before the event-loop seam above, the same request prefilled
   and then hung forever.
-
-## No-CPU decode over the pin cap: `--moe-flat-residency`
-
-`ft serve --model <checkpoint dir> --moe-strategy offload --moe-flat-residency --ple-backend disk`
-is the shape this cap allows when the GPU has room for every expert. It logs
-
-```
---moe-flat-residency: banks 63.46 GiB > pin budget 57.09 GiB; host-locking all 48 MoE layers
-instead of pinning (the startup copy needs no device address, so no layer decodes on the CPU)
-```
-
-loads the banks as ordinary RAM (the `VirtualLock` quota still refuses here, so all 48 layers echo
-PAGEABLE and that costs nothing), plans `--moe-cache-auto resolved moe_cache_size=24576` -- one slot
-per expert instead of the 22528 a `--moe-cpu-layers` split allows -- and moves them in
-`MoE flat residency: 24576 experts (63.46 GiB) into fixed GPU slots in 7.99s`. No
-`CPU MoE executor ready` line appears; the KV pool takes the remainder (397120 tokens, 9.38 GiB,
-beside the 621056 tokens the split-residency plan reserves).
-
-Measured on this box with the same checkpoint, one client
-(`python benchmarks/bench_token_speed.py --server http://127.0.0.1:1919 --concurrency 1
---decode 256 --requests 4 --warmup 2 --prompt-words 64`):
-
-| | `--moe-cpu-layers auto` | `--moe-flat-residency` |
-|---|---|---|
-| decode per stream | 30.28 tok/s (ITL p50 37.5 / p95 95.4 ms) | 104.65 tok/s (p50 9.2 / p95 10.8 ms) |
-| TTFT (143 prompt tokens) | 2203 ms | 278 ms |
-| aggregate output | 24.01 tok/s | 94.23 tok/s |
-
-The five CPU-decoded layers put a host round trip on every step, and split residency disables prefill
-overlap, so each prefill chunk re-streams whole layers out of pageable RAM -- that is the 2.2 s TTFT.
-Flat residency removes both, and lands at 104.65 tok/s against the 110 tok/s reported for the same
-hardware under Linux. What is left of that gap is the flashinfer/sgl-kernel fallbacks listed above
-(norms, activations, RoPE, `causal_conv1d`, sampling), not CPU decode.
 
 ## What the expert read costs, and what `--expert-load parallel` buys
 

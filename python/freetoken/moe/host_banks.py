@@ -353,10 +353,7 @@ class HostBank:
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
             _os_lock_refusal_reason = str(exc)
-            if _lock_plan[1]:
-                logger.info(f"bank lock failed; nothing here reads a locked bank again: {exc}")
-            else:
-                logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
+            logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
 
@@ -374,19 +371,17 @@ def os_lock_refusal() -> str | None:
     return _os_lock_refusal_reason
 
 
-_lock_plan = (0, False)  # (bytes this run will keep host-resident, whether a refusal is advisory)
+_lock_plan = 0  # bytes this run will keep host-resident; sizes the Windows working-set raise
 
 
-def set_lock_plan(*, resident_bytes: int = 0, advisory: bool = False) -> None:
-    """Tell the lock path how much this run will hold in RAM, and whether refusing the lock costs it anything.
+def set_lock_plan(*, resident_bytes: int = 0) -> None:
+    """Tell the lock path how much this run will hold in RAM.
 
     ``resident_bytes`` sizes the working-set raise: banks settle while later banks are still being read,
     so the working set at the first lock is a fraction of the footprint -- sized on the live number, the
-    first bank locks and the second is refused once the model is in. ``advisory`` reports a refusal at
-    info, which ``--moe-flat-residency`` earns by copying every bank into a GPU slot once and gathering
-    nothing afterwards; elsewhere a refusal stays a warning, as a reclaimed CPU-executor layer faults."""
+    first bank locks and the second is refused once the model is in."""
     global _lock_plan
-    _lock_plan = (max(0, int(resident_bytes)), bool(advisory))
+    _lock_plan = max(0, int(resident_bytes))
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
@@ -508,7 +503,7 @@ def _nt_lock_refusal(err: int, nbytes: int, ceiling: int, want: int) -> str:
 
 def _nt_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
-    want = _nt_quota_request(nbytes, _os_locked_total, _working_set_bytes() or 0, _lock_plan[0])
+    want = _nt_quota_request(nbytes, _os_locked_total, _working_set_bytes() or 0, _lock_plan)
     ceiling = _nt_raise_working_set_quota(want)
     if not _kernel32.VirtualLock(ctypes.c_void_p(addr), nbytes):
         err = ctypes.get_last_error()

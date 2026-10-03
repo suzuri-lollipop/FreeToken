@@ -433,8 +433,8 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
         labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
         downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
         if downgraded:
-            # a flat-residency boot labels every layer locked, so name the count when the
-            # list would run to the whole model
+            # an auto split can downgrade most of the model, so name the count when
+            # the list would run to the whole model
             shown = downgraded if len(downgraded) <= 12 else f"{len(downgraded)} layers"
             msg = (
                 f"host-locked banks: {shown} settled pageable instead of OS-locked; their bytes "
