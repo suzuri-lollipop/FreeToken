@@ -1,11 +1,14 @@
-// Disk-backed PLE row store: rows read straight from the checkpoint's fp8 shard tensors
-// through an extent table (PleRowSource in ple_ssd.py). Engine-thread only, no locks.
-// Duplicate rows in one fill dedup into ONE batched read round; no per-sequence state.
-// An optional host row LRU (row_cache_mb / row_cache_rows; env FREETOKEN_PLE_ROW_CACHE_MB
-// resolved in ple_disk.py, default 1024) serves repeated rows from RAM -- shared prefixes
-// across requests and decode revisits stop re-reading the O_DIRECT table, which matters
-// most when the device latency spikes.
-// Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
+// Disk-backed row store: fixed-width rows read straight from checkpoint shard tensors
+// through an extent table (row i of extent e at extent_base[e] + i * row_stride).
+// Engine-thread only, no locks. Duplicate rows in one fill dedup into ONE batched read
+// round; no per-sequence state. An optional host row LRU (row_cache_mb / row_cache_rows
+// ctor args; env FREETOKEN_PLE_ROW_CACHE_MB resolved in ple_disk.py) serves repeated rows
+// from RAM -- shared prefixes and decode revisits stop re-reading the O_DIRECT table.
+//
+//   RowStore  -- hash-agnostic: stage_rows(row_ids) + flush(); callers supply row ids.
+//   PleStore  -- RowStore plus the Qwen3.8-Flash-Next PLE n-gram hash: stage(tokens).
+//                Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
+//
 // Platform seams: TableFile (O_DIRECT+pread; Win: NO_BUFFERING), BatchReader (io_uring,
 // pread-pool fallback = the portable shape), cumemop_* (dlopen libcuda; Win: nvcuda).
 
@@ -312,7 +315,9 @@ class ThreadPoolBatchReader final : public BatchReader {
   ThreadPoolBatchReader() {
     // these threads block on I/O, not compute, so the core count is only a default
     unsigned n = std::max(1u, std::min(kReaderThreads, std::thread::hardware_concurrency()));
-    if (const char *env = std::getenv("FREETOKEN_PLE_READER_THREADS")) {
+    const char *env = std::getenv("FREETOKEN_ROW_STORE_READER_THREADS");
+    if (env == nullptr) env = std::getenv("FREETOKEN_PLE_READER_THREADS");  // the PLE-era name
+    if (env != nullptr) {
       // kBatchEntries is the submit depth, so threads past it never get a read
       const int v = std::atoi(env);
       if (v > 0) n = std::min((unsigned)v, kBatchEntries);
@@ -561,30 +566,24 @@ int64_t pos_mod(int64_t v, int64_t m) {
   return r < 0 ? r + m : r;
 }
 
-class PleStore {
+class RowStore {
   struct Extent {
     const TableFile *file;
     int64_t base;
   };
 
  public:
-  PleStore(std::vector<std::string> paths, std::vector<int64_t> extent_file,
+  RowStore(std::vector<std::string> paths, std::vector<int64_t> extent_file,
            std::vector<int64_t> extent_base, int64_t rows_per_extent, int64_t row_bytes,
-           int64_t row_stride, std::vector<int64_t> multipliers, std::vector<int64_t> head_vocab_sizes,
-           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring,
-           int64_t row_cache_mb, int64_t row_cache_rows)
-      : row_bytes_(row_bytes),
-        row_stride_(row_stride),
-        rows_per_extent_(rows_per_extent),
-        mult_(std::move(multipliers)),
-        sizes_(std::move(head_vocab_sizes)),
-        offsets_(std::move(head_offsets)),
-        eos_(eos_token_id) {
-    if (mult_.size() != 3 || sizes_.size() != offsets_.size() || sizes_.empty())
-      throw std::runtime_error("PLE hash geometry: want 3 multipliers and equal-length head tables");
+           int64_t row_stride, bool use_io_uring, int64_t row_cache_mb, int64_t row_cache_rows)
+      : row_bytes_(row_bytes), row_stride_(row_stride), rows_per_extent_(rows_per_extent) {
+    if (row_bytes_ <= 0 || row_stride_ < row_bytes_ || rows_per_extent_ <= 0)
+      throw std::runtime_error("row store geometry: want row_bytes > 0, row_stride >= row_bytes, rows_per_extent > 0");
     if (row_bytes_ > kPage)
-      throw std::runtime_error("PLE row_bytes " + std::to_string(row_bytes_) +
+      throw std::runtime_error("row_bytes " + std::to_string(row_bytes_) +
                                " exceeds a page; bounce slots assume one-page rows");
+    if (extent_file.size() != extent_base.size() || extent_file.empty())
+      throw std::runtime_error("row store geometry: extent_file and extent_base must be equal-length and non-empty");
     for (const std::string &p : paths)
       files_.push_back(std::make_unique<TableFile>(p));
     const int64_t extent_bytes = (rows_per_extent_ - 1) * row_stride_ + row_bytes_;
@@ -613,86 +612,39 @@ class PleStore {
   }
 
   // reader first: a still-running read must not land in freed bounce memory
-  ~PleStore() {
+  virtual ~RowStore() {
     reader_.reset();
     page_aligned_free(bounce_);
   }
 
-  PleStore(const PleStore &) = delete;
-  PleStore &operator=(const PleStore &) = delete;
+  RowStore(const RowStore &) = delete;
+  RowStore &operator=(const RowStore &) = delete;
 
-  // Row ids for the token at w[2] with context (w[0], w[1]); mirrors NGramEmbedding.row_ids incl. the eos barrier.
-  void hash_rows(const int64_t *w, int64_t *rows) {
-    const int64_t prev1 = w[1];
-    const int64_t prev2 = prev1 == eos_ ? eos_ : w[0];
-    const int64_t bigram = wrap_mul(w[2], mult_[0]) ^ wrap_mul(prev1, mult_[1]);
-    const int64_t trigram = bigram ^ wrap_mul(prev2, mult_[2]);
-    const size_t half = sizes_.size() / 2;
-    for (size_t h = 0; h < sizes_.size(); h++)
-      rows[h] = pos_mod(h < half ? bigram : trigram, sizes_[h]) + offsets_[h];
-  }
+  int64_t row_bytes() const { return row_bytes_; }
+  int64_t total_rows() const { return (int64_t)extents_.size() * rows_per_extent_; }
 
-  // Hash and queue one run: tokens_addr holds n+2 ids, the leading two are context. No I/O until flush().
-  void stage(uintptr_t tokens_addr, int64_t n, uintptr_t staging_addr) {
-    const int64_t *tokens = reinterpret_cast<const int64_t *>(tokens_addr);
+  // Queue n row ids (int64 at rows_addr); row i lands at staging_addr + i * dst_stride
+  // (dst_stride = 0 packs rows back to back). Out-of-range ids throw before any I/O is
+  // issued. No I/O until flush().
+  void stage_rows(uintptr_t rows_addr, int64_t n, uintptr_t staging_addr, int64_t dst_stride) {
+    const int64_t *rows = reinterpret_cast<const int64_t *>(rows_addr);
     uint8_t *staging = reinterpret_cast<uint8_t *>(staging_addr);
-    const size_t heads = sizes_.size();
-    std::vector<int64_t> rows(heads);
+    if (dst_stride == 0) dst_stride = row_bytes_;
+    if (dst_stride < row_bytes_)
+      throw std::runtime_error("stage_rows: dst_stride below row_bytes would overlap rows");
+    const int64_t total = total_rows();
     for (int64_t i = 0; i < n; i++) {
-      hash_rows(tokens + i, rows.data());
-      for (size_t h = 0; h < heads; h++)
-        request_row(rows[h], staging + ((size_t)i * heads + h) * row_bytes_);
+      if (rows[i] < 0 || rows[i] >= total)
+        throw std::out_of_range("stage_rows: row id " + std::to_string(rows[i]) + " outside [0, " +
+                                std::to_string(total) + ")");
     }
+    for (int64_t i = 0; i < n; i++) request_row(rows[i], staging + (size_t)i * (size_t)dst_stride);
   }
 
   // One batched disk round for everything staged; signals even when nothing was.
   void flush(uintptr_t signal_addr) {
     flush_pending();
     if (signal_addr) signal_flag(signal_addr);
-  }
-
-  // Whole deferred decode fill in one call, for the captured-graph flag-sync path:
-  // wait for the sampled-token readback event, build each request's [ctx2, ctx1, token]
-  // run straight from its host int32 token buffer (positions snapshot at dispatch entry)
-  // and the pinned readback, then stage + one disk round + flag signal. This ran as a
-  // per-request Python loop before, between the drain and the replay's memop WAIT --
-  // every microsecond of it was GPU idle.
-  // image_token_id >= 0 remaps context ids >= pad_shift (multimodal placeholders).
-  void fill_decode_graph(uintptr_t event_handle, const std::vector<int64_t> &ids_addrs,
-                         const std::vector<int64_t> &positions, uintptr_t readback_addr,
-                         uintptr_t staging_addr, int64_t image_token_id, int64_t pad_shift,
-                         uintptr_t signal_addr) {
-    const size_t n = ids_addrs.size();
-    if (positions.size() != n)
-      throw std::runtime_error("fill_decode_graph: ids/position count mismatch");
-    if (event_handle != 0) {
-      if (g_cu_event_sync == nullptr && !event_sync_available())
-        throw std::runtime_error("fill_decode_graph: cuEventSynchronize unavailable");
-      if (g_cu_event_sync(reinterpret_cast<void *>(event_handle)) != 0)
-        throw std::runtime_error("fill_decode_graph: readback event synchronize failed");
-    }
-    const int32_t *readback = reinterpret_cast<const int32_t *>(readback_addr);
-    uint8_t *staging = reinterpret_cast<uint8_t *>(staging_addr);
-    const size_t heads = sizes_.size();
-    const int64_t token_bytes = (int64_t)heads * row_bytes_;
-    std::vector<int64_t> rows(heads);
-    for (size_t i = 0; i < n; i++) {
-      const int32_t *ids = reinterpret_cast<const int32_t *>(ids_addrs[i]);
-      const int64_t p = positions[i];
-      int64_t w[3];
-      // mirrors ple_disk._context: eos pads past the start of the sequence
-      w[0] = p >= 2 ? ids[p - 2] : eos_;
-      w[1] = p >= 1 ? ids[p - 1] : eos_;
-      if (image_token_id >= 0) {
-        if (w[0] >= pad_shift) w[0] = image_token_id;
-        if (w[1] >= pad_shift) w[1] = image_token_id;
-      }
-      w[2] = readback[i];
-      hash_rows(w, rows.data());
-      for (size_t h = 0; h < heads; h++)
-        request_row(rows[h], staging + (int64_t)i * token_bytes + (int64_t)h * row_bytes_);
-    }
-    flush(signal_addr);
   }
 
   std::string io_backend() const {
@@ -717,16 +669,7 @@ class PleStore {
             (uint64_t)row_bytes_};
   }
 
- private:
-  struct Pending {
-    const TableFile *file;
-    int64_t read_off;
-    int64_t read_len;
-    int64_t row_off;  // row payload start inside the read buffer
-    int64_t row_id;   // for the row-cache insert on completion
-    std::vector<uint8_t *> dsts;
-  };
-
+ protected:
   // Queue dst on this fill's pending batch; duplicate rows fan out from one read, and
   // rows the RAM cache already holds copy straight into dst without joining the batch.
   void request_row(int64_t row_id, uint8_t *dst) {
@@ -757,11 +700,21 @@ class PleStore {
     pending_.push_back(std::move(p));
   }
 
+ private:
+  struct Pending {
+    const TableFile *file;
+    int64_t read_off;
+    int64_t read_len;
+    int64_t row_off;  // row payload start inside the read buffer
+    int64_t row_id;   // for the row-cache insert on completion
+    std::vector<uint8_t *> dsts;
+  };
+
   // Read every pending row in reader-capacity batches and fan out the copies.
   void flush_pending() {
     if (pending_.empty()) return;
     struct Cleanup {
-      PleStore *s;
+      RowStore *s;
       ~Cleanup() {
         s->pending_.clear();
         s->pending_index_.clear();
@@ -815,8 +768,6 @@ class PleStore {
   }
 
   int64_t row_bytes_, row_stride_, rows_per_extent_;
-  std::vector<int64_t> mult_, sizes_, offsets_;
-  int64_t eos_;
   std::vector<std::unique_ptr<TableFile>> files_;
   std::vector<Extent> extents_;
   std::unique_ptr<BatchReader> reader_;
@@ -835,10 +786,118 @@ class PleStore {
   uint64_t cache_hits_ = 0, cache_misses_ = 0, cache_evicts_ = 0;
 };
 
+// The Qwen3.8-Flash-Next PLE table: RowStore plus the checkpoint's n-gram hash, so a fill
+// takes raw token runs and never crosses the Python boundary per row.
+class PleStore final : public RowStore {
+ public:
+  PleStore(std::vector<std::string> paths, std::vector<int64_t> extent_file,
+           std::vector<int64_t> extent_base, int64_t rows_per_extent, int64_t row_bytes,
+           int64_t row_stride, std::vector<int64_t> multipliers, std::vector<int64_t> head_vocab_sizes,
+           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring,
+           int64_t row_cache_mb, int64_t row_cache_rows)
+      : RowStore(std::move(paths), std::move(extent_file), std::move(extent_base), rows_per_extent,
+                 row_bytes, row_stride, use_io_uring, row_cache_mb, row_cache_rows),
+        mult_(std::move(multipliers)),
+        sizes_(std::move(head_vocab_sizes)),
+        offsets_(std::move(head_offsets)),
+        eos_(eos_token_id) {
+    if (mult_.size() != 3 || sizes_.size() != offsets_.size() || sizes_.empty())
+      throw std::runtime_error("PLE hash geometry: want 3 multipliers and equal-length head tables");
+  }
+
+  // Row ids for the token at w[2] with context (w[0], w[1]); mirrors NGramEmbedding.row_ids incl. the eos barrier.
+  void hash_rows(const int64_t *w, int64_t *rows) {
+    const int64_t prev1 = w[1];
+    const int64_t prev2 = prev1 == eos_ ? eos_ : w[0];
+    const int64_t bigram = wrap_mul(w[2], mult_[0]) ^ wrap_mul(prev1, mult_[1]);
+    const int64_t trigram = bigram ^ wrap_mul(prev2, mult_[2]);
+    const size_t half = sizes_.size() / 2;
+    for (size_t h = 0; h < sizes_.size(); h++)
+      rows[h] = pos_mod(h < half ? bigram : trigram, sizes_[h]) + offsets_[h];
+  }
+
+  // Hash and queue one run: tokens_addr holds n+2 ids, the leading two are context. No I/O until flush().
+  void stage(uintptr_t tokens_addr, int64_t n, uintptr_t staging_addr) {
+    const int64_t *tokens = reinterpret_cast<const int64_t *>(tokens_addr);
+    uint8_t *staging = reinterpret_cast<uint8_t *>(staging_addr);
+    const size_t heads = sizes_.size();
+    std::vector<int64_t> rows(heads);
+    for (int64_t i = 0; i < n; i++) {
+      hash_rows(tokens + i, rows.data());
+      for (size_t h = 0; h < heads; h++)
+        request_row(rows[h], staging + ((size_t)i * heads + h) * (size_t)row_bytes());
+    }
+  }
+
+  // Whole deferred decode fill in one call, for the captured-graph flag-sync path:
+  // wait for the sampled-token readback event, build each request's [ctx2, ctx1, token]
+  // run straight from its host int32 token buffer (positions snapshot at dispatch entry)
+  // and the pinned readback, then stage + one disk round + flag signal. This ran as a
+  // per-request Python loop before, between the drain and the replay's memop WAIT --
+  // every microsecond of it was GPU idle.
+  // image_token_id >= 0 remaps context ids >= pad_shift (multimodal placeholders).
+  void fill_decode_graph(uintptr_t event_handle, const std::vector<int64_t> &ids_addrs,
+                         const std::vector<int64_t> &positions, uintptr_t readback_addr,
+                         uintptr_t staging_addr, int64_t image_token_id, int64_t pad_shift,
+                         uintptr_t signal_addr) {
+    const size_t n = ids_addrs.size();
+    if (positions.size() != n)
+      throw std::runtime_error("fill_decode_graph: ids/position count mismatch");
+    if (event_handle != 0) {
+      if (g_cu_event_sync == nullptr && !event_sync_available())
+        throw std::runtime_error("fill_decode_graph: cuEventSynchronize unavailable");
+      if (g_cu_event_sync(reinterpret_cast<void *>(event_handle)) != 0)
+        throw std::runtime_error("fill_decode_graph: readback event synchronize failed");
+    }
+    const int32_t *readback = reinterpret_cast<const int32_t *>(readback_addr);
+    uint8_t *staging = reinterpret_cast<uint8_t *>(staging_addr);
+    const size_t heads = sizes_.size();
+    const int64_t token_bytes = (int64_t)heads * row_bytes();
+    std::vector<int64_t> rows(heads);
+    for (size_t i = 0; i < n; i++) {
+      const int32_t *ids = reinterpret_cast<const int32_t *>(ids_addrs[i]);
+      const int64_t p = positions[i];
+      int64_t w[3];
+      // mirrors ple_disk._context: eos pads past the start of the sequence
+      w[0] = p >= 2 ? ids[p - 2] : eos_;
+      w[1] = p >= 1 ? ids[p - 1] : eos_;
+      if (image_token_id >= 0) {
+        if (w[0] >= pad_shift) w[0] = image_token_id;
+        if (w[1] >= pad_shift) w[1] = image_token_id;
+      }
+      w[2] = readback[i];
+      hash_rows(w, rows.data());
+      for (size_t h = 0; h < heads; h++)
+        request_row(rows[h], staging + (int64_t)i * token_bytes + (int64_t)h * row_bytes());
+    }
+    flush(signal_addr);
+  }
+
+ private:
+  std::vector<int64_t> mult_, sizes_, offsets_;
+  int64_t eos_;
+};
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  py::class_<PleStore>(m, "PleStore")
+  py::class_<RowStore>(m, "RowStore")
+      .def(py::init<std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>,
+                    int64_t, int64_t, int64_t, bool, int64_t, int64_t>(),
+           py::arg("paths"), py::arg("extent_file"), py::arg("extent_base"),
+           py::arg("rows_per_extent"), py::arg("row_bytes"), py::arg("row_stride"),
+           py::arg("use_io_uring") = true, py::arg("row_cache_mb") = 0,
+           py::arg("row_cache_rows") = -1)
+      .def("stage_rows", &RowStore::stage_rows, py::arg("rows_addr"), py::arg("n"),
+           py::arg("staging_addr"), py::arg("dst_stride") = 0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("flush", &RowStore::flush, py::arg("signal_addr") = 0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("io_backend", &RowStore::io_backend)
+      .def("cache_stats", &RowStore::cache_stats)
+      .def_property_readonly("row_bytes", &RowStore::row_bytes)
+      .def_property_readonly("total_rows", &RowStore::total_rows);
+  py::class_<PleStore, RowStore>(m, "PleStore")
       .def(py::init<std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>,
                     int64_t, int64_t, int64_t, std::vector<int64_t>,
                     std::vector<int64_t>, std::vector<int64_t>, int64_t, bool, int64_t, int64_t>(),
@@ -850,16 +909,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("row_cache_rows") = -1)
       .def("stage", &PleStore::stage, py::arg("tokens_addr"), py::arg("n"),
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
-      .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
-           py::call_guard<py::gil_scoped_release>())
       .def("fill_decode_graph", &PleStore::fill_decode_graph,
            py::arg("event_handle"), py::arg("ids_addrs"), py::arg("positions"),
            py::arg("readback_addr"), py::arg("staging_addr"),
            py::arg("image_token_id") = -1, py::arg("pad_shift") = 1000000,
            py::arg("signal_addr") = 0,
-           py::call_guard<py::gil_scoped_release>())
-      .def("io_backend", &PleStore::io_backend)
-      .def("cache_stats", &PleStore::cache_stats);
+           py::call_guard<py::gil_scoped_release>());
   m.def("event_sync_available", &event_sync_available);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));

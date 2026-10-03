@@ -10,10 +10,11 @@ import sys
 
 from setuptools import setup
 from torch.utils import cpp_extension
-from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
+from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension, ROCM_HOME
 
 
 ROOT = Path(__file__).parent
+KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include")
 
 # Windows has no lib64 and no GCC flag spelling; MSVC is the only host toolchain there.
 MSVC = sys.platform == "win32"
@@ -135,6 +136,43 @@ def _check_toolchain() -> None:
     module.check_nvcc_matches_torch()
 
 
+def _is_rocm() -> bool:
+    import torch
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _rocm_paths() -> tuple[list[str], list[str], str]:
+    candidates: list[Path] = []
+    if os.getenv("ROCM_HOME"):
+        candidates.append(Path(os.environ["ROCM_HOME"]))
+    if ROCM_HOME:
+        candidates.append(Path(ROCM_HOME))
+
+    # ROCm 7.14 PyTorch images ship the SDK as a Python package instead of
+    # installing it at /opt/rocm.
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec and spec.submodule_search_locations:
+        candidates.append(Path(next(iter(spec.submodule_search_locations))))
+    candidates.append(Path("/opt/rocm"))
+
+    for rocm_home in dict.fromkeys(candidates):
+        include_dir = rocm_home / "include"
+        library_dir = rocm_home / "lib"
+        if not (include_dir / "hip" / "hip_runtime.h").exists():
+            continue
+        if (library_dir / "libamdhip64.so").exists():
+            return [str(include_dir)], [str(library_dir)], "amdhip64"
+        versioned = sorted(library_dir.glob("libamdhip64.so.*"))
+        if versioned:
+            return [str(include_dir)], [str(library_dir)], f":{versioned[-1].name}"
+
+    searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
+    raise RuntimeError(
+        "A ROCm SDK with HIP headers and libamdhip64 is required to build on ROCm; "
+        f"searched: {searched}. Set ROCM_HOME to override."
+    )
+
+
 def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     if CUDA_HOME is None:
         raise RuntimeError(
@@ -197,7 +235,19 @@ def _build_ext_class():
     return _BuildExt
 
 
-cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
+IS_ROCM = _is_rocm()
+
+if IS_ROCM:
+    runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
+    runtime_link_args = [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
+    # These extensions contain host code only. BuildExtension supplies the ROCm
+    # platform defines to the C++ compiler; offload architecture flags belong on
+    # HIP device sources and would be rejected by the host compiler here.
+else:
+    runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
+    runtime_lib = "cudart"
+    runtime_link_args = []
+
 _activate_msvc_env()
 _check_toolchain()
 CLANG_CL = _find_clang_cl() if MSVC and cpp_extension.is_ninja_available() else None
@@ -210,12 +260,13 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
+            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+            library_dirs=runtime_library_dirs,
+            libraries=[runtime_lib],
             extra_compile_args=_cxx_flags(),
+            extra_link_args=runtime_link_args,
         ),
-        # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
+        # CPU-compute MoE executor for --moe-backend cpu. Links cudart/amdhip64 for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
         # use per-function target attributes (avx512bf16/avx512f) + a runtime
         # __builtin_cpu_supports dispatch, so the single binary stays portable
@@ -230,19 +281,20 @@ setup(
                 sources=[
                     "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
                 ],
-                include_dirs=cuda_include_dirs,
-                library_dirs=cuda_library_dirs,
-                libraries=["cudart"],
+                include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+                library_dirs=runtime_library_dirs,
+                libraries=[runtime_lib],
                 # c++20 is what makes clang-cl accept MSVC's <atomic> here (see _cxx_flags).
                 extra_compile_args=_cxx_flags(pthread=True, std="c++20" if MSVC else "c++17"),
+                extra_link_args=runtime_link_args,
             )
         ]),
-        # --ple-backend disk row store; the TableFile/BatchReader/cumemop seams carry Win32
-        # bodies, so this builds on Linux and Windows alike.
+        # disk-backed row store (PLE / Engram tables); the TableFile/BatchReader/cumemop
+        # seams carry Win32 bodies, so this builds on Linux and Windows alike.
         CppExtension(
-            name="freetoken.kernel._ple_store",
+            name="freetoken.kernel._row_store",
             sources=[
-                "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
             ],
             extra_compile_args=_cxx_flags(),
         ),

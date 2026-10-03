@@ -29,14 +29,14 @@
 #include <thread>
 #include <vector>
 
-// windows.h arrives through cuda_runtime_api.h, and its min/max macros collide with the
-// std::min / std::max the tiling loops call.
+// windows.h arrives through hip_compat's CUDA runtime include, and its min/max macros
+// collide with the std::min / std::max the tiling loops call.
 #if defined(_WIN32)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-#include <cuda_runtime_api.h>
+#include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
 #if defined(__linux__)
