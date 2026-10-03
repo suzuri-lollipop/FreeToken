@@ -30,6 +30,14 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+
+def _evictable_tokens(cm: "CacheManager") -> int:
+    """Evictable (warm, unkept) prefix-cache content in the KV pool, in tokens. Shared by the
+    `page_usage` fraction and the `evictable_kv_pages` gauge so the two never drift. Free-slot
+    accounting is subtracted by the caller, not here."""
+    return (cm.prefix_cache.full_evictable_size if (cm.is_hybrid or cm.is_swa)
+            else cm.prefix_cache.size_info.evictable_size)
+
 # snapshot_toolcall_anchor borrows a single slot from the shared ping-pong reserve;
 # keep enough free that the borrow can never starve the admission gate's 3-slot set.
 _ANCHOR_BORROW_MARGIN = 4
@@ -89,13 +97,26 @@ class CacheManager:
         point for the rest of the prompt. 1 (no-op) everywhere else."""
         return self.page_size if self.is_hybrid else 1
 
+    @property
+    def evictable_kv_pages(self) -> int:
+        """Warm (evictable, unkept) prefix-cache content in pages: contents resident in the
+        pool that no active request keeps, so they are excluded from ``page_usage``'s used."""
+        return _evictable_tokens(self) // self.page_size
+
+    @property
+    def evictable_mamba_slots(self) -> int:
+        """Warm GDN snapshots in the tree (hybrid only, 0 elsewhere)."""
+        return self.prefix_cache.mamba_evictable_size if self.is_hybrid else 0
+
+    @property
+    def evictable_swa_tokens(self) -> int:
+        """Warm (unlocked) window-pool tokens in the tree (SWA only, 0 elsewhere)."""
+        return self.prefix_cache.swa_evictable_size if (self.is_swa and self.swa_paged) else 0
+
     def page_usage(self) -> tuple[int, int]:
         """(used_pages, total_pages): allocated, non-evictable pages over the pool total
         (active requests + protected prefix; evictable prefix-cache pages are excluded)."""
-        total = self.num_pages
-        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
-                     else self.prefix_cache.size_info.evictable_size)
-        return total - len(self.free_slots) - evictable // self.page_size, total
+        return self.num_pages - len(self.free_slots) - _evictable_tokens(self) // self.page_size, self.num_pages
 
     def _make_prefix_cache(self, device, page_size, type):
         if type in ("hybrid_radix", "swa_radix"):

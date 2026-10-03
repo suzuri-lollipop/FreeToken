@@ -224,6 +224,11 @@ def tokenize_worker(
                         mamba_total_slots=msg.mamba_total_slots,
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
+                        kv_cached_pages=msg.kv_cached_pages,
+                        mamba_cached_slots=msg.mamba_cached_slots,
+                        swa_cached_tokens=msg.swa_cached_tokens,
+                        moe_used_slots=msg.moe_used_slots,
+                        moe_total_slots=msg.moe_total_slots,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)

@@ -1521,6 +1521,11 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
+    def resident_slots(self) -> int:
+        """#slots holding a valid expert right now (one host sync; dashboard gauge path,
+        never called inside forward)."""
+        return int((self.id_of_slot >= 0).sum())
+
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
             active = int(self.stat_active.item())

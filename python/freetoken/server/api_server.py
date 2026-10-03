@@ -184,6 +184,16 @@ class FrontendManager:
     cache_pools: Dict[str, int] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
+    # Whole-device accounting from the same ack, for /v1/meminfo: weights bytes, primary-rank
+    # device total, and the graph/activation headroom kept out of the pools. 0 until meta.
+    weights_bytes: int = 0
+    device_total_bytes: int = 0
+    nonpool_overhead_bytes: int = 0
+    # The RAW readiness ("meta", …) payload of EVERY TP rank, {rank: meta}: each rank owns a
+    # different device with its own weights and pool shards, so /meminfo can show all GPUs and
+    # sum the fleet. The flat fields above keep holding the primary rank's (panel behavior
+    # unchanged). {} until the acks arrive; an unranked payload lands under rank 0.
+    rank_metas: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
     # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
@@ -1086,12 +1096,25 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # (unit_bytes + the limits block + the pre-first-chat pool seed). Unpack the extras
         # aside so unit_bytes keeps its original three-key shape; unknown keys, if any, are inert.
         meta = dict(meta or {})
+        # Every TP rank now acks its own footprint; keep the raw per-rank payloads for the
+        # /meminfo fleet view, but populate the flat state (desktop panel, cache_geometry)
+        # only from the primary rank so a late rank's numbers never masquerade as the truth.
+        try:
+            rank = int(meta.get("rank", 0) or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        _GLOBAL_STATE.rank_metas[rank] = dict(meta)
+        if rank != 0:
+            return
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
         _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
+        _GLOBAL_STATE.weights_bytes = int(meta.pop("weights_bytes", 0) or 0)
+        _GLOBAL_STATE.device_total_bytes = int(meta.pop("device_total_bytes", 0) or 0)
+        _GLOBAL_STATE.nonpool_overhead_bytes = int(meta.pop("nonpool_overhead_bytes", 0) or 0)
         _GLOBAL_STATE.unit_bytes = meta
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind

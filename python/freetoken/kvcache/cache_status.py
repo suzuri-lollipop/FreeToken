@@ -194,6 +194,17 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
+    # Whole-device accounting for the /meminfo breakdown: weights bytes, device total and the
+    # graph/activation headroom kept out of the pools (all rank-local, captured in Engine init).
+    for _key, _attr in (
+        ("weights_bytes", "_weights_bytes"),
+        ("device_total_bytes", "_device_total"),
+        ("nonpool_overhead_bytes", "_nonpool_overhead_floor"),
+    ):
+        try:
+            meta[_key] = max(0, int(getattr(engine, _attr, 0) or 0))
+        except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
+            meta[_key] = 0
     # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)

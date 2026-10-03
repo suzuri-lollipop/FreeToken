@@ -2,8 +2,9 @@
 
 The FreeToken desktop app polls a handful of read-only endpoints every 1-2s to keep its UI
 current: ``GET /health`` (lifecycle), ``GET /v1/stats`` (runtime metrics), ``GET /v1/requests``
-(request-log ring, carries a ``?since=&limit=`` query string), ``GET /v1/cache/status``, and a
-bare ``GET /v1`` liveness probe. Uvicorn's ``uvicorn.access`` logger logs every one of these at
+(request-log ring, carries a ``?since=&limit=`` query string), ``GET /v1/cache/status``,
+``GET /v1/meminfo`` (the /meminfo dashboard's 3s poll), and a bare ``GET /v1`` liveness
+probe. Uvicorn's ``uvicorn.access`` logger logs every one of these at
 INFO, which floods both the engine's own stdout and the desktop's "Logs" screen (which tails
 that stdout) with lines nobody reads.
 
@@ -27,6 +28,8 @@ _POLLING_PATH_PREFIXES: tuple[str, ...] = (
     "/v1/stats",
     "/v1/requests",
     "/v1/cache/status",
+    "/v1/meminfo",
+    "/meminfo",
 )
 
 # The bare "/v1" probe is matched *exactly*, never as a prefix -- every path above (and

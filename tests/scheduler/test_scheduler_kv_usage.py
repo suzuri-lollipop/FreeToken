@@ -92,3 +92,32 @@ def test_log_cache_geometry_plain_model_kv_only(monkeypatch):
     line = lines[-1]
     assert "Cache rebuilt: KV 64 pages (1024 tokens, 1.00 GiB)" in line
     assert "swa" not in line and "mamba" not in line and "MoE" not in line
+
+
+def test_moe_residency_reports_slots_and_throttles_reads():
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    reads = {"n": 0}
+
+    class _Cache:
+        cache_size = 128
+
+        def resident_slots(self):
+            reads["n"] += 1
+            return 40
+
+    sched = SimpleNamespace(engine=SimpleNamespace(moe_offload_cache=_Cache()))
+    # First stamp refreshes; the next 15 serve the cached value (the gauge feeds a 3s
+    # dashboard, so the GPU slot map is never read on the hot decode path every step).
+    assert Scheduler._moe_residency(sched) == (40, 128)
+    for _ in range(15):
+        assert Scheduler._moe_residency(sched) == (40, 128)
+    assert reads["n"] == 1
+    assert Scheduler._moe_residency(sched) == (40, 128)  # 16th call refreshes again
+    assert reads["n"] == 2
+
+    # No offload cache (dense model / disabled): (0, 0) so the pool stays "unmeasured".
+    none_sched = SimpleNamespace(engine=SimpleNamespace(moe_offload_cache=None))
+    assert Scheduler._moe_residency(none_sched) == (0, 0)

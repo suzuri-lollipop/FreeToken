@@ -67,6 +67,7 @@ def _setup():
         _kv_usage_pages=cm.page_usage,
         _mamba_slot_usage=lambda: None,
         _swa_token_usage=lambda: None,
+        _moe_residency=lambda: (0, 0),
         _gpu_mem_bytes=lambda: 0,
         _match_stop_str=lambda _req: None,
         _account_prefill_debt=lambda _batch: None,

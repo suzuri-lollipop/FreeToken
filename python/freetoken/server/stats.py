@@ -32,10 +32,15 @@ class StatsTracker:
         self.completion_tokens_total = 0
         self.kv_used_pages = 0
         self.kv_total_pages = 0
+        self.kv_cached_pages = 0
         self.mamba_used_slots = 0
         self.mamba_total_slots = 0
+        self.mamba_cached_slots = 0
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
+        self.swa_cached_tokens = 0
+        self.moe_used_slots = 0
+        self.moe_total_slots = 0
         self.vram_bytes = 0
 
     @property
@@ -66,12 +71,18 @@ class StatsTracker:
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
             self.kv_used_pages = reply.kv_used_pages
             self.kv_total_pages = reply.kv_total_pages
+            self.kv_cached_pages = getattr(reply, "kv_cached_pages", 0)
         if getattr(reply, "mamba_total_slots", 0) > 0:  # hybrid (GDN) only
             self.mamba_used_slots = reply.mamba_used_slots
             self.mamba_total_slots = reply.mamba_total_slots
+            self.mamba_cached_slots = getattr(reply, "mamba_cached_slots", 0)
         if getattr(reply, "swa_total_tokens", 0) > 0:  # SWA (window pool) only
             self.swa_used_tokens = reply.swa_used_tokens
             self.swa_total_tokens = reply.swa_total_tokens
+            self.swa_cached_tokens = getattr(reply, "swa_cached_tokens", 0)
+        if getattr(reply, "moe_total_slots", 0) > 0:  # offloaded MoE experts only
+            self.moe_used_slots = getattr(reply, "moe_used_slots", 0)
+            self.moe_total_slots = reply.moe_total_slots
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
         if getattr(reply, "finished", False):

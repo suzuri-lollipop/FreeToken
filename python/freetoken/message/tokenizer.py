@@ -46,6 +46,14 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # Window (swa) pool token usage (used/total) for SWA models, else 0/0.
     swa_used_tokens: int = 0
     swa_total_tokens: int = 0
+    # Evictable (warm, unkept) content resident in each pool, same units as *_used. Pool
+    # occupancy = *_used + *_cached; only *_used is kept away from other requests.
+    kv_cached_pages: int = 0
+    mamba_cached_slots: int = 0
+    swa_cached_tokens: int = 0
+    # MoE expert-slot residency (filled/total) with an active offload cache, else 0/0.
+    moe_used_slots: int = 0
+    moe_total_slots: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
 

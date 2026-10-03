@@ -1,5 +1,6 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
+/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5), /v1/meminfo
+(VRAM breakdown) + /meminfo (its HTML dashboard).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -78,3 +79,16 @@ def register_control_routes(
         if get_model_sampling is not None:
             doc["model"]["sampling"] = get_model_sampling() or {}
         return doc
+
+    from fastapi.responses import HTMLResponse
+
+    from .meminfo import MEMINFO_HTML, build_meminfo
+
+    @app.get("/v1/meminfo")
+    async def meminfo():
+        return build_meminfo(get_state())
+
+    @app.get("/meminfo")
+    async def meminfo_page():
+        # Self-contained dashboard (vanilla JS polling /v1/meminfo); no assets, no build.
+        return HTMLResponse(MEMINFO_HTML)

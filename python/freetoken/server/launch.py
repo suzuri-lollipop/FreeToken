@@ -91,21 +91,28 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             _report_startup_error(ack_queue, exc)
             raise
 
-        if args.tp_info.is_primary():
-            # Report the real per-unit cache VRAM costs (KV/expert/mamba), the device-wide free
-            # VRAM, and the per-pool rebuild floors before the ready ack, so the supervisor has
-            # them (and the desktop's slider bounds) by the time the gate flips. Optional +
-            # best-effort: a failure here must never keep the model from serving, and older
-            # consumers ignore ("meta", …).
-            try:
-                from freetoken.kvcache.cache_status import compute_cache_status_meta
+        # Report the real per-unit cache VRAM costs (KV/expert/mamba), the device-wide free
+        # VRAM, the per-pool rebuild floors and this rank's whole-device footprint before the
+        # ready ack, so the supervisor has them (and the desktop's slider bounds) by the time
+        # the gate flips. EVERY rank reports its own payload keyed by rank: under TP each rank
+        # owns a different device with its own weights and pool shards, so the all-GPU meminfo
+        # view needs one per rank. Optional + best-effort: a failure here must never keep the
+        # model from serving, and older consumers ignore ("meta", …).
+        try:
+            from freetoken.kvcache.cache_status import compute_cache_status_meta
 
-                meta = compute_cache_status_meta(scheduler.engine)
-                # the parent must not touch CUDA to learn this
-                meta["gpus"] = scheduler.gpus
-                ack_queue.put(("meta", meta))
-            except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
-                pass
+            meta = compute_cache_status_meta(scheduler.engine)
+            # the parent must not touch CUDA to learn this
+            meta["gpus"] = scheduler.gpus
+            meta["rank"] = args.tp_info.rank
+            meta["tp_size"] = args.tp_info.size
+            ack_queue.put(("meta", meta))
+        except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
+            pass
+        # All ranks join this barrier so the ready ack cannot overtake a rank's still-in-flight
+        # meta: the supervisor stops draining ack_queue at ready and would never read it.
+        scheduler.sync_all_ranks()
+        if args.tp_info.is_primary():
             ack_queue.put("Scheduler is ready")
             # The supervisor stops draining ack_queue once ready, so uninstall the sink:
             # runtime cache rebuilds re-run the graph capture (which emits progress) and

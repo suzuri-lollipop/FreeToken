@@ -608,6 +608,10 @@ class Scheduler(SchedulerIOMixin):
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
+            kv_cached = self.cache_manager.evictable_kv_pages
+            mamba_cached = self.cache_manager.evictable_mamba_slots
+            swa_cached = self.cache_manager.evictable_swa_tokens
+            moe_used, moe_total = self._moe_residency()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -615,6 +619,11 @@ class Scheduler(SchedulerIOMixin):
                 m.mamba_total_slots = mamba_total
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
+                m.kv_cached_pages = kv_cached
+                m.mamba_cached_slots = mamba_cached
+                m.swa_cached_tokens = swa_cached
+                m.moe_used_slots = moe_used
+                m.moe_total_slots = moe_total
                 m.gpu_mem_bytes = mem
         self.status_reporter.report_batch(
             batch,
@@ -751,6 +760,18 @@ class Scheduler(SchedulerIOMixin):
             return None
         total = cm.swa_pool.swa_num_tokens - 1
         return total - cm.swa_available_size, total
+
+    def _moe_residency(self) -> Tuple[int, int]:
+        """(filled_slots, total_slots) of the MoE expert slot cache, else (0, 0). The slot
+        map lives on the GPU, so refresh at most every 16th stamped batch and serve the
+        cached value in between: the gauge feeds the 3s dashboard, never control."""
+        moc = getattr(self.engine, "moe_offload_cache", None)
+        if moc is None:
+            return 0, 0
+        self._moe_res_step = getattr(self, "_moe_res_step", -1) + 1
+        if self._moe_res_step % 16 == 0:
+            self._moe_res = (moc.resident_slots(), moc.cache_size)
+        return getattr(self, "_moe_res", (0, moc.cache_size))
 
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator
