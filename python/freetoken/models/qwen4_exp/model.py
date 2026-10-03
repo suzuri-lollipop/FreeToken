@@ -308,7 +308,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
-        if engine_config.ple_backend in ("disk", "swap"):
+        if engine_config.ple_backend == "disk":
             from freetoken.utils import download_hf_weight
 
             from .ple_disk import DiskRowTable, resolve_row_source
@@ -331,7 +331,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,
-                use_mmap=engine_config.ple_backend == "swap",
             )
             self._ple_table = disk_table
             for ple in ple_layers:

@@ -101,8 +101,7 @@ def resolve_row_source(folder: str) -> PleRowSource:
 
 
 class DiskRowTable:
-    """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk), or
-    served off a read-only mapping of the same shards so the OS pages them (--ple-backend swap)."""
+    """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
     def __init__(
         self,
@@ -112,7 +111,6 @@ class DiskRowTable:
         max_graph_rows: int = 256,
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
-        use_mmap: bool = False,
     ) -> None:
         from freetoken.kernel import _ple_store
 
@@ -146,11 +144,6 @@ class DiskRowTable:
             # O_DIRECT table; 0 keeps the historical read-every-fill behavior. Default
             # is deliberately modest: the expert banks already pin ~66 GiB of host RAM.
             row_cache_mb=int(os.getenv("FREETOKEN_PLE_ROW_CACHE_MB", "512") or "0"),
-            # swap: a row is one memcpy off one read-only mmap per shard, so the page cache, not a
-            # pinned budget or our LRU, decides what stays hot (and the kernel can drop it under
-            # memory pressure). The LRU above still answers repeats without a fault. If the
-            # filesystem refuses to map a shard, that shard stays on the pread path.
-            use_mmap=use_mmap,
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self.head_dim
@@ -184,9 +177,8 @@ class DiskRowTable:
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         if self._wait_sync and self._rows_gated(2):
             sync = "wait-sync bs1, launch-gating bs>=2 (shm one-shot AR interlock)"
-        self.backend = "swap" if use_mmap else "disk"
         logger.info_rank0(
-            f"PLE {self.backend} backend: {self._store.io_backend()}, {sync}"
+            f"PLE disk backend: {self._store.io_backend()}, {sync}"
             + (", cpp fill" if self._cpp_fill else "")
         )
 

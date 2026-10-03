@@ -6,9 +6,8 @@
 // across requests and decode revisits stop re-reading the O_DIRECT table, which matters
 // most when the device latency spikes.
 // Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
-// Platform seams: TableFile (O_DIRECT+pread, or one whole-file read-only mmap per shard when
-// the OS should page the rows; Win: NO_BUFFERING), BatchReader (io_uring, pread-pool fallback =
-// the portable shape, and the shape a mapped table needs), cumemop_* (dlopen libcuda; Win: nvcuda).
+// Platform seams: TableFile (O_DIRECT+pread; Win: NO_BUFFERING), BatchReader (io_uring,
+// pread-pool fallback = the portable shape), cumemop_* (dlopen libcuda; Win: nvcuda).
 
 #include <algorithm>
 #include <cerrno>
@@ -28,12 +27,12 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(__linux__) && __has_include(<linux/io_uring.h>)
 #include <linux/io_uring.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #define PLE_HAS_IO_URING 1
 #else
@@ -145,14 +144,13 @@ void pread_min(int fd, uint8_t *buf, int64_t len, int64_t need, int64_t off) {
 
 class TableFile {
  public:
-  // want_map (--ple-backend swap) maps the whole file read-only instead of reading per row: the
-  // page cache then IS the row tier (the kernel keeps hot rows and drops cold ones under RAM
-  // pressure). A file whose mmap is refused (a filesystem that cannot map it) stays on pread.
-  explicit TableFile(const std::string &path, bool want_map = false) {
-    // O_DIRECT would fight the mapping, so a mapped table reads through the page cache it needs
-    if (!want_map) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+  explicit TableFile(const std::string &path) {
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     direct_ = fd_ >= 0;
-    if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) {
+      fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      direct_ = false;
+    }
     if (fd_ < 0) throw std::runtime_error(path + ": " + std::strerror(errno));
     struct stat st{};
     if (fstat(fd_, &st) != 0) {
@@ -161,11 +159,9 @@ class TableFile {
     }
     size_ = st.st_size;
     if (!direct_) posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
-    if (want_map) map_in();
   }
 
   ~TableFile() {
-    if (mapped_) munmap(map_, (size_t)map_bytes_);
     if (fd_ >= 0) ::close(fd_);
   }
 
@@ -173,48 +169,18 @@ class TableFile {
   TableFile &operator=(const TableFile &) = delete;
 
   bool direct_io() const { return direct_; }
-  bool mapped() const { return mapped_; }
   int native_fd() const { return fd_; }
   int64_t size() const { return size_; }
 
-  // The one seam for "get these bytes into buf": the mapping copy faults the row in on the
-  // calling reader thread, so cold rows fault in parallel instead of stalling the engine thread.
-  void read_into(uint8_t *buf, int64_t len, int64_t need, int64_t off) const {
-    if (mapped_) {
-      if (off + len > map_bytes_)
-        throw std::runtime_error("mapped read past the end of the table at offset " +
-                                 std::to_string(off));
-      std::memcpy(buf, map_ + off, (size_t)len);
-      return;
-    }
-    pread_min(fd_, buf, len, need, off);
-  }
-
-  // keep buffered fallback reads out of the page cache; a no-op under direct I/O, and under a
-  // mapping, where discarding the cache would put every refill back on the device
+  // keep buffered fallback reads out of the page cache; a no-op under direct I/O
   void discard_cache(int64_t off, int64_t len) const {
-    if (!direct_ && !mapped_) posix_fadvise(fd_, off, len, POSIX_FADV_DONTNEED);
+    if (!direct_) posix_fadvise(fd_, off, len, POSIX_FADV_DONTNEED);
   }
 
  private:
   int fd_ = -1;
   bool direct_ = false;
-  bool mapped_ = false;
   int64_t size_ = 0;
-  uint8_t *map_ = nullptr;
-  int64_t map_bytes_ = 0;
-
-  // Whole file at offset 0: extents then address rows at map_ + base + i * stride with no
-  // page-aligned-offset bookkeeping (mmap takes only page-aligned offsets, headers are not).
-  void map_in() {
-    if (size_ <= 0) return;
-    void *p = mmap(nullptr, (size_t)size_, PROT_READ, MAP_SHARED, fd_, 0);
-    if (p == MAP_FAILED) return;
-    map_ = static_cast<uint8_t *>(p);
-    map_bytes_ = size_;
-    mapped_ = true;
-    madvise(map_, (size_t)map_bytes_, MADV_RANDOM);  // 160 B random rows: readahead wastes RAM
-  }
 };
 
 // ---- BatchReader: platform seam for parallel positioned reads ----
@@ -225,8 +191,8 @@ class BatchReader {
   virtual ~BatchReader() = default;
   virtual std::string name() const = 0;
   virtual unsigned capacity() const = 0;
-  virtual void submit(unsigned tag, const TableFile &file, uint8_t *buf, int64_t len,
-                      int64_t need, int64_t off) = 0;
+  virtual void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
+                      int64_t off) = 0;
   virtual unsigned wait_one() = 0;
   // reap every in-flight read so stale completions cannot leak into the next fill
   virtual void drain() noexcept = 0;
@@ -257,11 +223,11 @@ class ThreadPoolBatchReader final : public BatchReader {
   std::string name() const override { return "pread-pool x" + std::to_string(workers_.size()); }
   unsigned capacity() const override { return kBatchEntries; }
 
-  void submit(unsigned tag, const TableFile &file, uint8_t *buf, int64_t len, int64_t need,
+  void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
               int64_t off) override {
     {
       std::lock_guard<std::mutex> lock(mu_);
-      queue_.push_back(Req{tag, &file, buf, len, need, off});
+      queue_.push_back(Req{tag, fd, buf, len, need, off});
       in_flight_++;
     }
     work_cv_.notify_one();
@@ -288,7 +254,7 @@ class ThreadPoolBatchReader final : public BatchReader {
  private:
   struct Req {
     unsigned tag;
-    const TableFile *file;
+    int fd;
     uint8_t *buf;
     int64_t len;
     int64_t need;
@@ -311,7 +277,7 @@ class ThreadPoolBatchReader final : public BatchReader {
       }
       Done d{r.tag, {}};
       try {
-        r.file->read_into(r.buf, r.len, r.need, r.off);
+        pread_min(r.fd, r.buf, r.len, r.need, r.off);
       } catch (const std::exception &e) {
         d.error = e.what();
       }
@@ -383,12 +349,12 @@ class IoUringBatchReader final : public BatchReader {
   std::string name() const override { return "io_uring"; }
   unsigned capacity() const override { return entries_; }
 
-  void submit(unsigned tag, const TableFile &file, uint8_t *buf, int64_t len, int64_t need,
+  void submit(unsigned tag, int fd, uint8_t *buf, int64_t len, int64_t need,
               int64_t off) override {
     io_uring_sqe *sqe = &sqes_[sq_shadow_tail_ & *sq_mask_];
     std::memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_READ;
-    sqe->fd = file.native_fd();
+    sqe->fd = fd;
     sqe->addr = (uint64_t)(uintptr_t)buf;
     sqe->len = (uint32_t)len;
     sqe->off = (uint64_t)off;
@@ -497,7 +463,7 @@ class PleStore {
            std::vector<int64_t> extent_base, int64_t rows_per_extent, int64_t row_bytes,
            int64_t row_stride, std::vector<int64_t> multipliers, std::vector<int64_t> head_vocab_sizes,
            std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring,
-           int64_t row_cache_mb, int64_t row_cache_rows, bool use_mmap = false)
+           int64_t row_cache_mb, int64_t row_cache_rows)
       : row_bytes_(row_bytes),
         row_stride_(row_stride),
         rows_per_extent_(rows_per_extent),
@@ -510,13 +476,8 @@ class PleStore {
     if (row_bytes_ > kPage)
       throw std::runtime_error("PLE row_bytes " + std::to_string(row_bytes_) +
                                " exceeds a page; bounce slots assume one-page rows");
-    // A mapped table (--ple-backend swap) faults rows in through the page cache instead of
-    // re-reading the device on every fill; want_map_ keeps a refusal visible in io_backend().
-    want_map_ = use_mmap;
-    for (const std::string &p : paths) {
-      files_.push_back(std::make_unique<TableFile>(p, use_mmap));
-      mapped_files_ += files_.back()->mapped() ? 1 : 0;
-    }
+    for (const std::string &p : paths)
+      files_.push_back(std::make_unique<TableFile>(p));
     const int64_t extent_bytes = (rows_per_extent_ - 1) * row_stride_ + row_bytes_;
     for (size_t e = 0; e < extent_file.size(); e++) {
       const size_t fi = (size_t)extent_file.at(e);
@@ -527,8 +488,7 @@ class PleStore {
                                  std::to_string(files_[fi]->size()));
       extents_.push_back(Extent{files_[fi].get(), base});
     }
-    // A mapped row is a memcpy off the mapping, so it must run on a reader thread, not a ring
-    reader_ = make_batch_reader(use_io_uring && mapped_files_ == 0);
+    reader_ = make_batch_reader(use_io_uring);
     bounce_ = page_aligned_alloc((size_t)reader_->capacity() * kSpanMax);
     // row_cache_rows >= 0 wins over row_cache_mb (exact-slot sizing for tests);
     // both 0/negative -> cache off. The MB default lives in ple_disk.py (env), not here.
@@ -630,13 +590,7 @@ class PleStore {
     size_t direct = 0;
     for (const auto &f : files_) direct += f->direct_io() ? 1 : 0;
     std::string s = reader_->name();
-    // the buffered/direct split says nothing about a mapped file: its cache is the mapping
-    if (mapped_files_ > 0)
-      s += ", mmap " + std::to_string(mapped_files_) + "/" + std::to_string(files_.size()) +
-           " files (OS-paged)";
-    else if (want_map_)
-      s += ", mmap refused (buffered)";
-    else if (direct == files_.size())
+    if (direct == files_.size())
       s += ", O_DIRECT";
     else
       s += ", buffered " + std::to_string(files_.size() - direct) + "/" +
@@ -712,7 +666,7 @@ class PleStore {
     auto submit_slot = [&](unsigned tag) {
       const Pending &p = pending_[next];
       tag_pending[tag] = next++;
-      reader_->submit(tag, *p.file, bounce_ + (size_t)tag * kSpanMax, p.read_len,
+      reader_->submit(tag, p.file->native_fd(), bounce_ + (size_t)tag * kSpanMax, p.read_len,
                       p.row_off + row_bytes_, p.read_off);
     };
     try {
@@ -755,8 +709,6 @@ class PleStore {
   std::vector<int64_t> mult_, sizes_, offsets_;
   int64_t eos_;
   std::vector<std::unique_ptr<TableFile>> files_;
-  size_t mapped_files_ = 0;
-  bool want_map_ = false;
   std::vector<Extent> extents_;
   std::unique_ptr<BatchReader> reader_;
   uint8_t *bounce_ = nullptr;
@@ -780,14 +732,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<PleStore>(m, "PleStore")
       .def(py::init<std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>,
                     int64_t, int64_t, int64_t, std::vector<int64_t>,
-                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool, int64_t, int64_t,
-                    bool>(),
+                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool, int64_t, int64_t>(),
            py::arg("paths"), py::arg("extent_file"), py::arg("extent_base"),
            py::arg("rows_per_extent"), py::arg("row_bytes"), py::arg("row_stride"),
            py::arg("multipliers"),
            py::arg("head_vocab_sizes"), py::arg("head_offsets"), py::arg("eos_token_id"),
            py::arg("use_io_uring") = true, py::arg("row_cache_mb") = 0,
-           py::arg("row_cache_rows") = -1, py::arg("use_mmap") = false)
+           py::arg("row_cache_rows") = -1)
       .def("stage", &PleStore::stage, py::arg("tokens_addr"), py::arg("n"),
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,

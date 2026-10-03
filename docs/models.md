@@ -61,7 +61,4 @@ These families accept image input by default; pass `--text-model-only` to skip t
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next serves its 47.7 GiB PLE n-gram table through `--ple-backend`:
-  `disk` (default) re-reads rows from the checkpoint on every fill, `swap` maps the
-  checkpoint read-only so the OS page cache holds the hot rows, `pinned` page-locks
-  the whole table in host RAM.
+- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
