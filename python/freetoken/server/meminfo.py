@@ -99,7 +99,8 @@ def build_meminfo(state: Any) -> dict:
     ranks = []
     totals = {k: 0 for k in ("device_total_bytes", "weights_bytes", "overhead_bytes",
                              "pools_bytes", "cache_budget_bytes", "free_after_weights_bytes")}
-    pool_tot = {d[0]: {"bytes": 0, "units": 0, "unit_cost_sum": 0} for d in _POOL_DEFS}
+    pool_tot = {d[0]: {"bytes": 0, "units": 0, "unit_cost_sum": 0,
+                       "units_by_rank": [], "costs_by_rank": []} for d in _POOL_DEFS}
     for rank, m in ranks_in:
         pools = m.get("pools") or {}
         pbytes = {}
@@ -110,6 +111,10 @@ def build_meminfo(state: Any) -> dict:
             agg["bytes"] += nbytes
             agg["units"] = max(agg["units"], units)  # logical count is per-replica, not summed
             agg["unit_cost_sum"] += cost
+            # Under an uneven (bandwidth-weighted) shard the ranks disagree about what one
+            # unit costs, so the scalars above cannot be multiplied back into `bytes`.
+            agg["units_by_rank"].append(units)
+            agg["costs_by_rank"].append(cost)
         row = {"rank": rank, "gpus": list(m.get("gpus") or []),
                "device_total_bytes": _i(m, "device_total_bytes"),
                "weights_bytes": _i(m, "weights_bytes"),
@@ -158,6 +163,8 @@ def build_meminfo(state: Any) -> dict:
         measured = pinned is not None or cached is not None
         pools_out.append({"key": key, "label": label, "unit": unit,
                           "units": agg["units"], "unit_bytes": agg["unit_cost_sum"],
+                          "units_by_rank": agg["units_by_rank"],
+                          "unit_costs_by_rank": agg["costs_by_rank"],
                           "bytes": agg["bytes"],
                           # Headline occupancy = kept + evictable warm cache (what the pool
                           # actually holds), clamped to the allocation.
@@ -248,6 +255,8 @@ const GIB=1073741824;
 const COL={weights:'#64748b',kv:'#22c55e',swa:'#38bdf8',moe:'#f59e0b',mamba:'#a78bfa',
  overhead:'#94a3b8',residual:'#3f4a56',free:'#1a222c'};
 const fmt=b=>b==null||isNaN(b)||b<0?'-':(Math.abs(b)>=GIB?(b/GIB).toFixed(2)+' GiB':(b/1048576).toFixed(0)+' MiB');
+// Per-unit prices need sub-MiB digits: a KV token costs ~13 KiB and fmt() would print "0 MiB".
+const fmtu=b=>b==null||isNaN(b)||b<0?'-':(b>=GIB?(b/GIB).toFixed(2)+' GiB':b>=1048576?(b/1048576).toFixed(1)+' MiB':b>=1024?(b/1024).toFixed(1)+' KiB':b+' B');
 function gpuname(r){return (r.gpus||[]).map(g=>'GPU'+g.index+' '+g.name).join(' / ')||'-';}
 function poolcard(p){
  const cap=p.bytes,u=p.used_bytes,pin=p.pinned_bytes,ca=p.cached_bytes;
@@ -262,7 +271,11 @@ function poolcard(p){
    :(c0>0?`待機中：全 <b>${fmt(c0)}</b> はキャッシュとしてプールに残存 ・ 次リクエストで再利用`
      :'プール空 — まだ履歴は蓄積されていません'))
    :`確保 <b>${fmt(cap)}</b>（常駐） ・ ゲージ未稼働`;
- const units=`<div class="det">${(p.units||0).toLocaleString()} ${p.unit} × ${fmt(p.unit_bytes)}/u</div>`;
+ const per=p.units_by_rank||[],costs=p.unit_costs_by_rank||[];
+ const skew=per.length>1&&(new Set(per).size>1||new Set(costs).size>1);
+ const units=skew
+  ?`<div class="det">${per.map((n,i)=>`${n.toLocaleString()}×${fmtu(costs[i])}`).join(' + ')} ${p.unit}（rank別の枠×単価・積の和が上限）</div>`
+  :`<div class="det">${(p.units||0).toLocaleString()} ${p.unit} × ${fmtu(p.unit_bytes)}/u</div>`;
  return `<div class="card"><h3>${p.label}</h3>
  <div class="val"><b>${has?fmt(u):'—'}</b><span>${has?'蓄積 / 上限 '+fmt(cap)+pct:'上限 '+fmt(cap)+' ／ 蓄積 未計測'}</span></div>
  ${bar}<div class="det">${det}</div>${units}</div>`;}
@@ -290,7 +303,7 @@ function render(d){
   <td>${fmt((r.pools||{}).kv)}</td><td>${fmt((r.pools||{}).swa)}</td><td>${fmt((r.pools||{}).moe)}</td><td>${fmt((r.pools||{}).mamba)}</td>
   <td>${fmt(r.nonpool_overhead_bytes)}</td><td>${fmt(r.cache_budget_bytes)}</td><td>${r.live_bytes!=null?fmt(r.live_bytes):'-'}</td></tr>`).join('');
  const gtable=`<table class="gpus"><tr><th>Rank</th><th>GPU</th><th>総計</th><th>重み</th><th>KV</th><th>SWA</th><th>MoE</th><th>GDN</th><th>予備</th><th>予算</th><th>live</th></tr>${grows}</table>`;
- const note='使用中=確保済み(重み+プール+予備)+残余(rank0のみ実測)。各プールの「蓄積」=アクティブ(現役リクエストが排他使用中)+キャッシュ(生成後の履歴はここに自動で移る。破棄ではなく確保されたまま、次リクエストのプレフィックスヒットに使える)。barは実色=アクティブ・明るい分=キャッシュ。実VRAMは確保時点で確保分が常時在位するため推移しない。live/蓄積はrank0のゲージ比×全GPU確保分(対称シャードで厳密)。MoEプールに排他確保はなく、実色=直前のforwardが読んだスロット(残りもLRUがいつでも追い出せる)。JSON: <code>/v1/meminfo</code>';
+ const note='使用中=確保済み(重み+プール+予備)+残余(rank0のみ実測)。各プールの「蓄積」=アクティブ(現役リクエストが排他使用中)+キャッシュ(生成後の履歴はここに自動で移る。破棄ではなく確保されたまま、次リクエストのプレフィックスヒットに使える)。barは実色=アクティブ・明るい分=キャッシュ。実VRAMは確保時点で確保分が常時在位するため推移しない。live/蓄積はrank0のゲージ比×全GPU確保分(対称シャードで厳密)。MoEプールに排他確保はなく、実色=直前のforwardが読んだスロット(残りもLRUがいつでも追い出せる)。枠×単価の行が2項以上ならTPシャードが非対称で、各項の積の和が上限。JSON: <code>/v1/meminfo</code>';
  document.getElementById('app').innerHTML=top
   +'<h2>キャッシュプール — 蓄積と上限</h2>'+cards
   +'<h2>GPU ごとの割り当て</h2>'+gtable

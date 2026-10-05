@@ -109,8 +109,30 @@ def test_pools_report_allocated_and_used():
     assert moe["pinned_bytes"] == round(moe["bytes"] * 10 / 200)
     assert moe["cached_bytes"] == round(moe["bytes"] * 40 / 200)
     assert moe["used_bytes"] == moe["pinned_bytes"] + moe["cached_bytes"]
+    # The two scalars (max units, summed unit cost) cannot be multiplied back into `bytes`
+    # under an uneven shard, so the raw per-rank arrays ride along for the card footer.
+    assert moe["units_by_rank"] == [_MOE0, _MOE1]
+    assert moe["unit_costs_by_rank"] == [_MOE_SLOT, _MOE_SLOT]
+    assert kv["units_by_rank"] == [_KV0 * _PAGE, _KV1 * _PAGE]
+    assert mamba["unit_costs_by_rank"] == [_MAMBA_SLOT, _MAMBA_SLOT]
+    assert sum(u * c for u, c in zip(moe["units_by_rank"],
+                                     moe["unit_costs_by_rank"])) == moe["bytes"]
     # Absent pools (swa here) are omitted, not printed as a fake 0.
     assert all(p["key"] != "swa" for p in doc["pools"])
+
+
+def test_per_rank_units_track_an_uneven_expert_shard():
+    # Bandwidth-weighted TP shards: the thinner rank gets cheaper slots and MORE of them, so
+    # neither `units` (max) nor `unit_bytes` (sum) describes one GPU on its own.
+    st = _full_state()
+    st.rank_metas[1]["moe_bytes_per_expert"] = _MOE_SLOT * 2 // 3
+    st.rank_metas[1]["pools"]["moe_cache_size"] = (_MOE0 + _MOE1) * 3 // 2
+    moe = _pool(build_meminfo(st), "moe")
+    assert moe["unit_costs_by_rank"] == [_MOE_SLOT, _MOE_SLOT * 2 // 3]
+    assert moe["units_by_rank"] == [_MOE0, (_MOE0 + _MOE1) * 3 // 2]
+    assert moe["unit_bytes"] == _MOE_SLOT * 5 // 3
+    assert sum(u * c for u, c in zip(moe["units_by_rank"],
+                                     moe["unit_costs_by_rank"])) == moe["bytes"]
 
 
 def test_occupancy_clamps_to_allocation():
