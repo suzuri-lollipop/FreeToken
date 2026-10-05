@@ -40,6 +40,7 @@ class StatsTracker:
         self.swa_total_tokens = 0
         self.swa_cached_tokens = 0
         self.moe_used_slots = 0
+        self.moe_active_slots = 0
         self.moe_total_slots = 0
         self.vram_bytes = 0
 
@@ -82,6 +83,7 @@ class StatsTracker:
             self.swa_cached_tokens = getattr(reply, "swa_cached_tokens", 0)
         if getattr(reply, "moe_total_slots", 0) > 0:  # offloaded MoE experts only
             self.moe_used_slots = getattr(reply, "moe_used_slots", 0)
+            self.moe_active_slots = getattr(reply, "moe_active_slots", 0)
             self.moe_total_slots = reply.moe_total_slots
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
@@ -164,6 +166,13 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    # An LRU expert cache has no kept set: `filled` is the whole fill, `active` the part the
+    # last forward read.
+    moe = (
+        {"filled_slots": tr.moe_used_slots, "active_slots": tr.moe_active_slots,
+         "total_slots": tr.moe_total_slots}
+        if tr.moe_total_slots > 0 else None
+    )
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -171,6 +180,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "kv": kv,
         "mamba": mamba,
         "swa": swa,
+        "moe": moe,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {

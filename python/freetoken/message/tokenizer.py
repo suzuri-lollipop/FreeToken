@@ -52,7 +52,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     mamba_cached_slots: int = 0
     swa_cached_tokens: int = 0
     # MoE expert-slot residency (filled/total) with an active offload cache, else 0/0.
+    # Unlike the pools above, `used` here is the whole fill (every filled slot is evictable);
+    # `moe_active_slots` is the subset the last forward read, the rest is warm cache.
     moe_used_slots: int = 0
+    moe_active_slots: int = 0
     moe_total_slots: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0

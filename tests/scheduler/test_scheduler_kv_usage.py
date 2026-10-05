@@ -104,20 +104,30 @@ def test_moe_residency_reports_slots_and_throttles_reads():
     class _Cache:
         cache_size = 128
 
-        def resident_slots(self):
+        def residency_split(self):
             reads["n"] += 1
-            return 40
+            return 40, 6
 
-    sched = SimpleNamespace(engine=SimpleNamespace(moe_offload_cache=_Cache()))
+    sched = SimpleNamespace(engine=SimpleNamespace(moe_offload_cache=_Cache()),
+                            decode_manager=SimpleNamespace(running_reqs=[1]),
+                            prefill_manager=SimpleNamespace(pending_list=[]))
     # First stamp refreshes; the next 15 serve the cached value (the gauge feeds a 3s
     # dashboard, so the GPU slot map is never read on the hot decode path every step).
-    assert Scheduler._moe_residency(sched) == (40, 128)
+    assert Scheduler._moe_residency(sched) == (40, 6, 128)
     for _ in range(15):
-        assert Scheduler._moe_residency(sched) == (40, 128)
+        assert Scheduler._moe_residency(sched) == (40, 6, 128)
     assert reads["n"] == 1
-    assert Scheduler._moe_residency(sched) == (40, 128)  # 16th call refreshes again
+    assert Scheduler._moe_residency(sched) == (40, 6, 128)  # 16th call refreshes again
     assert reads["n"] == 2
 
-    # No offload cache (dense model / disabled): (0, 0) so the pool stays "unmeasured".
+    # Idle: the warm fill stays but the working set must not freeze at the last batch's.
+    sched.decode_manager.running_reqs = []
+    assert Scheduler._moe_residency(sched) == (40, 0, 128)
+    # A queued prefill is busy too -- chunked prefill reads experts with nothing running yet.
+    sched.prefill_manager.pending_list = [1]
+    assert Scheduler._moe_residency(sched) == (40, 6, 128)
+    assert reads["n"] == 2  # the busy check is free, no extra device read
+
+    # No offload cache (dense model / disabled): 0s so the pool stays "unmeasured".
     none_sched = SimpleNamespace(engine=SimpleNamespace(moe_offload_cache=None))
-    assert Scheduler._moe_residency(none_sched) == (0, 0)
+    assert Scheduler._moe_residency(none_sched) == (0, 0, 0)

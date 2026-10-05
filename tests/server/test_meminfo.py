@@ -52,7 +52,8 @@ _KV1, _MOE1, _MAN1 = 90, 240, 8    # rank1 unit counts (uneven shards)
 def _full_state():
     stats = SimpleNamespace(vram_bytes=10 * GIB, kv_used_pages=10, kv_total_pages=100,
                             kv_cached_pages=25, mamba_used_slots=2, mamba_total_slots=8,
-                            mamba_cached_slots=1, moe_used_slots=50, moe_total_slots=200)
+                            mamba_cached_slots=1, moe_used_slots=50, moe_active_slots=10,
+                            moe_total_slots=200)
     return SimpleNamespace(
         config=SimpleNamespace(served_model_name="m", page_size=_PAGE, tp_size=2),
         stats=stats,
@@ -102,11 +103,12 @@ def test_pools_report_allocated_and_used():
     assert mamba["used_bytes"] == round(mamba["bytes"] * 3 / 8)
     assert mamba["cached_bytes"] == round(mamba["bytes"] * 1 / 8)
     assert mamba["det_mode"] == "split"
-    # MoE residency gauge: rank0 filled 50/200 slots -> 25% of the summed allocation,
-    # reported as a single resident bar (no kept/evictable split).
-    assert moe["det_mode"] == "resident" and moe["used_mode"] == "rank0"
-    assert moe["used_bytes"] == round(moe["bytes"] * 50 / 200)
-    assert moe["cached_bytes"] is None
+    # MoE: rank0 filled 50/200 slots and the last forward read 10 of them -> the fill splits
+    # like the others (working set + warm rest), never as an exclusively held bar.
+    assert moe["det_mode"] == "working_set" and moe["used_mode"] == "rank0"
+    assert moe["pinned_bytes"] == round(moe["bytes"] * 10 / 200)
+    assert moe["cached_bytes"] == round(moe["bytes"] * 40 / 200)
+    assert moe["used_bytes"] == moe["pinned_bytes"] + moe["cached_bytes"]
     # Absent pools (swa here) are omitted, not printed as a fake 0.
     assert all(p["key"] != "swa" for p in doc["pools"])
 
@@ -147,6 +149,21 @@ def test_usage_gauges_none_when_never_sampled():
     st.stats = SimpleNamespace(vram_bytes=10 * GIB, kv_used_pages=10, kv_total_pages=100)
     kv = _pool(build_meminfo(st), "kv")
     assert kv["cached_bytes"] == 0 and kv["used_bytes"] == kv["pinned_bytes"]
+    # A backend that reports no MoE working set: the whole fill shows as warm cache.
+    st.stats = SimpleNamespace(vram_bytes=10 * GIB, moe_used_slots=50, moe_total_slots=200)
+    moe = _pool(build_meminfo(st), "moe")
+    assert moe["pinned_bytes"] == 0 and moe["cached_bytes"] == round(moe["bytes"] * 50 / 200)
+    # An oversized active gauge (stale sample) can never out-report the fill inside it.
+    st.stats = SimpleNamespace(vram_bytes=10 * GIB, moe_used_slots=50, moe_active_slots=90,
+                               moe_total_slots=200)
+    moe = _pool(build_meminfo(st), "moe")
+    assert moe["pinned_bytes"] == round(moe["bytes"] * 50 / 200) and moe["cached_bytes"] == 0
+
+
+def test_live_gauges_carry_the_moe_split():
+    live = build_meminfo(_full_state())["live"]
+    assert (live["moe_used_slots"], live["moe_active_slots"], live["moe_total_slots"]) == (
+        50, 10, 200)
 
 
 def test_flat_fallback_and_bare_state_never_raise():

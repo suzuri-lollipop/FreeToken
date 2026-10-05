@@ -76,6 +76,18 @@ def _pool_alloc(pools: dict, ub: dict, cfg: Any, key: str) -> tuple:
     return 0, 0, 0
 
 
+def _moe_ratios(stats: Any) -> tuple:
+    """(working-set, warm-cache) fill fractions of the MoE slot cache, or (None, None) when
+    the gauge never ran. Both are fractions of the cache: `active` is what the last forward
+    read, the rest of the fill is warm cache, and nothing in this pool is kept from eviction."""
+    total = _i(stats, "moe_total_slots")
+    if total <= 0:
+        return None, None
+    filled = min(_i(stats, "moe_used_slots"), total)
+    active = min(_i(stats, "moe_active_slots"), filled)
+    return active / total, (filled - active) / total
+
+
 def build_meminfo(state: Any) -> dict:
     """Full /v1/meminfo doc from a FrontendManager-like state, summed over all TP ranks.
     Never raises: a field the backend never sent (older build, still loading) reports 0."""
@@ -130,9 +142,9 @@ def build_meminfo(state: Any) -> dict:
                      _ratio("kv_cached_pages", "kv_total_pages")),
               "swa": (_ratio("swa_used_tokens", "swa_total_tokens"),
                       _ratio("swa_cached_tokens", "swa_total_tokens")),
-              # MoE residency is a single filled/total count (no kept-vs-evictable split):
-              # every filled slot holds a warm expert that any future routing may evict.
-              "moe": (_ratio("moe_used_slots", "moe_total_slots"), None),
+              # MoE has no kept set (every filled slot is evictable), so its split is the
+              # last forward's working set against the warm rest of the fill.
+              "moe": _moe_ratios(stats),
               "mamba": (_ratio("mamba_used_slots", "mamba_total_slots"),
                         _ratio("mamba_cached_slots", "mamba_total_slots"))}
     pools_out = []
@@ -152,9 +164,10 @@ def build_meminfo(state: Any) -> dict:
                           "used_bytes": min(agg["bytes"], (pinned or 0) + (cached or 0))
                           if measured else None,
                           "pinned_bytes": pinned, "cached_bytes": cached,
-                          # "resident": single filled-count gauge (MoE); "split": kept +
-                          # evictable warm cache (KV / GDN / SWA).
-                          "det_mode": "resident" if key == "moe" else "split",
+                          # "split": kept + evictable warm cache (KV / GDN / SWA);
+                          # "working_set": nothing is kept from eviction, so the dark part is
+                          # the last forward's working set instead (MoE).
+                          "det_mode": "working_set" if key == "moe" else "split",
                           "used_mode": "rank0" if measured else "none"})
 
     residual = sum(r_["residual_bytes"] for r_ in ranks)
@@ -182,7 +195,10 @@ def build_meminfo(state: Any) -> dict:
                  "kv_total_pages": _i(stats, "kv_total_pages"),
                  "mamba_used_slots": _i(stats, "mamba_used_slots"),
                  "mamba_cached_slots": _i(stats, "mamba_cached_slots"),
-                 "mamba_total_slots": _i(stats, "mamba_total_slots")},
+                 "mamba_total_slots": _i(stats, "mamba_total_slots"),
+                 "moe_used_slots": _i(stats, "moe_used_slots"),
+                 "moe_active_slots": _i(stats, "moe_active_slots"),
+                 "moe_total_slots": _i(stats, "moe_total_slots")},
     }
 
 
@@ -240,13 +256,11 @@ function poolcard(p){
  const fpin=has&&cap>0?Math.min(100,100*(pin||0)/cap):0;
  const fca=has?Math.max(0,f-fpin):0;
  const bar=`<div class="bar"><i style="width:${fpin.toFixed(1)}%;background:${COL[p.key]}"></i><i style="width:${fca.toFixed(1)}%;background:${COL[p.key]};opacity:.45"></i></div>`;
- const resident=p.det_mode==='resident',p0=pin||0,c0=ca||0;
- const det=has?(resident
-   ?`常駐エキスパート <b>${fmt(pin)}</b> ／ 確保 ${fmt(cap)}（LRU で蓄積）`
-   :(p0>0
-     ?`うちアクティブ(排他) <b>${fmt(p0)}</b> ・ キャッシュ <b>${fmt(c0)}</b>（退避可） ／ rank0比率×全GPU確保`
-     :(c0>0?`待機中：全 <b>${fmt(c0)}</b> はキャッシュとしてプールに残存 ・ 次リクエストで再利用`
-       :'プール空 — まだ履歴は蓄積されていません')))
+ const ws=p.det_mode==='working_set',p0=pin||0,c0=ca||0;
+ const det=has?(p0>0
+   ?`${ws?'うち現役ステップが使用':'うちアクティブ(排他)'} <b>${fmt(p0)}</b> ・ キャッシュ <b>${fmt(c0)}</b>（退避可） ／ rank0比率×全GPU確保`
+   :(c0>0?`待機中：全 <b>${fmt(c0)}</b> はキャッシュとしてプールに残存 ・ 次リクエストで再利用`
+     :'プール空 — まだ履歴は蓄積されていません'))
    :`確保 <b>${fmt(cap)}</b>（常駐） ・ ゲージ未稼働`;
  const units=`<div class="det">${(p.units||0).toLocaleString()} ${p.unit} × ${fmt(p.unit_bytes)}/u</div>`;
  return `<div class="card"><h3>${p.label}</h3>
@@ -276,7 +290,7 @@ function render(d){
   <td>${fmt((r.pools||{}).kv)}</td><td>${fmt((r.pools||{}).swa)}</td><td>${fmt((r.pools||{}).moe)}</td><td>${fmt((r.pools||{}).mamba)}</td>
   <td>${fmt(r.nonpool_overhead_bytes)}</td><td>${fmt(r.cache_budget_bytes)}</td><td>${r.live_bytes!=null?fmt(r.live_bytes):'-'}</td></tr>`).join('');
  const gtable=`<table class="gpus"><tr><th>Rank</th><th>GPU</th><th>総計</th><th>重み</th><th>KV</th><th>SWA</th><th>MoE</th><th>GDN</th><th>予備</th><th>予算</th><th>live</th></tr>${grows}</table>`;
- const note='使用中=確保済み(重み+プール+予備)+残余(rank0のみ実測)。各プールの「蓄積」=アクティブ(現役リクエストが排他使用中)+キャッシュ(生成後の履歴はここに自動で移る。破棄ではなく確保されたまま、次リクエストのプレフィックスヒットに使える)。barは実色=アクティブ・明るい分=キャッシュ。実VRAMは確保時点で確保分が常時在位するため推移しない。live/蓄積はrank0のゲージ比×全GPU確保分(対称シャードで厳密)。JSON: <code>/v1/meminfo</code>';
+ const note='使用中=確保済み(重み+プール+予備)+残余(rank0のみ実測)。各プールの「蓄積」=アクティブ(現役リクエストが排他使用中)+キャッシュ(生成後の履歴はここに自動で移る。破棄ではなく確保されたまま、次リクエストのプレフィックスヒットに使える)。barは実色=アクティブ・明るい分=キャッシュ。実VRAMは確保時点で確保分が常時在位するため推移しない。live/蓄積はrank0のゲージ比×全GPU確保分(対称シャードで厳密)。MoEプールに排他確保はなく、実色=直前のforwardが読んだスロット(残りもLRUがいつでも追い出せる)。JSON: <code>/v1/meminfo</code>';
  document.getElementById('app').innerHTML=top
   +'<h2>キャッシュプール — 蓄積と上限</h2>'+cards
   +'<h2>GPU ごとの割り当て</h2>'+gtable

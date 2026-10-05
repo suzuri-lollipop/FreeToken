@@ -228,6 +228,7 @@ def tokenize_worker(
                         mamba_cached_slots=msg.mamba_cached_slots,
                         swa_cached_tokens=msg.swa_cached_tokens,
                         moe_used_slots=msg.moe_used_slots,
+                        moe_active_slots=msg.moe_active_slots,
                         moe_total_slots=msg.moe_total_slots,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
                     )

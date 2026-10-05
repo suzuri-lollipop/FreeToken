@@ -612,7 +612,7 @@ class Scheduler(SchedulerIOMixin):
             kv_cached = self.cache_manager.evictable_kv_pages
             mamba_cached = self.cache_manager.evictable_mamba_slots
             swa_cached = self.cache_manager.evictable_swa_tokens
-            moe_used, moe_total = self._moe_residency()
+            moe_used, moe_live, moe_total = self._moe_residency()
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -624,6 +624,7 @@ class Scheduler(SchedulerIOMixin):
                 m.mamba_cached_slots = mamba_cached
                 m.swa_cached_tokens = swa_cached
                 m.moe_used_slots = moe_used
+                m.moe_active_slots = moe_live
                 m.moe_total_slots = moe_total
                 m.gpu_mem_bytes = mem
         self.status_reporter.report_batch(
@@ -762,17 +763,24 @@ class Scheduler(SchedulerIOMixin):
         total = cm.swa_pool.swa_num_tokens - 1
         return total - cm.swa_available_size, total
 
-    def _moe_residency(self) -> Tuple[int, int]:
-        """(filled_slots, total_slots) of the MoE expert slot cache, else (0, 0). The slot
-        map lives on the GPU, so refresh at most every 16th stamped batch and serve the
-        cached value in between: the gauge feeds the 3s dashboard, never control."""
+    def _moe_residency(self) -> Tuple[int, int, int]:
+        """(filled_slots, live_slots, total_slots) of the MoE expert slot cache, else 0s.
+        ``live`` is the last forward's working set, the only part of an LRU expert cache
+        anything is actually reading. The slot map lives on the GPU, so refresh at most every
+        16th stamped batch and serve the cached value in between: the gauge feeds the 3s
+        dashboard, never control."""
         moc = getattr(self.engine, "moe_offload_cache", None)
         if moc is None:
-            return 0, 0
+            return 0, 0, 0
         self._moe_res_step = getattr(self, "_moe_res_step", -1) + 1
         if self._moe_res_step % 16 == 0:
-            self._moe_res = (moc.resident_slots(), moc.cache_size)
-        return getattr(self, "_moe_res", (0, moc.cache_size))
+            self._moe_res = (*moc.residency_split(), moc.cache_size)
+        filled, live, total = getattr(self, "_moe_res", (0, 0, moc.cache_size))
+        if not (self.decode_manager.running_reqs or self.prefill_manager.pending_list):
+            # Idle: no forward is reading experts, so every held slot is warm cache -- and the
+            # cached tuple above would otherwise freeze the last batch's working set forever.
+            live = 0
+        return filled, live, total
 
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator

@@ -1598,14 +1598,22 @@ def test_miss_route_mask_unions_the_k_split_plans(monkeypatch):
     assert not cache.miss_route_mask(ids2, (0, 1)).any()
 
 
-def test_resident_slots_counts_only_filled_slots():
-    # The dashboard gauge counts valid slot-map entries; -1 marks an empty slot. The
+def test_residency_split_separates_working_set_from_warm_cache():
+    # The gauge counts valid slot-map entries (-1 = empty slot) and, among them, the slots
+    # stamped within the last forward (num_layers step increments back from `step`). The
     # unbound method works on a duck-typed namespace so no CUDA cache is needed here.
     from types import SimpleNamespace
 
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    fake = SimpleNamespace(id_of_slot=torch.tensor([-1, 0, 5, -1, 7, -1], dtype=torch.int32))
-    assert OffloadMoeCache.resident_slots(fake) == 3
-    empty = SimpleNamespace(id_of_slot=torch.full((8,), -1, dtype=torch.int32))
-    assert OffloadMoeCache.resident_slots(empty) == 0
+    fake = SimpleNamespace(
+        id_of_slot=torch.tensor([-1, 0, 5, -1, 7, -1], dtype=torch.int32),
+        usage=torch.tensor([0, 42, 12, 0, 41, 0], dtype=torch.int64),
+        step=torch.tensor(44, dtype=torch.int64), num_layers=4)
+    # Filled 3; of those, slots 1 and 4 were touched in steps 41..44 and slot 2 is warm.
+    assert OffloadMoeCache.residency_split(fake) == (3, 2)
+
+    empty = SimpleNamespace(id_of_slot=torch.full((8,), -1, dtype=torch.int32),
+                            usage=torch.full((8,), 99, dtype=torch.int64),
+                            step=torch.tensor(100, dtype=torch.int64), num_layers=4)
+    assert OffloadMoeCache.residency_split(empty) == (0, 0)

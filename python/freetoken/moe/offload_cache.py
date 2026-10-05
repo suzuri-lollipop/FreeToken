@@ -1456,10 +1456,15 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
-    def resident_slots(self) -> int:
-        """#slots holding a valid expert right now (one host sync; dashboard gauge path,
-        never called inside forward)."""
-        return int((self.id_of_slot >= 0).sum())
+    def residency_split(self) -> tuple[int, int]:
+        """(#slots holding a valid expert, #of them read or fetched by the last forward),
+        one host sync; the dashboard gauge path, never called inside forward. ``step``
+        advances once per MoE-layer call, so one forward spans ``num_layers`` of them and
+        the second count is that forward's working set. Everything filled but not in it is
+        warm cache: the LRU may evict any of those slots on the next call."""
+        filled = self.id_of_slot >= 0
+        live = filled & (self.usage > self.step - self.num_layers)
+        return int(filled.sum()), int(live.sum())
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
