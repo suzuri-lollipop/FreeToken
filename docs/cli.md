@@ -90,10 +90,22 @@ What is TP-sharded today:
 * **Experts**: the offload banks shard for NVFP4 experts (`--moe-strategy offload`, which `auto`
   picks): the Triton kernel declares its banks at the rank's intermediate width and packs the
   matching slice, so host RAM, the GPU slot cache and the PCIe stream halve per rank (Qwen3.8-Flash-Next's
-  63.5 GiB of expert banks become 31.8 GiB per rank at TP=2). bf16 experts with
-  `--moe-strategy fused` shard the same way. Refused under TP: the CPU and `hybrid` executors
-  (no TP path yet), MXFP4 / block-FP8 expert banks, and the Marlin / b12x packs -- their tiles
-  need a wider slice, so the kernel selector falls back to Triton instead.
+  63.5 GiB of expert banks become 31.8 GiB per rank at TP=2). The `cpu` and `hybrid` executors run
+  on those per-rank banks too, and bf16 experts with `--moe-strategy fused` shard the same way.
+  Refused under TP: an offload-family strategy (`offload` / `cpu` / `hybrid`, and `auto` resolving to
+  it) over experts that are not NVFP4 -- the MXFP4, block-FP8 and bf16 offload readers still emit full
+  width -- so serve those resident with `--moe-strategy fused`. The Marlin / b12x packs need a wider
+  slice than the shard leaves, so the kernel selector falls back to Triton instead.
+* That NVFP4 split is weighted by each rank's host->device bandwidth instead of cut evenly, by
+  default for `--moe-strategy offload` at `--tp-size > 1`: every rank probes its own link before the
+  weights load and the intermediate widths follow `bandwidth ** 0.4`, so a rank on a gen4 x4 slot next
+  to a gen5 x16 one takes the smaller slice and both ranks finish their streamed experts at the same
+  time (a pure bandwidth-proportional split would starve the fast rank's now-smaller slot cache). One
+  failed probe keeps the even split everywhere, and a non-zero `--moe-cpu-layers` (including `auto`)
+  disables the weighting because the CPU executor sizes its buffers off the even split.
+  `FREETOKEN_EXPERT_SHARD_FRAC=0.375,0.625` pins the per-rank fractions and skips the probe,
+  `FREETOKEN_EXPERT_SHARD_GAMMA=0` restores the plain even split, and `FREETOKEN_DENSE_SHARD_FRAC`
+  tilts the dense head split (attention / GatedDeltaNet heads) the same way.
 * `fi` and `qsa_sparse` attention. The other backends read global head counts and are refused
   (auto selection skips them).
 * An FTW directory cannot be sharded: it stores the tensors already fused at full width, so
