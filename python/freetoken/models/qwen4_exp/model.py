@@ -371,13 +371,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         """Full ``[T, vocab]`` logits from mixed hidden rows.
 
         The spec path needs EVERY row (ParallelLMHead.forward's row selection is
-        ctx-driven: per-request last row), so this is the direct shard matmul plus the
-        head's own vocab gather (rank-major order, padding trimmed) -- the same contract
+        ctx-driven: per-request last row), so this is the head's own shard projection
+        (its weight may be an fp8 replacement by now) plus the head's vocab gather
+        (rank-major order, padding trimmed) -- the same contract
         ParallelLMHead.forward implements for its selected rows.
         """
         head = self.lm_head
-        weight = head.tied_embedding.weight if head.tied_embedding is not None else head.weight
-        logits = torch.nn.functional.linear(mixed, weight, head.bias)
+        logits = head.shard_logits(mixed)
         if head.tp_size == 1:
             return logits
         shape = logits.shape
@@ -388,8 +388,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def greedy_ids(self, mixed: torch.Tensor) -> torch.Tensor:
         """Select every row's global argmax with one candidate per vocab shard."""
         head = self.lm_head
-        weight = head.tied_embedding.weight if head.tied_embedding is not None else head.weight
-        logits = torch.nn.functional.linear(mixed, weight, head.bias)
+        logits = head.shard_logits(mixed)
         if head.tp_size == 1:
             return logits.argmax(-1)
         start, count = head.vocab_range

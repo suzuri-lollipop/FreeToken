@@ -240,7 +240,13 @@ def test_draft_without_the_head_fails_loudly():
 
 @pytest.mark.parametrize("tied", [False, True])
 def test_greedy_shards_match_full_vocab_with_padding_and_ties(tied):
+    from freetoken.layers.embedding import ParallelLMHead
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    class Head(SimpleNamespace):
+        # The spec path multiplies through the head's projection rather than its raw
+        # weight, so borrow the real one and keep this stub honest about that.
+        shard_logits = ParallelLMHead.shard_logits
 
     # Each identity row selects one independent set of scores. Padding is deliberately
     # larger than every valid score; ties must pick the lowest global token id.
@@ -265,14 +271,40 @@ def test_greedy_shards_match_full_vocab_with_padding_and_ties(tied):
             return torch.cat(candidates).view(torch.bfloat16)
 
         weight = scores[:, rank * 3:(rank + 1) * 3].T.contiguous()
-        head = SimpleNamespace(
+        head = Head(
             weight=weight, tied_embedding=SimpleNamespace(weight=weight) if tied else None,
             bias=None, tp_size=3, vocab_range=(rank * 3, min(3, 7 - rank * 3)),
             _comm=SimpleNamespace(all_gather=gather),
+            quant_method=SimpleNamespace(
+                apply=lambda layer, x: torch.nn.functional.linear(x, layer.weight, layer.bias)),
         )
         model = SimpleNamespace(lm_head=head)
         got = Qwen4ExpForCausalLM.greedy_ids(model, mixed)
         assert torch.equal(got, expected)
+
+
+def test_spec_head_pass_reads_the_head_after_the_w8a16_replacement():
+    """The W8A16 lm-head frees its bf16 weight at finalize, so the spec path must
+    sample through the head's projection: reading ``lm_head.weight`` here crashed the
+    first MTP draft with linear(): argument 'weight' must be Tensor, not NoneType."""
+    model = _bare_model()
+    head = model.lm_head
+    assert head.tied_embedding is None and head.bias is None
+    ref = head.weight.detach().float().clone()
+
+    scale = (ref.abs().amax(1, keepdim=True) / 448.0).clamp(min=1e-12)
+    head._w8a16_weight = (ref / scale).to(torch.float8_e4m3fn)
+    head._w8a16_scale = scale.squeeze(1)
+    head.weight = None
+
+    torch.manual_seed(5)
+    mixed = torch.randn(3, ref.shape[1], dtype=torch.bfloat16)
+    logits = model.full_vocab_logits(mixed)
+    assert logits.shape == (3, ref.shape[0])
+    # per-channel e4m3 weight error sets the bound, as in the linear W8A16 tests
+    rel = ((logits.float() - mixed.float() @ ref.T).norm() / (mixed.float() @ ref.T).norm()).item()
+    assert rel < 0.05, rel
+    assert torch.equal(model.greedy_ids(mixed), logits.argmax(-1))
 
 
 @pytest.mark.parametrize("row", [0, 1])

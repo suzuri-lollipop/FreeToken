@@ -148,10 +148,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.quant_method = None
         # W8A16 opt-in for the UNTIED head: it is the largest bf16 decode read on the
         # rank (vocab/tp x hidden), and its fp8 replacement frees ~0.3 GiB straight
-        # into the expert slot cache. Forward only ever sees M <= running requests
-        # (prefill logits are gathered to last positions), so the decode kernel's
-        # M <= 32 window covers every captured graph. A tied head shares the input
-        # embedding's weight and keeps bf16 (quant_method is None there anyway).
+        # into the expert slot cache. Sampled forward only ever sees M <= running
+        # requests (prefill logits are gathered to last positions), so the decode
+        # kernel's M <= 32 window covers every captured graph; the speculative head
+        # pass exceeds it and takes the method's dequantized branch. A tied head shares
+        # the input embedding's weight and keeps bf16 (quant_method is None there anyway).
         self.w8a16_decode_ok = (
             tied_embedding is None
             and os.environ.get("FREETOKEN_W8A16_LM_HEAD", "1") == "1"
@@ -193,6 +194,19 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
+    def shard_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Logit columns of this rank's vocab shard, for any number of rows.
+
+        Goes through the head's own projection: an untied head's weight is replaced by
+        its fp8 form in :meth:`finalize` (leaving ``weight`` as None), so a caller must
+        never multiply against ``weight`` directly. Speculative decoding reaches for
+        this with more rows than the running batch, which is why it sits outside
+        :meth:`forward`'s last-token selection.
+        """
+        if self.tied_embedding is not None:
+            return F.linear(x, self.tied_embedding.weight, self.bias)
+        return self.quant_method.apply(self, x)
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
@@ -203,10 +217,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[indices].contiguous()
             del indices
 
-        if self.tied_embedding is not None:
-            logits = F.linear(x, self.tied_embedding.weight, self.bias)
-        else:
-            logits = self.quant_method.apply(self, x)
+        logits = self.shard_logits(x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
