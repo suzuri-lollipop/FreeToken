@@ -81,6 +81,15 @@ class Req:
     # only a single-chunk cold prefill produces), or a stash over the budget. Regular decode
     # continues untouched.
     spec_off: bool = False
+    # Rows the MTP head has consumed (its KV covers positions [0, spec_head_len)). Nonzero
+    # once the catch-up pass has run, which is what makes a later skipped row unrecoverable.
+    spec_head_len: int = 0
+    # Why spec stopped ('' while the request is still eligible). The scheduler counts these:
+    # a run where MTP never fired otherwise looks identical to one where it fired and lost.
+    spec_off_reason: str = ""
+    # Verify/accept tally of the current low-acceptance auto-off window.
+    spec_verifies: int = 0
+    spec_accepted: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

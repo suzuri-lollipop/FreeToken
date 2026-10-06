@@ -32,18 +32,16 @@ def _req(host_len=P + 1, max_extra=20):
 
 
 def _setup(req, mode="verify", pages=None):
-    calls = {"copy_from": [], "release": [], "freed": [], "removed": []}
+    calls = {"copy_from": [], "release": [], "freed": [], "removed": [], "slot_freed": []}
     pool = torch.zeros(4, 256, dtype=torch.int32)
     pool[0, P + 1] = 999  # the draft's staged pool slot (verify bump wrote it)
     pool[0, P + 2] = 42   # the engine's next_tokens_gpu write (Scheduler._forward)
 
     def free_resources(r):
-        # mirrors the real _free_req_resources spec cleanup (slot release is pool-side
-        # and covered by test_hybrid_cache_manager's roundtrip)
+        # mirrors the real _free_req_resources spec cleanup (it delegates to
+        # _release_spec_scratch, which the bound method below runs for real)
         calls["freed"].append(r)
-        r.spec_slot_idx = None
-        r.spec_residual = None
-        r.spec_draft = None
+        sched._release_spec_scratch(r)
         r.table_idx = -1
 
     sched = SimpleNamespace(
@@ -51,7 +49,8 @@ def _setup(req, mode="verify", pages=None):
         decode_manager=SimpleNamespace(remove_req=lambda r: calls["removed"].append(r)),
         _free_req_resources=free_resources,
         engine=SimpleNamespace(linear_state_pool=SimpleNamespace(
-            copy_from=lambda src, dst: calls["copy_from"].append((src, dst)))),
+            copy_from=lambda src, dst: calls["copy_from"].append((src, dst)),
+            free=lambda slot: calls["slot_freed"].append(slot))),
         token_pool=pool,
         cache_manager=SimpleNamespace(
             release_paged=lambda info: calls["release"].append(info)),
@@ -62,6 +61,11 @@ def _setup(req, mode="verify", pages=None):
     )
     req.spec_slot_idx = 3
     sched._restore_spec_prefix = lambda b: Scheduler._restore_spec_prefix(sched, b)
+    sched._count_spec_rejection = lambda r: Scheduler._count_spec_rejection(sched, r)
+    sched._spec_reject_summary = lambda: Scheduler._spec_reject_summary(sched)
+    sched._release_spec_scratch = lambda r: Scheduler._release_spec_scratch(sched, r)
+    sched._spec_reject = lambda r, reason: Scheduler._spec_reject(sched, r, reason)
+    sched._tally_verify = lambda r, a: Scheduler._tally_verify(sched, r, a)
     req.linear_slot_idx = 1
     batch = SimpleNamespace(reqs=[req], spec_mode=mode, spec_pages=pages)
     return sched, batch, calls, pool
@@ -222,12 +226,7 @@ def test_reject_or_abort_at_page_boundary_releases_uncommitted_page(aborted):
     assert [r.next_token for r in reply] == ([] if aborted else [2])
 
 
-def test_normal_decode_invalidates_draft_and_prompt_stash():
-    from freetoken.core import Batch
-
-    reqs = [_spec_req(P + 1, 10, P, spec_draft=42),
-            _spec_req(P + 1, 10, P, spec_residual=torch.ones(2, 4))]
-    batch = Batch(reqs=reqs, phase="decode")
+def _sched_for_batch(batch):
     sched = Scheduler.__new__(Scheduler)
     sched.config = SimpleNamespace(speculative="mtp", prefill_decode_interval=0)
     sched._prefill_debt = 0.0
@@ -236,11 +235,132 @@ def test_normal_decode_invalidates_draft_and_prompt_stash():
     sched._chunk_ema_spt = None
     sched.prefill_budget = 64
     sched._prefill_streak = 0
+    sched._spec_rejections = {}
+    sched.token_pool = {}
+    sched._build_spec_prologue = lambda r: "PROLOGUE"
+    sched.engine = SimpleNamespace(linear_state_pool=SimpleNamespace(free=lambda s: None))
     sched.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: None)
     sched.decode_manager = SimpleNamespace(schedule_next_batch=lambda: batch)
     sched._prepare_batch = lambda b: b
     sched._report_prompt_admissions = lambda b: None
+    return sched
+
+
+def test_normal_decode_kills_a_started_draft_and_keeps_a_fresh_stash():
+    from freetoken.core import Batch
+
+    started = _spec_req(P + 1, 10, P, spec_draft=42)
+    started.spec_head_len = P  # the head already consumed the prompt: no way back
+    waiting = _spec_req(P + 1, 10, P, spec_residual=torch.ones(2, 4))
+    waiting.spec_draft = 7  # never reached a spec step; the draft is stale
+    batch = Batch(reqs=[started, waiting], phase="decode")
+    sched = _sched_for_batch(batch)
     assert sched._schedule_next_batch() is batch
-    for req in reqs:
-        assert req.spec_off and req.spec_draft is None and req.spec_residual is None
-    assert sched._as_spec_batch(Batch(reqs=reqs[:1], phase="decode")) is None
+
+    assert started.spec_off and started.spec_draft is None
+    assert started.spec_off_reason == "batch_killed"
+    assert not waiting.spec_off and waiting.spec_residual is not None
+    assert waiting.spec_draft is None
+    # only the terminal one is counted, once
+    assert sched._spec_rejections == {"batch_killed": 1}
+    # a request with an intact stash resumes as soon as it runs alone again
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    alone = Batch(reqs=[waiting], phase="decode")
+    alone.padded_reqs = [waiting]
+    upgraded = sched._as_spec_batch(alone)
+    assert upgraded is not None and upgraded.spec_mode == "prologue_decode"
+
+
+def test_stash_beyond_the_lag_bound_is_released():
+    """A request that never runs alone must not pin its prompt-sized stash for its whole
+    life: past the lag bound its drafts are not worth the second row."""
+    from freetoken.scheduler.scheduler import _MTP_RESYNC_LAG as lag
+
+    def drained(extra):
+        # the head never saw the rows decoded since the stash was written
+        return _spec_req(P + extra + 1, 400, P + extra, spec_residual=torch.ones(P, 4))
+
+    late = drained(lag + 1)
+    _sched_for_batch(None)._on_regular_decode(late)
+    assert late.spec_off and late.spec_off_reason == "lag_overflow"
+    assert late.spec_residual is None
+
+    in_time = drained(1)
+    _sched_for_batch(None)._on_regular_decode(in_time)
+    assert not in_time.spec_off and in_time.spec_residual is not None
+
+
+def test_scratch_slot_survives_a_reject_and_dies_with_the_draft():
+    """The scratch slot is allocated once per request and reused: a reject copies it back
+    into the live slot and keeps it for the next step's clone. What must not happen is it
+    outliving the draft -- _spec_reject releases it, or the next admission cannot get it."""
+    req = _req(host_len=P + 2)
+    req.device_len = P + 2
+    req.spec_draft = 999
+    sched, batch, calls, _ = _setup(req, pages=[(0, 1, 2)])
+    _drain(sched, batch, {"y1": 41, "y2": 4242, "accept": False, "draft": 77})
+    assert calls["copy_from"] == [(3, 1)] and req.spec_slot_idx == 3
+
+    sched._spec_reject(req, "low_acceptance")
+    assert calls["slot_freed"] == [3] and req.spec_slot_idx is None
+
+
+def test_low_acceptance_disables_further_drafting():
+    """Every verify pays a second target row, so a request whose drafts keep missing stops
+    paying for them once the window says the head is not carrying its weight."""
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW
+
+    req = _spec_req(P + 2, 10, P, spec_draft=7, spec_residual=torch.ones(2, 4))
+    sched, _, _, _ = _setup(req)
+    for _ in range(_MTP_ACCEPT_WINDOW - 1):
+        sched._tally_verify(req, False)
+    assert not req.spec_off
+    sched._tally_verify(req, False)
+    assert req.spec_off and req.spec_off_reason == "low_acceptance"
+    assert req.spec_draft is None and req.spec_slot_idx is None
+    assert req.spec_residual is None
+    assert sched._spec_rejections.get("low_acceptance") == 1
+
+    # a draft that keeps landing stays on, and the window resets
+    good = _spec_req(P + 2, 10, P, spec_draft=7)
+    sched, _, _, _ = _setup(good)
+    for _ in range(2 * _MTP_ACCEPT_WINDOW):
+        sched._tally_verify(good, True)
+    assert not good.spec_off
+    assert good.spec_verifies == 0  # window rolled over clean
+
+
+def test_declines_are_counted_once_per_request():
+    """The reason counters are what the periodic acceptance line prints as "declined:", the
+    only field number for why MTP is not helping a workload. A request declined on every
+    step (a batch that never empties to one) must contribute one, not one per step."""
+    sched = _sched_for_batch(None)
+    assert sched._spec_reject_summary() == "-"
+
+    req = _spec_req(P + 1, 10, P, spec_draft=7)
+    req.spec_head_len = P  # started: every later regular decode re-declines it
+    for _ in range(5):
+        sched._on_regular_decode(req)
+    assert sched._spec_rejections == {"batch_killed": 1}
+
+    sched._count_spec_rejection("nongreedy")
+    assert sched._spec_reject_summary() == "batch_killed=1 nongreedy=1"
+
+
+def test_no_scratch_slot_declines_instead_of_raising():
+    """LinearStatePool.alloc raises when the free-list is empty, and the scheduler has no
+    way back out mid-decode -- so the raise must become a decline for that one request."""
+    from freetoken.core import Batch
+
+    req = _spec_req(P + 1, 10, P, spec_residual=torch.ones(P, 4))
+    sched = _sched_for_batch(None)
+
+    def boom(n):
+        raise RuntimeError("LinearStatePool exhausted")
+
+    sched.engine.linear_state_pool.alloc = boom
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    assert sched._as_spec_batch(batch) is None
+    assert req.spec_off and req.spec_off_reason == "exhausted"
+    assert req.spec_residual is None  # the stash went with the decision

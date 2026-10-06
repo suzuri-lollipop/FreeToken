@@ -1975,6 +1975,15 @@ class Engine:
                 _tc1 = _time.perf_counter()
             spec_stash = (
                 self.config.speculative == "mtp" and batch.is_prefill and not use_graph
+                # The residual is a full [T, hc*hidden] copy of this chunk; grabbing it for
+                # a batch nobody can draft with (every request already off, non-greedy, or
+                # multimodal) is a clone paid for nothing.
+                and any(
+                    not getattr(r, "spec_off", False)
+                    and r.sampling_params.is_greedy
+                    and not getattr(r, "mm_items", None)
+                    for r in batch.padded_reqs
+                )
             )
             if use_graph:
                 logits = self.graph_runner.replay(batch)
@@ -2130,32 +2139,42 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
 
     def _run_head_prologue(self, model, req: Req, prologue: Batch) -> None:
-        """The head's whole-prompt catch-up pass, once per request at its first decode step.
+        """The head's catch-up pass over the rows it has not seen, run before that step drafts.
 
-        Rows 0..T-1 with teacher-forced embeds (tokens 1..T-1 plus the first sampled
-        token), building the head layer's KV that the main prefill never ran. The shadow
-        batch sees a fresh prefill of length T (cached_len=0), so the sparse backend
-        initializes its slab/ring for the head layer exactly like a prompt chunk.
+        Rows 0..t-1 with teacher-forced embeds (tokens 1..t), building the head layer's KV
+        that the main forward never ran. The shadow batch sees a fresh prefill of length t
+        (cached_len=0), so the sparse backend initializes its slab/ring for the head layer
+        exactly like a prompt chunk. t is the scheduler's, capped by the stash: rows the
+        request decoded while the batch held more than one request have no residual, and
+        the head starts with a hole there (draft quality only).
         """
         residual = req.spec_residual
         assert residual is not None and prologue is not None, "prologue without the residual stash"
         next_embed = model.model.embed_tokens.forward(prologue.input_ids)
         self.attn_backend.prepare_metadata(prologue)
         model.mtp.forward(residual, next_embed, prologue)
+        req.spec_head_len = int(prologue.reqs[0].device_len)
         req.spec_residual = None  # consumed; the stash storage is released here
 
     def _stash_spec_residual(self, batch: Batch, residual: torch.Tensor) -> None:
-        """Per-req residual rows of this prefill chunk, for the head's prologue pass.
+        """Per-req residual rows of this prefill chunk, for the head's catch-up pass.
 
         Eligibility is decided here (Phase 1): single-chunk cold prompts only -- a prefix
         hit or a chunked continuation leaves positions whose residuals were never
         computed, and the catch-up pass needs every row. Non-greedy sampling and
-        over-budget prompts opt out too; all of these flip spec_off and regular decode
-        continues untouched.
+        over-budget prompts opt out too; all of these turn spec off for the request and
+        record the reason on it, which the scheduler counts at the drain.
+
+        The stash is prompt-sized, so its cap tracks the chunk budget that a single-chunk
+        prefill is already held to: asking for more than one chunk's worth of rows only
+        ever costs the clone without ever being eligible.
         """
         from freetoken.scheduler.prefill import ChunkedReq
 
-        budget = int(os.getenv("FREETOKEN_MTP_MAX_STASH_TOKENS", "16384"))
+        budget = min(
+            int(os.getenv("FREETOKEN_MTP_MAX_STASH_TOKENS", "16384")),
+            int(getattr(self.config, "max_extend_tokens", 0) or 16384),
+        )
         multi = len(batch.padded_reqs) > 1
         off = 0
         for req in batch.padded_reqs:
@@ -2163,15 +2182,21 @@ class Engine:
             rows, off = residual[off:off + n], off + n
             if getattr(req, "spec_off", False):
                 continue
-            if (
-                isinstance(req, ChunkedReq)
-                or req.cached_len > 0
-                or getattr(req, "linear_slot_idx", None) is None
-                or not req.sampling_params.is_greedy
-                or getattr(req, "mm_items", None)
-                or req.input_ids.numel() > budget
-            ):
+            if isinstance(req, ChunkedReq) or req.cached_len > 0:
+                reason = "chunked" if isinstance(req, ChunkedReq) else "prefix_hit"
+            elif getattr(req, "linear_slot_idx", None) is None:
+                reason = "no_gdn_pool"  # nothing to clone for a rejection rollback
+            elif not req.sampling_params.is_greedy:
+                reason = "nongreedy"
+            elif getattr(req, "mm_items", None):
+                reason = "mm"
+            elif req.input_ids.numel() > budget:
+                reason = "over_budget"
+            else:
+                reason = ""
+            if reason:
                 req.spec_off = True
+                req.spec_off_reason = reason
                 req.spec_residual = None
                 continue
             req.spec_residual = rows.clone() if multi else rows
