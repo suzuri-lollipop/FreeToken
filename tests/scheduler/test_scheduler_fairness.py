@@ -5,6 +5,9 @@ Two related fixes:
 * ``Scheduler._schedule_next_batch`` interleaves: after ``prefill_decode_interval``
   consecutive prefill steps it hands one step to the running decodes, so a long
   chunked prompt cannot stall everyone's inter-token latency. ``0`` disables it.
+* The wall-clock debt counts the chunk still IN FLIGHT, not only the chunks already
+  drained: the drain that books a chunk runs after the decision, so the accrued debt
+  alone lets one slow chunk stall a waiting decode for two chunks.
 * ``PrefillManager.schedule_next_batch`` backfills: a pending request that does
   not fit this step no longer blocks smaller requests queued behind it; the
   deferred ones keep their arrival order and retry next step.
@@ -42,6 +45,8 @@ def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float =
     scheduler._prefill_streak = 0
     scheduler._prefill_debt = debt
     scheduler._prefill_debt_s = debt_s
+    scheduler._debt_discharge = None
+    scheduler._last_data = None  # set per step by _inflight / _overlap_phases
     scheduler._chunk_target_s = chunk_target
     scheduler._chunk_ema_spt = chunk_ema
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=prefill)
@@ -102,12 +107,110 @@ def test_debt_not_owed_when_no_decode_is_running():
     assert _phases(scheduler, 4) == ["p"] * 4
 
 
+# ------------------------------------------------ P1b: the chunk still in flight counts too
+
+
+def _inflight(scheduler, seconds: float, phase: str = "prefill", spec_mode=None,
+              scheduled_at: float | None = None):
+    """Makes ``_last_data`` the batch overlap_loop launched but has not drained yet."""
+    import time as _time
+
+    if scheduled_at is None:
+        # a decode batch is never stamped (core.py: Batch.scheduled_at defaults to 0.0)
+        scheduled_at = _time.perf_counter() - seconds if phase == "prefill" else 0.0
+    scheduler._last_data = (
+        SimpleNamespace(  # ForwardData = (ForwardInput, ForwardOutput); only .batch matters
+            batch=SimpleNamespace(
+                is_prefill=phase == "prefill", spec_mode=spec_mode, prompt_admissions=[],
+                scheduled_at=scheduled_at, log_new_tokens=0,
+            ),
+        ),
+    )
+    return scheduler._last_data[0].batch
+
+
+def _overlap_phases(scheduler, n: int, chunk_s: float) -> list[str]:
+    """Steps the way ``overlap_loop`` does: the decision sees the batch launched last step
+    as still in flight, and the drain a few lines later books (or discharges) it."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    phases = []
+    for _ in range(n):
+        launched = type(scheduler)._schedule_next_batch(scheduler)
+        phases.append("p" if launched.is_prefill else "d")
+        if scheduler._last_data is not None:
+            Scheduler._account_prefill_debt(scheduler, scheduler._last_data[0].batch)
+        _inflight(scheduler, chunk_s, phase="prefill" if launched.is_prefill else "decode")
+    return phases
+
+
+def test_inflight_chunk_concedes_once_and_bounds_the_stall():
+    # every chunk runs 3s against a 2s budget: one concede per chunk, never two in a row
+    scheduler, calls = _stub_scheduler(interval=0, debt_s=2.0)
+    assert _overlap_phases(scheduler, 6, chunk_s=3.0) == ["p", "d", "p", "d", "p", "d"]
+    assert scheduler._prefill_debt == 0.0  # each chunk paid once, none re-opened the debt
+    assert calls == ["prefill", "decode"] * 3
+
+
+def test_inflight_term_concedes_one_step_before_the_drain_would():
+    # 0.5s chunks vs a 2s budget: drained time alone only owes after the 5th chunk books it,
+    # the in-flight term sees it at the 4th decision -- that one step is the user-visible gap
+    scheduler, _calls = _stub_scheduler(interval=0, debt_s=2.0)
+    assert _overlap_phases(scheduler, 6, chunk_s=0.5) == ["p", "p", "p", "p", "d", "p"]
+
+
+def test_count_guard_unchanged_when_debt_is_off():
+    # the in-flight term must not leak in while the debt is disabled
+    scheduler, _calls = _stub_scheduler(interval=2)
+    assert _overlap_phases(scheduler, 6, chunk_s=3.0) == ["p", "p", "d", "p", "p", "d"]
+
+
+def test_inflight_guard_matches_the_accrual_guard():
+    cases = [
+        dict(phase="prefill", spec_mode="verify"),  # a spec step rides phase="prefill"
+        dict(phase="decode"),                       # decode batches are unstamped
+        dict(phase="prefill", scheduled_at=0.0),    # unstamped prefill: never elapsed
+    ]
+    for case in cases:
+        scheduler, _calls = _stub_scheduler(interval=0, debt_s=2.0)
+        _inflight(scheduler, 9.0, **case)
+        assert _phases(scheduler, 3) == ["p"] * 3, case
+
+
+def test_discharge_is_one_shot_and_scoped_to_its_own_batch():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler, _calls = _stub_scheduler(interval=0, debt_s=2.0)
+    paid = _inflight(scheduler, 3.0)
+    type(scheduler)._schedule_next_batch(scheduler)  # concedes: P buys it
+    assert scheduler._debt_discharge is paid
+    Scheduler._account_prefill_debt(scheduler, paid)  # P's drain: nothing re-owed
+    assert scheduler._prefill_debt == 0.0
+    assert scheduler._debt_discharge is None
+    later = _inflight(scheduler, 3.0)
+    Scheduler._account_prefill_debt(scheduler, later)  # the next chunk still pays
+    assert scheduler._prefill_debt > 2.9
+
+
+def test_inflight_helper_is_gated_before_it_touches_last_data():
+    # the drain scheduler of test_cost_accounting_core / test_spec_drain has no _last_data;
+    # the debt gate being first is what keeps them off the new path
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._prefill_debt_s = 0.0
+    scheduler.decode_manager = SimpleNamespace(runnable=True)
+    assert Scheduler._inflight_prefill(scheduler) == (None, 0.0)
+    assert not hasattr(scheduler, "_last_data")
+
+
 def _stub_drain_scheduler(debt_s: float, decode_runnable: bool, chunk_target: float = 0.0):
     from freetoken.scheduler.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._prefill_debt = 0.0
     scheduler._prefill_debt_s = debt_s
+    scheduler._debt_discharge = None
     scheduler._chunk_target_s = chunk_target
     scheduler._chunk_ema_spt = None
     scheduler.decode_manager = SimpleNamespace(runnable=decode_runnable)
