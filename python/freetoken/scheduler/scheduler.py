@@ -60,6 +60,9 @@ def _gib(n_bytes: int) -> str:
 # 2x RTX PRO 4000 rig (churn: 2 victims + a 30k-token aggressor) the victims' max
 # inter-token gap dropped from the whole prefill window (91-159s) to one chunk
 # (~7s) in both healthy and NVMe-pathological device states (_scratch/agent3).
+# The chunk already launched but not yet drained counts toward those seconds (see
+# _inflight_prefill): the drain books it after the decision, so accrued-seconds-only
+# bounds a waiting decode at two chunks and lets one slow chunk buy two decode steps.
 def _prefill_debt_budget() -> float:
     raw = os.environ.get("FREETOKEN_PREFILL_DEBT_S", "2.0")
     try:
@@ -191,6 +194,9 @@ class Scheduler(SchedulerIOMixin):
         self._warned_cut_image = False
         self._prefill_streak = 0
         self._prefill_debt = 0.0  # prefill seconds accrued while a decode was runnable
+        # The in-flight chunk that already paid for the last concede, so its drain cannot
+        # re-open the debt it bought (one chunk == at most one concede, see _inflight_prefill).
+        self._debt_discharge = None
         self._prefill_debt_s = _prefill_debt_budget()
         self._chunk_target_s = _adaptive_chunk_target_s()
         self._chunk_ema_spt: float | None = None  # EMA of prefill seconds per token
@@ -653,7 +659,36 @@ class Scheduler(SchedulerIOMixin):
             or not self.decode_manager.runnable
         ):
             return
+        discharged = self._debt_discharge
+        if discharged is not None:
+            self._debt_discharge = None
+            if batch is discharged:
+                return  # this chunk bought the concede the guard just granted
         self._prefill_debt += time.perf_counter() - batch.scheduled_at
+
+    def _inflight_prefill(self) -> tuple[Batch | None, float]:
+        """The launched-but-undrained prefill chunk and how long it has been running.
+
+        ``overlap_loop`` drains ``_last_data`` a few lines AFTER deciding the next batch, so
+        ``_prefill_debt`` is one chunk stale at the decision and one slow chunk stalls a
+        waiting decode for TWO chunks. Counting the chunk in flight bounds the stall at one;
+        ``_account_prefill_debt`` then discharges it, so one chunk == one concede. Where the
+        already-booked debt alone also owed, that discharge skips a chunk which had not paid
+        for the concede: at most one un-charged chunk each time, the price of a fresh view.
+        Gate order is load-bearing -- stubs built with ``Scheduler.__new__`` have no
+        ``_last_data`` and rely on ``_prefill_debt_s`` being checked first.
+        """
+        if self._prefill_debt_s <= 0 or not self.decode_manager.runnable:
+            return None, 0.0
+        data = self._last_data
+        if data is None:
+            return None, 0.0
+        batch = data[0].batch
+        if not batch.is_prefill or getattr(batch, "spec_mode", None) is not None:
+            return None, 0.0  # spec rides phase="prefill" but is a decode step
+        if not getattr(batch, "scheduled_at", 0.0):
+            return None, 0.0  # unstamped: now - 0 would concede unconditionally
+        return batch, time.perf_counter() - batch.scheduled_at
 
     def _observe_chunk_time(self, batch) -> None:
         """EMA of prefill seconds-per-token, from the same schedule->drain window the
@@ -1194,9 +1229,13 @@ class Scheduler(SchedulerIOMixin):
         # _prefill_debt_s prefill SECONDS accrued while a decode was runnable (wall-clock
         # bound: chunk times swing ~10x under PLE device-latency spikes, which the count
         # cannot see) -- hand one step to running decodes so a long chunked prompt cannot
-        # stall everyone's ITL.
+        # stall everyone's ITL. The chunk still in flight counts too: the drain that would
+        # book it runs after this decision, so the accrued debt alone is one chunk late and
+        # bounds a waiting decode at two chunks instead of one.
+        inflight_batch, inflight_s = self._inflight_prefill()
+        threshold = self._effective_debt_s()
         owed = (interval > 0 and self._prefill_streak >= interval) or (
-            self._prefill_debt >= self._effective_debt_s() > 0
+            threshold > 0 and self._prefill_debt + inflight_s >= threshold
         )
         if not (owed and self.decode_manager.runnable):
             batch = self.prefill_manager.schedule_next_batch(self._adaptive_prefill_budget())
@@ -1222,6 +1261,9 @@ class Scheduler(SchedulerIOMixin):
             self._prefill_streak += 1
         else:
             self._prefill_streak = 0
+            # the chunk in flight bought this concede with the time it is about to report;
+            # discharging it is what keeps one slow chunk from buying two decode steps
+            self._debt_discharge = inflight_batch if inflight_s > 0 else None
             self._prefill_debt = 0.0
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
