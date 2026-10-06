@@ -27,6 +27,7 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.inline_system import InlineSystemError
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -144,6 +145,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    inline_system_policy: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -322,6 +324,7 @@ async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = No
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
             images=images,
+            inline_system_policy=spec.inline_system_policy,
         ),
     )
     return uid
@@ -335,11 +338,14 @@ def _count_cache_key(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
+    inline_system_policy: str | None,
 ) -> bytes:
-    """sha1 of the canonical-JSON rendering of the (messages, tools, kwargs) triple.
+    """sha1 of the canonical-JSON rendering of the (messages, tools, kwargs, policy)
+    tuple; the inline-system policy rewrites the prompt, so it changes the count.
     Image-bearing prompts are excluded by the caller (their count depends on bytes)."""
     canonical = json.dumps(
-        [messages, tools, chat_template_kwargs], sort_keys=True, ensure_ascii=False, default=str
+        [messages, tools, chat_template_kwargs, inline_system_policy],
+        sort_keys=True, ensure_ascii=False, default=str,
     )
     return hashlib.sha1(canonical.encode("utf-8", "surrogatepass")).digest()
 
@@ -349,6 +355,8 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    *,
+    inline_system_policy: str | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -363,7 +371,7 @@ async def count_prompt_tokens(
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
     refs = collect_image_refs(messages)
-    key = None if refs else _count_cache_key(messages, tools, chat_template_kwargs)
+    key = None if refs else _count_cache_key(messages, tools, chat_template_kwargs, inline_system_policy)
     if key is not None and (hit := _COUNT_LRU.get(key)) is not None:
         _COUNT_LRU.move_to_end(key)
         return hit
@@ -375,10 +383,13 @@ async def count_prompt_tokens(
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
         images=images,
+        inline_system_policy=inline_system_policy,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
         (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
+    except InlineSystemError as exc:
+        raise GenerationError(str(exc)) from exc
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
     count = int(user_msg.input_ids.numel())
@@ -410,6 +421,7 @@ async def prerender_prompt(spec: GenSpec, state: Any) -> tuple[str | None, Gener
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        inline_system_policy=spec.inline_system_policy,
     )
     try:
         manager = await asyncio.to_thread(build)

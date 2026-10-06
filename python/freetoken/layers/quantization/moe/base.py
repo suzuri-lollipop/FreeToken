@@ -76,6 +76,7 @@ class MoEConfig:
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"
     decode_target: str = "gpu"
+    dtype: torch.dtype = torch.bfloat16
     # per-rank relative weights for an uneven (bandwidth-balanced) intermediate split
     # of OFFLOADED nvfp4 experts; None keeps the even split (see shard_balance.py)
     shard_weights: "tuple[float, ...] | None" = None
@@ -99,6 +100,7 @@ class MoEConfig:
             apply_router_weight_on_input=bool(layer.apply_router_weight_on_input),
             strategy=layer.strategy,
             decode_target=layer.decode_target,
+            dtype=torch.get_default_dtype(),
             shard_weights=get_expert_shard_weights(),
         )
 
@@ -249,9 +251,7 @@ class MoEKernel(ABC):
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
 
-    def _common_reject(self, cfg: MoEConfig, *, resident_ok: bool, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
-        if not resident_ok and cfg.strategy == "resident":
-            return "not served resident; use --moe-strategy offload or cpu"
+    def _common_reject(self, cfg: MoEConfig, *, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
         if not tp_ok and cfg.tp_size > 1:
             return "TP > 1 is not supported for this expert format"
         if not cpu_ok and cfg.decode_target != "gpu":
@@ -292,12 +292,15 @@ class MoEMethod(QuantMethod):
     def cpu_format(self) -> str | None:
         return self.kernel.cpu_format
 
-    @abstractmethod
-    def create_weights(self, layer: Any) -> None: ...
+    def create_weights(self, layer: Any) -> None:
+        # resident experts stay out of the state dict; attach_resident_banks fills these after the dense weights load
+        layer._expert_banks = None
+        layer._expert_alphas = None
 
     def finalize(self, layer: Any) -> None:
         pass
 
-    @abstractmethod
     def resident_view(self, layer: Any) -> ExpertView:
         """Layout roles -> the resident layer's tensors, for apply()."""
+        assert layer._expert_banks is not None, "resident expert banks were never loaded"
+        return ExpertView(layer._expert_banks, n=self.cfg.num_experts, alphas=layer._expert_alphas)

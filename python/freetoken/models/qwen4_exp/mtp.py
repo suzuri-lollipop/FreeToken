@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.layers import BaseOP, LinearReplicated, OPList
+from freetoken.layers.quantization import QuantKind
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual, GroupedPlusOneRMSNorm
@@ -49,6 +50,52 @@ if TYPE_CHECKING:
 MTP_WIRINGS = ("norm_mix_fc", "norm_mixfrom_fc")
 
 
+class _DenseMTPExperts:
+    """The MTP head's experts stay dense state-dict tensors.
+
+    Resident experts normally carry no state-dict tensors at all: the engine fills
+    expert banks sized by ``num_moe_layers`` (``attach_resident_banks``). The head is
+    one layer outside that geometry and its weights ship in the checkpoint's ``mtp.*``
+    block, so this wrapper allocates the buffers ``_fuse_mtp_experts`` emits and hands
+    the kernel the matching view. Format, kernel and epilogue stay with ``inner``.
+    """
+
+    def __init__(self, inner):
+        if inner.kind not in (QuantKind.NONE, QuantKind.FP8_BLOCK):
+            raise NotImplementedError(
+                f"--speculative mtp: the head loads its {inner.kind} experts as dense "
+                "mtp.* tensors, which only bf16 and fp8-block exports provide; serve the "
+                "checkpoint without --speculative mtp"
+            )
+        self.__dict__["_inner"] = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def create_weights(self, layer) -> None:
+        cfg = self._inner.cfg
+        e, i, h = cfg.num_experts, cfg.local_intermediate, cfg.hidden
+        if self._inner.kind is QuantKind.FP8_BLOCK:
+            b = 128  # whole 128x128 blocks, unpadded: the packer emits no bank padding
+            layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=torch.float8_e4m3fn)
+            layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
+            layer.down_proj = torch.empty(e, h, i, dtype=torch.float8_e4m3fn)
+            layer.down_scale_inv = torch.empty(e, h // b, i // b, dtype=torch.bfloat16)
+        else:
+            layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=cfg.dtype)
+            layer.down_proj = torch.empty(e, h, i, dtype=cfg.dtype)
+
+    def resident_view(self, layer):
+        from freetoken.layers.quantization.moe.base import ExpertView
+
+        # load_state_dict swaps the tensors out, so read them off the layer every call
+        tensors = {"gate_up": layer.gate_up_proj, "down": layer.down_proj}
+        if self._inner.kind is QuantKind.FP8_BLOCK:
+            tensors["gate_up_scale"] = layer.gate_up_scale_inv
+            tensors["down_scale"] = layer.down_scale_inv
+        return ExpertView(tensors)
+
+
 class Qwen4ExpMTPLayer(BaseOP):
     """One MTP decoder layer: the frozen main-layer contract (model.py docstring)
     minus PLE -- the head has no n-gram layer of its own."""
@@ -59,13 +106,14 @@ class Qwen4ExpMTPLayer(BaseOP):
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
         # The head's experts are RESIDENT whatever the engine's moe_strategy is: the
         # offload cache is keyed by main-decoder layer ids (0..num_layers-1), so an
-        # OffloadMoELayer at the synthetic index would fall outside every cache. The
-        # fp8-block resident method is TP1-only today (fp8_block.py tp_ok=False) --
-        # TP2 placement is Phase 2 of the design doc; until then a TP2 engine building
-        # the head fails loudly at MoE construction.
+        # OffloadMoELayer at the synthetic index would fall outside every cache.
         self.mlp = Qwen4ExpMoE(
             replace(config, moe_strategy="fused"), layer_id, prefix=f"{prefix}.mlp"
         )
+        experts = self.mlp.experts
+        experts.quant_method = _DenseMTPExperts(experts.quant_method)
+        experts.quant_method.create_weights(experts)
+        experts.owns_experts = True
 
     def forward(self, hidden: torch.Tensor, batch: "Batch") -> torch.Tensor:
         block_input, inject = self.attn_hyper_connection.mix(hidden)

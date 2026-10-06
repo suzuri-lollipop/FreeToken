@@ -84,6 +84,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
+    inline_system_policy: str | None = None
     # True when `text` is an already-rendered chat-template string (frontend
     # prerender pass-through): encode it like the worker's own render, i.e.
     # without re-adding special tokens.
