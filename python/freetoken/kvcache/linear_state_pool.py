@@ -328,18 +328,35 @@ def _linear_pp_reserve(config) -> int:
     return max(6, config.max_running_req // 2)
 
 
+def _linear_spec_reserve(config) -> int:
+    """Slots held back for MTP speculative scratch: one per running request.
+
+    A verify clones the live slot into a scratch slot before the accept decision (the
+    scheduler clones once and keeps it across steps), so a full batch of spec-eligible
+    requests needs one spare slot each ON TOP of the sizing below. Without the reserve
+    the alloc lands in the middle of a decode step, where the scheduler has no clean way
+    back out and the whole step dies."""
+    if getattr(config, "speculative", "none") != "mtp":
+        return 0
+    model_config = getattr(config, "model_config", None)
+    if model_config is None or model_config.linear_attention_group() is None:
+        return 0  # no GDN state pool, so no scratch slot to reserve
+    return config.max_running_req
+
+
 def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix steady-state peak is 2 slots per running
     request (1 live + 1 committed snapshot locked through decode); the chunk-track
     ping-pong pair rides a shared reserve sized by _linear_pp_reserve (returned at the
-    decode transition), plus a cross-request snapshot cache and a padding sink. Naive GDN
-    keeps the old (max_running_req + 1)."""
+    decode transition), plus a cross-request snapshot cache, the MTP scratch reserve and
+    a padding sink. Naive GDN keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
+    reserve = _linear_spec_reserve(config)
     if config.cache_type != "hybrid_radix":
-        return mr + 1  # live + dummy/padding
+        return mr + 1 + reserve  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 2 * mr + _linear_pp_reserve(config) + n_cache + 1
+    return 2 * mr + _linear_pp_reserve(config) + n_cache + 1 + reserve
 
 
 def _linear_pool_min_slots(config) -> int:
@@ -350,8 +367,10 @@ def _linear_pool_min_slots(config) -> int:
     (tree-evictable) BEFORE it allocates, so progress never waits on a parked slot.
     Naive needs 1 per request + padding. Below this, a full max_running_req batch can't
     get its slots and admission deadlocks -- so a runtime rebuild rejects a smaller
-    request."""
+    request. The MTP scratch reserve is part of the floor too: a spec batch that cannot
+    clone is a step that cannot run."""
     mr = config.max_running_req
+    reserve = _linear_spec_reserve(config)
     if config.cache_type != "hybrid_radix":
-        return mr + 1
-    return 2 * mr + 4
+        return mr + 1 + reserve
+    return 2 * mr + 4 + reserve

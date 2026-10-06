@@ -294,6 +294,44 @@ def test_linear_state_pool_prices_itself():
     assert state_pool_bytes(config) == 0
 
 
+def test_mtp_scratch_reserve_is_priced_into_the_state_pool():
+    """--speculative mtp clones one GDN slot per running request per verify, so the reserve
+    has to show up in the slot count, in the floor a rebuild refuses to go below, and in the
+    byte estimate the budget plans with (state_pool_bytes follows the slot count)."""
+    from freetoken.kvcache.linear_state_pool import (
+        _linear_pool_min_slots, _linear_pool_num_slots, _linear_spec_reserve, state_pool_bytes,
+    )
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(1, 3), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+
+    def cfg(cache_type):
+        c = _generic_config()
+        c.linear_state_cache_ratio = 0.5
+        c.cache_type = cache_type
+        c.model_config.linear_attention_group = lambda: group
+        return c
+
+    for cache_type in ("radix", "hybrid_radix"):
+        plain, mtp = cfg(cache_type), cfg(cache_type)
+        mtp.speculative = "mtp"
+        # one scratch slot per running request, nothing more
+        assert _linear_spec_reserve(plain) == 0
+        assert _linear_spec_reserve(mtp) == mtp.max_running_req
+        assert _linear_pool_num_slots(mtp) == _linear_pool_num_slots(plain) + 4
+        assert _linear_pool_min_slots(mtp) == _linear_pool_min_slots(plain) + 4
+        # the VRAM estimate follows, so the KV budget shrinks instead of the pool
+        assert state_pool_bytes(mtp) > state_pool_bytes(plain)
+    # a model with no GDN state has nothing to reserve
+    no_linear = cfg("hybrid_radix")
+    no_linear.speculative = "mtp"
+    no_linear.model_config.linear_attention_group = lambda: None
+    assert _linear_spec_reserve(no_linear) == 0
+
+
 def test_validate_rebuild_targets_flow_by_kv_cost_signature():
     """The base template hands each family's kv_cost exactly the non-None target keys its
     signature declares: hybrid's pinned window flows through and changes the verdict;
