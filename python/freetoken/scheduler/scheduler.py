@@ -1671,14 +1671,19 @@ class Scheduler(SchedulerIOMixin):
             # decline it used to be -- that is what never came back
             req.spec_suspend -= 1
             req.spec_suspend_missed += 1
-            if req.spec_suspend == 0 and req.spec_suspend_missed > _MTP_RESYNC_LAG:
-                # the pause outran the hole the head may miss: the staged draft and the
-                # density that produced it were computed spec_suspend_missed committed
-                # tokens ago, so the resume drops both and cold-seeds a fresh pair instead
-                # of paying a verify aimed at the wrong position (measured: that verify
-                # rejects every time). Not terminal -- same trade as the resync above.
-                req.spec_suspend_missed = 0
-                if req.spec_draft is not None or req.spec_draft_probs is not None:
+            if req.spec_suspend == 0:
+                # the hole is PER EPISODE: reset at every countdown end, or two short pauses
+                # accumulate (the streak default sits exactly at the lag bound) and every
+                # other one re-seeds -- measured live as streak=48 with suspend_hole=22
+                missed, req.spec_suspend_missed = req.spec_suspend_missed, 0
+                if missed > _MTP_RESYNC_LAG and (
+                    req.spec_draft is not None or req.spec_draft_probs is not None
+                ):
+                    # the pause outran the hole the head may miss: the staged draft and the
+                    # density that produced it were computed `missed` committed tokens ago,
+                    # so the resume drops both and cold-seeds a fresh pair instead of paying
+                    # a verify aimed at the wrong position (measured: that verify rejects
+                    # every time). Not terminal -- same trade as the resync above.
                     req.spec_draft = None
                     req.spec_draft_probs = None
                     self._count_spec_rejection("suspend_hole", req)

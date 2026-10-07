@@ -454,6 +454,43 @@ def test_a_short_suspend_still_resumes_on_the_stale_draft(monkeypatch):
 
 
 
+def test_two_short_suspends_do_not_accumulate_their_holes(monkeypatch):
+    """The hole is PER EPISODE: two streak stand-downs of SKIP_STEPS rows each stay within
+    the lag bound and keep their drafts. An accumulating counter turned every second short
+    pause into a suspend_hole re-seed (measured live: streak=48 with suspend_hole=22 at the
+    default skip=8 == lag=8, where no episode ever outran the lag)."""
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
+
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 4)
+    monkeypatch.setattr(sched_mod, "_MTP_RESYNC_LAG", 4)
+    monkeypatch.setattr(sched_mod, "_MTP_REJECT_STREAK", 0)
+    sched = _sched_for_batch(None)
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    req = _spec_req(P + 2, 200, P, spec_draft=7, spec_head_len=P)
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+
+    def one_episode():
+        for _ in range(window):
+            sched._tally_verify(req, False)
+        assert req.spec_suspend == 4
+        for _ in range(4):
+            assert sched._as_spec_batch(batch) is None
+            batch.spec_mode = None
+            sched._on_regular_decode(req)
+        # 4 missed == the lag bound, not past it: the draft survives every episode
+        assert req.spec_draft == 7 and req.spec_suspend_missed == 0
+        assert "suspend_hole" not in sched._spec_rejections
+        assert sched._as_spec_batch(batch) is batch and batch.spec_mode == "verify"
+        batch.spec_mode = None
+        req.spec_verifies = req.spec_accepted = 0  # re-arm the window for the next episode
+
+    one_episode()
+    one_episode()
+
+
 def test_an_auto_off_reject_still_restores_the_scratch_slot(monkeypatch):
     """The low-acceptance auto-off frees the scratch slot, and a reject restores FROM it.
 
