@@ -1104,7 +1104,9 @@ class Scheduler(SchedulerIOMixin):
         The per-decline line is the point. The breakdown used to ride only inside the verify
         tally, so a workload that never qualified -- every prompt chunked, or every prompt a
         prefix hit -- printed nothing, and that was indistinguishable from MTP being off. A
-        reason is terminal per request, so the lines cannot outnumber the requests."""
+        terminal reason counts once per request; the episodic ones (resync, streak,
+        suspend_hole, a low_acceptance pause) count once per episode, and the per-reason line
+        cap bounds the log either way."""
         counts = getattr(self, "_spec_rejections", None)
         if counts is None:
             counts = self._spec_rejections = {}
