@@ -94,6 +94,27 @@ def test_vocab_sized_top_k_is_no_truncation():
     )
 
 
+def test_degenerate_top_p_is_clamped_like_the_main_sampler():
+    # Sampler.prepare clamps top_p into [1e-6, 1.0]; the API hands the raw knob over, and an
+    # unclamped p <= 0 renorms the row to all zeros -- the draw then comes back as the vocab's
+    # last token instead of the target's top one, and the rejection test divides by NaN
+    logits = torch.tensor([[3.0, 1.0, 0.0, -2.0]])
+    want = trunc_renorm_probs(logits, temperature=1.0, top_k=-1, top_p=1e-6)
+    assert want.argmax(-1).item() == 0 and (want[0, 1:] == 0).all()
+    for p in (0.0, -1.0):
+        got = trunc_renorm_probs(logits, temperature=1.0, top_k=-1, top_p=p)
+        assert torch.isfinite(got).all()
+        assert got.sum(-1).item() == pytest.approx(1.0, abs=1e-6)
+        assert torch.allclose(got, want)  # exactly the main sampler's clamped distribution
+
+
+def test_top_p_above_one_is_no_truncation():
+    logits = torch.randn(1, 9)
+    assert torch.allclose(
+        trunc_renorm_probs(logits, 1.0, top_p=1.5), torch.softmax(logits, dim=-1), atol=1e-7
+    )
+
+
 # ------------------------------------------------- truncation, on the real kernels
 #
 # Above is the host reference; the engine calls the same kernels the normal sampler does
@@ -113,6 +134,7 @@ def _use_triton_kernels(monkeypatch):
     (1.0, -1, 1.0),
     (0.7, 32, 0.9),
     (2.0, -1, 0.5),
+    (0.7, -1, 0.0),  # the degenerate knob: the clamp must reach the kernel path too
 ])
 def test_truncation_kernels_match_the_reference(monkeypatch, temperature, top_k, top_p):
     _use_triton_kernels(monkeypatch)

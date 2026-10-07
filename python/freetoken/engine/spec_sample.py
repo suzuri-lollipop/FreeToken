@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 
 # Temperature floor, matching Sampler.prepare: T=0 is the greedy path, never this one.
 MIN_TEMPERATURE = 1e-6
+# Top-p bounds, matching Sampler.prepare's min(max(top_p, MIN_P), 1.0): the API hands the
+# knob over unvalidated, and an unclamped p <= 0 renorms to an all-zero row -- the draw then
+# comes back as the vocab's last token instead of the target's top one.
+MIN_TOP_P = 1e-6
 # Guards a divide by an all-zero residual (q == p exactly, or a fully truncated row).
 _EPS = 1e-20
 
@@ -114,7 +118,9 @@ def trunc_renorm_probs(
     Both filters run whenever the row needs them and are skipped when the host value says it
     is a no-op (``top_k >= vocab`` / ``top_p == 1``), which is what the sampler itself does;
     a knob that arrives as a device tensor (a per-request override riding in on the payload)
-    cannot be inspected here, so its filter runs with the value as given.
+    cannot be inspected here, so its filter runs with the value as given. Degenerate knobs
+    are clamped to the same bounds Sampler.prepare applies (top_p into [MIN_TOP_P, 1.0]), so
+    a raw ``top_p <= 0`` truncates to the target's top token here exactly as it does there.
 
     CPU tensors take a plain-torch reference path with the same rules -- it is what the unit
     tests pin the semantics with, and the fallback if a renorm kernel ever cannot be used.
@@ -142,7 +148,8 @@ def trunc_renorm_probs(
         )
     if not skip_p:
         probs = sampling.top_p_renorm_probs(
-            probs, _param(top_p, x.device, torch.float32, rows=x.shape[0])
+            probs, _param(top_p, x.device, torch.float32, floor=MIN_TOP_P, ceiling=1.0,
+                          rows=x.shape[0])
         )
     return probs
 
@@ -156,7 +163,7 @@ def _trunc_renorm_torch(x, temperature, top_k, top_p):
     vocab = x.shape[-1]
     t = max(_as_host(temperature), MIN_TEMPERATURE)
     k = int(_as_host(top_k))
-    p = float(_as_host(top_p))
+    p = min(max(float(_as_host(top_p)), MIN_TOP_P), 1.0)
     k = vocab if k <= 0 or k > vocab else k
     values, indices = (x / t).topk(k, dim=-1)  # descending; a no-op sort when k == vocab
     probs = torch.softmax(values, dim=-1)
