@@ -2256,7 +2256,8 @@ class Engine:
             from .spec_sample import expected_acceptance
 
             logger.info_rank0(
-                f"[mtp-s] ratio={ratio.item():.3f} "
+                f"[mtp-s] u={[round(v, 4) for v in uniforms.tolist()]} "
+                f"ratio={ratio.item():.3f} "
                 f"ceiling={expected_acceptance(q, carried).item():.3f} accept={int(accept)}"
             )
         # zero on a request's first verify (the prologue builds head KV without producing

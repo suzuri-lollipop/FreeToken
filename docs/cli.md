@@ -220,7 +220,7 @@ paying that price for a draft that lands ~0.15 of the time.
 | `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
 | `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
 | `FREETOKEN_MTP_DECLINE_LOG` | 5 | Decline lines printed per reason; the counters keep counting past it |
-| `FREETOKEN_MTP_DEBUG` | off | Per-step trace: `[mtp]` decisions, `[mtp-s]` rejection ratios, `[mtp-t]` step timings. Reads the value for truth, so `0` is off; the timing line synchronizes the device every spec step, so never leave it on for a throughput run |
+| `FREETOKEN_MTP_DEBUG` | off | Per-step trace: `[mtp]` decisions, `[mtp-s]` rejection ratios with the host uniforms that decided them, `[mtp-t]` step timings. Reads the value for truth, so `0` is off; the timing line synchronizes the device every spec step, so never leave it on for a throughput run |
 
 What to read when MTP appears to do nothing:
 

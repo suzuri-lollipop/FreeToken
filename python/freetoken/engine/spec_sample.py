@@ -13,10 +13,10 @@ temperature, then top-k, then top-p, then renormalization. Truncating one side o
 push the acceptance ratio above 1 on the trimmed tail and re-introduce the bias.
 
 Everything is plain torch over dense ``[B, V]`` rows. The uniforms arrive as arguments
-rather than being drawn here, and the engine draws them on the host: a step is then
-reproducible from the numbers its payload logs, and every TP rank decides on the same ones
-(a device RNG would advance at a different offset per rank and the ranks would emit
-different tokens).
+rather than being drawn here, and the engine draws them on the host from a seeded
+generator: every TP rank decides on the same ones (a device RNG would advance at a
+different offset per rank and the ranks would emit different tokens), and the verify
+trace prints the draws next to the verdict, so a traced step is reproducible from its log.
 """
 
 from __future__ import annotations
