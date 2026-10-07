@@ -324,3 +324,77 @@ def test_the_carried_density_belongs_to_the_request():
     assert eng._spec_draft_probs(b, 8) is not first
     assert eng._spec_draft_probs(a, 8) is first
 
+
+def test_knob_tensors_are_cached_and_clamped():
+    """The per-row knob tensors are rebuilt twice per sampled step (q and p_next); the cache
+    turns that into zero allocs after the first, with the same skip rules and clamps."""
+    from freetoken.engine.spec_sample import MIN_TOP_P, _knob_tensors
+
+    x = torch.randn(2, 11)
+    first = _knob_tensors(x, 0.7, 5, 0.9)
+    second = _knob_tensors(x, 0.7, 5, 0.9)
+    assert all(a is b for a, b in zip(first, second))  # cached by host value
+    t, k, p = first
+    assert t.tolist() == [pytest.approx(0.7)] * 2
+    assert k.tolist() == [5, 5] and k.dtype == torch.int32
+    assert p.tolist() == [pytest.approx(0.9)] * 2
+
+    # no-op knobs build nothing; degenerate ones land on Sampler.prepare's bounds
+    assert _knob_tensors(x, 1.0, -1, 1.0)[1:] == (None, None)
+    assert _knob_tensors(x, 1.0, 11, 1.0)[1] is None       # k >= vocab: no truncation
+    _, _, p0 = _knob_tensors(x, 1.0, -1, 0.0)
+    assert p0.tolist() == [pytest.approx(MIN_TOP_P, rel=1e-5)] * 2
+
+    # a tensor knob cannot be keyed by value and never pollutes the cache
+    tv = _knob_tensors(x, torch.full((2,), 0.7), 5, 0.9)
+    assert _knob_tensors(x, torch.full((2,), 0.7), 5, 0.9)[0] is not tv[0]
+
+
+@needs_cuda
+def test_both_knobs_take_one_fused_renorm_launch(monkeypatch):
+    """top_k AND top_p active (the checkpoint's own defaults) must reach the fused triton
+    renorm -- one launch, no intermediate full-vocab row, whatever backend supplied the
+    softmax -- and stay numerically the two-stage truncation it replaces."""
+    import freetoken.kernel.triton.sampling as tri
+    from freetoken.engine import spec_sample
+
+    calls = []
+    real = tri.top_k_top_p_renorm_probs
+
+    def spy(probs, top_k, top_p):
+        calls.append((probs.shape, top_k.tolist(), top_p.tolist()))
+        return real(probs, top_k, top_p)
+
+    monkeypatch.setattr(spec_sample, "_KNOB_CACHE", {})
+    monkeypatch.setattr(tri, "top_k_top_p_renorm_probs", spy)
+    _use_triton_kernels(monkeypatch)  # the softmax backend; the fused renorm is triton either way
+    torch.manual_seed(5)
+    logits = torch.randn(2, 4096, device="cuda") * 3
+    got = trunc_renorm_probs(logits, 1.0, top_k=20, top_p=0.95)
+    assert len(calls) == 1 and calls[0][1] == [20, 20]
+    want = trunc_renorm_probs(logits, 1.0, top_k=-1, top_p=1.0)  # plain softmax start point
+    staged = tri.top_k_renorm_probs(
+        want, torch.full((2,), 20, dtype=torch.int32, device="cuda"))
+    staged = tri.top_p_renorm_probs(staged, torch.full((2,), 0.95, device="cuda"))
+    torch.testing.assert_close(got, staged, atol=2e-5, rtol=2e-4)
+    assert torch.allclose(got.sum(-1), torch.ones(2, device="cuda"), atol=1e-4)
+
+
+@needs_cuda
+def test_spec_stage_round_trips_uniforms_and_draft():
+    """One pinned row carries the step's four uniforms (bit-exact through the int64 view)
+    and the draft id, replacing three pageable copies the eager step used to serialize on."""
+    from freetoken.engine.engine import Engine
+
+    eng = Engine.__new__(Engine)
+    eng.device = torch.device("cuda")
+    uniforms = torch.rand(4)
+    u, draft = eng._spec_stage(uniforms, 4242)
+    assert u.device.type == "cuda" and draft.device.type == "cuda"
+    torch.cuda.synchronize()
+    assert torch.equal(u.cpu(), uniforms)  # bit-exact: same fp32 bits, int64 carrier
+    assert draft.tolist() == [4242] and draft.dtype == torch.int64
+    # the buffers are reused, so a second stage must not alias stale values into a consumer
+    u2, d2 = eng._spec_stage(torch.rand(4), 7)
+    assert u2.data_ptr() == u.data_ptr() and d2.tolist() == [7]
+

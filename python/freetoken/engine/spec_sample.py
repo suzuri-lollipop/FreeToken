@@ -41,6 +41,12 @@ _EPS = 1e-20
 SAMPLING_ENV = "FREETOKEN_MTP_SAMPLING"
 DEBUG_ENV = "FREETOKEN_MTP_DEBUG"
 
+# Per-knob-set device tensors, keyed by the host values that built them. A sampled
+# request's knobs are constant for its life and a step builds them TWICE (q and the
+# head's p_next): the cache turns six small allocs + pageable H2Ds per step into zero.
+_KNOB_CACHE: dict = {}
+_KNOB_CACHE_CAP = 64
+
 
 def debug_traced() -> bool:
     """Whether the per-step MTP trace is on.
@@ -102,6 +108,38 @@ def spec_supported(params: "SamplingParams") -> bool:
     return params.is_greedy or sampling_enabled(params)
 
 
+def _knob_tensors(x: torch.Tensor, temperature, top_k, top_p):
+    """The three knobs as per-row device tensors, ``None`` for a filter that is a no-op.
+
+    Same skip rules and clamps as before (and as Sampler.prepare): ``top_k`` runs only for
+    1 < k < vocab and lands in [1, vocab], ``top_p`` only for p < 1 and lands in
+    [MIN_TOP_P, 1.0], temperature floors at MIN_TEMPERATURE. Host-valued knobs are cached
+    by value; a tensor knob (a per-request override) cannot be, and builds fresh.
+    """
+    rows, vocab, device = x.shape[0], x.shape[-1], x.device
+    skip_k = not isinstance(top_k, torch.Tensor) and (top_k is None or not 1 < top_k < vocab)
+    skip_p = not isinstance(top_p, torch.Tensor) and (top_p is None or top_p >= 1.0)
+    key = None
+    if not any(isinstance(v, torch.Tensor) for v in (temperature, top_k, top_p)):
+        key = (str(device), rows, vocab, float(temperature),
+               None if top_k is None else int(top_k),
+               None if top_p is None else float(top_p))
+        hit = _KNOB_CACHE.get(key)
+        if hit is not None:
+            return hit
+    out = (
+        _param(temperature, device, torch.float32, floor=MIN_TEMPERATURE, rows=rows),
+        None if skip_k else _param(top_k, device, torch.int32, floor=1, ceiling=vocab, rows=rows),
+        None if skip_p else _param(top_p, device, torch.float32,
+                                   floor=MIN_TOP_P, ceiling=1.0, rows=rows),
+    )
+    if key is not None:
+        if len(_KNOB_CACHE) >= _KNOB_CACHE_CAP:
+            _KNOB_CACHE.clear()
+        _KNOB_CACHE[key] = out
+    return out
+
+
 def trunc_renorm_probs(
     logits: torch.Tensor,
     temperature,
@@ -121,12 +159,14 @@ def trunc_renorm_probs(
     cannot be inspected here, so its filter runs with the value as given. Degenerate knobs
     are clamped to the same bounds Sampler.prepare applies (top_p into [MIN_TOP_P, 1.0]), so
     a raw ``top_p <= 0`` truncates to the target's top token here exactly as it does there.
+    When both filters run they run as ONE fused kernel launch (the top-k threshold seeds the
+    top-p bracket; no intermediate full-vocab row is written), and host-valued knobs reuse
+    cached per-row device tensors -- the step builds them twice, for ``q`` and for ``p``.
 
     CPU tensors take a plain-torch reference path with the same rules -- it is what the unit
     tests pin the semantics with, and the fallback if a renorm kernel ever cannot be used.
     """
     x = logits.float()
-    vocab = x.shape[-1]
     if x.device.type == "cpu":
         return _trunc_renorm_torch(x, temperature, top_k, top_p)
     from freetoken.kernel.backend import is_flashinfer_installed
@@ -136,21 +176,19 @@ def trunc_renorm_probs(
     else:
         import freetoken.kernel.triton.sampling as sampling
 
-    probs = sampling.softmax(
-        x, _param(temperature, x.device, torch.float32, floor=MIN_TEMPERATURE, rows=x.shape[0]),
-        enable_pdl=False,
-    )
-    skip_k = not isinstance(top_k, torch.Tensor) and (top_k is None or not 1 < top_k < vocab)
-    skip_p = not isinstance(top_p, torch.Tensor) and (top_p is None or top_p >= 1.0)
-    if not skip_k:
-        probs = sampling.top_k_renorm_probs(
-            probs, _param(top_k, x.device, torch.int32, floor=1, ceiling=vocab, rows=x.shape[0])
-        )
-    if not skip_p:
-        probs = sampling.top_p_renorm_probs(
-            probs, _param(top_p, x.device, torch.float32, floor=MIN_TOP_P, ceiling=1.0,
-                          rows=x.shape[0])
-        )
+    t_t, k_t, p_t = _knob_tensors(x, temperature, top_k, top_p)
+    probs = sampling.softmax(x, t_t, enable_pdl=False)
+    if k_t is not None and p_t is not None:
+        # ONE exact fused k-then-p renorm instead of two launches with a full-vocab
+        # intermediate row. flashinfer has no fused renorm; the triton kernel draws no
+        # RNG, so it is as rank-deterministic as whichever backend supplied the softmax.
+        from freetoken.kernel.triton.sampling import top_k_top_p_renorm_probs
+
+        return top_k_top_p_renorm_probs(probs, k_t, p_t)
+    if k_t is not None:
+        probs = sampling.top_k_renorm_probs(probs, k_t)
+    if p_t is not None:
+        probs = sampling.top_p_renorm_probs(probs, p_t)
     return probs
 
 

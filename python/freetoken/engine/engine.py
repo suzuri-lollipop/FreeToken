@@ -2174,13 +2174,30 @@ class Engine:
         """Four fresh uniforms (accept, residual, bonus, draft) for one spec step, on host.
 
         A fixed CPU generator, not the device RNG: every TP rank samples the same token from
-        the same gathered logits, so ranks cannot diverge on the accept decision, and the
-        step is reproducible from the numbers the payload logs.
+        the same gathered logits, so ranks cannot diverge on the accept decision, and with the
+        verify trace on (which prints them) a step is reproducible from its log.
         """
         gen = getattr(self, "_spec_gen", None)
         if gen is None:
             gen = self._spec_gen = torch.Generator().manual_seed(0x5EC7)  # rank-independent
         return torch.rand(4, generator=gen)
+
+    def _spec_stage(self, uniforms: torch.Tensor, draft_id: int):
+        """The sampled step's host values as ONE async H2D, and its device views.
+
+        The four fp32 uniforms ride bit-exact in the first two int64 slots (an fp32 view of
+        the pinned row) and the draft id under test in the third. Pageable copies of this
+        size serialize against the stream they feed; one pinned row does not, and the eager
+        sampled step used to pay three of them.
+        """
+        h = getattr(self, "_spec_stage_h", None)
+        if h is None:
+            h = self._spec_stage_h = torch.empty(3, dtype=torch.int64, pin_memory=True)
+            self._spec_stage_d = torch.empty(3, dtype=torch.int64, device=self.device)
+        h.view(torch.float32)[:4].copy_(uniforms)
+        h[2] = draft_id
+        self._spec_stage_d.copy_(h, non_blocking=True)
+        return self._spec_stage_d.view(torch.float32)[:4], self._spec_stage_d[2:3]
 
     def _spec_draft_probs(self, req: Req, vocab: int) -> torch.Tensor:
         """The head density carried from one spec step to the next, one row per request.
@@ -2232,9 +2249,8 @@ class Engine:
         # a few launches on a step that is already paying for two rows of the target.
         qs = trunc_renorm_probs(logits, params.temperature, params.top_k, params.top_p)
         q = qs[:1]
-        u = uniforms.to(self.device, non_blocking=True)
+        u, draft = self._spec_stage(uniforms, batch.spec_draft_id if verify else 0)
         if verify:
-            draft = torch.tensor([batch.spec_draft_id], dtype=torch.int64, device=self.device)
             carried = self._spec_draft_probs(req, logits.shape[-1])
             emit, accept, ratio = rejection_sample(q, carried, draft, u[0:1], u[1:2])
             # row 1 re-draws from the target's own row-1 density: on an acceptance the head
