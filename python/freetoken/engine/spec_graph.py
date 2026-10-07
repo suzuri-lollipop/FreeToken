@@ -158,7 +158,8 @@ class SpecGraphRunner:
         hk = self.h_knobs
         hk[0:2] = t
         hk[2:4] = p
-        hk[4:6] = float(k)
+        hk.view(torch.int32)[4:6].copy_(
+            torch.as_tensor([k, k], dtype=torch.int32))  # top-k as int32, no cast in the body
         self.d_knobs.copy_(hk, non_blocking=True)
         src = carried if carried is not None else req.spec_draft_probs
         if src is not None:
@@ -235,7 +236,7 @@ class SpecGraphRunner:
         logits = model.full_vocab_logits(mixed)
         t = self.d_knobs[0:2]
         p = self.d_knobs[2:4]
-        k = self.d_knobs[4:6].to(torch.int32)
+        k = self.d_knobs.view(torch.int32)[4:6]
         qs = top_k_top_p_renorm_probs(sampling.softmax(logits, t, enable_pdl=False), k, p)
         u = self.d_su.view(torch.float32)[:4]
         emit, accept, _ratio = rejection_sample(
