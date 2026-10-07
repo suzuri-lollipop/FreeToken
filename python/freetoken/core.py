@@ -73,20 +73,27 @@ class Req:
     # the head's whole-prompt catch-up pass (Batch.spec_prologue) consumes it at the first
     # decode step and drops it. Spec is gated on prompts whose stash fits the budget.
     spec_residual: torch.Tensor | None = None
+    # The density that produced spec_draft, carried between spec steps so the sampled verify can
+    # reject-test against the p the draft was actually drawn from. One row per request (~1 MiB):
+    # requests alternate single-request batches, so an engine-wide row would mix their densities.
+    spec_draft_probs: torch.Tensor | None = None
     # Pending draft token id (host int) predicted for the position after the current input
     # token; None until the head has produced one.
     spec_draft: int | None = None
-    # Permanently disables spec for this request: non-greedy sampling, a prefix-cache hit or
-    # a chunked prompt (the head's catch-up pass needs the WHOLE prompt's residuals, which
-    # only a single-chunk cold prefill produces), or a stash over the budget. Regular decode
-    # continues untouched.
+    # Permanently disables spec for this request: non-greedy sampling under the kill switch, an
+    # image row, a stash that cannot cover the prompt (only with cold start off), or the
+    # acceptance floor with FREETOKEN_MTP_RESUME_AFTER=0. Regular decoding continues untouched.
     spec_off: bool = False
-    # Rows the MTP head has consumed (its KV covers positions [0, spec_head_len)). Nonzero
-    # once the catch-up pass has run, which is what makes a later skipped row unrecoverable.
+    # Rows the MTP head has consumed (its KV covers positions [0, spec_head_len), plus any hole
+    # where a mixed batch decoded rows it never saw). Nonzero once the head has run at all.
     spec_head_len: int = 0
     # Why spec stopped ('' while the request is still eligible). The scheduler counts these:
     # a run where MTP never fired otherwise looks identical to one where it fired and lost.
     spec_off_reason: str = ""
+    # Decode steps left before a request stands down by the acceptance floor re-probes. Kept
+    # separate from spec_off because the floor is a statistical judgement on a small window:
+    # ending the request on one trip is what switched good heads off mid-answer.
+    spec_suspend: int = 0
     # What the engine's residual gate saw when it declined (rows, cache hit, the stash cap), for
     # the scheduler's decline line: the drain runs after complete_one() has advanced cached_len,
     # so the live numbers no longer describe the decision that was made.
@@ -94,6 +101,8 @@ class Req:
     # Verify/accept tally of the current low-acceptance auto-off window.
     spec_verifies: int = 0
     spec_accepted: int = 0
+    # Consecutive rejected verifies: the per-step signal behind the short stand-down.
+    spec_rejects: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

@@ -235,7 +235,7 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
@@ -246,6 +246,15 @@ class PrefillAdder:
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
+            # A continuation is a FRESH Req, so the MTP residual stash has to be handed over here:
+            # the head catches up over every row the chunks computed, and a stash dropped at the
+            # chunk boundary is indistinguishable from the hole a prefix-cache hit leaves. The
+            # decline reason is deliberately not carried -- the chunk that decided it reports it
+            # at its own drain, and carrying it would count the same request twice.
+            if req is not None:
+                req.spec_residual = chunked_req.spec_residual
+                req.spec_off = chunked_req.spec_off
+            return req
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, restore_host = resource

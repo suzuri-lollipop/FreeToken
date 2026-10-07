@@ -165,19 +165,58 @@ checkpoint that ships an MTP head can serve it.
 
 Drafting is opportunistic: a request that does not qualify decodes normally, at its own cost. The
 rules are what a log with no MTP activity means, so they are printed at start-up too. A request must
-reach a decode batch of one, and its prompt must be a cold single-chunk prefill -- the head catches
-up on the prompt's residual rows, and those exist only for rows the target forward ran. A prefix
-cache hit, a prompt that splits over `--max-prefill-length`, a prompt over the stash budget and image
-rows therefore all decline it. Greedy requests verify by comparing token ids and can capture a CUDA
-graph; sampled requests verify by exact rejection sampling (output distribution unchanged) and always
-run eager, so a sampled-only workload never prints a captured-graph line.
+reach a decode batch of one (a spec step is a two-row forward for a single request), and the head
+drafts over the prompt's residual rows: those exist only for rows the target forward actually ran,
+so a prefix-cache hit never produced them and a prompt longer than the stash budget cannot be
+covered in full. Both of those declines disappear with `FREETOKEN_MTP_COLD_START`: the head then
+seeds its first draft from the row it is decoding and pays for the missing catch-up with a few
+rejected verifies. Any number of prefill chunks is fine -- each chunk adds its rows to the stash --
+and sharing a decode batch with another request is no longer terminal either: the staged draft is
+dropped because it aims at a position that already committed, and drafting resumes the moment the
+request runs alone. Greedy requests verify by comparing token ids
+and can capture a CUDA graph; sampled requests verify by exact rejection sampling (output
+distribution unchanged) and always run eager, so a sampled-only workload never prints a
+captured-graph line. Only the drafting steps leave the overlap pipeline (the next batch's positions
+and pages are built from the accept count), so a request that never drafts pays nothing for
+somebody else's draft; `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1` restores the old serialized loop.
+Enabling the head is not free even for traffic that never drafts: it adds one full-attention layer
+to the pool sizing (KV plus its index slab, so the KV/expert pools are a layer smaller), and one
+GDN scratch slot per running request is held back for verify rollbacks.
+
+Acceptance is a property of the text as much as of the engine: how often a draft lands is how
+predictable the next token is. The head's own ceiling is a separate, measurable quantity -- the
+wiring probe (`_scratch/mtp_probe.py`, teacher-forced prose and code) put the shipping wiring at
+0.560, and a live greedy session measured 0.578 -- while random word-salad prompts in the same
+build measured 0.42-0.50. So compare acceptance only between runs of the same text and the same
+sampling mode, and read a lone number with that in mind. Sampling mode matters on its own: a
+sampled request lands below its greedy equivalent by construction, because rejection sampling
+accepts a draft with probability `min(1, q(y)/p(y))` -- its ceiling is `sum(min(q, p))`, not an
+argmax match -- and the flatter the request's temperature/top_p, the lower that sum. `[mtp-s]`
+prints the ceiling next to the ratio for exactly this comparison, and
+`FREETOKEN_MTP_MIN_ACCEPTANCE` is the floor that stops paying a second target row for a draft that
+keeps missing; a sampled-only workload sits permanently closer to it than a greedy one.
+
+What a draft costs, measured on one RTX-class card with this checkpoint and three identical cold
+642-token sampled prompts (256 tokens out, every gate open so the head drafted 99.6% of steps):
+21.9 tok/s with drafting off, 16.0 with it on, at acceptance 0.453 -- so a spec step costs about two
+decode steps and break-even would need acceptance at 1.0, which no head reaches. Shrinking the GPU
+expert cache from 4204 to 1200 slots slowed both arms by about a third (21.9 -> 14.8 without
+drafting, 16.0 -> 10.6 with) and left the ratio unchanged: the second row is compute, not an expert
+fetch, so no batching of drafts amortizes it away. The same step on a 10k-token prompt costs nearer
+1.5 decode steps, which is why a long answer can break even at the acceptance it actually reaches
+while a short one cannot -- the whole reason `streak` and `low_acceptance` stand down instead of
+paying that price for a draft that lands ~0.15 of the time.
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `FREETOKEN_MTP_ACCEPT_WINDOW` | 64 | Verifies per acceptance report and per auto-off window (floor 8) |
 | `FREETOKEN_MTP_MIN_ACCEPTANCE` | 0.35 | Below this acceptance within one window the request stops drafting; `0` disables the check |
+| `FREETOKEN_MTP_REJECT_STREAK` | 3 | Consecutive rejected verifies that trigger a short stand-down (the per-step half of the floor); `0` disables |
+| `FREETOKEN_MTP_SKIP_STEPS` | 8 | Decode steps that stand-down lasts before drafting resumes |
+| `FREETOKEN_MTP_RESUME_AFTER` | one window | Decode steps a suspended request waits before re-probing the floor; `0` makes the trip terminal |
+| `FREETOKEN_MTP_COLD_START` | off | Draft even when the prompt rows are gone (prefix hit) or over the stash budget: the head seeds its first draft from its own row instead of declining. Costs a few rejected verifies, buys back the multi-turn traffic that always hits the cache |
 | `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off |
-| `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual may be held for the head, capped by `--max-prefill-length` |
+| `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual is held for the head's catch-up pass (~20 KiB/row at this model's width, so ~320 MiB per draftable request; also how long the catch-up pass is) |
 | `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
 | `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
 | `FREETOKEN_MTP_DECLINE_LOG` | 5 | Decline lines printed per reason; the counters keep counting past it |
@@ -187,14 +226,33 @@ What to read when MTP appears to do nothing:
 
 - `MTP spec: enabled ...` at start-up names the caps and which sampling modes may draft. No such line
   means `--speculative mtp` was not passed.
-- `MTP spec: declined <reason> for req <uid>: ...` prints once per declined request with the numbers
-  the gate used; the `declined: <reason>=<count>` breakdown rides on every tally line.
+- `MTP spec: declined <reason> for req <uid>: ...` prints with the numbers the gate used (a capped
+  number of lines per reason); the `declined: <reason>=<count>` breakdown rides on every tally
+  line, and counts per request for the terminal reasons, per episode for `resync` and `streak`.
+
+| Decline reason | Means |
+|---|---|
+| `prefix_hit` | The prompt's first rows came from the prefix cache, so no residual exists for them and there is nothing to catch the head up on. Only a decline with `FREETOKEN_MTP_COLD_START=0`: with it on, the head drafts from where it is |
+| `over_budget` | The prompt is longer than `FREETOKEN_MTP_MAX_STASH_TOKENS` rows (the line prints `stashed=` how far it got); cold start drafts these without the catch-up pass instead |
+| `nongreedy` | Only with `FREETOKEN_MTP_SAMPLING=0`: the request samples and sampled drafting was switched off |
+| `mm` | The prompt carries image rows; those keep the regular decode path |
+| `no_gdn_pool` | No GDN state pool to clone for a rejection rollback (non-hybrid model, or the pool is off) |
+| `exhausted` | The GDN pool had no scratch slot to spare for this request |
+| `resync` | The decode batch grew past one request, so the head missed rows. Not terminal: the staged draft is dropped (it aims at a position that already committed) and drafting continues, one rejected verify later |
+| `no_stash` | The prefill forward produced no residual rows for this request, so the head cannot be caught up. The forward gate declines whole batches and names no request, which is why this reason exists at all: it is the visible form of "the prefill never offered me rows". Cold start removes it by drafting anyway |
+| `lag_overflow` | The request decoded more than `FREETOKEN_MTP_RESYNC_LAG` rows unseen by the head before ever drafting, so the stash (prompt-sized, otherwise pinned for the request's whole life) is written off. Terminal only with cold start off |
+| `low_acceptance` | This request's acceptance fell under `FREETOKEN_MTP_MIN_ACCEPTANCE` within one window of verifies; drafting stands down for `FREETOKEN_MTP_RESUME_AFTER` decode steps and probes again (`0` ends it for the request) |
+| `streak` | `FREETOKEN_MTP_REJECT_STREAK` verifies in a row missed, so the next `FREETOKEN_MTP_SKIP_STEPS` are spent decoding: after three misses the next draft lands ~0.15 while a verify costs ~2.1 decode steps. Not terminal, and the one number to read before blaming the head |
+| `no_room` | One row of output budget left: an accept could not pay out, so drafting is over for this request |
+
 - `MTP spec: acceptance <a>/<n> = <rate>` prints when the verify window fills, when the report
   interval elapses, and as the queue drains; the periodic `Decode batch` line carries `mtp: ...` too,
   so the state is readable even with zero verifies.
 - `GET /v1/stats` reports the same counters under `spec` (`verifies`, `accepted`, `acceptance_rate`,
-  `declined`), and `spec` is `null` when speculative decoding is off -- which is how "not enabled" and
-  "enabled, and nothing ever qualified" tell each other apart without reading a log.
+  `declined`, plus the coverage split `steps` / `decode_steps` / `drafted_ratio` and the
+  `cold_seeds` that had no catch-up pass behind them), and `spec` is `null` when speculative
+  decoding is off -- which is how "not enabled" and "enabled, and nothing ever qualified" tell each
+  other apart without reading a log.
 
 ### API behaviour
 

@@ -107,10 +107,11 @@ def test_stats_reports_backend_page_size(pools, expected):
 def test_stats_reports_mtp_tallies_whether_or_not_anything_drafts():
     from freetoken.server.stats import StatsTracker, build_stats
 
-    def doc(speculative, verifies=0, accepted=0, declines=None):
+    def doc(speculative, verifies=0, accepted=0, declines=None, steps=0, decode_steps=0):
         tracker = StatsTracker()
         tracker.spec_verifies, tracker.spec_accepted = verifies, accepted
         tracker.spec_declines = dict(declines or {})
+        tracker.spec_steps, tracker.spec_decode_steps = steps, decode_steps
         config = SimpleNamespace(served_model_name="unit-model", max_seq_len=262144,
                                  page_size=1, served_modalities=(), speculative=speculative,
                                  model_config=SimpleNamespace())
@@ -123,8 +124,15 @@ def test_stats_reports_mtp_tallies_whether_or_not_anything_drafts():
     assert doc("mtp", declines={"prefix_hit": 9, "chunked": 12}) == {
         "verifies": 0, "accepted": 0, "acceptance_rate": None,
         "declined": {"chunked": 12, "prefix_hit": 9},
+        "steps": 0, "decode_steps": 0, "cold_seeds": 0, "drafted_ratio": None,
     }
     assert doc("mtp", verifies=64, accepted=37)["acceptance_rate"] == 0.578
+    # coverage: 16 spec steps against 64 regular decode steps is a request that stopped
+    # drafting, which the acceptance rate alone cannot say
+    assert doc("mtp", verifies=64, accepted=37, steps=16, decode_steps=64) == {
+        "verifies": 64, "accepted": 37, "acceptance_rate": 0.578, "declined": {},
+        "steps": 16, "decode_steps": 64, "cold_seeds": 0, "drafted_ratio": 0.2,
+    }
 
 
 def test_stats_tracker_keeps_the_last_mtp_snapshot():

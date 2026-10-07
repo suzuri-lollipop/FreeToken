@@ -65,6 +65,7 @@ def _setup(req, mode="verify", pages=None):
     sched._log_spec_decline = lambda reason, r: Scheduler._log_spec_decline(sched, reason, r)
     sched._decline_detail = lambda r: Scheduler._decline_detail(sched, r)
     sched._spec_reject_summary = lambda: Scheduler._spec_reject_summary(sched)
+    sched._spec_coverage = lambda: Scheduler._spec_coverage(sched)
     sched._release_spec_scratch = lambda r: Scheduler._release_spec_scratch(sched, r)
     sched._spec_reject = lambda r, reason: Scheduler._spec_reject(sched, r, reason)
     sched._tally_verify = lambda r, a: Scheduler._tally_verify(sched, r, a)
@@ -153,10 +154,19 @@ def _upgrade_sched(req):
 
     sched = SimpleNamespace(
         config=SimpleNamespace(speculative="mtp"),
-        engine=SimpleNamespace(linear_state_pool=SimpleNamespace(alloc=lambda n: [5])),
+        engine=SimpleNamespace(linear_state_pool=SimpleNamespace(
+            alloc=lambda n: [5], free=lambda slot: None)),
         token_pool=_Pool(),
         _build_spec_prologue=lambda r: "PROLOGUE",
+        _spec_rejections={},
+        _spec_decline_lines={},
     )
+    sched._spec_reject = lambda r, reason: Scheduler._spec_reject(sched, r, reason)
+    sched._count_spec_rejection = (
+        lambda reason, r=None: Scheduler._count_spec_rejection(sched, reason, r))
+    sched._log_spec_decline = lambda reason, r: Scheduler._log_spec_decline(sched, reason, r)
+    sched._decline_detail = lambda r: Scheduler._decline_detail(sched, r)
+    sched._release_spec_scratch = lambda r: Scheduler._release_spec_scratch(sched, r)
     return sched, writes
 
 
@@ -174,12 +184,15 @@ def test_verify_needs_room_for_two_tokens():
     from freetoken.core import Batch
     from freetoken.scheduler.scheduler import Scheduler
 
-    # remain_len == 1: an accept would append two tokens past the budget -> stay regular
+    # remain_len == 1: an accept would append two tokens past the budget -> stay regular, and the
+    # draft is declined as the end of the generation rather than as a lost batch (see no_room)
     req = _spec_req(P + 1, 1, P, spec_draft=42, spec_slot_idx=5)
     sched, writes = _upgrade_sched(req)
     batch = Batch(reqs=[req], phase="decode")
     assert Scheduler._as_spec_batch(sched, batch) is None
     assert req.device_len == P + 1 and batch.spec_mode is None and not writes
+    assert req.spec_off and req.spec_off_reason == "no_room"
+    assert req.spec_slot_idx is None  # the scratch slot came back with the draft
 
     # remain_len == 2: the verify upgrade stages the draft and bumps the row count
     req2 = _spec_req(P + 1, 2, P, spec_draft=42, spec_slot_idx=5)
@@ -249,29 +262,40 @@ def _sched_for_batch(batch):
     return sched
 
 
-def test_normal_decode_kills_a_started_draft_and_keeps_a_fresh_stash():
+def test_a_mixed_batch_resyncs_a_started_draft_not_kills_it():
+    """A decode batch that grew past one request used to END drafting for every request that
+    had already started (the reason read as batch_killed). The head's KV is still valid for the
+    rows it saw, so only the staged draft -- now aimed at a committed position -- is worthless:
+    drop it and keep drafting."""
     from freetoken.core import Batch
 
     started = _spec_req(P + 1, 10, P, spec_draft=42)
-    started.spec_head_len = P  # the head already consumed the prompt: no way back
+    started.spec_head_len = P  # the head consumed the prompt; its KV covers [0, P)
     waiting = _spec_req(P + 1, 10, P, spec_residual=torch.ones(2, 4))
     waiting.spec_draft = 7  # never reached a spec step; the draft is stale
     batch = Batch(reqs=[started, waiting], phase="decode")
     sched = _sched_for_batch(batch)
     assert sched._schedule_next_batch() is batch
 
-    assert started.spec_off and started.spec_draft is None
-    assert started.spec_off_reason == "batch_killed"
-    assert not waiting.spec_off and waiting.spec_residual is not None
-    assert waiting.spec_draft is None
-    # only the terminal one is counted, once
-    assert sched._spec_rejections == {"batch_killed": 1}
-    # a request with an intact stash resumes as soon as it runs alone again
+    assert not started.spec_off and started.spec_draft is None
+    assert waiting.spec_draft is None and waiting.spec_residual is not None
+    # counted once, and only when a draft was actually thrown away
+    assert sched._spec_rejections == {"resync": 1}
+    sched._on_regular_decode(started)
+    assert sched._spec_rejections == {"resync": 1}
+
+    # both requests are drafting again the moment they run alone
     sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
     alone = Batch(reqs=[waiting], phase="decode")
     alone.padded_reqs = [waiting]
     upgraded = sched._as_spec_batch(alone)
     assert upgraded is not None and upgraded.spec_mode == "prologue_decode"
+    reseed = Batch(reqs=[started], phase="decode")
+    reseed.padded_reqs = [started]
+    assert sched._as_spec_batch(reseed) is reseed
+    assert reseed.spec_mode == "prologue_decode"
+    assert reseed.spec_prologue is None  # a re-seed: no catch-up pass behind it
+    assert sched._spec_cold_seeds == 1
 
 
 def test_stash_beyond_the_lag_bound_is_released():
@@ -308,11 +332,14 @@ def test_scratch_slot_survives_a_reject_and_dies_with_the_draft():
     assert calls["slot_freed"] == [3] and req.spec_slot_idx is None
 
 
-def test_low_acceptance_disables_further_drafting():
-    """Every verify pays a second target row, so a request whose drafts keep missing stops
-    paying for them once the window says the head is not carrying its weight."""
+def test_low_acceptance_disables_further_drafting(monkeypatch):
+    """With FREETOKEN_MTP_RESUME_AFTER=0 the floor is terminal -- the pre-suspend behaviour,
+    kept as the arm an A/B runs against: every verify pays a second target row, so a request
+    whose drafts keep missing stops paying for them."""
+    import freetoken.scheduler.scheduler as sched_mod
     from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW
 
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 0)
     req = _spec_req(P + 2, 10, P, spec_draft=7, spec_residual=torch.ones(2, 4))
     sched, _, _, _ = _setup(req)
     for _ in range(_MTP_ACCEPT_WINDOW - 1):
@@ -333,14 +360,47 @@ def test_low_acceptance_disables_further_drafting():
     assert good.spec_verifies == 0  # window rolled over clean
 
 
-def test_an_auto_off_reject_still_restores_the_scratch_slot():
+def test_a_missed_window_stands_down_and_probes_again(monkeypatch):
+    """One window is a small sample (at 0.45 true acceptance a 16-window lands under a 0.35
+    floor ~20% of the time), so missing it pauses drafting instead of ending it -- and the
+    regular steps it falls back to count the pause away without filing the lag as terminal."""
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
+
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 3)
+    monkeypatch.setattr(sched_mod, "_MTP_REJECT_STREAK", 0)  # isolate the slow window from the streak
+    sched = _sched_for_batch(None)
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    req = _spec_req(P + 2, 10, P, spec_draft=7, spec_head_len=P)
+    for _ in range(window):
+        sched._tally_verify(req, False)
+    assert req.spec_suspend == 3 and not req.spec_off
+    assert sched._spec_rejections == {"low_acceptance": 1}
+
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    for left in (2, 1, 0):
+        assert sched._as_spec_batch(batch) is None  # no upgrade while standing down
+        batch.spec_mode = None
+        sched._on_regular_decode(req)
+        assert req.spec_suspend == left
+    assert not req.spec_off  # the pause never became batch_killed / lag_overflow
+    assert sched._spec_rejections == {"low_acceptance": 1}
+    assert sched._as_spec_batch(batch) is batch  # resumed on the stale draft: one wasted verify
+    assert batch.spec_mode == "verify"
+
+
+def test_an_auto_off_reject_still_restores_the_scratch_slot(monkeypatch):
     """The low-acceptance auto-off frees the scratch slot, and a reject restores FROM it.
 
     Tallying before the commit therefore rolls back with `spec_slot_idx` already None: the GDN
     pool turns that into a tensor-shape error raised on the engine stream mid-decode, which
     takes the scheduler process down with it."""
+    import freetoken.scheduler.scheduler as sched_mod
     from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
 
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 0)  # terminal arm: the slot must outlive it
     req = _spec_req(P + 2, 10, P, spec_draft=999, spec_verifies=window - 1)
     req.device_len = P + 2
     sched, batch, calls, _pool = _setup(req)
@@ -362,10 +422,10 @@ def test_declines_are_counted_once_per_request():
     req.spec_head_len = P  # started: every later regular decode re-declines it
     for _ in range(5):
         sched._on_regular_decode(req)
-    assert sched._spec_rejections == {"batch_killed": 1}
+    assert sched._spec_rejections == {"resync": 1}
 
     sched._count_spec_rejection("nongreedy")
-    assert sched._spec_reject_summary() == "batch_killed=1 nongreedy=1"
+    assert sched._spec_reject_summary() == "nongreedy=1 resync=1"
 
 
 def test_no_scratch_slot_declines_instead_of_raising():
@@ -467,6 +527,46 @@ def test_the_tally_prints_below_the_verify_window(monkeypatch):
     assert any("(last " in l for l in lines[before:])
 
 
+def test_a_fresh_stash_at_the_last_row_is_no_room_not_batch_killed():
+    """Why a request stopped drafting is the whole point of the breakdown: a draft that never
+    started with one row of budget left ends for lack of room, and must not be filed under
+    concurrency -- and its prompt-sized stash should go with the decision, not with the finish."""
+    from freetoken.core import Batch
+
+    req = _spec_req(P + 1, 1, P, spec_residual=torch.ones(P, 4))
+    sched = _sched_for_batch(None)
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    assert sched._as_spec_batch(batch) is None
+    assert req.spec_off and req.spec_off_reason == "no_room"
+    assert req.spec_residual is None
+    assert sched._spec_rejections == {"no_room": 1}
+
+
+def test_a_short_miss_streak_buys_back_the_expensive_steps():
+    """Measured on live traffic: the next draft lands 0.51 after an accept and ~0.15 after three
+    straight misses, while a verify costs ~2.1 decode steps. The slow window cannot see that
+    within its own sample, so the streak stands down for a few steps first."""
+    from freetoken.scheduler.scheduler import _MTP_SKIP_STEPS
+
+    req = _spec_req(P + 2, 10, P, spec_draft=7)
+    sched, _, _, _ = _setup(req)
+    for _ in range(2):
+        sched._tally_verify(req, False)
+    assert not req.spec_suspend and getattr(sched, "_spec_rejections", {}) == {}
+    sched._tally_verify(req, False)  # third straight miss
+    assert req.spec_suspend == _MTP_SKIP_STEPS and not req.spec_off
+    assert req.spec_rejects == 0  # the streak itself is consumed, not left armed
+    assert sched._spec_rejections == {"streak": 1}
+
+    req.spec_suspend = 0  # an accept on the way back out resets it
+    sched._tally_verify(req, True)
+    assert req.spec_rejects == 0
+    sched._tally_verify(req, False)
+    sched._tally_verify(req, False)
+    assert not req.spec_suspend and sched._spec_rejections == {"streak": 1}
+
+
 def test_a_request_the_forward_never_stashed_is_declined_not_dropped():
     """The batch-level forward gate names no request, so a request reaching a single-request
     decode batch with neither a draft nor a stash was off-spec in silence. Counting it is the
@@ -482,15 +582,104 @@ def test_a_request_the_forward_never_stashed_is_declined_not_dropped():
     assert sched._spec_rejections == {"no_stash": 1}
 
 
+def test_cold_start_seeds_a_draft_with_nothing_to_catch_up_on(monkeypatch):
+    """The catch-up pass is an optimization, not a precondition: with the switch on, a request
+    whose prompt rows are gone still drafts, seeded by the head pass of its own first spec
+    step. Counted, because those drafts are worth less than a warmed-up one."""
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+
+    monkeypatch.setattr(sched_mod, "mtp_cold_start", lambda: True)
+    req = _spec_req(P + 1, 10, P)  # no draft, no stash, the head has never run
+    sched = _sched_for_batch(None)
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    assert sched._as_spec_batch(batch) is batch
+    assert batch.spec_mode == "prologue_decode"
+    assert batch.spec_prologue is None  # no catch-up batch: this step's head pass seeds it
+    assert not req.spec_off and sched._spec_rejections == {}
+    assert sched._spec_cold_seeds == 1
+
+
+def test_only_a_spec_batch_forces_the_serial_drain():
+    """The accept dependency belongs to the spec batch, not to --speculative mtp as a whole:
+    a prefill or regular decode batch must keep the overlap pipeline, while both spec shapes
+    (the catch-up step that produces the first draft, and the verify that decides on it) feed
+    the next batch's positions, pages and token_pool rows from the drained payload."""
+    from types import SimpleNamespace as NS
+
+    drain = Scheduler._needs_serial_drain
+    assert not drain(None)
+    assert not drain((NS(batch=NS(spec_mode=None)), NS()))
+    assert not drain((NS(batch=NS()), NS()))  # no spec_mode attribute at all
+    assert drain((NS(batch=NS(spec_mode="verify")), NS()))
+    assert drain((NS(batch=NS(spec_mode="prologue_decode")), NS()))
+
+
 def test_the_reply_snapshot_is_a_copy_and_only_when_drafting_is_on():
     """/v1/stats reads these counters after the replies carrying them have been serialized, so
     the snapshot must not alias the live map the next decline keeps writing into."""
     sched = _sched_for_batch(None)
     req = _spec_req(P + 2, 10, P, spec_draft=7)
     sched._tally_verify(req, True)
-    verifies, accepted, declines = sched._spec_snapshot()
+    verifies, accepted, declines, steps, decode_steps, cold = sched._spec_snapshot()
     assert (verifies, accepted) == (1, 1) and declines == {}
+    assert (steps, decode_steps, cold) == (0, 0, 0)
     declines["chunked"] = 1
     assert "chunked" not in sched._spec_rejections
     sched.config.speculative = "none"
     assert sched._spec_snapshot() is None
+
+
+def test_the_coverage_split_is_what_separates_a_bad_head_from_a_bad_policy():
+    """Acceptance says nothing about how many steps drafted: a 0.45 measured over 16 verifies
+    of a 256-token answer is a switched-off request, not a weak head."""
+    sched = _sched_for_batch(None)
+    assert sched._spec_coverage() == ""  # no steps yet: the field is absent, not 0/0
+    sched._spec_steps, sched._spec_decode_steps = 61, 131
+    assert sched._spec_coverage() == ", drafted 61/192 (0.32)"
+    sched._spec_cold_seeds = 7
+    assert sched._spec_coverage().endswith("(0.32) cold=7")
+    assert "drafted 61/192" in sched._spec_status()
+
+
+def test_a_decline_only_run_reports_without_dividing_by_zero(monkeypatch):
+    """A run where nothing ever drafted still has a breakdown worth printing -- and printing it
+    raised ZeroDivisionError on the idle flush, which took the whole backend worker down with
+    it (live: --speculative mtp with the stash budget at zero died as soon as the queue drained).
+    """
+    lines = _spec_logs(monkeypatch)
+    sched = _sched_for_batch(None)
+    sched._count_spec_rejection("no_stash")
+    sched._report_spec_tally(force=True)
+    assert any("MTP spec: no verifies" in l and "no_stash=1" in l for l in lines)
+    assert "no verifies" in sched._spec_status()
+
+
+def _cfg_sched():
+    from types import SimpleNamespace as NS
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    sched = NS(config=NS(model_config=None), engine=NS(model=None), _spec_report_s=10.0)
+    sched._report_spec_config = lambda: Scheduler._report_spec_config(sched)
+    return sched
+
+
+def test_startup_names_the_declines_the_switches_have_removed(monkeypatch):
+    """The start-up line is the only MTP statement made before traffic exists, so it has to say
+    which declines the knobs in effect would produce -- and which they cancel."""
+    import freetoken.scheduler.scheduler as sched_mod
+
+    lines = _spec_logs(monkeypatch)
+    monkeypatch.setattr(sched_mod, "mtp_cold_start", lambda: False)
+    _cfg_sched()._report_spec_config()
+    line = [l for l in lines if "MTP spec: enabled" in l][0]
+    assert "single-request decode batches" in line
+    assert "prefix-hit, over-budget and image rows never draft" in line
+
+    lines.clear()
+    monkeypatch.setattr(sched_mod, "mtp_cold_start", lambda: True)
+    _cfg_sched()._report_spec_config()
+    assert "draft cold" in [l for l in lines if "MTP spec: enabled" in l][0]

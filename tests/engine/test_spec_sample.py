@@ -256,6 +256,19 @@ def test_gate_tracks_params_and_the_kill_switch():
         assert not sampling_enabled(SamplingParams(temperature=1.0, top_k=20))
 
 
+def test_truncation_is_row_independent():
+    """The sampled step truncates both target rows in one pass, so per-row and batched calls
+    must agree bit for bit -- the equivalence the batching leans on, and the reason the
+    spec step can spend one launch set instead of two."""
+    torch.manual_seed(11)
+    x = torch.randn(3, 64)
+    for top_k, top_p in ((8, 0.9), (64, 1.0), (-1, 0.5), (1, 1.0)):
+        batched = trunc_renorm_probs(x, 0.7, top_k, top_p)
+        rows = torch.cat([trunc_renorm_probs(x[i : i + 1], 0.7, top_k, top_p) for i in range(3)])
+        assert torch.equal(batched, rows), (top_k, top_p)
+        assert torch.allclose(batched.sum(-1), torch.ones(3), atol=1e-5)
+
+
 def test_the_trace_switch_reads_zero_as_off():
     """The trace synchronizes the device on every spec step, so a value that only LOOKED
     disabled would cost the throughput the trace is used to measure."""
@@ -266,3 +279,26 @@ def test_the_trace_switch_reads_zero_as_off():
         assert not debug_traced()
         mp.setenv("FREETOKEN_MTP_DEBUG", "1")
         assert debug_traced()
+
+
+def test_the_carried_density_belongs_to_the_request():
+    """Rejection sampling is unbiased only against the density the draft was DRAWN from, so
+    that row cannot be engine-wide: two sampled requests alternate single-request spec
+    batches, and the second step would overwrite the p the first is about to test against."""
+    from freetoken.core import Req
+    from freetoken.engine.engine import Engine
+
+    eng = Engine.__new__(Engine)
+    eng.device = torch.device("cpu")
+
+    def req():
+        return Req(input_ids=torch.arange(4, dtype=torch.int32), table_idx=0, cached_len=0,
+                   output_len=4, uid=1, sampling_params=SamplingParams(temperature=0.7),
+                   cache_handle=None)
+
+    a, b = req(), req()
+    first = eng._spec_draft_probs(a, 8)
+    assert first is a.spec_draft_probs and first.shape == (1, 8)
+    assert eng._spec_draft_probs(b, 8) is not first
+    assert eng._spec_draft_probs(a, 8) is first
+

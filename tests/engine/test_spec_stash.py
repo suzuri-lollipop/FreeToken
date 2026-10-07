@@ -3,17 +3,19 @@ _stash_spec_residual), CPU-only.
 
 Prefill decides here whether a request may draft later: the rows the target forward did
 not run the MTP head on are handed to the first decode step as a prologue, which is what
-keeps acceptance at 100% on the prompt instead of starting from a cold head. Two failure
-modes are silent and expensive, so they are pinned on the host-side state only:
+keeps acceptance at 100% on the prompt instead of starting from a cold head. That pass
+wants a hole-free span starting at position 0, so chunked prefills ACCUMULATE and only
+genuinely missing rows decline. Two failure modes are silent and expensive, so they are
+pinned on the host-side state only:
 
-  * stashing anyway when the verify could never run (chunked prefill, shared prefix, no
-    GDN pool, sampling turned off for non-greedy requests, multimodal spans). The prologue
-    then runs the head over rows nothing verified, and the first mismatch costs a rollback
-    with no committed state to roll back to -- the same wrongness the pre-MTP loop had, paid
-    for with a draft model.
-  * stashing an unbounded row span. The stash is prompt-sized, so a long-prompt request
-    that never gets to draft (it stays in a mixed batch for its whole life) pins host
-    memory for nothing. The cap therefore tracks max_extend_tokens, not just a constant.
+  * stashing anyway when the verify could never run (a shared prefix, no GDN pool, sampling
+    turned off by the kill switch, multimodal spans). The prologue then runs the head over
+    rows nothing verified, and the first mismatch costs a rollback with no committed state to
+    roll back to -- the same wrongness the pre-MTP loop had, paid for with a draft model.
+  * stashing an unbounded row span. The stash is prompt-sized and becomes the catch-up pass,
+    so FREETOKEN_MTP_MAX_STASH_TOKENS bounds both the memory a long prompt pins until its
+    first decode step spends it and the time that step pays. It deliberately no longer
+    follows the prefill chunk size.
 
 Nothing here touches CUDA, so a wrong gate still lets the model answer correctly -- with
 worse tokens-per-second and a little more resident host memory. The scheduler side of the
@@ -92,9 +94,9 @@ def test_multi_request_batch_copies_before_the_residual_is_reused():
 
 def test_every_decline_is_named_and_drops_the_stash():
     """Each reason costs something different, and the log line is the only place the field
-    number for "why is MTP not helping this workload" comes from."""
+    number for "why is MTP not helping this workload" comes from. A chunked prompt is NOT in
+    this list: its chunks accumulate (test_chunked_prefill_accumulates_its_rows)."""
     cases = {
-        "chunked": _req(6, chunked=True),
         "prefix_hit": _req(6, cached_len=2),
         "no_gdn_pool": _req(6, gdn_slot=None),
         "mm": _req(6, mm_items=[{"fake": "image"}]),
@@ -127,22 +129,85 @@ def test_sampled_request_stashes_until_the_kill_switch_says_otherwise(monkeypatc
     assert declined.spec_residual is None
 
 
-def test_stash_cap_follows_the_prefill_chunk_budget(monkeypatch):
-    """The cap is min(env, max_extend_tokens): a prompt that arrives in pieces bigger than
-    the prefill chunk is chunked anyway, and a stash larger than one forward is a lie."""
+def test_the_stash_budget_counts_rows_not_one_chunk(monkeypatch):
+    """Phase 1 tied the cap to max_extend_tokens because a stash could not span chunks. Now it
+    can, so the cap is only the memory and time a long prompt buys: rows of prompt residual."""
     monkeypatch.delenv("FREETOKEN_MTP_MAX_STASH_TOKENS", raising=False)
-    over = _req(8199)  # numel 8200 > min(16384 default, 8192 max_extend_tokens)
-    _stash(over)
-    assert over.spec_off and over.spec_off_reason == "over_budget"
+    wide = _req(12000)  # 12000 rows: more than one chunk, less than the 16384 default
+    _stash(wide, max_extend_tokens=32)
+    assert not wide.spec_off and wide.spec_residual.shape[0] == 12000
 
     monkeypatch.setenv("FREETOKEN_MTP_MAX_STASH_TOKENS", "64")
     capped = _req(70)
-    _stash(capped, max_extend_tokens=32)
+    _stash(capped)
     assert capped.spec_off and capped.spec_off_reason == "over_budget"
+    assert capped.spec_residual is None
 
     fits = _req(30)
-    _stash(fits, max_extend_tokens=32)
+    _stash(fits)
     assert not fits.spec_off and fits.spec_residual is not None
+
+
+def test_chunked_prefill_accumulates_its_rows(monkeypatch):
+    """The catch-up pass needs every row the request ran, not one forward's worth, so each chunk
+    adds its rows: that is what puts a long cold prompt on the spec path at all."""
+    monkeypatch.delenv("FREETOKEN_MTP_MAX_STASH_TOKENS", raising=False)
+    first = _req(8, chunked=True)  # cached_len 0, extend_len 6
+    _stash(first, rows=6)
+    assert first.spec_off is False and first.spec_residual.shape[0] == 6
+
+    first.cached_len = 6  # the chunk committed exactly what the stash already covers
+    first.device_len = 8  # the final chunk: a plain Req with cached_len > 0
+    _stash(first, rows=2)
+    stash = first.spec_residual
+    assert first.spec_off is False and stash.shape[0] == 8
+    assert stash._base is None  # a concatenation, not an alias into either forward's buffer
+    assert stash[:6, 0].tolist() == [4 * i for i in range(6)]  # the first chunk's rows, in order
+
+
+def test_a_hole_in_the_span_declines_as_prefix_hit(monkeypatch):
+    """Rows the target served from cache were never run, so no stash can cover them -- and rows
+    that advanced while nothing was stashed are the same defect from the other side."""
+    monkeypatch.delenv("FREETOKEN_MTP_MAX_STASH_TOKENS", raising=False)
+    hit = _req(6, cached_len=2)
+    _stash(hit)
+    assert hit.spec_off and hit.spec_off_reason == "prefix_hit"
+    assert "stashed=0" in hit.spec_off_detail
+
+    req = _req(8, chunked=True)
+    _stash(req, rows=6)
+    req.cached_len = 9  # committed rows the head never saw a residual for
+    req.device_len = 11
+    _stash(req, rows=2)
+    assert req.spec_off and req.spec_off_reason == "prefix_hit"
+    # an intermediate chunk's input_ids is a prefix slice, so the line must not call its length
+    # the prompt: 9 rows in would otherwise read as a 9-token prompt
+    assert "rows=9" in req.spec_off_detail and "prompt=" not in req.spec_off_detail
+    assert req.spec_residual is None  # the partial span goes with the decision
+
+
+def test_cold_start_turns_those_declines_into_no_stash(monkeypatch):
+    """With FREETOKEN_MTP_COLD_START the span rule stops being an eligibility test: the request
+    keeps its right to draft, it just gets no catch-up pass -- so the gate drops whatever partial
+    span it holds (a span with a hole at the END catches the head up on nothing useful) and
+    records no reason at all."""
+    import freetoken.engine.engine as eng_mod
+
+    monkeypatch.delenv("FREETOKEN_MTP_MAX_STASH_TOKENS", raising=False)
+    monkeypatch.setattr(eng_mod, "mtp_cold_start", lambda: True)
+
+    hit = _req(6, cached_len=2)
+    _stash(hit)
+    assert not hit.spec_off and hit.spec_residual is None
+    assert hit.spec_off_reason == ""
+
+    req = _req(8, chunked=True)
+    _stash(req, rows=6)
+    assert req.spec_residual.shape[0] == 6  # still contiguous so far: the span is kept
+    req.cached_len = 9
+    req.device_len = 11
+    _stash(req, rows=2)
+    assert not req.spec_off and req.spec_residual is None
 
 
 def test_the_forward_gate_and_the_stash_gate_read_sampling_the_same_way(monkeypatch):

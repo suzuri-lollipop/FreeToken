@@ -60,10 +60,14 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
     # MTP draft tallies since the engine started, passed through to the frontend like the pool
-    # snapshots above. 0/empty when speculative decoding is off.
+    # snapshots above: the acceptance pair, the decline reasons and the drafted-step coverage.
+    # 0/empty when speculative decoding is off.
     spec_verifies: int = 0
     spec_accepted: int = 0
     spec_declines: dict[str, int] = field(default_factory=dict)
+    spec_steps: int = 0
+    spec_decode_steps: int = 0
+    spec_cold_seeds: int = 0
 
 
 @dataclass

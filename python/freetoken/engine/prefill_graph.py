@@ -82,6 +82,12 @@ class PrefillGraphRunner:
             return False
         if getattr(req, "mm_items", None):
             return False
+        if getattr(req, "spec_residual", None) is not None and not getattr(req, "spec_off", False):
+            # The replay returns before the engine's residual-stash gate, so a graphed chunk
+            # would commit rows the MTP head never gets a residual for -- hole in the span,
+            # and the request declines for the rest of its life. Keep it eager while its
+            # stash is live; a request already off-spec has nothing left to protect.
+            return False
         if req.linear_slot_idx is None or engine.linear_state_pool is None:
             return False
         fla = batch.fla_metadata

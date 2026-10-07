@@ -27,7 +27,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
-from .config import EngineConfig, tp_preflight_error
+from .config import EngineConfig, mtp_cold_start, mtp_stash_budget, tp_preflight_error
 from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
@@ -2083,7 +2083,8 @@ class Engine:
         u_spec = self.spec_uniforms() if sampling else None
 
         with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
-            if mode == "prologue_decode":
+            if mode == "prologue_decode" and batch.spec_prologue is not None:
+                # a cold seed step (no stash) skips this: the head pass below seeds the draft
                 self._run_head_prologue(model, req, batch.spec_prologue)
             if _dbg_spec:
                 _t1 = _time.perf_counter()
@@ -2181,17 +2182,22 @@ class Engine:
             gen = self._spec_gen = torch.Generator().manual_seed(0x5EC7)  # rank-independent
         return torch.rand(4, generator=gen)
 
-    def _spec_draft_probs(self, vocab: int) -> torch.Tensor:
-        """The head density carried from one spec step to the next.
+    def _spec_draft_probs(self, req: Req, vocab: int) -> torch.Tensor:
+        """The head density carried from one spec step to the next, one row per request.
 
-        The rejection test needs the distribution that PRODUCED the draft id, and the head
-        pass that produced it ran in the previous step -- its argmax went out in the payload,
-        its density stays here. One row of fp32 logits, so the carry costs ~1 MiB and no host
-        round-trip.
+        The rejection test needs the distribution that PRODUCED the draft id, and the head pass
+        that produced it ran in the previous step -- its argmax went out in the payload, its
+        density stays here. One row of fp32 costs ~1 MiB and no host round-trip.
+
+        It lives on the request, not the engine: spec steps only run for a single-request batch,
+        but two requests alternate those batches, and a shared row would have every request's
+        second verify reject-test against the OTHER request's density -- which both loses
+        acceptance and drops the guarantee that the emitted token follows the target's
+        distribution, since rejection sampling is unbiased only against the p it drew from.
         """
-        buf = getattr(self, "spec_draft_probs", None)
+        buf = req.spec_draft_probs
         if buf is None or buf.shape[-1] != vocab:
-            buf = self.spec_draft_probs = torch.zeros(
+            buf = req.spec_draft_probs = torch.zeros(
                 1, vocab, dtype=torch.float32, device=self.device
             )
         return buf
@@ -2221,19 +2227,21 @@ class Engine:
         params = req.sampling_params
         verify = batch.spec_mode == "verify"
         logits = model.full_vocab_logits(mixed)
-        q = trunc_renorm_probs(logits[:1], params.temperature, params.top_k, params.top_p)
+        # Both target rows truncate in ONE pass: the kernels are per row (and so is the CPU
+        # reference), so row 0's q is bit-identical to the separate call this replaces, minus
+        # a few launches on a step that is already paying for two rows of the target.
+        qs = trunc_renorm_probs(logits, params.temperature, params.top_k, params.top_p)
+        q = qs[:1]
         u = uniforms.to(self.device, non_blocking=True)
         if verify:
             draft = torch.tensor([batch.spec_draft_id], dtype=torch.int64, device=self.device)
-            carried = self._spec_draft_probs(logits.shape[-1])
+            carried = self._spec_draft_probs(req, logits.shape[-1])
             emit, accept, ratio = rejection_sample(q, carried, draft, u[0:1], u[1:2])
             # row 1 re-draws from the target's own row-1 density: on an acceptance the head
             # consumes this token, and the next verify's draft comes out of the same pass
             # (both draws are [rows] tensors and the head indexes a FLAT id list, so stacking
             # them into a [2, 1] column dies inside the embedding gather)
-            head_in = torch.cat((emit, draw_probs(
-                trunc_renorm_probs(logits[1:2], params.temperature, params.top_k,
-                                   params.top_p), u[2:3])))
+            head_in = torch.cat((emit, draw_probs(qs[1:2], u[2:3])))
             select_row = accept.to(torch.int64)
         else:
             emit, accept = draw_probs(q, u[0:1]), torch.zeros(
@@ -2254,7 +2262,7 @@ class Engine:
         # zero on a request's first verify (the prologue builds head KV without producing
         # densities): a zero p always rejects, and the residual is then exactly q, so the
         # emitted token is still a clean target draw
-        self._spec_draft_probs(p_next.shape[-1]).copy_(p_next)
+        self._spec_draft_probs(req, p_next.shape[-1]).copy_(p_next)
         bonus = head_in[1:2] if verify else emit  # row 1 means nothing on a rejection
         vals = torch.cat((emit, bonus, draft_id, accept.to(torch.int64))).tolist()
         payload = {"y1": int(vals[0]), "draft": int(vals[2])}
@@ -2287,41 +2295,44 @@ class Engine:
     def _stash_spec_residual(self, batch: Batch, residual: torch.Tensor) -> None:
         """Per-req residual rows of this prefill chunk, for the head's catch-up pass.
 
-        Eligibility is decided here (Phase 1): single-chunk cold prompts only -- a prefix
-        hit or a chunked continuation leaves positions whose residuals were never
-        computed, and the catch-up pass needs every row. Multimodal spans and over-budget
-        prompts opt out, and so does non-greedy sampling while the FREETOKEN_MTP_SAMPLING
-        kill switch turns the sampled verify off (see spec_supported); all of these turn
-        spec off for the request and record the reason on it, which the scheduler counts at
-        the drain.
+        The catch-up pass is a head-only prefill over the rows THIS request's prefills computed,
+        so what it needs is a hole-free span starting at position 0 -- not one chunk. Every chunk
+        adds its rows to the stash, which makes a prompt that splits over --max-prefill-length as
+        draftable as a short one. A prefix-cache hit stays declined: those rows were never run
+        and nothing downstream can produce them. Multimodal spans and over-budget prompts opt
+        out, and so does non-greedy sampling while the FREETOKEN_MTP_SAMPLING kill switch turns
+        the sampled verify off (see spec_supported); all of these turn spec off for the request
+        and record the reason on it, which the scheduler counts at the drain.
 
-        The stash is prompt-sized, so its cap tracks the chunk budget that a single-chunk
-        prefill is already held to: asking for more than one chunk's worth of rows only
-        ever costs the clone without ever being eligible.
+        The stash is prompt-sized, so it lives and dies by mtp_stash_budget (per-row cost there).
         """
+        budget = mtp_stash_budget()
+        multi = len(batch.padded_reqs) > 1
         from freetoken.scheduler.prefill import ChunkedReq
 
-        budget = min(
-            int(os.getenv("FREETOKEN_MTP_MAX_STASH_TOKENS", "16384")),
-            int(getattr(self.config, "max_extend_tokens", 0) or 16384),
-        )
-        multi = len(batch.padded_reqs) > 1
         off = 0
         for req in batch.padded_reqs:
             n = req.extend_len
             rows, off = residual[off:off + n], off + n
             if getattr(req, "spec_off", False):
                 continue
-            if isinstance(req, ChunkedReq) or req.cached_len > 0:
-                reason = "chunked" if isinstance(req, ChunkedReq) else "prefix_hit"
+            prior = req.spec_residual
+            held = 0 if prior is None else int(prior.shape[0])
+            if held != req.cached_len or held + n > budget:
+                # No hole-free span that fits the cap. Either the rows are gone (a radix hit) or
+                # the prompt is longer than the stash budget -- with cold-start drafting the
+                # head simply starts without a catch-up pass, so nothing is declined here; the
+                # partial stash goes because a span with a hole at the END is worthless.
+                if mtp_cold_start():
+                    req.spec_residual = None
+                    continue
+                reason = "prefix_hit" if held != req.cached_len else "over_budget"
             elif getattr(req, "linear_slot_idx", None) is None:
                 reason = "no_gdn_pool"  # nothing to clone for a rejection rollback
             elif not spec_supported(req.sampling_params):
                 reason = "nongreedy"  # sampled drafting is available but switched off
             elif getattr(req, "mm_items", None):
                 reason = "mm"
-            elif req.input_ids.numel() > budget:
-                reason = "over_budget"
             else:
                 reason = ""
             if reason:
@@ -2329,14 +2340,23 @@ class Engine:
                 req.spec_off_reason = reason
                 # the numbers the decision was made on, for the scheduler's decline line
                 sp = req.sampling_params
+                # a chunk's input_ids is a prefix slice: on an intermediate chunk this counts the
+                # rows placed so far, not the prompt, and calling that "prompt" made a 35k prompt
+                # declining at its fourth chunk read like a 16k one
+                span = "rows" if isinstance(req, ChunkedReq) else "prompt"
                 req.spec_off_detail = (
-                    f"prompt={req.input_ids.numel()} new={n} cached={req.cached_len} "
-                    f"out={req.output_len} stash_budget={budget} "
+                    f"{span}={req.input_ids.numel()} new={n} cached={req.cached_len} "
+                    f"stashed={held} out={req.output_len} stash_budget={budget} "
                     f"sampling=(T={sp.temperature}, top_k={sp.top_k}, top_p={sp.top_p})"
                 )
                 req.spec_residual = None
                 continue
-            req.spec_residual = rows.clone() if multi else rows
+            if prior is None:
+                # a view of this forward's rows when nobody else shares the buffer: the stash
+                # outlives the forward, but the buffer it was cut from is not reused either
+                req.spec_residual = rows.clone() if multi else rows
+            else:
+                req.spec_residual = torch.cat((prior, rows))
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
