@@ -10,7 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
+from freetoken.mm.media import (
+    collect_image_refs,
+    fetch_image_bytes,
+    has_image_parts,
+    image_reject_reason,
+)
 from freetoken.server.generation import GenerationError, render_messages
 from freetoken.server.stats import derive_model_card
 
@@ -140,3 +145,73 @@ def test_image_token_budget_flags_land_in_the_multimodal_config():
         assert parse_args(["--model", "/models/anon"])[0].mm.processor_kwargs == {}
         with pytest.raises(SystemExit):  # argparse reports the bad pair and exits
             parse_args(["--model", "/models/anon", "--image-min-tokens", "2048", "--image-max-tokens", "1024"])
+
+
+class _StreamState:
+    """The frontend half of a streaming submission: records the TokenizeMsg, no engine."""
+
+    def __init__(self) -> None:
+        self.config = _config(vision_enabled=True)
+        self.sent = None
+
+    def new_user(self) -> int:
+        return 42
+
+    async def send_one(self, msg):
+        self.sent = msg
+
+
+class _Renderer:
+    def render_prompt(self, msg) -> str:
+        return "rendered"
+
+
+def _image_request(stream: bool):
+    from freetoken.server.openai_api import ChatCompletionRequest
+
+    return ChatCompletionRequest(
+        model="unit-model",
+        stream=stream,
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}},
+            {"type": "text", "text": "what is in this image?"},
+        ]}],
+    )
+
+
+def test_has_image_parts_does_not_consume_the_refs():
+    msgs = render_messages(
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}]
+    )
+    assert has_image_parts(msgs)
+    assert collect_image_refs(msgs) == [{"kind": "url", "data": "https://x/y.png"}]
+    # the popped part stays behind as the template's placeholder, so the check holds
+    assert has_image_parts(msgs)
+    assert not has_image_parts([{"role": "user", "content": "hi"}])
+
+
+def test_streaming_image_request_submits_its_images():
+    # A stream pre-renders to validate the template before SSE headers go out. That
+    # check must not consume the refs submit_generation pops, or the worker tokenizes
+    # a text-only prompt and the model describes an image it was never given.
+    from freetoken.server.openai_api import handle_chat_completion
+
+    state = _StreamState()
+    state.frontend_tokenizer = lambda: _Renderer()
+    asyncio.run(handle_chat_completion(_image_request(True), None, state, {}))
+    assert state.sent is not None
+    assert state.sent.images == [b"fakepng"]
+    assert not state.sent.pre_rendered
+    assert has_image_parts(state.sent.text)
+
+
+def test_streaming_text_request_keeps_the_prerendered_fast_path():
+    from freetoken.server.openai_api import ChatCompletionRequest, handle_chat_completion
+
+    state = _StreamState()
+    state.frontend_tokenizer = lambda: _Renderer()
+    req = ChatCompletionRequest(model="unit-model", stream=True, messages=[{"role": "user", "content": "hi"}])
+    asyncio.run(handle_chat_completion(req, None, state, {}))
+    assert state.sent.text == "rendered"
+    assert state.sent.pre_rendered
+    assert state.sent.images is None

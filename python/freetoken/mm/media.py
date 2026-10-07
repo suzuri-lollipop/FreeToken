@@ -15,7 +15,12 @@ _MAX_IMAGE_BYTES = 32 << 20
 
 
 def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pop the image refs out of rendered messages in prompt order; the bare {"type": "image"} parts stay for the chat template."""
+    """Pop the image refs out of rendered messages in prompt order; the bare {"type": "image"} parts stay for the chat template.
+
+    Destructive: one request may own its refs exactly once. A read-only caller (a
+    pre-check that only wants "does this prompt carry images") must use
+    ``has_image_parts``, else the real consumer sees an image-less prompt.
+    """
     refs: list[dict[str, Any]] = []
     for m in messages:
         content = m.get("content")
@@ -27,6 +32,18 @@ def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if ref:
                     refs.append(ref)
     return refs
+
+
+def has_image_parts(messages: list[dict[str, Any]]) -> bool:
+    """True when any message carries an image part, ref already popped or not."""
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image":
+                return True
+    return False
 
 
 def image_reject_reason(config: ServerArgs) -> str | None:
@@ -109,4 +126,4 @@ async def fetch_image_bytes(refs: list[dict[str, Any]], config: ServerArgs) -> l
     return out
 
 
-__all__ = ["collect_image_refs", "fetch_image_bytes", "image_reject_reason"]
+__all__ = ["collect_image_refs", "fetch_image_bytes", "has_image_parts", "image_reject_reason"]

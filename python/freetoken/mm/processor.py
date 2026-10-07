@@ -111,7 +111,7 @@ class MMProcessor(ABC):
 
     def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
         """Swap each image placeholder for its replacement sequence and precompute rope positions."""
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         ids = input_ids.tolist()
         target = self.placeholder
@@ -122,7 +122,12 @@ class MMProcessor(ABC):
                 f"carries {len(images)} images"
             )
 
-        pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
+        # phone and messenger saves leave the pixels sideways and record the fix-up in
+        # EXIF only; without the transpose the encoder sees the stored orientation
+        pils = [
+            ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+            for raw in images
+        ]
         items = self.process(pils)
         out: list[int] = []
         cursor = 0
