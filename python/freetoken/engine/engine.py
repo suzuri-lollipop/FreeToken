@@ -2038,6 +2038,25 @@ class Engine:
             _dbg.host_phase(_ek + "fe.ret", _time.perf_counter() - _te)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def spec_graph_will_replay(self, sampling: bool) -> bool:
+        """Whether the next verify of this kind replays a captured graph.
+
+        The scheduler asks this to skip the per-step batch preparation a replay never
+        reads (positions, mapping tuples, out_loc, attn/FLA metadata, the sampler knobs):
+        the graph derives every input from its staged scalars and in-graph gathers.
+        Mirrors _forward_spec's dispatch exactly, so a step prepared by the fast path
+        always lands on the replay -- and a warm/eager step (or one after an invalidate)
+        gets the full preparation it needs.
+        """
+        runner = getattr(self, "_spec_graph", None)
+        if runner is None:
+            return False
+        if sampling:
+            from .spec_sample import sampled_graph_enabled
+
+            return runner.graph_sampled is not None and sampled_graph_enabled()
+        return runner.graph is not None
+
     @torch.inference_mode()
     def _forward_spec(self, batch: Batch) -> ForwardOutput:
         """MTP spec step (single request, greedy or rejection-sampled; --speculative mtp).

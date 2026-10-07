@@ -1539,6 +1539,14 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
+        # A graphed verify derives every input from its staged scalars and in-graph
+        # gathers, so the per-step tensor prep a replay never reads (positions, mapping
+        # tuples, out_loc, FLA/attn metadata) is pure waste. The page charge IS read: the
+        # in-graph gather of out_loc hits the page-table rows allocate_paged just filled.
+        spec_graphed = (
+            getattr(batch, "spec_mode", None) == "verify"
+            and self.engine.spec_graph_will_replay(getattr(batch, "spec_sample", False))
+        )
         if batch.is_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
@@ -1562,13 +1570,15 @@ class Scheduler(SchedulerIOMixin):
             batch.spec_pages = recorded
         if batch.is_prefill:
             self._gather_multimodal(batch)
-        batch.positions = _make_positions(batch, self.device)
-        if self._model_is_mrope:
-            batch.mrope_positions = _make_mrope_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
+        input_mapping = write_mapping = None
+        if not spec_graphed:
+            batch.positions = _make_positions(batch, self.device)
+            if self._model_is_mrope:
+                batch.mrope_positions = _make_mrope_positions(batch, self.device)
+            input_mapping = _make_input_tuple(batch, self.device)
+            write_mapping = _make_write_tuple(batch, self.device)
+            batch.out_loc = self.engine.page_table[input_mapping]
+        if self.engine.linear_state_pool is not None and not spec_graphed:
             if batch.is_decode:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
@@ -1594,10 +1604,16 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not spec_graphed:
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            # spec steps never reach the sampler (forward_batch dispatches to _forward_spec
+            # before the args are read), so building its knob tensors per verify was waste
+            sample_args=(
+                None if getattr(batch, "spec_mode", None) is not None
+                else self.engine.sampler.prepare(batch)
+            ),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
@@ -1987,7 +2003,8 @@ class Scheduler(SchedulerIOMixin):
             import time as _time
 
             _q0 = _time.perf_counter()
-        batch.input_ids = self.token_pool[input_mapping]
+        if input_mapping is not None:
+            batch.input_ids = self.token_pool[input_mapping]
         if _dbg is not None:
             _q1 = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.inputids", _q1 - _q0)
@@ -2000,7 +2017,10 @@ class Scheduler(SchedulerIOMixin):
         if _dbg is not None:
             _q2 = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.fbcall", _q2 - _qa)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if output_mapping is not None:
+            # a graphed verify writes its bonus token in-graph (and the drain repairs the
+            # rejected draft's slot); this store feeds the eager steps only
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         if _dbg is not None:
             _q3 = _time.perf_counter()

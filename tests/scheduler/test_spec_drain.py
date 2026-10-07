@@ -783,3 +783,80 @@ def test_startup_names_the_declines_the_switches_have_removed(monkeypatch):
     monkeypatch.setattr(sched_mod, "mtp_cold_start", lambda: True)
     _cfg_sched()._report_spec_config()
     assert "draft cold" in [l for l in lines if "MTP spec: enabled" in l][0]
+
+
+def _prepare_sched(will_replay: bool):
+    """A stub scheduler for _prepare_batch: spies on the calls the fast path must skip.
+
+    The eager-path assertions build positions/mappings, whose pinned staging needs a CUDA
+    device, so both tests below skip without one.
+    """
+    calls = {"prepare_metadata": 0, "sampler": 0, "record": []}
+    sched = Scheduler.__new__(Scheduler)
+    sched._forward_iter = 0
+    sched.device = torch.device("cpu")
+    sched._model_is_mrope = False
+    sched.engine = SimpleNamespace(
+        graph_runner=SimpleNamespace(
+            pad_batch=lambda b: setattr(b, "padded_reqs", list(b.reqs))),
+        page_table=torch.zeros(2, 64, dtype=torch.int32),
+        linear_state_pool=None,
+        attn_backend=SimpleNamespace(prepare_metadata=lambda b: calls.__setitem__(
+            "prepare_metadata", calls["prepare_metadata"] + 1)),
+        sampler=SimpleNamespace(prepare=lambda b: calls.__setitem__(
+            "sampler", calls["sampler"] + 1) or "ARGS"),
+        spec_graph_will_replay=lambda sampling: will_replay,
+    )
+    sched.cache_manager = SimpleNamespace(
+        free_swa_out_of_window_extend=lambda reqs: None,
+        maybe_free_swa_out_of_window=lambda reqs, forward_iter: None,
+        allocate_paged=lambda reqs, record=False: calls["record"].append(record),
+    )
+    sched._gather_multimodal = lambda b: None
+    return sched, calls
+
+
+_needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned staging needs CUDA")
+
+
+@_needs_cuda
+def test_a_graphed_verify_skips_the_prep_the_replay_never_reads():
+    """The graphed verify derives every input from its staged scalars and in-graph gathers,
+    so positions/mappings/out_loc/metadata/sampler-knobs built per step are waste -- but the
+    page charge is NOT: the in-graph out_loc gather reads the rows allocate_paged filled."""
+    from freetoken.core import Batch
+
+    req = _spec_req(P + 2, 10, P, spec_draft=7, spec_head_len=P, spec_slot_idx=5)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.spec_mode = "verify"
+
+    sched, calls = _prepare_sched(will_replay=True)
+    fi = Scheduler._prepare_batch(sched, batch)
+    assert fi.input_tuple is None and fi.write_tuple is None and fi.sample_args is None
+    assert getattr(batch, "positions", None) is None
+    assert getattr(batch, "attn_metadata", None) is None
+    assert calls == {"prepare_metadata": 0, "sampler": 0, "record": [True]}
+
+    # the eager fallback (warm steps, an invalidate, the kill switch) gets the full prep
+    sched2, calls2 = _prepare_sched(will_replay=False)
+    batch2 = Batch(reqs=[_spec_req(P + 2, 10, P, spec_draft=7)], phase="prefill")
+    batch2.spec_mode = "verify"
+    fi2 = Scheduler._prepare_batch(sched2, batch2)
+    assert fi2.input_tuple is not None and fi2.write_tuple is not None
+    assert batch2.positions is not None and batch2.out_loc is not None
+    assert calls2["prepare_metadata"] == 1
+    # ...but the sampler knobs stay skipped for EVERY spec batch: _forward_spec never reads them
+    assert fi2.sample_args is None and calls2["sampler"] == 0
+
+
+@_needs_cuda
+def test_a_regular_batch_still_prepares_and_samples():
+    from freetoken.core import Batch
+
+    req = _spec_req(P + 1, 10, P)
+    batch = Batch(reqs=[req], phase="decode")
+    sched, calls = _prepare_sched(will_replay=True)  # the flag must not leak to regular steps
+    fi = Scheduler._prepare_batch(sched, batch)
+    assert fi.input_tuple is not None and fi.sample_args == "ARGS"
+    assert batch.positions is not None and calls["prepare_metadata"] == 1
+

@@ -242,9 +242,13 @@ class SpecGraphRunner:
         emit, accept, _ratio = rejection_sample(
             qs[:1], self.d_carried, self.d_su[2:3], u[0:1], u[1:2])
         bonus = draw_probs(qs[1:2], u[2:3])
+        # one cast per value: the accept flag feeds both the row select and the payload,
+        # the bonus int32 both the next-token slot and the in-graph pool write
+        acc64 = accept.to(torch.int64)
+        bonus32 = bonus.to(torch.int32).view(1)
         head_in = torch.cat((emit, bonus))
         head_logits = model.draft(residual, head_in.to(torch.int32), batch,
-                                  select_row=accept.to(torch.int64), return_logits=True)
+                                  select_row=acc64, return_logits=True)
         p_next = top_k_top_p_renorm_probs(
             sampling.softmax(head_logits, t[:1], enable_pdl=False), k[:1], p[:1])
         draft_id = draw_probs(p_next, u[3:4])
@@ -252,12 +256,12 @@ class SpecGraphRunner:
         self.d_payload[0] = emit[0]
         self.d_payload[1] = bonus[0]
         self.d_payload[2] = draft_id[0]
-        self.d_payload[3] = accept.to(torch.int64)[0]
-        self.d_next.copy_(bonus.view(1).to(torch.int32))
+        self.d_payload[3] = acc64[0]
+        self.d_next.copy_(bonus32)
         # same pool write the greedy body makes: the accepted bonus belongs at device_len,
         # and on a rejection the drain overwrites the draft's slot with the emitted token
         engine.spec_token_pool.index_put_(
-            (self.d_table, self.d_scal[S_SEQ:S_SEQ + 1]), bonus.to(torch.int32).view(1)
+            (self.d_table, self.d_scal[S_SEQ:S_SEQ + 1]), bonus32
         )
 
     # ------------------------------------------------------------------ capture

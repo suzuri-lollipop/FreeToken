@@ -274,7 +274,7 @@ def rejection_sample(
     # a p of zero means the draft head would never have proposed this id, so the ratio is
     # zero rather than the huge number the division would give against a clamped floor
     ratio = torch.where(
-        p_at > 0, (q_at / p_at.clamp_min(_EPS)).clamp_(max=1.0), torch.zeros_like(p_at)
+        p_at > 0, (q_at / p_at.clamp_min(_EPS)).clamp_(max=1.0), 0.0
     )
     accept = uniform < ratio
     residual = (q_probs - p_probs).clamp_min_(0.0)
