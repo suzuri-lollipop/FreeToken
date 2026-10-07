@@ -157,6 +157,45 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+### Speculative decoding (MTP)
+
+`--speculative mtp` builds the checkpoint's MTP head, drafts the next token with it and verifies the
+draft inside the same forward, so one step costs two target rows and emits one or two tokens. Only a
+checkpoint that ships an MTP head can serve it.
+
+Drafting is opportunistic: a request that does not qualify decodes normally, at its own cost. The
+rules are what a log with no MTP activity means, so they are printed at start-up too. A request must
+reach a decode batch of one, and its prompt must be a cold single-chunk prefill -- the head catches
+up on the prompt's residual rows, and those exist only for rows the target forward ran. A prefix
+cache hit, a prompt that splits over `--max-prefill-length`, a prompt over the stash budget and image
+rows therefore all decline it. Greedy requests verify by comparing token ids and can capture a CUDA
+graph; sampled requests verify by exact rejection sampling (output distribution unchanged) and always
+run eager, so a sampled-only workload never prints a captured-graph line.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `FREETOKEN_MTP_ACCEPT_WINDOW` | 64 | Verifies per acceptance report and per auto-off window (floor 8) |
+| `FREETOKEN_MTP_MIN_ACCEPTANCE` | 0.35 | Below this acceptance within one window the request stops drafting; `0` disables the check |
+| `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off |
+| `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual may be held for the head, capped by `--max-prefill-length` |
+| `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
+| `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
+| `FREETOKEN_MTP_DECLINE_LOG` | 5 | Decline lines printed per reason; the counters keep counting past it |
+| `FREETOKEN_MTP_DEBUG` | off | Per-step trace: `[mtp]` decisions, `[mtp-s]` rejection ratios, `[mtp-t]` step timings. Reads the value for truth, so `0` is off; the timing line synchronizes the device every spec step, so never leave it on for a throughput run |
+
+What to read when MTP appears to do nothing:
+
+- `MTP spec: enabled ...` at start-up names the caps and which sampling modes may draft. No such line
+  means `--speculative mtp` was not passed.
+- `MTP spec: declined <reason> for req <uid>: ...` prints once per declined request with the numbers
+  the gate used; the `declined: <reason>=<count>` breakdown rides on every tally line.
+- `MTP spec: acceptance <a>/<n> = <rate>` prints when the verify window fills, when the report
+  interval elapses, and as the queue drains; the periodic `Decode batch` line carries `mtp: ...` too,
+  so the state is readable even with zero verifies.
+- `GET /v1/stats` reports the same counters under `spec` (`verifies`, `accepted`, `acceptance_rate`,
+  `declined`), and `spec` is `null` when speculative decoding is off -- which is how "not enabled" and
+  "enabled, and nothing ever qualified" tell each other apart without reading a log.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
@@ -208,7 +247,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
 | `health` | `GET /health` | Server status, model, load progress |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, accepted input modalities |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, MTP draft tallies, accepted input modalities |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |

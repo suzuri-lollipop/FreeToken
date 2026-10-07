@@ -61,13 +61,16 @@ def _setup(req, mode="verify", pages=None):
     )
     req.spec_slot_idx = 3
     sched._restore_spec_prefix = lambda b: Scheduler._restore_spec_prefix(sched, b)
-    sched._count_spec_rejection = lambda r: Scheduler._count_spec_rejection(sched, r)
+    sched._count_spec_rejection = lambda reason, r=None: Scheduler._count_spec_rejection(sched, reason, r)
+    sched._log_spec_decline = lambda reason, r: Scheduler._log_spec_decline(sched, reason, r)
+    sched._decline_detail = lambda r: Scheduler._decline_detail(sched, r)
     sched._spec_reject_summary = lambda: Scheduler._spec_reject_summary(sched)
     sched._release_spec_scratch = lambda r: Scheduler._release_spec_scratch(sched, r)
     sched._spec_reject = lambda r, reason: Scheduler._spec_reject(sched, r, reason)
     sched._tally_verify = lambda r, a: Scheduler._tally_verify(sched, r, a)
     req.linear_slot_idx = 1
     batch = SimpleNamespace(reqs=[req], spec_mode=mode, spec_pages=pages)
+    sched._report_spec_tally = lambda force=False: Scheduler._report_spec_tally(sched, force)
     return sched, batch, calls, pool
 
 
@@ -330,6 +333,24 @@ def test_low_acceptance_disables_further_drafting():
     assert good.spec_verifies == 0  # window rolled over clean
 
 
+def test_an_auto_off_reject_still_restores_the_scratch_slot():
+    """The low-acceptance auto-off frees the scratch slot, and a reject restores FROM it.
+
+    Tallying before the commit therefore rolls back with `spec_slot_idx` already None: the GDN
+    pool turns that into a tensor-shape error raised on the engine stream mid-decode, which
+    takes the scheduler process down with it."""
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
+
+    req = _spec_req(P + 2, 10, P, spec_draft=999, spec_verifies=window - 1)
+    req.device_len = P + 2
+    sched, batch, calls, _pool = _setup(req)
+    _drain(sched, batch, {"y1": 41, "y2": 4242, "accept": False, "draft": 77})
+    assert calls["copy_from"] == [(3, 1)]  # restored while the slot was still its own
+    assert req.spec_off and req.spec_off_reason == "low_acceptance"
+    assert calls["slot_freed"] == [3] and req.spec_slot_idx is None
+    assert req.spec_draft is None  # the draft went with the decision, after the commit
+
+
 def test_declines_are_counted_once_per_request():
     """The reason counters are what the periodic acceptance line prints as "declined:", the
     only field number for why MTP is not helping a workload. A request declined on every
@@ -364,3 +385,112 @@ def test_no_scratch_slot_declines_instead_of_raising():
     assert sched._as_spec_batch(batch) is None
     assert req.spec_off and req.spec_off_reason == "exhausted"
     assert req.spec_residual is None  # the stash went with the decision
+
+
+def _spec_logs(monkeypatch):
+    """Capture what the scheduler prints.
+
+    The MTP lines are the only field number for whether drafting ran and why not, so their
+    existence -- not just the counters behind them -- is part of the behaviour under test."""
+    import freetoken.scheduler.scheduler as sched_mod
+
+    lines: list[str] = []
+    monkeypatch.setattr(sched_mod.logger, "info_rank0", lambda msg: lines.append(msg))
+    return lines
+
+
+def test_a_decline_prints_where_it_is_counted(monkeypatch):
+    """The decline breakdown used to live only inside the verify tally, so a workload where
+    nothing ever qualified printed nothing and read exactly like MTP being switched off."""
+    lines = _spec_logs(monkeypatch)
+    sched = _sched_for_batch(None)
+    req = _spec_req(P + 1, 10, P)
+    sched._spec_reject(req, "no_stash")
+    assert any(
+        l.startswith("MTP spec: declined no_stash") and f"req {req.uid}" in l for l in lines
+    )
+    n = len(lines)
+    sched._spec_reject(req, "batch_killed")  # already off: one count, one line
+    assert len(lines) == n and sched._spec_rejections == {"no_stash": 1}
+
+
+def test_the_gates_own_numbers_reach_the_decline_line(monkeypatch):
+    """The prefill forward decides before the drain has advanced the request, so it hands its
+    snapshot over; the line must quote that rather than the drained (and now misleading) state."""
+    lines = _spec_logs(monkeypatch)
+    sched = _sched_for_batch(None)
+    req = _spec_req(P + 1, 10, P)
+    req.spec_off_detail = "prompt=35905 new=8192 cached=27712 stash_budget=8192"
+    sched._count_spec_rejection("prefix_hit", req)
+    line = next(l for l in lines if "declined prefix_hit" in l)
+    assert "prompt=35905" in line and "stash_budget=8192" in line
+    assert req.spec_off_detail == ""  # consumed: a later decline describes itself
+
+
+def test_decline_lines_are_bounded_per_reason(monkeypatch):
+    """One line per request is the design, but a workload of thousands of declined requests
+    still needs a ceiling -- the counters, not the log, carry the total."""
+    import freetoken.scheduler.scheduler as sched_mod
+
+    lines = _spec_logs(monkeypatch)
+    monkeypatch.setattr(sched_mod, "_MTP_DECLINE_LOG_CAP", 2)
+    sched = _sched_for_batch(None)
+    for i in range(5):
+        req = _spec_req(P + 1, 10, P)
+        req.uid = 100 + i
+        sched._count_spec_rejection("prefix_hit", req)
+    assert len([l for l in lines if "declined prefix_hit" in l]) == 2
+    assert any("further requests without a line" in l for l in lines)
+    assert sched._spec_rejections["prefix_hit"] == 5
+
+
+def test_the_tally_prints_below_the_verify_window(monkeypatch):
+    """A clock-driven flush is what makes a handful of verifies readable at all: the window
+    alone would leave a short run silent for the rest of its life."""
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW
+
+    lines = _spec_logs(monkeypatch)
+    req = _spec_req(P + 2, 10, P, spec_draft=7)
+    sched, _, _, _ = _setup(req)
+    sched._tally_verify(req, True)
+    sched._report_spec_tally()  # the drain's throttled call
+    assert any("MTP spec: acceptance 1/1 = 1.000" in l for l in lines)
+
+    before = len(lines)
+    sched._report_spec_tally()
+    sched._report_spec_tally(force=True)  # run_when_idle polls: nothing new to say
+    assert len(lines) == before
+
+    # the window still prints on its own, and labels what moved since the last line
+    for _ in range(_MTP_ACCEPT_WINDOW):
+        sched._tally_verify(req, True)
+    assert any("(last " in l for l in lines[before:])
+
+
+def test_a_request_the_forward_never_stashed_is_declined_not_dropped():
+    """The batch-level forward gate names no request, so a request reaching a single-request
+    decode batch with neither a draft nor a stash was off-spec in silence. Counting it is the
+    only way the breakdown stops being empty exactly when drafting is not running."""
+    from freetoken.core import Batch
+
+    req = _spec_req(P + 1, 10, P)
+    sched = _sched_for_batch(None)
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    assert sched._as_spec_batch(batch) is None
+    assert req.spec_off and req.spec_off_reason == "no_stash"
+    assert sched._spec_rejections == {"no_stash": 1}
+
+
+def test_the_reply_snapshot_is_a_copy_and_only_when_drafting_is_on():
+    """/v1/stats reads these counters after the replies carrying them have been serialized, so
+    the snapshot must not alias the live map the next decline keeps writing into."""
+    sched = _sched_for_batch(None)
+    req = _spec_req(P + 2, 10, P, spec_draft=7)
+    sched._tally_verify(req, True)
+    verifies, accepted, declines = sched._spec_snapshot()
+    assert (verifies, accepted) == (1, 1) and declines == {}
+    declines["chunked"] = 1
+    assert "chunked" not in sched._spec_rejections
+    sched.config.speculative = "none"
+    assert sched._spec_snapshot() is None

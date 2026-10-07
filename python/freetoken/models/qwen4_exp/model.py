@@ -406,20 +406,27 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return gathered[:, :, 1].gather(0, winners.unsqueeze(0)).squeeze(0).to(torch.int64)
 
     def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch,
-              *, select_row: torch.Tensor | None = None) -> torch.Tensor:
-        """Greedy MTP draft ids for the rows of ``residual`` (the spec step's head pass).
+              *, select_row: torch.Tensor | None = None,
+              return_logits: bool = False) -> torch.Tensor:
+        """MTP head output for the rows of ``residual`` (the spec step's head pass).
 
         All rows update head KV. select_row chooses which verified prefix needs
         a new draft before the shared mixer and vocabulary projection.
+
+        ``return_logits`` trades the argmax ids for the head's full-vocab logits: a sampled
+        request needs the head's DENSITY (it is both the distribution the draft is drawn from
+        and the ``p`` of the next step's rejection test), which argmax throws away.
         """
         if self.mtp is None:
             raise AssertionError("draft() needs the MTP head (--speculative mtp)")
+        # the embedding gather indexes with a flat id list; a column would fail in the kernel
+        assert next_ids.dim() == 1, f"draft() needs flat next_ids, got {tuple(next_ids.shape)}"
         next_embed = self.model.embed_tokens.forward(next_ids)
         head_out = self.mtp.forward(residual, next_embed, batch)
         if select_row is not None:
             head_out = head_out.index_select(0, select_row)
         mixed = self.model.hyper_connection_mixer.mix(head_out)[0]
-        return self.greedy_ids(mixed)
+        return self.full_vocab_logits(mixed) if return_logits else self.greedy_ids(mixed)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

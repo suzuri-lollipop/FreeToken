@@ -231,6 +231,9 @@ def tokenize_worker(
                         moe_active_slots=msg.moe_active_slots,
                         moe_total_slots=msg.moe_total_slots,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        spec_verifies=msg.spec_verifies,
+                        spec_accepted=msg.spec_accepted,
+                        spec_declines=dict(msg.spec_declines or {}),
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

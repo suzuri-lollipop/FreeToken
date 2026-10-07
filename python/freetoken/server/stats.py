@@ -43,6 +43,11 @@ class StatsTracker:
         self.moe_active_slots = 0
         self.moe_total_slots = 0
         self.vram_bytes = 0
+        # MTP draft tallies, last-known like the pools: lifetime verifies, accepts among them,
+        # and the per-request decline reasons the engine and scheduler counted.
+        self.spec_verifies = 0
+        self.spec_accepted = 0
+        self.spec_declines: dict[str, int] = {}
 
     @property
     def active(self) -> int:
@@ -87,6 +92,12 @@ class StatsTracker:
             self.moe_total_slots = reply.moe_total_slots
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        # MTP counters are cumulative, so any reply carrying them is a snapshot worth keeping --
+        # including the all-zero one that says "drafting is enabled and nothing qualified yet".
+        if getattr(reply, "spec_declines", None) or getattr(reply, "spec_verifies", 0) > 0:
+            self.spec_verifies = reply.spec_verifies
+            self.spec_accepted = reply.spec_accepted
+            self.spec_declines = dict(reply.spec_declines)
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -174,6 +185,15 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "total_slots": tr.moe_total_slots}
         if tr.moe_total_slots > 0 else None
     )
+    # MTP is keyed off the config, not the counters: the point of this section is telling "no
+    # speculative decoding" apart from "drafting enabled and nothing ever qualified".
+    spec = (
+        {"verifies": tr.spec_verifies, "accepted": tr.spec_accepted,
+         "acceptance_rate": (
+             round(tr.spec_accepted / tr.spec_verifies, 3) if tr.spec_verifies else None),
+         "declined": dict(tr.spec_declines)}
+        if getattr(config, "speculative", "none") == "mtp" else None
+    )
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -182,6 +202,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "mamba": mamba,
         "swa": swa,
         "moe": moe,
+        "spec": spec,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {

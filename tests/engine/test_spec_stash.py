@@ -1,4 +1,5 @@
-"""Engine-side MTP residual stash gate (engine/engine.py:_stash_spec_residual), CPU-only.
+"""Engine-side MTP residual stash gates (engine/engine.py:_spec_stash_eligible and
+_stash_spec_residual), CPU-only.
 
 Prefill decides here whether a request may draft later: the rows the target forward did
 not run the MTP head on are handed to the first decode step as a prologue, which is what
@@ -6,9 +7,10 @@ keeps acceptance at 100% on the prompt instead of starting from a cold head. Two
 modes are silent and expensive, so they are pinned on the host-side state only:
 
   * stashing anyway when the verify could never run (chunked prefill, shared prefix, no
-    GDN pool, temperature>0, multimodal spans). The prologue then runs the head over rows
-    nothing verified, and the first mismatch costs a rollback with no committed state to
-    roll back to -- the same wrongness the pre-MTP loop had, paid for with a draft model.
+    GDN pool, sampling turned off for non-greedy requests, multimodal spans). The prologue
+    then runs the head over rows nothing verified, and the first mismatch costs a rollback
+    with no committed state to roll back to -- the same wrongness the pre-MTP loop had, paid
+    for with a draft model.
   * stashing an unbounded row span. The stash is prompt-sized, so a long-prompt request
     that never gets to draft (it stays in a mixed batch for its whole life) pins host
     memory for nothing. The cap therefore tracks max_extend_tokens, not just a constant.
@@ -29,9 +31,9 @@ from freetoken.engine.engine import Engine
 from freetoken.scheduler.prefill import ChunkedReq
 
 
-def _engine(max_extend_tokens: int = 8192) -> Engine:
+def _engine(max_extend_tokens: int = 8192, speculative: str = "mtp") -> Engine:
     eng = Engine.__new__(Engine)
-    eng.config = SimpleNamespace(max_extend_tokens=max_extend_tokens)
+    eng.config = SimpleNamespace(max_extend_tokens=max_extend_tokens, speculative=speculative)
     return eng
 
 
@@ -95,7 +97,6 @@ def test_every_decline_is_named_and_drops_the_stash():
         "chunked": _req(6, chunked=True),
         "prefix_hit": _req(6, cached_len=2),
         "no_gdn_pool": _req(6, gdn_slot=None),
-        "nongreedy": _req(6, temperature=0.7),
         "mm": _req(6, mm_items=[{"fake": "image"}]),
     }
     for reason, req in cases.items():
@@ -103,6 +104,27 @@ def test_every_decline_is_named_and_drops_the_stash():
         assert req.spec_off is True, reason
         assert req.spec_off_reason == reason
         assert req.spec_residual is None
+        # the rows and the cap the gate saw, handed over for the scheduler's decline line:
+        # by the time that prefill drains, complete_one() has moved cached_len to the whole
+        # prompt and extend_len reads 0, so the live request no longer describes the decision
+        assert "prompt=" in req.spec_off_detail, reason
+        assert "stash_budget=" in req.spec_off_detail, reason
+
+
+def test_sampled_request_stashes_until_the_kill_switch_says_otherwise(monkeypatch):
+    """A non-greedy request drafts too: its verify rejects by ratio instead of comparing ids,
+    so the prologue rows are still worth the host memory. FREETOKEN_MTP_SAMPLING=0 restores
+    the old decline, which is the A/B switch the gate keeps for exactly that reason."""
+    sampled = _req(6, temperature=0.7)
+    residual = _stash(sampled)
+    assert sampled.spec_off is False and sampled.spec_residual is not None
+    assert torch.equal(sampled.spec_residual, residual[:sampled.extend_len])
+
+    monkeypatch.setenv("FREETOKEN_MTP_SAMPLING", "0")
+    declined = _req(6, temperature=0.7)
+    _stash(declined)
+    assert declined.spec_off is True and declined.spec_off_reason == "nongreedy"
+    assert declined.spec_residual is None
 
 
 def test_stash_cap_follows_the_prefill_chunk_budget(monkeypatch):
@@ -121,3 +143,42 @@ def test_stash_cap_follows_the_prefill_chunk_budget(monkeypatch):
     fits = _req(30)
     _stash(fits, max_extend_tokens=32)
     assert not fits.spec_off and fits.spec_residual is not None
+
+
+def test_the_forward_gate_and_the_stash_gate_read_sampling_the_same_way(monkeypatch):
+    """The forward-level gate decides whether the residual rows exist at all.
+
+    It once tested ``is_greedy`` while this file's per-request gate had moved to
+    ``spec_supported``: a sampled batch then computed no residual, so no draft was ever
+    produced and the request decoded regularly forever -- and because the batch-level gate
+    names no request, not even a decline was counted. Both gates must read the same switch.
+    """
+    sampled = _req(6, temperature=0.7)
+    eng = _engine()
+    assert eng._spec_stash_eligible(_prefill_batch(sampled), False)
+    _stash(sampled)
+    assert sampled.spec_off is False and sampled.spec_residual is not None
+
+    monkeypatch.setenv("FREETOKEN_MTP_SAMPLING", "0")
+    killed = _req(6, temperature=0.7)
+    assert not _engine()._spec_stash_eligible(_prefill_batch(killed), False)
+    _stash(killed)
+    assert killed.spec_off and killed.spec_off_reason == "nongreedy"
+
+
+def test_the_forward_gate_only_pays_for_a_batch_someone_can_draft_with():
+    """The stash is a [T, hc*hidden] clone of the chunk, so it is bought only when a request in
+    this batch can spend it: a request already off, an image row, a captured prefill chunk (no
+    residual comes out of a graph replay), or an engine with no speculative decoding at all."""
+    eng = _engine()
+    off = _req(6)
+    off.spec_off = True
+    assert not eng._spec_stash_eligible(_prefill_batch(off), False)
+    image = _req(6, mm_items=[{"fake": "image"}])
+    assert not eng._spec_stash_eligible(_prefill_batch(image), False)
+    assert not eng._spec_stash_eligible(_prefill_batch(_req(6)), True)
+    assert not _engine(speculative="none")._spec_stash_eligible(_prefill_batch(_req(6)), False)
+    # one draftable request in a batch of declined ones is enough to produce the rows
+    declined, greedy = _req(6), _req(6)
+    declined.spec_off = True
+    assert eng._spec_stash_eligible(_prefill_batch(declined, greedy), False)

@@ -238,6 +238,21 @@ def test_draft_without_the_head_fails_loudly():
         model.draft(torch.randn(1, 4), torch.tensor([1]), None)
 
 
+def test_draft_needs_flat_next_ids():
+    """The sampled verify composes its two head rows from [rows] draws.
+
+    Stacking those gives a [2, 1] column that the embedding gather refuses deep inside its
+    kernel, on the GPU, after the whole forward -- the assert puts the failure at the call.
+    """
+    model = _bare_model()
+    model.mtp.layers.op_list.clear()
+    model.mtp.wiring = "norm_mix_fc"
+    fill_weights(model.mtp, seed=12, device=torch.device("cpu"))
+    residual = torch.randn(2, model._config.qwen4_args.ple_state_width)
+    with pytest.raises(AssertionError, match="flat next_ids"):
+        model.draft(residual, torch.tensor([[5], [6]], dtype=torch.int32), None)
+
+
 @pytest.mark.parametrize("tied", [False, True])
 def test_greedy_shards_match_full_vocab_with_padding_and_ties(tied):
     from freetoken.layers.embedding import ParallelLMHead

@@ -31,6 +31,7 @@ from .config import EngineConfig, tp_preflight_error
 from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .spec_sample import debug_traced, spec_supported
 from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -1973,18 +1974,7 @@ class Engine:
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph) as _deferred_fill:
             if _dbg is not None:
                 _tc1 = _time.perf_counter()
-            spec_stash = (
-                self.config.speculative == "mtp" and batch.is_prefill and not use_graph
-                # The residual is a full [T, hc*hidden] copy of this chunk; grabbing it for
-                # a batch nobody can draft with (every request already off, non-greedy, or
-                # multimodal) is a clone paid for nothing.
-                and any(
-                    not getattr(r, "spec_off", False)
-                    and r.sampling_params.is_greedy
-                    and not getattr(r, "mm_items", None)
-                    for r in batch.padded_reqs
-                )
-            )
+            spec_stash = self._spec_stash_eligible(batch, use_graph)
             if use_graph:
                 logits = self.graph_runner.replay(batch)
             elif spec_stash:
@@ -2050,36 +2040,47 @@ class Engine:
 
     @torch.inference_mode()
     def _forward_spec(self, batch: Batch) -> ForwardOutput:
-        """MTP spec step (greedy, single request; _scratch/mtp_design.md).
+        """MTP spec step (single request, greedy or rejection-sampled; --speculative mtp).
 
-        All modes run the head unconditionally so the accept decision, both argmaxes and
+        All modes run the head unconditionally so the accept decision, both target tokens and
         the next draft come back in ONE device->host read (the eager normal_loop
         serializes here anyway). Row 0 supplies a fresh draft after a rejection;
         row 1 supplies it after acceptance.
+
+        Greedy verify replays a captured graph once the runner has one; sampled verify always
+        runs eager (:meth:`_spec_sampled_step`).
         """
         model = self.model
         req = batch.reqs[0]
         assert len(batch.reqs) == 1, "spec steps run a single request"
         assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
         mode = batch.spec_mode
+        # non-greedy requests verify by rejection sampling instead of comparing ids
+        sampling = bool(batch.spec_sample)
         runner = getattr(self, "_spec_graph", None)
         if mode == "verify":
             if runner is None:
                 from .spec_graph import SpecGraphRunner
 
                 runner = self._spec_graph = SpecGraphRunner(self)
-            if runner.graph is not None:
+            # the sampled step runs eager: whether its truncation kernels run at all is a
+            # host-side decision (top_k >= vocab is a no-op the sampler skips), so a capture
+            # would freeze the knobs of whichever request happened to be resident
+            if runner.graph is not None and not sampling:
                 return runner.run(self, model, batch, req)
-        _dbg_spec = os.getenv("FREETOKEN_MTP_DEBUG")
+        _dbg_spec = debug_traced()
         if _dbg_spec:
             import time as _time
 
             _t0 = _time.perf_counter()
 
         capture_state = None
-        if (mode == "verify" and not runner.disabled
+        if (mode == "verify" and not sampling and not runner.disabled
                 and runner.warm + 1 >= runner.WARM_STEPS):
             capture_state = runner.save_state(req.linear_slot_idx)
+        # one draw set per sampled step, drawn on the host so a step is reproducible from its
+        # payload and every TP rank works from the same numbers
+        u_spec = self.spec_uniforms() if sampling else None
 
         with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
             if mode == "prologue_decode":
@@ -2087,28 +2088,38 @@ class Engine:
             if _dbg_spec:
                 _t1 = _time.perf_counter()
             mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-            ids = model.greedy_ids(mixed)
-            if _dbg_spec:
-                torch.cuda.synchronize(self.device)
-                _t2 = _time.perf_counter()
-            if mode == "prologue_decode":
-                y = ids[0]
-                d = model.draft(residual, y.view(1).to(torch.int32), batch)
-                vals = torch.stack([y, d[0]]).tolist()
-                next_tokens_gpu = y.view(1).to(torch.int32)
-                payload = {"y1": int(vals[0]), "draft": int(vals[1])}
+            if sampling:
+                # the density that produced the draft rode in from the previous head pass, so
+                # the rejection test costs no host round-trip
+                payload, next_tokens_gpu = self._spec_sampled_step(
+                    model, batch, req, mixed, residual, u_spec
+                )
+                if _dbg_spec:
+                    torch.cuda.synchronize(self.device)
+                    _t2 = _time.perf_counter()
             else:
-                y1, y2 = ids[0], ids[1]
-                accepted = y1 == batch.spec_draft_id
-                d = model.draft(residual, torch.stack([y1, y2]).to(torch.int32), batch,
-                                select_row=accepted.to(torch.int64).view(1))
-                vals = torch.stack([y1, y2, d[0]]).tolist()
-                accept = int(vals[0]) == batch.spec_draft_id
-                next_tokens_gpu = y2.view(1).to(torch.int32)
-                payload = {
-                    "y1": int(vals[0]), "y2": int(vals[1]),
-                    "accept": accept, "draft": int(vals[2]),
-                }
+                ids = model.greedy_ids(mixed)
+                if _dbg_spec:
+                    torch.cuda.synchronize(self.device)
+                    _t2 = _time.perf_counter()
+                if mode == "prologue_decode":
+                    y = ids[0]
+                    d = model.draft(residual, y.view(1).to(torch.int32), batch)
+                    vals = torch.stack([y, d[0]]).tolist()
+                    next_tokens_gpu = y.view(1).to(torch.int32)
+                    payload = {"y1": int(vals[0]), "draft": int(vals[1])}
+                else:
+                    y1, y2 = ids[0], ids[1]
+                    accepted = y1 == batch.spec_draft_id
+                    d = model.draft(residual, torch.stack([y1, y2]).to(torch.int32), batch,
+                                    select_row=accepted.to(torch.int64).view(1))
+                    vals = torch.stack([y1, y2, d[0]]).tolist()
+                    accept = int(vals[0]) == batch.spec_draft_id
+                    next_tokens_gpu = y2.view(1).to(torch.int32)
+                    payload = {
+                        "y1": int(vals[0]), "y2": int(vals[1]),
+                        "accept": accept, "draft": int(vals[2]),
+                    }
             if _dbg_spec:
                 _t3 = _time.perf_counter()
                 logger.info_rank0(
@@ -2123,7 +2134,7 @@ class Engine:
             and runner.graph is None and not runner.disabled
         ):
             runner.warm += 1
-            if runner.warm >= runner.WARM_STEPS:
+            if runner.warm >= runner.WARM_STEPS and not sampling:
                 # capture on this step's context; the state is restored around the
                 # warm/capture/replay runs, so the step's own eager payload stays the
                 # one the drain consumes
@@ -2156,14 +2167,133 @@ class Engine:
         req.spec_head_len = int(prologue.reqs[0].device_len)
         req.spec_residual = None  # consumed; the stash storage is released here
 
+    # ----------------------------------------------------------- sampled spec step
+
+    def spec_uniforms(self) -> torch.Tensor:
+        """Four fresh uniforms (accept, residual, bonus, draft) for one spec step, on host.
+
+        A fixed CPU generator, not the device RNG: every TP rank samples the same token from
+        the same gathered logits, so ranks cannot diverge on the accept decision, and the
+        step is reproducible from the numbers the payload logs.
+        """
+        gen = getattr(self, "_spec_gen", None)
+        if gen is None:
+            gen = self._spec_gen = torch.Generator().manual_seed(0x5EC7)  # rank-independent
+        return torch.rand(4, generator=gen)
+
+    def _spec_draft_probs(self, vocab: int) -> torch.Tensor:
+        """The head density carried from one spec step to the next.
+
+        The rejection test needs the distribution that PRODUCED the draft id, and the head
+        pass that produced it ran in the previous step -- its argmax went out in the payload,
+        its density stays here. One row of fp32 logits, so the carry costs ~1 MiB and no host
+        round-trip.
+        """
+        buf = getattr(self, "spec_draft_probs", None)
+        if buf is None or buf.shape[-1] != vocab:
+            buf = self.spec_draft_probs = torch.zeros(
+                1, vocab, dtype=torch.float32, device=self.device
+            )
+        return buf
+
+    def _spec_sampled_step(self, model, batch: Batch, req: Req, mixed, residual,
+                           uniforms) -> tuple[dict, torch.Tensor]:
+        """The non-greedy MTP step: returns ``(payload, next_token)``.
+
+        Counterpart of the greedy branch in :meth:`_forward_spec`, running the same three ops
+        the captured greedy body runs on its static buffers, but with the real per-request
+        tensors and the request's own sampling parameters:
+
+          1. the target's distribution at the drafted position, truncated and renormalized
+             exactly as the draft head's was when it drew the id under test;
+          2. the rejection test on that pair -- keep the draft, else take the residual draw,
+             which is what pins the output to the target's distribution for any draft head;
+          3. the head pass on the VERIFIED prefix, whose density is both the next draft's draw
+             and the next step's ``p``.
+
+        Row 1 of the target pass only means anything once the draft is accepted, so the bonus
+        token it yields (the K+1-th token, drawn from the target's own distribution rather than
+        argmaxed) is dropped on a rejection -- the same one-or-two tokens per step the greedy
+        path pays out.
+        """
+        from .spec_sample import draw_probs, rejection_sample, trunc_renorm_probs
+
+        params = req.sampling_params
+        verify = batch.spec_mode == "verify"
+        logits = model.full_vocab_logits(mixed)
+        q = trunc_renorm_probs(logits[:1], params.temperature, params.top_k, params.top_p)
+        u = uniforms.to(self.device, non_blocking=True)
+        if verify:
+            draft = torch.tensor([batch.spec_draft_id], dtype=torch.int64, device=self.device)
+            carried = self._spec_draft_probs(logits.shape[-1])
+            emit, accept, ratio = rejection_sample(q, carried, draft, u[0:1], u[1:2])
+            # row 1 re-draws from the target's own row-1 density: on an acceptance the head
+            # consumes this token, and the next verify's draft comes out of the same pass
+            # (both draws are [rows] tensors and the head indexes a FLAT id list, so stacking
+            # them into a [2, 1] column dies inside the embedding gather)
+            head_in = torch.cat((emit, draw_probs(
+                trunc_renorm_probs(logits[1:2], params.temperature, params.top_k,
+                                   params.top_p), u[2:3])))
+            select_row = accept.to(torch.int64)
+        else:
+            emit, accept = draw_probs(q, u[0:1]), torch.zeros(
+                1, dtype=torch.bool, device=self.device)
+            head_in, select_row = emit, None
+        p_next = trunc_renorm_probs(
+            model.draft(residual, head_in.to(torch.int32), batch, select_row=select_row,
+                        return_logits=True),
+            params.temperature, params.top_k, params.top_p)
+        draft_id = draw_probs(p_next, u[3:4])
+        if verify and debug_traced():
+            from .spec_sample import expected_acceptance
+
+            logger.info_rank0(
+                f"[mtp-s] ratio={ratio.item():.3f} "
+                f"ceiling={expected_acceptance(q, carried).item():.3f} accept={int(accept)}"
+            )
+        # zero on a request's first verify (the prologue builds head KV without producing
+        # densities): a zero p always rejects, and the residual is then exactly q, so the
+        # emitted token is still a clean target draw
+        self._spec_draft_probs(p_next.shape[-1]).copy_(p_next)
+        bonus = head_in[1:2] if verify else emit  # row 1 means nothing on a rejection
+        vals = torch.cat((emit, bonus, draft_id, accept.to(torch.int64))).tolist()
+        payload = {"y1": int(vals[0]), "draft": int(vals[2])}
+        if verify:
+            payload.update({"y2": int(vals[1]), "accept": bool(vals[3])})
+            return payload, bonus.view(1).to(torch.int32)
+        return payload, emit.view(1).to(torch.int32)
+
+
+    def _spec_stash_eligible(self, batch: Batch, use_graph: bool) -> bool:
+        """Whether this prefill forward must produce the residual the MTP head catches up on.
+
+        The residual is a full [T, hc*hidden] copy of the chunk, so it is only paid for a
+        batch with someone who can draft with it: requests already declined stay off,
+        multimodal rows keep the regular decode path, and sampling is judged with the same
+        predicate as the per-request gate and the verify itself (:func:`spec_supported`).
+        Testing it against ``is_greedy`` here instead starves every sampled request in
+        silence: with no stash there is never a first draft, so the request decodes regularly
+        and no decline reason is recorded either.
+        """
+        if self.config.speculative != "mtp" or not batch.is_prefill or use_graph:
+            return False
+        return any(
+            not getattr(r, "spec_off", False)
+            and spec_supported(r.sampling_params)
+            and not getattr(r, "mm_items", None)
+            for r in batch.padded_reqs
+        )
+
     def _stash_spec_residual(self, batch: Batch, residual: torch.Tensor) -> None:
         """Per-req residual rows of this prefill chunk, for the head's catch-up pass.
 
         Eligibility is decided here (Phase 1): single-chunk cold prompts only -- a prefix
         hit or a chunked continuation leaves positions whose residuals were never
-        computed, and the catch-up pass needs every row. Non-greedy sampling and
-        over-budget prompts opt out too; all of these turn spec off for the request and
-        record the reason on it, which the scheduler counts at the drain.
+        computed, and the catch-up pass needs every row. Multimodal spans and over-budget
+        prompts opt out, and so does non-greedy sampling while the FREETOKEN_MTP_SAMPLING
+        kill switch turns the sampled verify off (see spec_supported); all of these turn
+        spec off for the request and record the reason on it, which the scheduler counts at
+        the drain.
 
         The stash is prompt-sized, so its cap tracks the chunk budget that a single-chunk
         prefill is already held to: asking for more than one chunk's worth of rows only
@@ -2186,8 +2316,8 @@ class Engine:
                 reason = "chunked" if isinstance(req, ChunkedReq) else "prefix_hit"
             elif getattr(req, "linear_slot_idx", None) is None:
                 reason = "no_gdn_pool"  # nothing to clone for a rejection rollback
-            elif not req.sampling_params.is_greedy:
-                reason = "nongreedy"
+            elif not spec_supported(req.sampling_params):
+                reason = "nongreedy"  # sampled drafting is available but switched off
             elif getattr(req, "mm_items", None):
                 reason = "mm"
             elif req.input_ids.numel() > budget:
@@ -2197,6 +2327,13 @@ class Engine:
             if reason:
                 req.spec_off = True
                 req.spec_off_reason = reason
+                # the numbers the decision was made on, for the scheduler's decline line
+                sp = req.sampling_params
+                req.spec_off_detail = (
+                    f"prompt={req.input_ids.numel()} new={n} cached={req.cached_len} "
+                    f"out={req.output_len} stash_budget={budget} "
+                    f"sampling=(T={sp.temperature}, top_k={sp.top_k}, top_p={sp.top_p})"
+                )
                 req.spec_residual = None
                 continue
             req.spec_residual = rows.clone() if multi else rows

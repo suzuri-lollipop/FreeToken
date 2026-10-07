@@ -34,8 +34,27 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated_tokens: int | None = None,
+        spec: str | None = None,
     ) -> None:
-        if batch.is_prefill:
+        # An MTP spec batch rides phase="prefill" for the extend machinery but IS a decode
+        # step (Scheduler._schedule_next_batch applies the same rule to the interleave
+        # streak): charging it to the prefill line drops its output tokens out of the
+        # gen-throughput window, and an accept emits two of them.
+        if getattr(batch, "spec_mode", None) is not None:
+            self._report_decode(
+                batch,
+                running_reqs=running_reqs,
+                queue_reqs=queue_reqs,
+                kv_used_pages=kv_used_pages,
+                kv_total_pages=kv_total_pages,
+                page_size=page_size,
+                mamba_slots=mamba_slots,
+                swa_tokens=swa_tokens,
+                generated_tokens=generated_tokens,
+                spec=spec,
+            )
+        elif batch.is_prefill:
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,
@@ -55,6 +74,7 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                spec=spec,
             )
 
     def _report_prefill(
@@ -103,9 +123,15 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated_tokens: int | None = None,
+        spec: str | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        # One token per request is only right for a regular step: the drain that knows what
+        # the forward emitted passes the real count (a verify emits two on an accept).
+        self._decode_generated_tokens += (
+            len(batch.reqs) if generated_tokens is None else generated_tokens
+        )
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
@@ -121,6 +147,7 @@ class SchedulerStatusReporter:
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
+            f"{_spec_msg(spec)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
@@ -128,6 +155,11 @@ class SchedulerStatusReporter:
 
 def _usage_ratio(used: int, total: int) -> float:
     return used / total if total > 0 else 0.0
+
+
+def _spec_msg(spec: str | None) -> str:
+    """The MTP tally on the line that prints without verifies; empty when spec decoding is off."""
+    return f"mtp: {spec}, " if spec else ""
 
 
 def _mamba_msg(mamba_slots: tuple[int, int] | None) -> str:

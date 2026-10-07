@@ -87,6 +87,10 @@ class Req:
     # Why spec stopped ('' while the request is still eligible). The scheduler counts these:
     # a run where MTP never fired otherwise looks identical to one where it fired and lost.
     spec_off_reason: str = ""
+    # What the engine's residual gate saw when it declined (rows, cache hit, the stash cap), for
+    # the scheduler's decline line: the drain runs after complete_one() has advanced cached_len,
+    # so the live numbers no longer describe the decision that was made.
+    spec_off_detail: str = ""
     # Verify/accept tally of the current low-acceptance auto-off window.
     spec_verifies: int = 0
     spec_accepted: int = 0
@@ -189,6 +193,9 @@ class Batch:
     spec_mode: str | None = field(default=None, init=False)
     # "verify" only: the host draft id under test (the engine's accept decision input).
     spec_draft_id: int = field(default=-1, init=False)
+    # Non-greedy MTP: verify runs rejection sampling against the head's carried-over density
+    # instead of comparing ids. Set by the scheduler alongside spec_mode.
+    spec_sample: bool = field(default=False, init=False)
     # Page charges for this verify; reject releases only pages beyond row 0.
     spec_pages: list | None = field(default=None, init=False)
     # "prologue_decode" only: the scheduler-prepared head-only batch over the prompt rows

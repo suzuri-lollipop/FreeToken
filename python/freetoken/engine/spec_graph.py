@@ -131,6 +131,7 @@ class SpecGraphRunner:
         self.md.block_table = backend._block_table(self.md.ring_slots.to(torch.int64))
 
     def _body(self, engine: "Engine", model: "Qwen4ExpForCausalLM") -> None:
+        # greedy only: the sampled verify step stays eager (see Engine._spec_sampled_step)
         self._fanout()
         self._gather_inputs(engine)
         batch = self.batch
@@ -164,7 +165,8 @@ class SpecGraphRunner:
                            batch: "Batch", req, eager_payload: dict, before_state) -> bool:
         """Capture using the just-run eager step's context (state restored around the
         warm/capture/replay executions, exactly the sequence the P3 spike proved). The
-        final replay must reproduce the eager payload; a failure stops the engine."""
+        final replay must reproduce the eager payload; a failure stops the engine.
+        """
         table = getattr(model, "_ple_table", None)
         if table is None or not hasattr(table, "fill_spec_rows"):
             self.disabled = True
@@ -204,7 +206,7 @@ class SpecGraphRunner:
             if got != want:
                 raise RuntimeError(f"spec graph replay diverged from eager: {got} != {want}")
             self.graph = graph
-            logger.info_rank0("MTP spec graph captured (two-row verify step)")
+            logger.info_rank0("MTP spec graph captured (two-row greedy verify step)")
             return True
         except Exception as e:
             self.disabled = True
@@ -227,12 +229,12 @@ class SpecGraphRunner:
     # ------------------------------------------------------------------ replay
     def run(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
             batch: "Batch", req):
-        import os
         import time as _time
 
         from freetoken.engine.engine import ForwardOutput
+        from .spec_sample import debug_traced
 
-        dbg = os.getenv("FREETOKEN_MTP_DEBUG")
+        dbg = debug_traced()
         t0 = _time.perf_counter() if dbg else 0.0
         self._stage(batch, req)
         t1 = _time.perf_counter() if dbg else 0.0

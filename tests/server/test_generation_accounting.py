@@ -104,6 +104,42 @@ def test_stats_reports_backend_page_size(pools, expected):
     assert doc["kv"] == {"used_pages": 0, "total_pages": 130, "page_size": expected}
 
 
+def test_stats_reports_mtp_tallies_whether_or_not_anything_drafts():
+    from freetoken.server.stats import StatsTracker, build_stats
+
+    def doc(speculative, verifies=0, accepted=0, declines=None):
+        tracker = StatsTracker()
+        tracker.spec_verifies, tracker.spec_accepted = verifies, accepted
+        tracker.spec_declines = dict(declines or {})
+        config = SimpleNamespace(served_model_name="unit-model", max_seq_len=262144,
+                                 page_size=1, served_modalities=(), speculative=speculative,
+                                 model_config=SimpleNamespace())
+        state = SimpleNamespace(stats=tracker, config=config, cache_pools=None)
+        return build_stats(state, 0, 0)["spec"]
+
+    # no speculative decoding: no section, so a client cannot read someone else's zeros
+    assert doc("none") is None
+    # drafting on and nothing ever qualified: the zeros and the reasons ARE the answer
+    assert doc("mtp", declines={"prefix_hit": 9, "chunked": 12}) == {
+        "verifies": 0, "accepted": 0, "acceptance_rate": None,
+        "declined": {"chunked": 12, "prefix_hit": 9},
+    }
+    assert doc("mtp", verifies=64, accepted=37)["acceptance_rate"] == 0.578
+
+
+def test_stats_tracker_keeps_the_last_mtp_snapshot():
+    from freetoken.server.stats import StatsTracker
+
+    tracker = StatsTracker()
+    tracker.observe(_ack(completion=2, finished=False))
+    assert (tracker.spec_verifies, tracker.spec_declines) == (0, {})
+    tracker.observe(UserReply(uid=42, incremental_output="", finished=False,
+                              spec_verifies=64, spec_accepted=37,
+                              spec_declines={"prefix_hit": 9}))
+    assert (tracker.spec_verifies, tracker.spec_accepted) == (64, 37)
+    assert tracker.spec_declines == {"prefix_hit": 9}
+
+
 def test_non_stream_records_the_request_with_real_token_totals():
     request_ring.reset()
     st = FakeState([_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)])
