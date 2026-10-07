@@ -390,6 +390,69 @@ def test_a_missed_window_stands_down_and_probes_again(monkeypatch):
     assert sched._as_spec_batch(batch) is batch  # resumed on the stale draft: one wasted verify
     assert batch.spec_mode == "verify"
 
+def test_a_long_suspend_reseeds_instead_of_verifying_a_stale_draft(monkeypatch):
+    """A stand-down longer than the resync lag leaves a hole the head never sees, and the
+    staged draft (with its carried density) was computed that many committed tokens ago.
+    Resuming on it verifies against the wrong position, so the countdown's end drops both
+    and the next alone step cold-seeds a fresh draft -- counted, never terminal."""
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
+
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 10)
+    monkeypatch.setattr(sched_mod, "_MTP_RESYNC_LAG", 4)
+    monkeypatch.setattr(sched_mod, "_MTP_REJECT_STREAK", 0)
+    sched = _sched_for_batch(None)
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    req = _spec_req(P + 2, 60, P, spec_draft=7, spec_head_len=P, spec_slot_idx=5)
+    req.spec_draft_probs = torch.zeros(1, 4)
+    for _ in range(window):
+        sched._tally_verify(req, False)
+    assert req.spec_suspend == 10 and not req.spec_off
+
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    for _ in range(10):
+        assert sched._as_spec_batch(batch) is None  # no upgrade while standing down
+        batch.spec_mode = None
+        sched._on_regular_decode(req)
+    assert req.spec_draft is None and req.spec_draft_probs is None
+    assert sched._spec_rejections == {"low_acceptance": 1, "suspend_hole": 1}
+    assert req.spec_slot_idx == 5  # the scratch slot survives: the head KV is still usable
+    assert not req.spec_off and req.spec_suspend_missed == 0
+    out = sched._as_spec_batch(batch)
+    assert out is batch and batch.spec_mode == "prologue_decode"
+    assert batch.spec_prologue is None  # a re-seed: no catch-up pass behind it
+    assert sched._spec_cold_seeds == 1
+
+
+def test_a_short_suspend_still_resumes_on_the_stale_draft(monkeypatch):
+    """Within the lag bound the hole is one the head already tolerates (a mixed batch
+    leaves the same), so the staged draft is kept and its one wasted verify stays the
+    cheaper half of the trade."""
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+    from freetoken.scheduler.scheduler import _MTP_ACCEPT_WINDOW as window
+
+    monkeypatch.setattr(sched_mod, "_MTP_RESUME_AFTER", 3)
+    monkeypatch.setattr(sched_mod, "_MTP_RESYNC_LAG", 8)
+    monkeypatch.setattr(sched_mod, "_MTP_REJECT_STREAK", 0)
+    sched = _sched_for_batch(None)
+    sched.engine.linear_state_pool.alloc = lambda n: list(range(n))
+    req = _spec_req(P + 2, 60, P, spec_draft=7, spec_head_len=P)
+    for _ in range(window):
+        sched._tally_verify(req, False)
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    for _ in range(3):
+        assert sched._as_spec_batch(batch) is None
+        batch.spec_mode = None
+        sched._on_regular_decode(req)
+    assert req.spec_draft == 7
+    assert "suspend_hole" not in sched._spec_rejections
+    assert sched._as_spec_batch(batch) is batch and batch.spec_mode == "verify"
+
+
 
 def test_an_auto_off_reject_still_restores_the_scratch_slot(monkeypatch):
     """The low-acceptance auto-off frees the scratch slot, and a reject restores FROM it.

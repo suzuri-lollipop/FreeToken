@@ -94,6 +94,10 @@ class Req:
     # separate from spec_off because the floor is a statistical judgement on a small window:
     # ending the request on one trip is what switched good heads off mid-answer.
     spec_suspend: int = 0
+    # Regular rows decoded while suspended, i.e. rows the head missed on purpose. Compared
+    # with the resync lag when the countdown ends: a bigger hole re-seeds the draft instead
+    # of verifying one aimed that many committed tokens back.
+    spec_suspend_missed: int = 0
     # What the engine's residual gate saw when it declined (rows, cache hit, the stash cap), for
     # the scheduler's decline line: the drain runs after complete_one() has advanced cached_len,
     # so the live numbers no longer describe the decision that was made.

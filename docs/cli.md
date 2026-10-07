@@ -215,7 +215,7 @@ paying that price for a draft that lands ~0.15 of the time.
 | `FREETOKEN_MTP_SKIP_STEPS` | 8 | Decode steps that stand-down lasts before drafting resumes |
 | `FREETOKEN_MTP_RESUME_AFTER` | one window | Decode steps a suspended request waits before re-probing the floor; `0` makes the trip terminal |
 | `FREETOKEN_MTP_COLD_START` | off | Draft even when the prompt rows are gone (prefix hit) or over the stash budget: the head seeds its first draft from its own row instead of declining. Costs a few rejected verifies, buys back the multi-turn traffic that always hits the cache |
-| `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off |
+| `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off, and before a stand-down's resume re-seeds the draft instead of verifying it (`suspend_hole`) |
 | `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual is held for the head's catch-up pass (~20 KiB/row at this model's width, so ~320 MiB per draftable request; also how long the catch-up pass is) |
 | `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
 | `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
@@ -228,7 +228,8 @@ What to read when MTP appears to do nothing:
   means `--speculative mtp` was not passed.
 - `MTP spec: declined <reason> for req <uid>: ...` prints with the numbers the gate used (a capped
   number of lines per reason); the `declined: <reason>=<count>` breakdown rides on every tally
-  line, and counts per request for the terminal reasons, per episode for `resync` and `streak`.
+  line, and counts per request for the terminal reasons, per episode for `resync`, `streak` and
+  `suspend_hole`.
 
 | Decline reason | Means |
 |---|---|
@@ -242,6 +243,7 @@ What to read when MTP appears to do nothing:
 | `no_stash` | The prefill forward produced no residual rows for this request, so the head cannot be caught up. The forward gate declines whole batches and names no request, which is why this reason exists at all: it is the visible form of "the prefill never offered me rows". Cold start removes it by drafting anyway |
 | `lag_overflow` | The request decoded more than `FREETOKEN_MTP_RESYNC_LAG` rows unseen by the head before ever drafting, so the stash (prompt-sized, otherwise pinned for the request's whole life) is written off. Terminal only with cold start off |
 | `low_acceptance` | This request's acceptance fell under `FREETOKEN_MTP_MIN_ACCEPTANCE` within one window of verifies; drafting stands down for `FREETOKEN_MTP_RESUME_AFTER` decode steps and probes again (`0` ends it for the request) |
+| `suspend_hole` | A stand-down lasted longer than `FREETOKEN_MTP_RESYNC_LAG` rows, so the staged draft (and the sampled path's carried density) was computed too many committed tokens ago to verify: both are dropped and the next single-request step cold-seeds a fresh draft. Not terminal |
 | `streak` | `FREETOKEN_MTP_REJECT_STREAK` verifies in a row missed, so the next `FREETOKEN_MTP_SKIP_STEPS` are spent decoding: after three misses the next draft lands ~0.15 while a verify costs ~2.1 decode steps. Not terminal, and the one number to read before blaming the head |
 | `no_room` | One row of output budget left: an accept could not pay out, so drafting is over for this request |
 
