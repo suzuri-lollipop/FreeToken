@@ -25,7 +25,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, has_image_parts, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 from freetoken.tokenizer.inline_system import InlineSystemError
 
@@ -309,7 +309,9 @@ async def submit_generation(spec: GenSpec, state: Any, rendered: str | None = No
     the already-rendered prompt from ``prerender_prompt``; it rides the str fast path
     so the worker does not render the same template a second time."""
     refs = collect_image_refs(spec.messages)
-    if rendered is not None and refs:
+    # has_image_parts, not refs: a frontend pre-check could have consumed the refs
+    # already, and a prerendered str is text-only, so it must never carry an image.
+    if rendered is not None and has_image_parts(spec.messages):
         rendered = None
     images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
@@ -431,7 +433,7 @@ async def prerender_prompt(spec: GenSpec, state: Any) -> tuple[str | None, Gener
         rendered = await asyncio.to_thread(manager.render_prompt, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
         return None, GenerationError(f"could not encode request: {exc}")
-    if collect_image_refs(spec.messages):
+    if has_image_parts(spec.messages):
         return None, None
     return rendered, None
 

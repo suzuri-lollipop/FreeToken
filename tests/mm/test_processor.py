@@ -85,6 +85,71 @@ def test_placeholder_count_is_checked_before_any_image_is_decoded():
         _Family(n_soft=1).apply(ids, [b"not an image"])
 
 
+def _reference_image():
+    """Upright 48x24 with off-center colored blocks, so any rotation is observable."""
+    from PIL import Image
+
+    up = Image.new("RGB", (48, 24), (255, 255, 255))
+    for x in range(2, 8):
+        for y in range(2, 8):
+            up.putpixel((x, y), (200, 0, 0))
+    for x in range(40, 46):
+        for y in range(16, 22):
+            up.putpixel((x, y), (0, 0, 200))
+    return up
+
+
+def _stored_bytes(orientation):
+    """The reference saved in the rotated state an EXIF Orientation tag describes."""
+    from PIL import Image
+
+    # each method is what ImageOps.exif_transpose applies to undo that orientation,
+    # so storing it is the inverse of the fix-up the decode path must perform
+    method = {
+        2: Image.Transpose.FLIP_LEFT_RIGHT,
+        3: Image.Transpose.ROTATE_180,
+        4: Image.Transpose.FLIP_TOP_BOTTOM,
+        5: Image.Transpose.TRANSPOSE,
+        6: Image.Transpose.ROTATE_90,
+        7: Image.Transpose.TRANSVERSE,
+        8: Image.Transpose.ROTATE_270,
+    }.get(orientation)
+    up = _reference_image()
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    (up if method is None else up.transpose(method)).save(buf, format="PNG", exif=exif)
+    return buf.getvalue()
+
+
+class _Recorder(_Family):
+    """Keeps the images apply() decoded, so the processor input can be inspected."""
+
+    def __init__(self):
+        super().__init__(1)
+        self.seen = []
+
+    def process(self, images):
+        self.seen.extend(images)
+        return super().process(images)
+
+
+@pytest.mark.parametrize("orientation", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_apply_undoes_exif_orientation_before_the_processor_runs(orientation):
+    # camera and messenger saves keep the pixels sideways and record the fix-up in
+    # metadata only, so the encoder would otherwise get a rotated image
+    from PIL import Image
+
+    raw = _stored_bytes(orientation)
+    assert Image.open(io.BytesIO(raw)).getexif()[0x0112] == orientation
+    fam = _Recorder()
+    fam.apply(torch.tensor([PLACEHOLDER], dtype=torch.int32), [raw])
+    (decoded,) = fam.seen
+    up = _reference_image()
+    assert decoded.mode == "RGB" and decoded.size == up.size
+    assert decoded.tobytes() == up.tobytes()
+
+
 def test_image_positions_freeze_t_spread_hw_and_advance_by_the_longer_side():
     # [text x2][img 2x3 = 6][text x1][img 3x1 = 3][text x2] -> 14 tokens
     pos, delta = image_positions(14, [(2, 6, 2, 3), (9, 3, 3, 1)])
