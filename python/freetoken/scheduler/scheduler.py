@@ -34,7 +34,8 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from freetoken.engine.config import mtp_cold_start, mtp_stash_budget
-from freetoken.engine.spec_sample import debug_traced, sampling_path_enabled, spec_supported
+from freetoken.engine.spec_sample import (
+    debug_traced, sampled_graph_enabled, sampling_path_enabled, spec_supported)
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -1163,7 +1164,7 @@ class Scheduler(SchedulerIOMixin):
         """Say, once at startup, what MTP will consider draftable -- before any traffic exists.
 
         Every eligibility rule that lives only in a gate downstream (prompt size, single-chunk
-        cold prefills, one-request decode batches, greedy-only graph capture) otherwise has to
+        cold prefills, one-request decode batches, the per-kind graph captures) otherwise has to
         be inferred from a line that needs verifies to print, so an unqualified workload reads
         as a broken engine. The stash size is spelled out in bytes too: the cap is prompt-sized
         and its unit is the residual row width, not tokens."""
@@ -1189,7 +1190,8 @@ class Scheduler(SchedulerIOMixin):
             f"tally_every={self._spec_report_s:.0f}s decline_log={_MTP_DECLINE_LOG_CAP} | "
             f"draftable: single-request decode batches whose head catches up over the prompt "
             f"stash ({stash}, any number of prefill chunks); sampled drafting {sampling}; {span} "
-            f"| CUDA graph capture is greedy-only"
+            f"| CUDA graph capture per verify kind"
+            f"{'' if sampled_graph_enabled() else ' (sampled stays eager: FREETOKEN_MTP_SAMPLED_GRAPH=0)'}"
         )
 
     def _report_spec_tally(self, force: bool = False) -> None:

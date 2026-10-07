@@ -40,6 +40,7 @@ _EPS = 1e-20
 
 SAMPLING_ENV = "FREETOKEN_MTP_SAMPLING"
 DEBUG_ENV = "FREETOKEN_MTP_DEBUG"
+GRAPH_ENV = "FREETOKEN_MTP_SAMPLED_GRAPH"
 
 # Per-knob-set device tensors, keyed by the host values that built them. A sampled
 # request's knobs are constant for its life and a step builds them TWICE (q and the
@@ -106,6 +107,35 @@ def _param(value, device, dtype, *, floor=None, ceiling=None, rows=1):
 def spec_supported(params: "SamplingParams") -> bool:
     """Whether a request may draft at all: greedy compares ids, sampled compares densities."""
     return params.is_greedy or sampling_enabled(params)
+
+
+def sampled_graph_enabled() -> bool:
+    """Whether the sampled verify may replay a captured graph (else it stays eager).
+
+    ``FREETOKEN_MTP_SAMPLED_GRAPH=0`` is the kill switch: the capture is verified against
+    the eager step it replaces before it serves anything, but an escape hatch that needs no
+    code change is what makes an A/B of the graph itself a one-env rerun.
+    """
+    return os.environ.get(GRAPH_ENV, "1") != "0"
+
+
+def graph_knob_values(params: "SamplingParams", vocab: int) -> tuple[float, int, float]:
+    """The (temperature, top_k, top_p) a captured sampled step stages per replay.
+
+    A graph cannot skip a kernel launch the way the host path does, so a disabled filter is
+    expressed AS ITS NO-OP VALUE (k = vocab keeps every token, p = 1.0 keeps all mass) and
+    the fused renorm always runs. Clamped to the same bounds as :func:`_knob_tensors`, which
+    keeps the staged values -- and so the emitted distribution -- identical for the knobs
+    the host path would have run; a single-knob request renorms through the fused kernel on
+    both its q and its p, so its rejection test stays exact, at a ~1e-7 fp difference
+    against the eager single-filter path (acceptance-neutral, distribution-neutral).
+    """
+    t = max(float(params.temperature), MIN_TEMPERATURE)
+    k = params.top_k
+    k = vocab if k is None or not 1 < k < vocab else int(k)
+    p = params.top_p
+    p = 1.0 if p is None or p >= 1.0 else min(max(float(p), MIN_TOP_P), 1.0)
+    return t, k, p
 
 
 def _knob_tensors(x: torch.Tensor, temperature, top_k, top_p):

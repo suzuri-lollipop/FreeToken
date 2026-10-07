@@ -31,7 +31,7 @@ from .config import EngineConfig, mtp_cold_start, mtp_stash_budget, tp_preflight
 from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from .spec_sample import debug_traced, spec_supported
+from .spec_sample import debug_traced, sampled_graph_enabled, spec_supported
 from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -2047,8 +2047,10 @@ class Engine:
         serializes here anyway). Row 0 supplies a fresh draft after a rejection;
         row 1 supplies it after acceptance.
 
-        Greedy verify replays a captured graph once the runner has one; sampled verify always
-        runs eager (:meth:`_spec_sampled_step`).
+        Both verify kinds replay a captured graph once the runner has one; the sampled
+        capture stages its uniforms/knobs/density per replay (FREETOKEN_MTP_SAMPLED_GRAPH=0
+        keeps it eager). Eager fallbacks: :meth:`_spec_sampled_step`, and the prologue/seed
+        steps which are variable-length and never captured.
         """
         model = self.model
         req = batch.reqs[0]
@@ -2063,10 +2065,12 @@ class Engine:
                 from .spec_graph import SpecGraphRunner
 
                 runner = self._spec_graph = SpecGraphRunner(self)
-            # the sampled step runs eager: whether its truncation kernels run at all is a
-            # host-side decision (top_k >= vocab is a no-op the sampler skips), so a capture
-            # would freeze the knobs of whichever request happened to be resident
-            if runner.graph is not None and not sampling:
+            if sampling:
+                # the knobs ride a staged row (graph_knob_values), so one capture serves
+                # every sampled request instead of freezing whoever was resident at capture
+                if runner.graph_sampled is not None and sampled_graph_enabled():
+                    return runner.run_sampled(self, model, batch, req, self.spec_uniforms())
+            elif runner.graph is not None:
                 return runner.run(self, model, batch, req)
         _dbg_spec = debug_traced()
         if _dbg_spec:
@@ -2075,9 +2079,18 @@ class Engine:
             _t0 = _time.perf_counter()
 
         capture_state = None
-        if (mode == "verify" and not sampling and not runner.disabled
-                and runner.warm + 1 >= runner.WARM_STEPS):
-            capture_state = runner.save_state(req.linear_slot_idx)
+        carried_pre = None
+        if mode == "verify" and not runner.disabled:
+            if not sampling:
+                if runner.graph is None and runner.warm + 1 >= runner.WARM_STEPS:
+                    capture_state = runner.save_state(req.linear_slot_idx)
+            elif (sampled_graph_enabled() and runner.graph_sampled is None
+                  and runner.warm_sampled + 1 >= runner.WARM_STEPS):
+                capture_state = runner.save_state(req.linear_slot_idx)
+                # the eager step is about to overwrite the request's density with its
+                # p_next; the capture choreography rejects against the PRE-step row
+                carried_pre = (req.spec_draft_probs.clone()
+                               if req.spec_draft_probs is not None else None)
         # one draw set per sampled step, drawn on the host so a step is reproducible from its
         # payload and every TP rank works from the same numbers
         u_spec = self.spec_uniforms() if sampling else None
@@ -2130,16 +2143,21 @@ class Engine:
         if _deferred_fill is not None:
             self._pending_host_fill = _deferred_fill
 
-        if (
-            runner is not None and mode == "verify"
-            and runner.graph is None and not runner.disabled
-        ):
-            runner.warm += 1
-            if runner.warm >= runner.WARM_STEPS and not sampling:
-                # capture on this step's context; the state is restored around the
-                # warm/capture/replay runs, so the step's own eager payload stays the
-                # one the drain consumes
-                runner.capture_after_step(self, model, batch, req, payload, capture_state)
+        if runner is not None and mode == "verify" and not runner.disabled:
+            if sampling:
+                if runner.graph_sampled is None and sampled_graph_enabled():
+                    runner.warm_sampled += 1
+                    if runner.warm_sampled >= runner.WARM_STEPS:
+                        # capture on this step's context; the state is restored around the
+                        # warm/capture/replay runs, so the step's own eager payload stays the
+                        # one the drain consumes
+                        runner.capture_after_step_sampled(
+                            self, model, batch, req, payload, capture_state,
+                            u_spec, carried_pre)
+            elif runner.graph is None:
+                runner.warm += 1
+                if runner.warm >= runner.WARM_STEPS:
+                    runner.capture_after_step(self, model, batch, req, payload, capture_state)
 
         if mode == "prologue_decode":
             req.complete_one()  # a regular decode row; the drain only picks up the draft

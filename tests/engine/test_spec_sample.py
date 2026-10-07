@@ -398,3 +398,49 @@ def test_spec_stage_round_trips_uniforms_and_draft():
     u2, d2 = eng._spec_stage(torch.rand(4), 7)
     assert u2.data_ptr() == u.data_ptr() and d2.tolist() == [7]
 
+
+def test_graph_knob_values_express_skips_as_no_op_values():
+    """A capture cannot skip a launch, so a disabled filter is STAGED as its no-op value:
+    k = vocab keeps every token, p = 1.0 keeps all mass, and the clamps match the host path
+    (Sampler.prepare's bounds) so a graphed step truncates exactly like the eager one."""
+    from freetoken.engine.spec_sample import MIN_TEMPERATURE, MIN_TOP_P, graph_knob_values
+
+    params = SamplingParams(temperature=1.0, top_k=20, top_p=0.95)
+    assert graph_knob_values(params, 1000) == (1.0, 20, 0.95)
+    # disabled / degenerate knobs become the no-op or clamped value
+    assert graph_knob_values(SamplingParams(temperature=0.5), 1000) == (0.5, 1000, 1.0)
+    assert graph_knob_values(
+        SamplingParams(temperature=1.0, top_k=5000, top_p=1.5), 1000)[1:] == (1000, 1.0)
+    t, _, p = graph_knob_values(
+        SamplingParams(temperature=1e-9, top_k=20, top_p=0.0), 1000)
+    assert t == MIN_TEMPERATURE and p == MIN_TOP_P
+
+
+def test_sampled_graph_switch_reads_zero_as_off(monkeypatch):
+    from freetoken.engine.spec_sample import sampled_graph_enabled
+
+    monkeypatch.delenv("FREETOKEN_MTP_SAMPLED_GRAPH", raising=False)
+    assert sampled_graph_enabled()
+    monkeypatch.setenv("FREETOKEN_MTP_SAMPLED_GRAPH", "0")
+    assert not sampled_graph_enabled()
+    monkeypatch.setenv("FREETOKEN_MTP_SAMPLED_GRAPH", "1")
+    assert sampled_graph_enabled()
+
+
+@needs_cuda
+def test_fused_renorm_is_the_identity_at_the_no_op_knobs(monkeypatch):
+    """The graphed body always runs the fused renorm, so its no-op point (k = vocab,
+    p = 1.0) must hand the softmax back unchanged -- that is what lets one capture serve
+    requests whose filters the eager path would have skipped entirely."""
+    import freetoken.kernel.triton.sampling as tri
+
+    _use_triton_kernels(monkeypatch)
+    torch.manual_seed(7)
+    logits = torch.randn(2, 4096, device="cuda") * 3
+    probs = trunc_renorm_probs(logits, 1.0, top_k=-1, top_p=1.0)  # plain softmax
+    k = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
+    p = torch.ones(2, device="cuda")
+    got = tri.top_k_top_p_renorm_probs(probs, k, p)
+    torch.testing.assert_close(got, probs, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(got.sum(-1), torch.ones(2, device="cuda"), atol=1e-6)
+
