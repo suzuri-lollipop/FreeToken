@@ -584,10 +584,23 @@ class Scheduler(SchedulerIOMixin):
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
+        if _dbg is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter()
 
         batch, fout = last_data[0].batch, last_data[1]
         next_tokens_cpu, copy_done = fout.next_tokens_cpu, fout.copy_done_event
         copy_done.synchronize()
+        if _dbg is not None:
+            # the serial spec drain waits the whole in-flight step here; splitting the
+            # bucket is what tells the GPU tail apart from the host work that follows
+            _n = _time.perf_counter()
+            _dbg.host_phase("drain.sync", _n - _t0)
+            _t0 = _n
         spec_payload = fout.spec
         if spec_payload is None and getattr(fout, "spec_cpu", None) is not None:
             # graphed spec step: the pinned payload row landed with the copy_done event
@@ -769,6 +782,8 @@ class Scheduler(SchedulerIOMixin):
             ),
         )
         self.send_result(reply)
+        if _dbg is not None:
+            _dbg.host_phase("drain.work", _time.perf_counter() - _t0)
 
     def _account_prefill_debt(self, batch) -> None:
         """Accrue the wall time a prefill batch held the engine while decodes waited.
@@ -1605,6 +1620,9 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
         interval = self.config.prefill_decode_interval
         batch = None
         # schedule_next_batch consumes the admission, so the interleave guard must run
@@ -1625,7 +1643,11 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
+                if _dbg is not None:
+                    _tu = time.perf_counter()
                 upgraded = self._as_spec_batch(batch)
+                if _dbg is not None:
+                    _dbg.host_phase("sched.upgrade", time.perf_counter() - _tu)
                 if upgraded is not None:
                     batch = upgraded
                 elif getattr(self.config, "speculative", "none") == "mtp":
@@ -1646,7 +1668,11 @@ class Scheduler(SchedulerIOMixin):
             # discharging it is what keeps one slow chunk from buying two decode steps
             self._debt_discharge = inflight_batch if inflight_s > 0 else None
             self._prefill_debt = 0.0
+        if _dbg is not None:
+            _tp = time.perf_counter()
         forward_input = self._prepare_batch(batch)
+        if _dbg is not None:
+            _dbg.host_phase("sched.prepare", time.perf_counter() - _tp)
         self._report_prompt_admissions(batch)
         return forward_input
 
