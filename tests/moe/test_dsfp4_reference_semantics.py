@@ -48,15 +48,35 @@ def _fp8_roundtrip(x: torch.Tensor, block: int) -> torch.Tensor:
     return (q * s.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
 
-def reference(x, slots, weights, banks, block):
+# fp32 accumulation noise, relative: the GEMV walks K sequentially, the grouped GEMM in tl.dot
+# trees and this reference through cuBLAS, so a route output is only reproducible to ~1e-5.
+_FP32_NOISE = 2.0 ** -16
+
+
+def _tie_allowance(raw: torch.Tensor) -> torch.Tensor:
+    """One bf16 step where ``raw`` sits within :data:`_FP32_NOISE` of the midpoint of its two bf16
+    neighbours (0 elsewhere): there the rounding is decided by the accumulation order."""
+    mag = raw.abs()
+    b16 = mag.to(torch.bfloat16)
+    b32 = b16.float()
+    up = torch.nextafter(b16, torch.full_like(b16, float("inf"))).float()
+    dn = torch.nextafter(b16, torch.zeros_like(b16)).float()
+    mid = torch.where(mag >= b32, 0.5 * (b32 + up), 0.5 * (b32 + dn))
+    return torch.where((mag - mid).abs() <= _FP32_NOISE * mag, 0.5 * (up - dn), 0.0)
+
+
+def reference(x, slots, weights, banks, block, ties=False):
     """The MoE over dequantized banks: per-route bf16 expert outputs accumulated into an fp32 ``y``,
-    returned in fp32 (the kernels round that sum to bf16)."""
+    returned in fp32 (the kernels round that sum to bf16). With ``ties`` also return the slack each
+    element gains from :func:`_tie_allowance`.
+    """
     gu_p, gu_s, dn_p, dn_s = banks
     W13 = _dequant(gu_p, gu_s)  # [E, 2I, H]
     W2 = _dequant(dn_p, dn_s)  # [E, H, I]
     xq = _fp8_roundtrip(x, block).float()
     T = x.shape[0]
     y = torch.zeros(T, H, dtype=torch.float32, device=x.device)
+    allow = torch.zeros(T, H, dtype=torch.float32, device=x.device)
     for t in range(T):
         for r in range(TOP_K):
             e = int(slots[t, r])
@@ -64,8 +84,25 @@ def reference(x, slots, weights, banks, block):
             gate, up = gu[:I].clamp(max=LIMIT), gu[I:].clamp(-LIMIT, LIMIT)
             h = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
             hq = _fp8_roundtrip(h.view(1, -1), block).float().view(-1)
-            y[t] += (weights[t, r].float() * (hq @ W2[e].T)).to(torch.bfloat16).float()
-    return y
+            raw = weights[t, r].float() * (hq @ W2[e].T)
+            y[t] += raw.to(torch.bfloat16).float()
+            if ties:
+                allow[t] += _tie_allowance(raw)
+    return (y, allow) if ties else y
+
+
+def assert_matches(got, x, slots, weights, banks, block):
+    """The one freedom every implementation has over :func:`reference`: a route's bf16 output can
+    flip one step where its fp32 value lands on a midpoint, and the routes cancel -- 1.8% of the
+    elements (measured here) sum hundreds of magnitude down to single digits, where that step is a
+    large relative error on ``y`` (observed: one flip, 0.5 on a 4.5 output, from an fp32 value 8e-6
+    off the midpoint)."""
+    want, allow = reference(x, slots, weights, banks, block, ties=True)
+    bad = (got - want).abs() > 2e-2 + allow + 2e-2 * want.abs()
+    assert not bool(bad.any()), (
+        f"{int(bad.sum())} of {bad.numel()} off, worst abs {float((got - want).abs().max()):.4g} "
+        f"at {bad.nonzero()[:4].tolist()}"
+    )
 
 
 def _inputs(T, device, seed=1):
@@ -84,8 +121,7 @@ def test_gemv_path_matches_the_transcription(block):
     banks = _banks("cuda")
     x, slots, w = _inputs(6, "cuda")
     got = routed_experts_fp4(x, slots, w, *banks, LIMIT, act_block=block).float()
-    want = reference(x, slots, w, banks, block)
-    torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    assert_matches(got, x, slots, w, banks, block)
 
 
 @pytest.mark.parametrize("block", [32, 128])
@@ -109,8 +145,7 @@ def test_cpu_executor_matches_the_transcription(block):
     got = ex.decode(0, x, w, slots.clone()).clone().float()
     torch.cuda.synchronize()
     del ex
-    want = reference(x, slots, w, (gu_p, gu_s, dn_p, dn_s), block)
-    torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    assert_matches(got, x, slots, w, (gu_p, gu_s, dn_p, dn_s), block)
 
 
 def test_grouped_prefill_path_matches_the_transcription():
@@ -119,8 +154,7 @@ def test_grouped_prefill_path_matches_the_transcription():
     banks = _banks("cuda")
     x, slots, w = _inputs(64, "cuda")
     got = fused_ds_fp4.routed_experts_fp4_prefill(x, slots, w, *banks, LIMIT, E, act_block=32).float()
-    want = reference(x, slots, w, banks, 32)
-    torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    assert_matches(got, x, slots, w, banks, 32)
 
 
 @pytest.mark.parametrize("block", [32, 128])
@@ -154,7 +188,7 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     # and each share matches the reference over its own routes (a zero weight drops a route)
     got_clean = routed_experts_fp4(x, gpu_slots, gpu_w, *clean, LIMIT, act_block=block)
     assert torch.equal(got, got_clean)
-    torch.testing.assert_close(got.float(), reference(x, slots, gpu_w, clean, block), atol=2e-2, rtol=2e-2)
+    assert_matches(got.float(), x, slots, gpu_w, clean, block)
     # the CPU executor computes the complementary split from the same raw ids (ids < 0 skipped)
     pinned = {}
     for name, t in (("gate_up_packed", clean[0]), ("gate_up_scale", clean[1]), ("down_packed", clean[2]), ("down_scale", clean[3])):
@@ -167,4 +201,4 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     cpu_out = ex.decode(0, x, w, cpu_ids.clone()).clone()
     torch.cuda.synchronize()
     del ex
-    torch.testing.assert_close(cpu_out.float(), reference(x, slots, torch.where(on_gpu, 0.0, w), clean, block), atol=2e-2, rtol=2e-2)
+    assert_matches(cpu_out.float(), x, slots, torch.where(on_gpu, 0.0, w), clean, block)

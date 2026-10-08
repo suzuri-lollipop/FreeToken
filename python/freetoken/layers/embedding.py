@@ -48,7 +48,7 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
-        # W8A16-in for the INPUT embedding (opt-in, default OFF pending quality A/B):
+        # W8A16-in for the INPUT embedding (ON by default, --no-embed-fp8 turns it off):
         # the bf16 table (vocab/tp x hidden, 1.27 GiB total here) is REPLACED by its
         # per-row fp8-e4m3 form at finalize, freeing half its VRAM straight into the
         # expert slot cache. The decode gather then reads one fp8 row per token and

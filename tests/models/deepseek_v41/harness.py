@@ -15,6 +15,7 @@ from freetoken.engine.engine import _materialize_loaded_weight_state_dict
 from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
 from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
 from freetoken.layers import set_rope_device
+from freetoken.layers.embedding import VocabParallelEmbedding, set_w8a16_embed_default
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.layers.quantization.method import finalize_quant
 from freetoken.models import create_model
@@ -48,8 +49,16 @@ class TinyEngine:
             quant = checkpoint_quant_config(checkpoint, hf_config, get_model_spec("DeepseekV41ForCausalLM"))
         self.config = replace(mc, moe_strategy="offload" if quantized else "fused", decode_target="gpu", quant=quant)
         mc = self.config
-        with torch.device("meta"), torch_dtype(torch.bfloat16):
-            self.model = create_model(self.config)
+        # The reference models a bf16 embedding, so the harness never takes the W8A16 fp8 table the
+        # engine turns on by default (--embed-fp8): per-row e4m3 costs ~0.03 of logit error on its
+        # own, which busts the bf16 ATOL and pushes the fp4 quantized runs past QUANT_TOL too.
+        ambient = VocabParallelEmbedding._W8A16_EMBED_DEFAULT
+        set_w8a16_embed_default(False)
+        try:
+            with torch.device("meta"), torch_dtype(torch.bfloat16):
+                self.model = create_model(self.config)
+        finally:
+            set_w8a16_embed_default(ambient)
         state = _materialize_loaded_weight_state_dict(
             self.model.state_dict(), iter_weights(checkpoint, self.device, include_moe_experts=False), device=self.device,
         )
