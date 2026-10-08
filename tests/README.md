@@ -94,6 +94,7 @@ checkpoint is set:
 | `FREETOKEN_TP_SIZE` | `e2e/test_tp_parity.py` — ranks to boot (default 2; skips when fewer GPUs are visible) |
 | `FREETOKEN_TP_BOOT_TIMEOUT` | `e2e/test_tp_parity.py` — seconds to wait for "serving" (default 600) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
+| `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
 `generation_config.json` (pass@N at the recommended temperature, or a single greedy

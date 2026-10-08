@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from ..registry import LayerKind, register_method
-from ..scheme import FP8_BLOCK as BLOCK, QuantKind
+from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 FP8 = torch.float8_e4m3fn
@@ -28,6 +28,8 @@ class TritonFp8BlockMoEKernel(MoEKernel):
             # the TP shard keeps whole scale blocks (MoEConfig.local_intermediate_range),
             # which needs the full intermediate to be a multiple of the block
             return f"fp8 block MoE needs the intermediate ({cfg.intermediate}) to be a multiple of {BLOCK}"
+        if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
+            return f"fp8 block MoE kernel serves {BLOCK}x{BLOCK} expert blocks only"
         reason = gated_epilogue_reason(cfg)
         if reason:
             return f"fp8 block MoE kernel: {reason}"

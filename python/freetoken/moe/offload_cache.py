@@ -25,6 +25,7 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -370,6 +371,7 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_blocks_per_bank = 8
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
@@ -565,6 +567,7 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+        self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
     def validate_rebuild(self, cache_size: int) -> None:
@@ -1573,7 +1576,9 @@ class OffloadMoeCache:
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
             src_indices, evict_slots, num_indices = self._plan_buffers(plan)
-            kwargs = {} if blocks_per_bank is None else {"blocks_per_bank": blocks_per_bank}
+            if blocks_per_bank is None:
+                # the grid width measured for this host's link, not the kernel's default
+                blocks_per_bank = self._copy_blocks_per_bank
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
@@ -1581,7 +1586,7 @@ class OffloadMoeCache:
                 evict_slots,
                 src_indices,
                 num_indices,
-                **kwargs,
+                blocks_per_bank=blocks_per_bank,
             )
             return
 
