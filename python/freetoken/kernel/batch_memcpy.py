@@ -26,8 +26,12 @@ def _probe(fn) -> None:
     at call time; probing here turns every such mode into a load_batch_memcpy
     exception the caller's fallback path can catch."""
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
-    dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
+    dst = torch.empty(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # Callers may run this inside torch.cuda.stream(), so the destination's
+    # allocation is stream-ordered on THEIR stream: the copy has to wait for it or
+    # a queued write there can overtake the copy and read back as wrong bytes.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),
@@ -39,6 +43,7 @@ def _probe(fn) -> None:
         raise RuntimeError("cudaMemcpyBatchAsync probe copied wrong bytes")
 
 
+@lru_cache(maxsize=None)
 def load_batch_memcpy():
     """Build (once), probe, and return the batch-memcpy entry point, or raise.
 

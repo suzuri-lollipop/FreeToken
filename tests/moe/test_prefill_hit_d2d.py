@@ -76,6 +76,44 @@ def test_batch_memcpy_roundtrip():
     stream.synchronize()
     assert torch.equal(dst.cpu(), src[perm])
 
+@CUDA
+@JIT
+@BATCH_API
+def test_probe_waits_for_the_calling_stream():
+    """The probe must order its copy after work queued on the CALLER's stream: a
+    caller inside ``torch.cuda.stream()`` has pending writes there, and an
+    unordered copy lets them overtake it and read back as wrong bytes."""
+    from freetoken.kernel import batch_memcpy
+
+    fn = batch_memcpy.load_batch_memcpy()
+    for _ in range(4):
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(10_000_000)  # park the stream so the race is not a coin flip
+            batch_memcpy._probe(fn)
+        side.synchronize()
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_probe_runs_once_per_process():
+    """The probe is a real H2D plus a host sync, so a loader call must not pay for
+    it again -- ``batch_memcpy_jit`` goes through the loader on every call."""
+    from freetoken.kernel import batch_memcpy
+
+    calls = []
+    real_probe = batch_memcpy._probe
+    batch_memcpy._probe = lambda fn: calls.append(fn)
+    batch_memcpy.load_batch_memcpy.cache_clear()
+    try:
+        for _ in range(3):
+            batch_memcpy.load_batch_memcpy()
+    finally:
+        batch_memcpy._probe = real_probe
+        batch_memcpy.load_batch_memcpy.cache_clear()
+    assert len(calls) == 1
+
 
 @CUDA
 @JIT
