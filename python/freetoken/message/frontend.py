@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 from .utils import deserialize_type, serialize_type
@@ -56,6 +56,16 @@ class UserReply(BaseFrontendMsg):
     moe_total_slots: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # MTP draft tallies since the engine started: verifies run, accepts among them, the
+    # per-request decline reasons, and the step split behind them (spec steps vs the regular
+    # decode steps they replaced). All zero/empty when speculative decoding is off, which the
+    # point of publishing them is to distinguish from "on, and nothing ever qualified".
+    spec_verifies: int = 0
+    spec_accepted: int = 0
+    spec_declines: dict[str, int] = field(default_factory=dict)
+    spec_steps: int = 0
+    spec_decode_steps: int = 0
+    spec_cold_seeds: int = 0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

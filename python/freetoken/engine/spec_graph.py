@@ -5,6 +5,14 @@ live slot advances through both rows. A rejection restores that intermediate
 state and continues with a fresh draft; it never re-runs the rejected step.
 Per-step inputs are staged or gathered inside the graph. Disk PLE rows are
 filled before graph replay because both input tokens are already host-known.
+
+Two captures share the statics and the shadow batch: the GREEDY body (argmax
+verify) and the SAMPLED body (rejection sampling). The sampled one takes its
+uniforms, sampling knobs, draft id and carried density through static buffers
+staged per replay -- a graph cannot branch on host values, so a disabled
+truncation filter is staged as its no-op value and the fused renorm always runs
+(spec_sample.graph_knob_values). Both captures verify the replay against the
+eager step they replace before serving anything.
 """
 
 from __future__ import annotations
@@ -37,12 +45,16 @@ class SpecGraphRunner:
         self.engine = engine
         self.device = engine.device
         self.graph: torch.cuda.CUDAGraph | None = None
+        self.graph_sampled: torch.cuda.CUDAGraph | None = None
         self.disabled = False
         self.warm = 0
+        self.warm_sampled = 0
         self._stream = torch.cuda.Stream()
 
     # ------------------------------------------------------------------ statics
     def _alloc_static(self, model: "Qwen4ExpForCausalLM") -> None:
+        if getattr(self, "d_scal", None) is not None:
+            return  # shared across both captures; the first one allocates
         d = self.device
         self.h_scal = torch.empty(S_N, dtype=torch.int64, pin_memory=True)
         self.d_scal = torch.empty(S_N, dtype=torch.int64, device=d)
@@ -98,6 +110,24 @@ class SpecGraphRunner:
         self.batch = batch
         self.md = md
 
+    def _alloc_sampled_statics(self, vocab: int) -> None:
+        """The sampled body's statics: staged uniforms/draft, knobs, carried density.
+
+        One graph serves every sampled request: the truncation knobs ride a staged row
+        (a disabled filter arrives as its no-op value) and the carried density round-trips
+        through a static [1, vocab] fp32 row copied in from / out to the request's own.
+        """
+        if getattr(self, "d_carried", None) is not None:
+            assert self.sampled_vocab == vocab, "vocab changed between sampled captures"
+            return
+        d = self.device
+        self.sampled_vocab = vocab
+        self.h_su = torch.empty(3, dtype=torch.int64, pin_memory=True)
+        self.d_su = torch.empty(3, dtype=torch.int64, device=d)
+        self.h_knobs = torch.empty(6, dtype=torch.float32, pin_memory=True)
+        self.d_knobs = torch.empty(6, dtype=torch.float32, device=d)
+        self.d_carried = torch.zeros(1, vocab, dtype=torch.float32, device=d)
+
     # ------------------------------------------------------------------ staging
     def _stage(self, batch: "Batch", req) -> None:
         # rows are [cached_len, cached_len+1]; device_len == cached_len + 2 here
@@ -109,6 +139,33 @@ class SpecGraphRunner:
         h[S_DRAFT] = batch.spec_draft_id
         h[S_SEQ] = req.device_len
         self.d_scal.copy_(h, non_blocking=True)
+
+    def _stage_sampled(self, batch: "Batch", req, uniforms, carried=None) -> None:
+        """The sampled step's three staged rows: shared scalars, uniforms+draft, knobs.
+
+        ``carried`` overrides the request's density row -- the capture sequence passes the
+        PRE-step snapshot so each of its warm/capture/replay bodies rejects against the same
+        p the eager step did (the bodies overwrite d_carried with their p_next).
+        """
+        from .spec_sample import graph_knob_values
+
+        self._stage(batch, req)
+        h = self.h_su
+        h.view(torch.float32)[:4].copy_(uniforms)
+        h[2] = batch.spec_draft_id
+        self.d_su.copy_(h, non_blocking=True)
+        t, k, p = graph_knob_values(req.sampling_params, self.sampled_vocab)
+        hk = self.h_knobs
+        hk[0:2] = t
+        hk[2:4] = p
+        hk.view(torch.int32)[4:6].copy_(
+            torch.as_tensor([k, k], dtype=torch.int32))  # top-k as int32, no cast in the body
+        self.d_knobs.copy_(hk, non_blocking=True)
+        src = carried if carried is not None else req.spec_draft_probs
+        if src is not None:
+            self.d_carried.copy_(src)
+        else:
+            self.d_carried.zero_()  # first verify: a zero p always rejects into a clean q draw
 
     def _fanout(self) -> None:
         """In-graph derivations from the staged scalars (recorded once at capture)."""
@@ -131,6 +188,7 @@ class SpecGraphRunner:
         self.md.block_table = backend._block_table(self.md.ring_slots.to(torch.int64))
 
     def _body(self, engine: "Engine", model: "Qwen4ExpForCausalLM") -> None:
+        # greedy only: the sampled verify step stays eager (see Engine._spec_sampled_step)
         self._fanout()
         self._gather_inputs(engine)
         batch = self.batch
@@ -153,18 +211,74 @@ class SpecGraphRunner:
             (self.d_table, self.d_scal[S_SEQ:S_SEQ + 1]), y2.to(torch.int32).view(1)
         )
 
+    def _body_sampled(self, engine: "Engine", model: "Qwen4ExpForCausalLM") -> None:
+        """The sampled verify body: Engine._spec_sampled_step's op sequence on statics.
+
+        Same three stages -- target density q at the drafted position, the rejection test
+        against the carried p, the head pass on the verified prefix -- with the uniforms,
+        knobs, draft id and carried density read from the staged buffers and the payload /
+        next token / fresh density written back to statics. The fused renorm always runs:
+        a filter the host path would skip is staged as its no-op value instead.
+        """
+        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.triton.sampling import top_k_top_p_renorm_probs
+
+        if is_flashinfer_installed():
+            import flashinfer.sampling as sampling
+        else:
+            import freetoken.kernel.triton.sampling as sampling
+        from .spec_sample import draw_probs, rejection_sample
+
+        self._fanout()
+        self._gather_inputs(engine)
+        batch = self.batch
+        mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
+        logits = model.full_vocab_logits(mixed)
+        t = self.d_knobs[0:2]
+        p = self.d_knobs[2:4]
+        k = self.d_knobs.view(torch.int32)[4:6]
+        qs = top_k_top_p_renorm_probs(sampling.softmax(logits, t, enable_pdl=False), k, p)
+        u = self.d_su.view(torch.float32)[:4]
+        emit, accept, _ratio = rejection_sample(
+            qs[:1], self.d_carried, self.d_su[2:3], u[0:1], u[1:2])
+        bonus = draw_probs(qs[1:2], u[2:3])
+        # one cast per value: the accept flag feeds both the row select and the payload,
+        # the bonus int32 both the next-token slot and the in-graph pool write
+        acc64 = accept.to(torch.int64)
+        bonus32 = bonus.to(torch.int32).view(1)
+        head_in = torch.cat((emit, bonus))
+        head_logits = model.draft(residual, head_in.to(torch.int32), batch,
+                                  select_row=acc64, return_logits=True)
+        p_next = top_k_top_p_renorm_probs(
+            sampling.softmax(head_logits, t[:1], enable_pdl=False), k[:1], p[:1])
+        draft_id = draw_probs(p_next, u[3:4])
+        self.d_carried.copy_(p_next)
+        self.d_payload[0] = emit[0]
+        self.d_payload[1] = bonus[0]
+        self.d_payload[2] = draft_id[0]
+        self.d_payload[3] = acc64[0]
+        self.d_next.copy_(bonus32)
+        # same pool write the greedy body makes: the accepted bonus belongs at device_len,
+        # and on a rejection the drain overwrites the draft's slot with the emitted token
+        engine.spec_token_pool.index_put_(
+            (self.d_table, self.d_scal[S_SEQ:S_SEQ + 1]), bonus32
+        )
+
     # ------------------------------------------------------------------ capture
     def invalidate(self) -> None:
-        """Drop the capture (a cache rebuild reallocated pool addresses baked into the
-        graph); the next WARM_STEPS spec steps run eager and recapture."""
+        """Drop the captures (a cache rebuild reallocated pool addresses baked into the
+        graphs); the next WARM_STEPS steps of each kind run eager and recapture."""
         self.graph = None
+        self.graph_sampled = None
         self.warm = 0
+        self.warm_sampled = 0
 
     def capture_after_step(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
                            batch: "Batch", req, eager_payload: dict, before_state) -> bool:
         """Capture using the just-run eager step's context (state restored around the
         warm/capture/replay executions, exactly the sequence the P3 spike proved). The
-        final replay must reproduce the eager payload; a failure stops the engine."""
+        final replay must reproduce the eager payload; a failure stops the engine.
+        """
         table = getattr(model, "_ple_table", None)
         if table is None or not hasattr(table, "fill_spec_rows"):
             self.disabled = True
@@ -204,13 +318,86 @@ class SpecGraphRunner:
             if got != want:
                 raise RuntimeError(f"spec graph replay diverged from eager: {got} != {want}")
             self.graph = graph
-            logger.info_rank0("MTP spec graph captured (two-row verify step)")
+            logger.info_rank0("MTP spec graph captured (two-row greedy verify step)")
             return True
         except Exception as e:
             self.disabled = True
             self.graph = None
             raise RuntimeError(
                 "MTP graph capture failed after modifying model state; cannot safely continue"
+            ) from e
+
+    def capture_after_step_sampled(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
+                                   batch: "Batch", req, eager_payload: dict, before_state,
+                                   uniforms, carried_pre) -> bool:
+        """The sampled counterpart of :meth:`capture_after_step`.
+
+        Same warm/capture/replay choreography with the state restored around each run, plus
+        the two sampled-only invariants: every body run re-stages d_carried from the PRE-step
+        density snapshot (the bodies overwrite it with their p_next), and the uniforms the
+        eager step consumed are the ones every run is staged with -- the step is a
+        deterministic function of (state, inputs, uniforms), so the final replay must
+        reproduce the eager payload exactly or the capture is rejected.
+        """
+        table = getattr(model, "_ple_table", None)
+        if table is None or not hasattr(table, "fill_spec_rows"):
+            self.disabled = True
+            logger.warning_rank0("MTP spec graph needs the disk PLE backend; staying eager")
+            return False
+        src = carried_pre if carried_pre is not None else req.spec_draft_probs
+        if src is None:
+            return False  # no density row to capture against; a later warm step will have one
+        vocab = int(src.shape[-1])
+        self._alloc_static(model)
+        self._alloc_sampled_statics(vocab)
+        try:
+            self._stage_sampled(batch, req, uniforms, carried=carried_pre)
+            table.fill_spec_rows(req)
+            self.restore_state(req.linear_slot_idx, before_state)
+            torch.cuda.synchronize(self.device)
+            with engine.ctx.forward_batch(self.batch):
+                s = self._stream
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    self._body_sampled(engine, model)
+                torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize(self.device)
+            self.restore_state(req.linear_slot_idx, before_state)
+            torch.cuda.synchronize(self.device)
+
+            # the warm body left its p_next in d_carried; every run rejects against the same
+            self._stage_sampled(batch, req, uniforms, carried=carried_pre)
+            table.fill_spec_rows(req)
+            graph = torch.cuda.CUDAGraph()
+            with engine.ctx.forward_batch(self.batch):
+                with torch.cuda.graph(graph, stream=self._stream):
+                    self._body_sampled(engine, model)
+            torch.cuda.synchronize(self.device)
+            self.restore_state(req.linear_slot_idx, before_state)
+            torch.cuda.synchronize(self.device)
+
+            self._stage_sampled(batch, req, uniforms, carried=carried_pre)
+            table.fill_spec_rows(req)
+            graph.replay()
+            torch.cuda.synchronize(self.device)
+            got = [int(v) for v in self.d_payload.tolist()]
+            want = [eager_payload["y1"], eager_payload["y2"], eager_payload["draft"],
+                    int(bool(eager_payload["accept"]))]
+            if got != want:
+                raise RuntimeError(
+                    f"sampled spec graph replay diverged from eager: {got} != {want}")
+            self.graph_sampled = graph
+            # leave the request where the eager step left it: its own density row holds the
+            # p_next this step produced (the replay just recomputed the identical one)
+            engine._spec_draft_probs(req, vocab).copy_(self.d_carried)
+            logger.info_rank0("MTP spec graph captured (sampled two-row verify step)")
+            return True
+        except Exception as e:
+            self.disabled = True
+            self.graph_sampled = None
+            raise RuntimeError(
+                "MTP sampled graph capture failed after modifying model state; "
+                "cannot safely continue"
             ) from e
 
     def save_state(self, slot: int):
@@ -227,12 +414,12 @@ class SpecGraphRunner:
     # ------------------------------------------------------------------ replay
     def run(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
             batch: "Batch", req):
-        import os
         import time as _time
 
         from freetoken.engine.engine import ForwardOutput
+        from .spec_sample import debug_traced
 
-        dbg = os.getenv("FREETOKEN_MTP_DEBUG")
+        dbg = debug_traced()
         t0 = _time.perf_counter() if dbg else 0.0
         self._stage(batch, req)
         t1 = _time.perf_counter() if dbg else 0.0
@@ -249,6 +436,42 @@ class SpecGraphRunner:
             if self._runs <= 3 or self._runs % 64 == 0:
                 logger.info_rank0(
                     f"[mtp-g] run#{self._runs} stage={(t1-t0)*1e3:.2f}ms "
+                    f"fill={(t2-t1)*1e3:.2f}ms replay_issue={(t3-t2)*1e3:.2f}ms"
+                )
+        return ForwardOutput(self.d_next, self.next_cpu, event, None, self.payload_cpu)
+
+    def run_sampled(self, engine: "Engine", model: "Qwen4ExpForCausalLM",
+                    batch: "Batch", req, uniforms):
+        """The sampled replay: stage the step's host values, replay, hand the density back.
+
+        The carried density round-trips through the request's own row (the static buffer is
+        shared -- two sampled requests alternate these batches, and a density left in the
+        static would test the other request's draft, exactly what _spec_draft_probs exists
+        to prevent). Both copies are same-stream D2D of one fp32 row.
+        """
+        import time as _time
+
+        from freetoken.engine.engine import ForwardOutput
+        from .spec_sample import debug_traced
+
+        dbg = debug_traced()
+        t0 = _time.perf_counter() if dbg else 0.0
+        self._stage_sampled(batch, req, uniforms)
+        t1 = _time.perf_counter() if dbg else 0.0
+        model._ple_table.fill_spec_rows(req)
+        t2 = _time.perf_counter() if dbg else 0.0
+        self.graph_sampled.replay()
+        engine._spec_draft_probs(req, self.sampled_vocab).copy_(self.d_carried)
+        t3 = _time.perf_counter() if dbg else 0.0
+        self.payload_cpu.copy_(self.d_payload, non_blocking=True)
+        self.next_cpu.copy_(self.d_next, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(engine.stream)
+        if dbg:
+            self._runs_s = getattr(self, "_runs_s", 0) + 1
+            if self._runs_s <= 3 or self._runs_s % 64 == 0:
+                logger.info_rank0(
+                    f"[mtp-gs] run#{self._runs_s} stage={(t1-t0)*1e3:.2f}ms "
                     f"fill={(t2-t1)*1e3:.2f}ms replay_issue={(t3-t2)*1e3:.2f}ms"
                 )
         return ForwardOutput(self.d_next, self.next_cpu, event, None, self.payload_cpu)

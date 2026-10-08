@@ -202,16 +202,19 @@ def test_lm_head_w8a16_replaces_untied_head_only(monkeypatch):
     off = ParallelLMHead(4096, 1024, quant_config=NoQuantConfig(), prefix="lm_head")
     assert not off.w8a16_decode_ok
 
-    # finalize swaps in the per-channel fp8 weight; the decode kernel (M=20 -> the
-    # BLOCK_M=32 path) tracks the bf16 reference within weight-only fp8 error.
+    # finalize swaps in the per-channel fp8 weight; the head's own projection still serves
+    # every row count: the decode kernel (M=20 -> the BLOCK_M=32 path) and the prefill
+    # dequant branch (M=64) the speculative head pass runs on. Both track the bf16
+    # reference within weight-only fp8 error.
     torch.manual_seed(7)
     w_bf16 = (torch.randn(4096, 1024) * 0.02).to(torch.bfloat16).cuda()
     head.weight = w_bf16.clone()
     head.quant_method.finalize(head)
     assert head.weight is None
     assert head._w8a16_weight.dtype == torch.float8_e4m3fn
-    x = torch.randn(20, 1024, device="cuda", dtype=torch.bfloat16)
-    y = head.quant_method.apply(head, x)
-    ref = x.float() @ w_bf16.float().T
-    rel = ((y.float() - ref).norm() / ref.norm()).item()
-    assert rel < 0.04, rel
+    for rows in (20, 64):
+        x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
+        y = head.shard_logits(x)  # through the head, which is what the spec path calls
+        ref = x.float() @ w_bf16.float().T
+        rel = ((y.float() - ref).norm() / ref.norm()).item()
+        assert rel < 0.04, f"M={rows}: rel err {rel}"

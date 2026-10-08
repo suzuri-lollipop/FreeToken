@@ -33,6 +33,9 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from freetoken.engine.config import mtp_cold_start, mtp_stash_budget
+from freetoken.engine.spec_sample import (
+    debug_traced, sampled_graph_enabled, sampling_path_enabled, spec_supported)
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
@@ -93,6 +96,47 @@ _CHUNK_ALIGN = 64
 # reuse collapses despite ~83% touched overlap, cadence 2x. At 128 the working set
 # (~4-5k) fits and the promote reuse survives (see _scratch/agent3 RESULTS).
 _CHUNK_MIN = 128
+
+# MTP low-acceptance auto-off. Every verify pays a second row through the target model, so
+# a request whose draft keeps missing stops paying for it: below this acceptance over a
+# window of verifies it drafts less than the extra row costs. 0 disables the check.
+_MTP_ACCEPT_WINDOW = max(8, int(os.environ.get("FREETOKEN_MTP_ACCEPT_WINDOW", "64")))
+_MTP_MIN_ACCEPTANCE = float(os.environ.get("FREETOKEN_MTP_MIN_ACCEPTANCE", "0.35"))
+# Decode steps a request stands down for after a window that missed the floor, then re-probes.
+# A window is a small sample: at 0.45 true acceptance a 64-window misses a 0.35 floor ~6% of the
+# time (a 16-window, ~20%), and ending the request on one trip switched good heads off
+# mid-answer. One window is the default so a false trip costs a window of drafts, not the answer;
+# 0 restores the terminal behaviour for an A/B.
+_RESUME_AFTER_ENV = os.environ.get("FREETOKEN_MTP_RESUME_AFTER")
+_MTP_RESUME_AFTER = (
+    max(0, int(_RESUME_AFTER_ENV)) if _RESUME_AFTER_ENV else _MTP_ACCEPT_WINDOW
+)
+# The fast half of the same decision, on the host and per step: measured on live traffic, the
+# next draft lands 0.51 of the time after an accept, 0.33 after two misses and ~0.15 after
+# three -- while a verify costs about 2.1 decode steps. So after a short miss streak the next
+# few steps are worth more spent decoding. 0 disables the stand-down.
+_MTP_REJECT_STREAK = max(0, int(os.environ.get("FREETOKEN_MTP_REJECT_STREAK", "3")))
+_MTP_SKIP_STEPS = max(1, int(os.environ.get("FREETOKEN_MTP_SKIP_STEPS", "8")))
+# Rows a request may decode without the head seeing them (because the batch grew beyond
+# one request) before its prompt residual stash is written off as too stale to catch up.
+# Bounded so a request that never runs alone cannot pin its stash for its whole life.
+_MTP_RESYNC_LAG = max(1, int(os.environ.get("FREETOKEN_MTP_RESYNC_LAG", "8")))
+# Decline lines per reason. A reason is terminal for a request so the counters stay small, but
+# a workload of thousands of declined requests still needs a ceiling on the log it writes.
+_MTP_DECLINE_LOG_CAP = max(0, int(os.environ.get("FREETOKEN_MTP_DECLINE_LOG", "5")))
+
+
+def _mtp_report_interval_s() -> float:
+    """How often the MTP tally may repeat when verifies are too sparse to drive it.
+
+    The line used to ride the verify window alone, so a workload that never became eligible
+    printed nothing and read exactly like MTP being switched off. 0 keeps it window-only.
+    """
+    raw = os.environ.get("FREETOKEN_MTP_REPORT_INTERVAL_S", "60")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise ValueError(f"FREETOKEN_MTP_REPORT_INTERVAL_S must be a number, got {raw!r}")
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
@@ -204,10 +248,31 @@ class Scheduler(SchedulerIOMixin):
         # the moe _debug_stats probe (which must not be enabled on PLE-graph rigs).
         self._chunk_timing = os.environ.get("FREETOKEN_CHUNK_TIMING", "0") == "1"
         self._ct_chunks = 0
+        # MTP bookkeeping: why requests stopped drafting (reason -> count) and the running
+        # verify/accept tally. Both the lifetime tally and the tally since the line was last
+        # printed are kept: the lifetime numbers alone read as if they were the window's.
+        self._spec_rejections: dict[str, int] = {}
+        self._spec_verifies = 0
+        self._spec_accepted = 0
+        self._spec_win_verifies = 0
+        self._spec_win_accepted = 0
+        # coverage: decode steps that ran as spec steps vs regular ones. Acceptance alone
+        # cannot tell "drafted and lost" from "switched off sixteen verifies into a 256-token
+        # answer", which is the difference between a bad head and a bad policy.
+        self._spec_steps = 0
+        self._spec_decode_steps = 0
+        # decline lines already printed per reason, so a burst of declined requests cannot
+        # bury the log while the first few still explain the workload
+        self._spec_decline_lines: dict[str, int] = {}
+        self._spec_report_s = _mtp_report_interval_s()
+        self._spec_last_report = time.monotonic()
+        self._spec_reported: tuple[int, dict[str, int]] = (0, {})
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        if getattr(config, "speculative", "none") == "mtp":
+            self._report_spec_config()
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -215,6 +280,10 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        # A short burst never reaches the verify window, so drain it here instead of leaving its
+        # numbers stranded until some later request crosses the window.
+        if getattr(self.config, "speculative", "none") == "mtp":
+            self._report_spec_tally(force=True)
         self.cache_manager.check_integrity()
 
     @torch.inference_mode()
@@ -326,6 +395,15 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        # The accept of an in-flight spec batch is host state the next batch is built from, so
+        # this iteration cannot issue first: drain it (in the order normal_loop uses -- the
+        # deferred PLE fill runs inside _process_last_data, before that batch's copy_done wait,
+        # and the launch that would otherwise need ordering has not happened yet).
+        if self._needs_serial_drain(last_data):
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            last_data = None
+            self._last_data = None
         forward_input = self._schedule_next_batch()
         if _ct:
             _ct2 = time.perf_counter()
@@ -470,9 +548,9 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        # MTP spec steps need the accept count BEFORE the next batch's host bookkeeping
-        # (positions, pages, pool rows); the overlap loop issues N+1 before draining N.
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative != "none":
+        # MTP keeps the overlap loop too: an MTP spec batch is drained before the next batch is
+        # scheduled (see _needs_serial_drain), which is the only place its accept is needed.
+        if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -483,6 +561,21 @@ class Scheduler(SchedulerIOMixin):
             while True:
                 data = self.overlap_loop(data)
 
+    @staticmethod
+    def _needs_serial_drain(last_data: ForwardData | None) -> bool:
+        """Whether the in-flight batch must be drained before the next one may be scheduled.
+
+        Only an MTP spec batch qualifies: how far its tokens committed (one token on a reject,
+        two on an accept) is what the next batch's positions, page spans and token_pool rows
+        are computed from, and the overlap loop would build those from the un-read reply. Every
+        other batch leaves the pipeline intact -- this dependency is the only reason
+        ``--speculative mtp`` used to run the whole scheduler without overlap, taxing the
+        requests that never drafted a token."""
+        return (
+            last_data is not None
+            and getattr(last_data[0].batch, "spec_mode", None) is not None
+        )
+
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
@@ -491,10 +584,23 @@ class Scheduler(SchedulerIOMixin):
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
+        if _dbg is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter()
 
         batch, fout = last_data[0].batch, last_data[1]
         next_tokens_cpu, copy_done = fout.next_tokens_cpu, fout.copy_done_event
         copy_done.synchronize()
+        if _dbg is not None:
+            # the serial spec drain waits the whole in-flight step here; splitting the
+            # bucket is what tells the GPU tail apart from the host work that follows
+            _n = _time.perf_counter()
+            _dbg.host_phase("drain.sync", _n - _t0)
+            _t0 = _n
         spec_payload = fout.spec
         if spec_payload is None and getattr(fout, "spec_cpu", None) is not None:
             # graphed spec step: the pinned payload row landed with the copy_done event
@@ -510,6 +616,14 @@ class Scheduler(SchedulerIOMixin):
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         spec_two_row = getattr(batch, "spec_mode", None) == "verify"
+        if getattr(self.config, "speculative", "none") == "mtp":
+            # counted on the drain, where the batch shape is known: a spec batch IS a decode
+            # step (the verify rides phase="prefill" for the extend machinery), and the split
+            # between the two is the coverage the acceptance numbers do not show
+            if getattr(batch, "spec_mode", None) is not None:
+                self._spec_steps = getattr(self, "_spec_steps", 0) + 1
+            elif batch.is_decode:
+                self._spec_decode_steps = getattr(self, "_spec_decode_steps", 0) + 1
         with self.cache_manager.lazy_free_region():
             if spec_two_row:
                 # The spec drain owns this batch's bookkeeping (accept: complete_one +
@@ -517,6 +631,13 @@ class Scheduler(SchedulerIOMixin):
                 # below must not also run (its prefill branch would radix-commit).
                 self._drain_spec(batch, spec_payload, reply, new_finished_reqs)
             for i, req in enumerate(() if spec_two_row else batch.reqs):
+                if batch.is_prefill and req.spec_off and req.spec_off_reason:
+                    # The engine's residual-stash gate declined this request during this
+                    # forward. Prefill only: the scheduler's own declines set the same
+                    # field, and re-adopting one at every decode drain would bury the
+                    # counters the periodic acceptance line prints.
+                    self._count_spec_rejection(req.spec_off_reason, req)
+                    req.spec_off_reason = ""
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
@@ -611,6 +732,7 @@ class Scheduler(SchedulerIOMixin):
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
+        spec = getattr(self.config, "speculative", "none") == "mtp"
         if reply:
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
@@ -619,6 +741,7 @@ class Scheduler(SchedulerIOMixin):
             mamba_cached = self.cache_manager.evictable_mamba_slots
             swa_cached = self.cache_manager.evictable_swa_tokens
             moe_used, moe_live, moe_total = self._moe_residency()
+            spec_snapshot = self._spec_snapshot() if spec else None
             for m in reply:
                 m.kv_used_pages = used
                 m.kv_total_pages = total
@@ -633,6 +756,15 @@ class Scheduler(SchedulerIOMixin):
                 m.moe_active_slots = moe_live
                 m.moe_total_slots = moe_total
                 m.gpu_mem_bytes = mem
+                if spec_snapshot is not None:
+                    (m.spec_verifies, m.spec_accepted, m.spec_declines, m.spec_steps,
+                     m.spec_decode_steps, m.spec_cold_seeds) = spec_snapshot
+        spec_info = None
+        if spec:
+            spec_info = self._spec_status()
+            # also on a clock: a run whose verifies never reach the window would otherwise sit
+            # silent for its whole life, which is the failure this line exists to rule out
+            self._report_spec_tally()
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -642,8 +774,16 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            spec=spec_info,
+            # the drain counted what this forward shipped: two tokens on an MTP accept, one
+            # on a reject (and none when the request was already gone).
+            generated_tokens=(
+                len(reply) if getattr(batch, "spec_mode", None) is not None else None
+            ),
         )
         self.send_result(reply)
+        if _dbg is not None:
+            _dbg.host_phase("drain.work", _time.perf_counter() - _t0)
 
     def _account_prefill_debt(self, batch) -> None:
         """Accrue the wall time a prefill batch held the engine while decodes waited.
@@ -974,6 +1114,260 @@ class Scheduler(SchedulerIOMixin):
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
+    def _count_spec_rejection(self, reason: str, req: Req | None = None) -> None:
+        """One more request that MTP declined to draft, by reason, with a line where it happens.
+
+        The per-decline line is the point. The breakdown used to ride only inside the verify
+        tally, so a workload that never qualified -- every prompt chunked, or every prompt a
+        prefix hit -- printed nothing, and that was indistinguishable from MTP being off. A
+        terminal reason counts once per request; the episodic ones (resync, streak,
+        suspend_hole, a low_acceptance pause) count once per episode, and the per-reason line
+        cap bounds the log either way."""
+        counts = getattr(self, "_spec_rejections", None)
+        if counts is None:
+            counts = self._spec_rejections = {}
+        counts[reason] = counts.get(reason, 0) + 1
+        self._log_spec_decline(reason, req)
+
+    def _log_spec_decline(self, reason: str, req: Req | None) -> None:
+        lines = getattr(self, "_spec_decline_lines", None)
+        if lines is None:
+            lines = self._spec_decline_lines = {}
+        shown = lines.get(reason, 0)
+        if shown >= _MTP_DECLINE_LOG_CAP:
+            if shown == _MTP_DECLINE_LOG_CAP:
+                logger.info_rank0(
+                    f"MTP spec: {reason} declined further requests without a line "
+                    f"(total {getattr(self, '_spec_rejections', {}).get(reason, 0)}, "
+                    f"first {_MTP_DECLINE_LOG_CAP} shown)"
+                )
+            lines[reason] = shown + 1
+            return
+        lines[reason] = shown + 1
+        logger.info_rank0(f"MTP spec: declined {reason}{self._decline_detail(req)}")
+
+    def _decline_detail(self, req: Req | None) -> str:
+        """The numbers a decline was decided on, in the state the decider saw.
+
+        ``prefix_hit`` means nothing until you can see the hit was 35904 of a 35904 token
+        prompt, and ``over_budget`` nothing until you can see the cap it tripped. The engine's
+        residual gate hands its own snapshot over through ``spec_off_detail``: by the time the
+        scheduler drains that prefill, ``complete_one`` has moved ``cached_len`` up to the full
+        prompt and ``extend_len`` reads 0, so guessing from the live request would lie."""
+        if req is None:
+            return ""
+        detail = getattr(req, "spec_off_detail", "") or ""
+        req.spec_off_detail = ""  # consumed, so a later decline describes itself
+        if not detail:
+            parts = [
+                f"prompt={req.input_ids.numel()}",
+                f"new={req.extend_len}",
+                f"cached={req.cached_len}",
+                f"out={req.output_len}",
+            ]
+            sp = getattr(req, "sampling_params", None)
+            if sp is not None:
+                parts.append(f"sampling=(T={sp.temperature}, top_k={sp.top_k}, top_p={sp.top_p})")
+            detail = " ".join(parts)
+        return f" for req {req.uid}: {detail}"
+
+    def _spec_reject_summary(self) -> str:
+        counts = getattr(self, "_spec_rejections", None) or {}
+        return " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "-"
+
+    def _report_spec_config(self) -> None:
+        """Say, once at startup, what MTP will consider draftable -- before any traffic exists.
+
+        Every eligibility rule that lives only in a gate downstream (prompt size, single-chunk
+        cold prefills, one-request decode batches, the per-kind graph captures) otherwise has to
+        be inferred from a line that needs verifies to print, so an unqualified workload reads
+        as a broken engine. The stash size is spelled out in bytes too: the cap is prompt-sized
+        and its unit is the residual row width, not tokens."""
+        cfg = self.config
+        budget = mtp_stash_budget()
+        hidden = getattr(cfg.model_config, "hidden_size", None)
+        hc = getattr(getattr(self.engine.model, "model", None), "hc_count", None)
+        # one residual row is hc_count hyper-connection streams of hidden, in the model's dtype
+        stash = f"{budget} tokens"
+        if hidden and hc:
+            stash += f" (~{budget * hidden * hc * 2 / 2 ** 20:.0f} MiB/req)"
+        sampling = "on" if sampling_path_enabled() else "off (FREETOKEN_MTP_SAMPLING=0)"
+        span = (
+            "prefix-hit and over-budget prompts draft cold"
+            if mtp_cold_start()
+            else "prefix-hit, over-budget and image rows never draft"
+        )
+        logger.info_rank0(
+            f"MTP spec: enabled | window={_MTP_ACCEPT_WINDOW} "
+            f"min_acceptance={_MTP_MIN_ACCEPTANCE:.2f} resume_after={_MTP_RESUME_AFTER} "
+            f"reject_streak={_MTP_REJECT_STREAK}x{_MTP_SKIP_STEPS} "
+            f"resync_lag={_MTP_RESYNC_LAG} "
+            f"tally_every={self._spec_report_s:.0f}s decline_log={_MTP_DECLINE_LOG_CAP} | "
+            f"draftable: single-request decode batches whose head catches up over the prompt "
+            f"stash ({stash}, any number of prefill chunks); sampled drafting {sampling}; {span} "
+            f"| CUDA graph capture per verify kind"
+            f"{'' if sampled_graph_enabled() else ' (sampled stays eager: FREETOKEN_MTP_SAMPLED_GRAPH=0)'}"
+        )
+
+    def _report_spec_tally(self, force: bool = False) -> None:
+        """Print the MTP tally: lifetime verify/accept, the span since the last line, and the
+        decline breakdown.
+
+        Driven by three things, because verifies alone were not enough to make a run readable:
+        the auto-off window, the drain on a clock, and a forced flush when the queue empties
+        (a short burst otherwise dies below the window and never reports).
+        """
+        reported_verifies, reported_rejections = getattr(self, "_spec_reported", (0, {}))
+        rejections = getattr(self, "_spec_rejections", None) or {}
+        n, a = getattr(self, "_spec_verifies", 0), getattr(self, "_spec_accepted", 0)
+        wn, wa = (
+            getattr(self, "_spec_win_verifies", 0),
+            getattr(self, "_spec_win_accepted", 0),
+        )
+        # something new, always: run_when_idle is polled on every blocking wait, and a tally that
+        # had nothing to add would reprint itself for as long as the server sits idle
+        if n == reported_verifies and rejections == reported_rejections:
+            return
+        now = time.monotonic()
+        if not force and now - getattr(self, "_spec_last_report", now) < getattr(
+            self, "_spec_report_s", 0.0
+        ):
+            return
+        self._spec_last_report = now
+        self._spec_reported = (n, dict(rejections))
+        self._spec_win_verifies = self._spec_win_accepted = 0
+        since = f" (last {wa}/{wn})" if wn else ""
+        # a decline-only run has nothing to divide: reporting the breakdown without the
+        # acceptance number is the point (it is how a no-drafting run stays readable), but the
+        # first version of this line still did a / n and killed the backend worker on idle flush
+        tally = (
+            f"acceptance {a}/{n} = {a / n:.3f}{since}{self._spec_coverage()}"
+            if n
+            else "no verifies"
+        )
+        logger.info_rank0(f"MTP spec: {tally} | declined: {self._spec_reject_summary()}")
+
+    def _spec_coverage(self) -> str:
+        """``drafted s/(s+d)``: the share of decode steps that ran as spec steps.
+
+        Without it one acceptance number reads the same whether the head drafted the whole
+        answer or was switched off sixteen verifies in and spent the rest decoding normally
+        -- a bad head and a bad policy look identical otherwise. ``cold`` counts the seeds that
+        had no catch-up pass behind them (cold start, or a hole the head never saw): drafts
+        worth less than the average, which is why they must not be read silently."""
+        s = getattr(self, "_spec_steps", 0)
+        d = getattr(self, "_spec_decode_steps", 0)
+        cold = getattr(self, "_spec_cold_seeds", 0)
+        if not (s or d):
+            return ""
+        tail = f" cold={cold}" if cold else ""
+        return f", drafted {s}/{s + d} ({s / (s + d):.2f}){tail}"
+
+    def _spec_status(self) -> str:
+        """The one-field MTP snapshot for the periodic Decode line.
+
+        The Decode line is the only status output with a cadence that does not depend on
+        verifies, so it carries whether drafting ran at all -- the question the acceptance line
+        structurally cannot answer when no verify ever happened."""
+        n, a = getattr(self, "_spec_verifies", 0), getattr(self, "_spec_accepted", 0)
+        # 0/0 = 0.000 reads as a head that never lands a draft; it means nothing was drafted
+        tally = f"acceptance {a}/{n} = {a / n:.3f}" if n else "no verifies"
+        return f"{tally}{self._spec_coverage()}, declined: {self._spec_reject_summary()}"
+
+    def _spec_snapshot(self) -> tuple[int, int, dict[str, int], int, int, int] | None:
+        """The MTP counters to stamp onto a reply, or None when the engine does not draft.
+
+        One snapshot per batch, and the decline map is copied rather than aliased: it keeps
+        growing while the frontend serializes the replies that carry it."""
+        if getattr(self.config, "speculative", "none") != "mtp":
+            return None
+        return (
+            getattr(self, "_spec_verifies", 0),
+            getattr(self, "_spec_accepted", 0),
+            dict(getattr(self, "_spec_rejections", None) or {}),
+            getattr(self, "_spec_steps", 0),
+            getattr(self, "_spec_decode_steps", 0),
+            getattr(self, "_spec_cold_seeds", 0),
+        )
+
+    def _release_spec_scratch(self, req: Req) -> None:
+        """Drop everything the spec path holds between steps: draft, residual stash, scratch slot.
+
+        Every path that stops drafting must call this. The scratch slot rides the same
+        free-list as the live/ping-pong slots, so a leaked one is a slot the next admission
+        cannot get -- and LinearStatePool.alloc raises mid-decode, where there is no way
+        back out but killing the scheduler."""
+        req.spec_draft = None
+        req.spec_residual = None
+        req.spec_draft_probs = None
+        if req.spec_slot_idx is not None:
+            pool = self.engine.linear_state_pool
+            if pool is not None:
+                pool.free(req.spec_slot_idx)
+            req.spec_slot_idx = None
+
+    def _spec_reject(self, req: Req, reason: str) -> None:
+        """Turn MTP off for one request, release its scratch state, and count the reason.
+
+        Counting happens on the transition only: a request declined every decode step
+        (because the batch is never size 1) would otherwise bury the counters."""
+        if not req.spec_off:
+            self._count_spec_rejection(reason, req)
+        req.spec_off = True
+        req.spec_off_reason = reason
+        self._release_spec_scratch(req)
+
+    def _tally_verify(self, req: Req, accepted: bool) -> None:
+        """Fold one verify into the running tally and the request's auto-off window.
+
+        A request whose drafts keep missing pays a second target row for nothing, so the
+        window closes shop below ``FREETOKEN_MTP_MIN_ACCEPTANCE`` (0 disables the check and
+        leaves the call to whoever reads the printed acceptance): the request stands down for
+        ``FREETOKEN_MTP_RESUME_AFTER`` decode steps and probes again, because one window is too
+        small a sample to end an answer on.
+        """
+        self._spec_verifies = getattr(self, "_spec_verifies", 0) + 1
+        self._spec_accepted = getattr(self, "_spec_accepted", 0) + int(accepted)
+        self._spec_win_verifies = getattr(self, "_spec_win_verifies", 0) + 1
+        self._spec_win_accepted = getattr(self, "_spec_win_accepted", 0) + int(accepted)
+        req.spec_verifies += 1
+        req.spec_accepted += int(accepted)
+        if accepted:
+            req.spec_rejects = 0
+        elif _MTP_REJECT_STREAK:
+            req.spec_rejects += 1
+            if req.spec_rejects >= _MTP_REJECT_STREAK and not req.spec_suspend:
+                # the next draft after a short miss streak lands ~15% of the time while a
+                # verify costs ~2.1 decode steps: spend those steps decoding instead, then
+                # probe again (the same stand-down the slow window uses, one scale smaller)
+                req.spec_rejects = 0
+                req.spec_suspend = _MTP_SKIP_STEPS
+                self._count_spec_rejection("streak", req)
+        if self._spec_win_verifies >= _MTP_ACCEPT_WINDOW:
+            self._report_spec_tally(force=True)
+        if req.spec_verifies >= _MTP_ACCEPT_WINDOW:
+            rate = req.spec_accepted / req.spec_verifies
+            req.spec_verifies = req.spec_accepted = 0
+            if rate < _MTP_MIN_ACCEPTANCE:
+                if _MTP_RESUME_AFTER:
+                    # stand down and re-probe: one window is too small a sample to end a
+                    # request's whole answer on (see _MTP_RESUME_AFTER), and the head's KV and
+                    # scratch slot survive the pause, so resuming costs nothing
+                    if not req.spec_suspend:
+                        self._count_spec_rejection("low_acceptance", req)
+                        logger.info_rank0(
+                            f"MTP spec: req {req.uid} acceptance {rate:.3f} below "
+                            f"{_MTP_MIN_ACCEPTANCE:.2f}; drafting suspended for "
+                            f"{_MTP_RESUME_AFTER} decode steps"
+                        )
+                    req.spec_suspend = _MTP_RESUME_AFTER
+                else:
+                    logger.info_rank0(
+                        f"MTP spec: req {req.uid} acceptance {rate:.3f} below "
+                        f"{_MTP_MIN_ACCEPTANCE:.2f}, drafting disabled"
+                    )
+                    self._spec_reject(req, "low_acceptance")
+
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
         # abort in the same overlap iteration races _process_last_data and would free it twice --
@@ -981,13 +1375,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
-        # MTP spec resources: the scratch GDN slot comes from the same free-list as the
-        # live/ping-pong slots; the stash/draft references must not outlive the request.
-        if req.spec_slot_idx is not None and self.engine.linear_state_pool is not None:
-            self.engine.linear_state_pool.free(req.spec_slot_idx)
-        req.spec_slot_idx = None
-        req.spec_residual = None
-        req.spec_draft = None
+        # MTP spec resources: the stash/draft references and the scratch GDN slot must not
+        # outlive the request (the slot shares the free-list with the live/ping-pong slots).
+        self._release_spec_scratch(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -1149,6 +1539,14 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
+        # A graphed verify derives every input from its staged scalars and in-graph
+        # gathers, so the per-step tensor prep a replay never reads (positions, mapping
+        # tuples, out_loc, FLA/attn metadata) is pure waste. The page charge IS read: the
+        # in-graph gather of out_loc hits the page-table rows allocate_paged just filled.
+        spec_graphed = (
+            getattr(batch, "spec_mode", None) == "verify"
+            and self.engine.spec_graph_will_replay(getattr(batch, "spec_sample", False))
+        )
         if batch.is_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
@@ -1172,13 +1570,15 @@ class Scheduler(SchedulerIOMixin):
             batch.spec_pages = recorded
         if batch.is_prefill:
             self._gather_multimodal(batch)
-        batch.positions = _make_positions(batch, self.device)
-        if self._model_is_mrope:
-            batch.mrope_positions = _make_mrope_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
+        input_mapping = write_mapping = None
+        if not spec_graphed:
+            batch.positions = _make_positions(batch, self.device)
+            if self._model_is_mrope:
+                batch.mrope_positions = _make_mrope_positions(batch, self.device)
+            input_mapping = _make_input_tuple(batch, self.device)
+            write_mapping = _make_write_tuple(batch, self.device)
+            batch.out_loc = self.engine.page_table[input_mapping]
+        if self.engine.linear_state_pool is not None and not spec_graphed:
             if batch.is_decode:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
@@ -1204,10 +1604,16 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not spec_graphed:
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            # spec steps never reach the sampler (forward_batch dispatches to _forward_spec
+            # before the args are read), so building its knob tensors per verify was waste
+            sample_args=(
+                None if getattr(batch, "spec_mode", None) is not None
+                else self.engine.sampler.prepare(batch)
+            ),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
@@ -1230,6 +1636,9 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        from freetoken.moe import _debug_stats
+
+        _dbg = _debug_stats.probe()
         interval = self.config.prefill_decode_interval
         batch = None
         # schedule_next_batch consumes the admission, so the interleave guard must run
@@ -1250,16 +1659,18 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
+                if _dbg is not None:
+                    _tu = time.perf_counter()
                 upgraded = self._as_spec_batch(batch)
+                if _dbg is not None:
+                    _dbg.host_phase("sched.upgrade", time.perf_counter() - _tu)
                 if upgraded is not None:
                     batch = upgraded
-                else:
-                    # Regular decode skips the head's KV updates, so an old draft must
-                    # never resume after a concurrent request leaves the batch.
+                elif getattr(self.config, "speculative", "none") == "mtp":
+                    # A regular decode batch runs the graph and never feeds the head, so
+                    # every row placed here is a row the head will never see.
                     for req in getattr(batch, "reqs", ()):
-                        req.spec_off = True
-                        req.spec_draft = None
-                        req.spec_residual = None
+                        self._on_regular_decode(req)
         if batch is None:
             return None
         # Spec batches ride phase="prefill" for the extend machinery but ARE decode steps:
@@ -1273,40 +1684,146 @@ class Scheduler(SchedulerIOMixin):
             # discharging it is what keeps one slow chunk from buying two decode steps
             self._debt_discharge = inflight_batch if inflight_s > 0 else None
             self._prefill_debt = 0.0
+        if _dbg is not None:
+            _tp = time.perf_counter()
         forward_input = self._prepare_batch(batch)
+        if _dbg is not None:
+            _dbg.host_phase("sched.prepare", time.perf_counter() - _tp)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _on_regular_decode(self, req: Req) -> None:
+        """Reconcile one request's spec state after a regular (non-spec) decode step.
+
+        A regular step means the batch was not upgraded -- it grew past one request, or the
+        draft was declined for the last row. The head's KV stays valid for every row it did
+        see; only the staged draft is now aimed at a position that has already committed, so it
+        is dropped and the next spec step re-seeds one (one rejected verify, then normal
+        drafting). Ending the request here -- the old terminal ``batch_killed`` -- took drafting
+        away from every concurrent turn, which is most of the traffic on a shared server.
+
+        A request that never reached its first spec step still holds the prompt stash and
+        resumes unchanged once it runs alone again; past the lag bound the span can no longer
+        cover the prompt, so the stash (prompt-sized, and otherwise pinned for the whole life
+        of a request that never runs alone) is released -- and the draft goes cold with it when
+        cold start is on."""
+        if req.spec_off:
+            return
+        if req.spec_suspend:
+            # standing down by the acceptance floor: the head is falling behind ON PURPOSE, so
+            # neither the lag nor the batch shape may turn that pause into the terminal
+            # decline it used to be -- that is what never came back
+            req.spec_suspend -= 1
+            req.spec_suspend_missed += 1
+            if req.spec_suspend == 0:
+                # the hole is PER EPISODE: reset at every countdown end, or two short pauses
+                # accumulate (the streak default sits exactly at the lag bound) and every
+                # other one re-seeds -- measured live as streak=48 with suspend_hole=22
+                missed, req.spec_suspend_missed = req.spec_suspend_missed, 0
+                if missed > _MTP_RESYNC_LAG and (
+                    req.spec_draft is not None or req.spec_draft_probs is not None
+                ):
+                    # the pause outran the hole the head may miss: the staged draft and the
+                    # density that produced it were computed `missed` committed tokens ago,
+                    # so the resume drops both and cold-seeds a fresh pair instead of paying
+                    # a verify aimed at the wrong position (measured: that verify rejects
+                    # every time). Not terminal -- same trade as the resync above.
+                    req.spec_draft = None
+                    req.spec_draft_probs = None
+                    self._count_spec_rejection("suspend_hole", req)
+            return
+        if req.spec_head_len or req.spec_slot_idx is not None:
+            if req.spec_draft is not None:
+                req.spec_draft = None
+                self._count_spec_rejection("resync", req)
+            return
+        req.spec_draft = None
+        stash = req.spec_residual
+        if stash is not None and req.cached_len - stash.shape[0] > _MTP_RESYNC_LAG:
+            if mtp_cold_start():
+                req.spec_residual = None  # the span is stale; the head can still draft cold
+                self._count_spec_rejection("lag_overflow", req)
+            else:
+                self._spec_reject(req, "lag_overflow")
 
     def _as_spec_batch(self, batch: Batch) -> Batch | None:
         """Upgrade a single-request decode batch into an MTP spec batch, or None to keep it regular.
 
-        Only a single greedy request with room for two output tokens is eligible.
+        Only a single request with room for two output tokens is eligible; its sampling is
+        verified by id comparison (greedy) or by rejection sampling (non-greedy).
         The draft is staged after the last placed token; both rows use the extend
-        attention path, with intermediate GDN/PLE state saved for rejection.
+        attention path, with intermediate GDN/PLE state saved for rejection. Every decline
+        that is final for the request goes through ``_spec_reject`` so it is counted and
+        its scratch state released.
         """
         if getattr(self.config, "speculative", "none") != "mtp" or len(batch.reqs) != 1:
             return None
         req = batch.reqs[0]
-        if req.spec_off or not req.can_decode or not req.sampling_params.is_greedy:
+        if req.spec_off or not req.can_decode:
+            return None
+        if req.spec_suspend:
+            # standing down by the acceptance floor: no upgrade here, and the regular step it
+            # falls back to is what counts the pause down. The stale draft is deliberately kept
+            # -- it costs one reject after the resume, while dropping it would leave neither a
+            # draft nor a stash to work from, which is a terminal decline by the rules above.
+            return None
+        if not spec_supported(req.sampling_params):
+            self._spec_reject(req, "nongreedy")
             return None
         if getattr(req, "mm_items", None):
-            req.spec_off = True  # Phase 1: image rows keep the regular decode path
+            self._spec_reject(req, "mm")  # Phase 1: image rows keep the regular decode path
+            return None
+        if req.remain_len < 2:
+            # One row of output budget left: an accept could not pay out, so neither a draft nor
+            # the catch-up pass is worth anything. Declining here also keeps the breakdown honest
+            # -- left to _on_regular_decode this reads as a resync, blaming concurrency for
+            # what is just the end of the generation (measured: every drafted request logged it)
+            # -- and it releases the prompt-sized stash instead of holding it until finish.
+            self._spec_reject(req, "no_room")
             return None
         if req.spec_draft is not None:
             mode = "verify"
         elif req.spec_residual is not None:
             mode = "prologue_decode"
+        elif req.spec_head_len or mtp_cold_start():
+            # No stash: either the head already ran and a mixed batch left a hole (its KV is
+            # valid for everything it saw), or cold start is on and we draft from the first row.
+            # No prologue batch is built, so the head pass of this step produces the seed draft.
+            # Counted, because a cold draft is worth much less than a caught-up one and the
+            # acceptance number has to be read against how often it happened.
+            mode = "prologue_decode"
+            self._spec_cold_seeds = getattr(self, "_spec_cold_seeds", 0) + 1
         else:
-            return None
-        if mode == "verify" and req.remain_len < 2:
+            # Neither: this request has no rows to catch the head up on and never had a draft.
+            # The prefill forward declines at the BATCH level (its gate covers every request in
+            # one test) and so names no request, which leaves the reason to be recovered from the
+            # request here -- and a committed prompt can never grow a stash afterwards.
+            if not spec_supported(req.sampling_params):
+                reason = "nongreedy"  # FREETOKEN_MTP_SAMPLING=0 starved the whole batch
+            elif getattr(req, "mm_items", None):
+                reason = "mm"
+            else:
+                reason = "no_stash"
+            self._spec_reject(req, reason)
             return None
         if req.spec_slot_idx is None:
             pool = self.engine.linear_state_pool
             if pool is None:
-                req.spec_off = True
+                self._spec_reject(req, "no_gdn_pool")
                 return None
-            req.spec_slot_idx = pool.alloc(1)[0]
+            try:
+                req.spec_slot_idx = pool.alloc(1)[0]
+            except RuntimeError:
+                # _linear_spec_reserve makes this unreachable on a correctly sized pool,
+                # but declining one request beats an uncaught raise in the decode loop:
+                # the slot is already free-listed, so nothing leaked.
+                self._spec_reject(req, "exhausted")
+                logger.info_rank0(
+                    f"MTP spec: no free GDN state slot for req {req.uid}, drafting disabled"
+                )
+                return None
         batch.spec_mode = mode
+        batch.spec_sample = not req.sampling_params.is_greedy
         if mode == "verify":
             # The draft is staged into BOTH stores: the token pool feeds the forward
             # rows, and the host id buffer feeds the PLE extend fill (which builds this
@@ -1320,21 +1837,28 @@ class Scheduler(SchedulerIOMixin):
             batch.spec_draft_id = req.spec_draft
             batch.phase = "prefill"
         else:
-            batch.spec_prologue = self._build_spec_prologue(req)
+            if req.spec_residual is not None:
+                batch.spec_prologue = self._build_spec_prologue(req)
+            # else: a cold seed step -- no catch-up pass, the head pass of this very step
+            # produces the first draft from the row it is decoding
         return batch
 
     def _build_spec_prologue(self, req: Req) -> Batch:
-        """The head-only catch-up batch over the prompt rows (see Engine._run_head_prologue).
+        """The head-only catch-up batch over the rows the head has not seen.
 
-        A shadow request view makes the sparse backend see a fresh length-T prefill: the
-        head layer's slab/ring start empty and the page slots already exist (the main
-        prefill charged them), so out_loc is just the page-table row slice and the embeds
-        are the pool's tokens 1..T (teacher forcing; pool[T] is the first sampled token).
+        See Engine._run_head_prologue. A shadow request view makes the sparse backend see
+        a fresh length-t prefill: the head layer's slab/ring start empty and the page slots
+        already exist (the main forward charged them), so out_loc is just the page-table row
+        slice and the embeds are the pool's tokens 1..t (teacher forcing; pool[t] is the
+        token that followed the last row). t is capped by the stash: rows placed after the
+        prompt (a request that decoded in a multi-request batch before its first spec step)
+        have no residual, so the head starts with a hole there -- it costs draft quality,
+        never correctness.
         """
         from types import SimpleNamespace
 
-        t = int(req.cached_len)
-        assert t >= 1 and req.device_len == t + 1, (t, req.device_len)
+        t = min(int(req.cached_len), int(req.spec_residual.shape[0]))
+        assert t >= 1 and req.device_len >= t + 1, (t, req.device_len)
         shadow = SimpleNamespace(
             table_idx=req.table_idx, cached_len=0, device_len=t, extend_len=t,
             linear_slot_idx=req.linear_slot_idx,
@@ -1351,6 +1875,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _restore_spec_prefix(self, batch: Batch) -> None:
         req = batch.reqs[0]
+        # the scratch slot a rollback restores from is freed only after the commit (see
+        # _drain_spec): a None here means something reordered the tally ahead of the rollback
+        # and the pool copy below would fail as a tensor-shape error on the engine stream
+        assert req.spec_slot_idx is not None, "spec rollback without a scratch slot"
         self.engine.linear_state_pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
         req.cached_len = req.device_len - 1
         if batch.spec_pages:
@@ -1374,17 +1902,6 @@ class Scheduler(SchedulerIOMixin):
             return
         if spec is None:
             raise RuntimeError("MTP spec step returned no payload")
-        if batch.spec_mode == "verify":
-            # rate-limited ops visibility: the running acceptance over all verifies
-            stats = getattr(self, "_spec_stats", None)
-            if stats is None:
-                stats = self._spec_stats = [0, 0]
-            stats[0] += 1
-            stats[1] += int(bool(spec["accept"]))
-            if stats[0] % 64 == 0:
-                logger.info_rank0(
-                    f"MTP spec: acceptance {stats[1]}/{stats[0]} = {stats[1] / stats[0]:.3f}"
-                )
         if spec["accept"]:
             req.complete_one()
             req.spec_draft = spec.get("draft")
@@ -1399,7 +1916,13 @@ class Scheduler(SchedulerIOMixin):
             req.spec_draft = spec.get("draft")
             tokens = (spec["y1"],)
             skip_first_append = True
-        if os.getenv("FREETOKEN_MTP_DEBUG"):
+        # The tally runs last because it can end the draft: a request that trips the
+        # low-acceptance floor is turned off through _spec_reject, which frees the scratch
+        # slot the rollback above restores FROM. Doing it first hands the pool a None index
+        # (a shape error out of the GDN copy, on the engine stream, mid-decode).
+        if batch.spec_mode == "verify":
+            self._tally_verify(req, bool(spec["accept"]))
+        if debug_traced():
             logger.info_rank0(
                 f"[mtp] {batch.spec_mode} accept={spec['accept']} y1={spec['y1']} "
                 f"y2={spec.get('y2')} draft={spec.get('draft')} emit={tokens} "
@@ -1480,7 +2003,8 @@ class Scheduler(SchedulerIOMixin):
             import time as _time
 
             _q0 = _time.perf_counter()
-        batch.input_ids = self.token_pool[input_mapping]
+        if input_mapping is not None:
+            batch.input_ids = self.token_pool[input_mapping]
         if _dbg is not None:
             _q1 = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.inputids", _q1 - _q0)
@@ -1493,7 +2017,10 @@ class Scheduler(SchedulerIOMixin):
         if _dbg is not None:
             _q2 = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.fbcall", _q2 - _qa)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if output_mapping is not None:
+            # a graphed verify writes its bonus token in-graph (and the drain repairs the
+            # rejected draft's slot); this store feeds the eager steps only
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         if _dbg is not None:
             _q3 = _time.perf_counter()

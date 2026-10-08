@@ -90,6 +90,39 @@ def test_multichunk_overlap_no_double_free():
     assert len(cm.free_slots) == cm.num_pages - 4 * CHUNK
 
 
+def test_a_continuation_chunk_carries_the_mtp_stash():
+    """Stage D: the head catches up over the rows EVERY chunk computed, so the residual stash has
+    to survive the fresh Req a continuation is built into. Dropped at the chunk boundary it is
+    indistinguishable from the hole a prefix-cache hit leaves, and long prompts never draft."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(3 * CHUNK, dtype=torch.int32),
+                                  sampling_params=SamplingParams(max_tokens=4))]
+
+    first = pm.schedule_next_batch(CHUNK)
+    cm.allocate_paged(first.reqs)
+    req0 = first.reqs[0]
+    assert isinstance(req0, ChunkedReq)
+    stash = torch.arange(CHUNK * 2, dtype=torch.float32).view(CHUNK, 2)
+    req0.spec_residual = stash  # what the engine's gate leaves on a chunk's rows
+    req0.complete_one()
+
+    second = pm.schedule_next_batch(CHUNK)
+    cm.allocate_paged(second.reqs)
+    req1 = second.reqs[0]
+    assert req1.spec_residual is stash
+    assert not req1.spec_off
+    req1.spec_off = True  # declined mid-prompt: the veto belongs to the whole request
+    req1.complete_one()
+
+    third = pm.schedule_next_batch(CHUNK)
+    assert not isinstance(third.reqs[0], ChunkedReq)  # the last chunk
+    assert third.reqs[0].spec_residual is stash and third.reqs[0].spec_off
+
+
 def test_radix_hit_admission_reports_nonzero_cached_tokens():
     """A second request sharing a cached prefix admits with the prefix-cache hit recorded."""
     from freetoken.core import SamplingParams

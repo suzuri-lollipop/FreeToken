@@ -622,6 +622,16 @@ def top_k_renorm_probs(probs, top_k):
     return _topk(probs, _topk_target(top_k, probs.size(0), probs.device), False)
 
 
+def top_k_top_p_renorm_probs(probs, top_k, top_p):
+    """One launch of the exact k-then-p renorm (the DRAW=False arm of the fused kernel):
+    the top-k threshold becomes the top-p bracket's lower edge and the p target scales by
+    the kept k mass, so no renormalized intermediate is ever written."""
+    probs = probs.float()
+    B = probs.size(0)
+    return _topp(probs, _topp_target(top_p, B, probs.device),
+                 _topk_target(top_k, B, probs.device), False)
+
+
 def top_k_sampling_from_probs(probs, top_k, indices=None, deterministic=True, generator=None,
                               check_nan=False, seed=None, offset=None, return_valid=False):
     probs = probs.float()
@@ -644,7 +654,7 @@ def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
 
 
 __all__ = [
-    "softmax", "top_k_renorm_probs", "top_p_renorm_probs",
+    "softmax", "top_k_renorm_probs", "top_p_renorm_probs", "top_k_top_p_renorm_probs",
     "sampling_from_probs", "top_k_sampling_from_probs",
     "top_p_sampling_from_probs", "top_k_top_p_sampling_from_probs",
 ]

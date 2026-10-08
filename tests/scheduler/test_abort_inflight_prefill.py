@@ -76,6 +76,7 @@ def _setup():
         _last_data=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
+    stub._release_spec_scratch = lambda req: Scheduler._release_spec_scratch(stub, req)
     return pool, cm, tm, dm, pm, sent, stub
 
 

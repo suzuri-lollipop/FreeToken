@@ -88,6 +88,9 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
+        spec_verifies=64,
+        spec_accepted=37,
+        spec_declines={"prefix_hit": 9, "chunked": 12},
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -102,6 +105,17 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
+    # the MTP counters ride the same reply, and the decline map survives as a dict
+    assert decoded.spec_verifies == 64
+    assert decoded.spec_accepted == 37
+    assert decoded.spec_declines == {"prefix_hit": 9, "chunked": 12}
+
+    # a reply from an engine that does not draft them at all still decodes
+    legacy = BaseFrontendMsg.encoder(msg)
+    for key in ("spec_verifies", "spec_accepted", "spec_declines"):
+        legacy.pop(key)
+    old = BaseFrontendMsg.decoder(legacy)
+    assert (old.spec_verifies, old.spec_accepted, old.spec_declines) == (0, 0, {})
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
@@ -110,12 +124,17 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        spec_verifies=49, spec_accepted=37, spec_declines={"prefix_hit": 9},
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    # the MTP counters ride the same reply, and a field the scheduler stamps but this message
+    # does not declare kills the detokenizer worker when it decodes the first one
+    assert (decoded.spec_verifies, decoded.spec_accepted) == (49, 37)
+    assert decoded.spec_declines == {"prefix_hit": 9}
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

@@ -271,13 +271,18 @@ class DiskRowTable:
         signaled ahead of the replay -- the captured lookup's memop WAIT is satisfied on
         arrival and no deferred post-drain fill is needed.
         """
-        runs = [
-            torch.cat((
-                torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
-                self._ple_ids(req.input_ids[req.cached_len:req.device_len]).to(torch.int64),
-            ))
-        ]
-        self.fill(runs, graph=True)
+        # One reused run buffer: this fires every spec step, so the tensor alloc + cat the
+        # general path pays would be per-step waste for a fixed 2-context + 2-token shape.
+        n = req.device_len - req.cached_len
+        run = getattr(self, "_spec_run", None)
+        if run is None or run.numel() < 2 + n:
+            run = self._spec_run = torch.empty(2 + n, dtype=torch.int64)
+        run = run[:2 + n]
+        ctx = self._ple_context(req.input_ids, req.cached_len)
+        run[0] = ctx[0]
+        run[1] = ctx[1]
+        run[2:] = self._ple_ids(req.input_ids[req.cached_len:req.device_len])
+        self.fill([run], graph=True)
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""

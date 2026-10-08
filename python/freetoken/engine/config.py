@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Mapping
@@ -344,3 +345,27 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
                 "MoE with --moe-strategy fused (experts resident on every rank), or a single rank"
             )
     return None
+
+
+def mtp_stash_budget() -> int:
+    """Rows of prompt residual a request may hold for the MTP head's catch-up pass.
+
+    The stash is prompt-sized -- one row is ``hc_count * hidden`` in the model's dtype, ~20 KiB
+    at this model's geometry -- so this is what a long prompt pins from its prefill until its
+    first decode step spends it. Raising the cap makes longer prompts draftable at that cost
+    plus a proportionally longer catch-up pass (the prologue is one head layer per stashed row,
+    measured at ~170 ms per 10k rows). Appending a chunk also copies the span, so the transient
+    peak is the cap plus one chunk, not the cap.
+    """
+    return max(0, int(os.environ.get("FREETOKEN_MTP_MAX_STASH_TOKENS", "16384")))
+
+
+def mtp_cold_start() -> bool:
+    """Whether a request may draft without the head having caught up over its prompt.
+
+    The catch-up pass is an optimization, not a requirement: a head that starts empty (or with
+    a hole) produces weak first drafts, and each of those costs one rejected verify -- while
+    declining them keeps the whole prefix-hit traffic (any multi-turn conversation) off the
+    spec path entirely. Off by default until measured against the declines it replaces.
+    """
+    return os.environ.get("FREETOKEN_MTP_COLD_START", "0") not in ("", "0")
