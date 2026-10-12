@@ -392,6 +392,17 @@ class OffloadMoELayer(MoELayer):
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
+            if cache.collect_decode_freq:
+                # hybrid layers snapshot the histogram inside ensure_experts_hybrid;
+                # CPU layers route here instead, so tally them the same way (raw ids,
+                # before the executor consumes them). Graphs must be off: a captured
+                # decode replays kernels, not this host-side accumulation.
+                ids = topk_ids.reshape(-1).long()
+                cache.decode_freq[self.layer_id].scatter_add_(
+                    0, ids, torch.ones_like(ids)
+                )
+            if self.layer_id == 0:
+                cache._profile_dump_step()
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid" and hidden_states.shape[0] >= cache.hybrid_min_bs:
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)

@@ -373,6 +373,9 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # learned-profile dump sink + step counter (see _profile_dump_step)
+        self._profile_out: str | None = None
+        self._profile_steps = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -1592,6 +1595,8 @@ class OffloadMoeCache:
         the active count. The CPU computes (missing - fetched) experts. Device-side;
         accumulates both the scalar totals and the per-layer breakdown."""
         assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
+        if layer_id == 0:
+            self._profile_dump_step()
         missing = self.num_missing_full.sum()
         fetched = self.num_indices.sum()
         active = self.active_mask.sum()
@@ -1664,6 +1669,40 @@ class OffloadMoeCache:
                 "fetched_per_step": (f / s) if s else 0.0,
             })
         return {"per_layer": per_layer}
+
+    def _profile_dump_step(self) -> None:
+        """Periodic learned-profile checkpoint: refresh _profile_out every 256 decode
+        steps so a hard-killed worker still leaves the histogram on disk (the atexit
+        hook only runs on a graceful shutdown)."""
+        if self._profile_out is None:
+            return
+        self._profile_steps += 1
+        if self._profile_steps % 256 == 0:
+            total = self.dump_bank_profile(self._profile_out)
+            if total:
+                logger.info_rank0(
+                    f"expert profile checkpoint: {total} routed observations -> "
+                    f"{self._profile_out}"
+                )
+
+    def dump_bank_profile(self, path: str) -> int:
+        """Write the accumulated decode routing histogram as an FTXP expert profile
+        (hottest (layer, expert) pairs first) for --moe-bank-profile.
+
+        The histogram only fills with collect_decode_freq on and CUDA graphs disabled
+        (a captured decode replays kernels, not this host-side accumulation). Returns
+        the number of routed observations the ranking saw."""
+        from freetoken.moe.expert_profile import rank_by_counts, write_profile
+
+        freq = self.decode_freq.detach().to("cpu")
+        total = int(freq.sum())
+        if total == 0:
+            return 0
+        write_profile(
+            path, rank_by_counts(freq.tolist()),
+            num_layers=self.num_layers, num_experts=self.num_experts,
+        )
+        return total
 
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.

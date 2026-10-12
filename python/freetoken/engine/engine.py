@@ -1585,6 +1585,32 @@ class Engine:
         from freetoken.moe import _debug_stats
 
         cache.collect_stats = config.moe_collect_stats or _debug_stats.ENABLED
+        if config.moe_profile_out:
+            # profile collection: the histogram needs the host-side accumulation the
+            # captured decode graph would skip, so collect while graphs are off
+            cache.collect_stats = True
+            cache.collect_decode_freq = True
+            out = config.moe_profile_out
+            cache._profile_out = out
+            logger.info_rank0(
+                f"expert profile collection: routing histogram -> {out} "
+                "(checkpoint every 256 decode steps)"
+            )
+
+            def _dump_routing_profile():
+                try:
+                    total = cache.dump_bank_profile(out)
+                    if total:
+                        logger.info_rank0(
+                            f"expert profile written to {out} from {total} routed "
+                            "observations (feed it back via --moe-bank-profile)"
+                        )
+                except Exception as exc:  # never block shutdown over a dump
+                    logger.warning_rank0(f"expert profile dump failed: {exc}")
+
+            import atexit
+
+            atexit.register(_dump_routing_profile)
         if _debug_stats.probe() is not None:
             _debug_stats.probe().attach(cache)
         layers = attach_offload_moe_cache(self.model, cache)

@@ -845,6 +845,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-profile-out",
+        type=str,
+        default=ServerArgs.moe_profile_out,
+        help=(
+            "With --moe-collect-stats (implied): accumulate the decode routing "
+            "histogram and write an FTXP expert profile here at shutdown, ranked "
+            "hottest-first from your workload's actual routing. Feed it back with "
+            "--moe-bank-profile. The histogram only fills with CUDA graphs disabled "
+            "(--cuda-graph-bs 0), so run the collection pass that way."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-skip-minw",
         type=float,
         default=ServerArgs.moe_skip_minw,

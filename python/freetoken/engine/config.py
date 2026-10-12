@@ -102,6 +102,9 @@ class EngineConfig:
     # 0.0 keeps every route (exact decode); 0.1 matches the Strata-GLM default.
     moe_skip_minw: float = 0.0
     moe_skip_keep: int = 2
+    # When set (with moe_collect_stats), dump the decode routing histogram as an
+    # FTXP profile here at shutdown: a measured ranking for --moe-bank-profile.
+    moe_profile_out: str | None = None
     # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

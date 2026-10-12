@@ -1660,3 +1660,41 @@ def test_materialize_layer_prefetches_the_next_disk_layer(tmp_path, monkeypatch)
     )
     cache.materialize_layer(L - 1)  # no next layer: nothing more to prefetch
     assert len(called) == 4
+
+
+_cuda_skip = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+@_cuda_skip
+def test_dump_bank_profile_ranks_by_routed_counts(tmp_path):
+    """The learned-profile dump turns the decode routing histogram into an FTXP
+    profile ranked hottest-first, so --moe-bank-profile can consume the workload's
+    own routing (empty histogram writes nothing)."""
+    from freetoken.moe.expert_profile import load_profile
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cuda")
+    )
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+         "down": [torch.randn(4, 8, 16) for _ in range(2)]}
+    )
+    assert cache.dump_bank_profile(str(tmp_path / "p.ftxp")) == 0  # nothing routed yet
+
+    cache.collect_decode_freq = True
+    ids = torch.tensor([[3, 3, 1, 0], [0, 2, 1, 2]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts_hybrid(0, ids[:, :2].contiguous())
+    cache.ensure_experts_hybrid(1, ids[:, 2:].contiguous())
+    torch.cuda.synchronize()
+
+    out = tmp_path / "p.ftxp"
+    total = cache.dump_bank_profile(str(out))
+    assert total == 8  # both steps, all four routes each
+    pairs, num_layers, num_experts = load_profile(str(out))
+    assert num_layers == 2 and num_experts == 4
+    # layer 0 saw expert 3 twice, layer 1 expert 1 twice (stable order breaks the
+    # tie), then the singly-routed pairs
+    pairs = pairs[:4]
+    assert pairs[0] == (0, 3) and pairs[1] == (1, 1)
+    assert set(pairs[2:]) == {(0, 0), (0, 2)}
