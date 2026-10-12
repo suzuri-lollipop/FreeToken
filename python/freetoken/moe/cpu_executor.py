@@ -224,6 +224,8 @@ class CpuMoeExecutor:
             {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt,
             hot_sources,
         )
+        ptrs["ra_gate"] = self._readahead_windows(cache, "gate_up")
+        ptrs["ra_down"] = self._readahead_windows(cache, "down")
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -367,6 +369,28 @@ class CpuMoeExecutor:
         if not any(h is not None for h in out):
             return None
         return out
+
+    def _readahead_windows(self, cache, role: str) -> torch.Tensor:
+        """Flat [3*L] int64 (base, row bytes, window bytes) of the file-tier mmap
+        window per layer, 0 when the layer's bank for ``role`` is not file-backed.
+        The C++ submit() MADV_WILLNEEDs cold rows inside these windows so the GEMV
+        workers hit warm pages instead of faulting 64KB blocks off the NVMe."""
+        import numpy as np
+
+        per_file = (getattr(cache, "_file_banks", None) or {}).get(role)
+        L = self.num_layers
+        base = np.zeros(3 * L, dtype=np.int64)
+        for l, hb in enumerate((per_file or [])):
+            if hb is None or getattr(hb, "tensor", None) is None:
+                continue
+            t = hb.tensor
+            if t.dim() < 2 or t.shape[0] == 0:
+                continue
+            row = int(t[0].numel()) * t.element_size()
+            base[l] = int(t.data_ptr())
+            base[L + l] = row
+            base[2 * L + l] = int(t.numel()) * t.element_size()
+        return base.tolist()  # pybind takes a plain int sequence
 
     def _make_table(self, layers: list[torch.Tensor],
                     hot_layers: list[tuple[torch.Tensor, dict[int, int]] | None] | None = None,

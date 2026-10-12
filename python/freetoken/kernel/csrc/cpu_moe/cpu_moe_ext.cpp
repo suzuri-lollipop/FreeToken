@@ -16,6 +16,10 @@
 // (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
 #include <algorithm>
+
+#if defined(__linux__)
+#include <sys/mman.h>  // posix_madvise(MADV_WILLNEED) for the disk-tier readahead
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <cmath>
@@ -1289,6 +1293,14 @@ struct CpuMoeExecutor {
   }
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+
+  // Disk-tier readahead windows (flat [3*L]: base, row bytes, window bytes; row bytes
+  // 0 disables that layer's bank). An expert whose table entry lands inside the window
+  // is a cold file-mapped row: it would fault page-by-page inside the GEMV workers (a
+  // serialized ~63us read per 64KB fault-around block), so submit() MADV_WILLNEEDs
+  // those rows first and the kernel's async readahead overlaps the workers' warm
+  // compact-row work.
+  std::vector<int64_t> ra_gate, ra_down;
   float swiglu_alpha;
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
@@ -1403,7 +1415,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_)
+                 std::vector<int> core_ids_,
+                 std::vector<int64_t> ra_gate_, std::vector<int64_t> ra_down_)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1423,7 +1436,9 @@ struct CpuMoeExecutor {
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
-        core_ids(std::move(core_ids_)) {
+        core_ids(std::move(core_ids_)),
+        ra_gate(std::move(ra_gate_)),
+        ra_down(std::move(ra_down_)) {
     DotChoice c = select_dot();
     dot = c.fn;
     nvdot = select_nvdot();
@@ -1949,7 +1964,39 @@ struct CpuMoeExecutor {
     }
   }
 
+  void readahead_cold_rows(const MoeTask* t) {
+    if (ra_gate.empty()) return;
+    const int L = t->layer_id;
+    if (L < 0 || L >= num_layers) return;
+    const int64_t gb = ra_gate[L], gr = ra_gate[num_layers + L],
+                gl = ra_gate[2 * (size_t)num_layers + L];
+    const int64_t db = ra_down[L], dr = ra_down[num_layers + L],
+                dl = ra_down[2 * (size_t)num_layers + L];
+    if (gr <= 0 && dr <= 0) return;
+    const int n = t->num_tokens * top_k;
+    for (int i = 0; i < n; ++i) {
+      const int32_t e = t->ids[i];
+      if (e < 0 || e >= num_experts) continue;
+      const size_t idx = (size_t)L * num_experts + (size_t)e;
+#if defined(__linux__)
+      if (gr > 0) {
+        const int64_t p = (int64_t)gate_up_tbl[idx];
+        if (p >= gb && p + gr <= gb + gl)
+          posix_madvise((void*)(uintptr_t)p, (size_t)gr, POSIX_MADV_WILLNEED);
+      }
+      if (dr > 0) {
+        const int64_t p = (int64_t)down_tbl[idx];
+        if (p >= db && p + dr <= db + dl)
+          posix_madvise((void*)(uintptr_t)p, (size_t)dr, POSIX_MADV_WILLNEED);
+      }
+#else
+      (void)gb; (void)gr; (void)gl; (void)db; (void)dr; (void)dl; (void)idx;
+#endif
+    }
+  }
+
   void submit(MoeTask* t) {
+    readahead_cold_rows(t);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2183,7 +2230,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    double, double, std::vector<int>, std::vector<int64_t>,
+                    std::vector<int64_t>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -2192,7 +2240,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"))
+           py::arg("core_ids"), py::arg("ra_gate"), py::arg("ra_down"))
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
