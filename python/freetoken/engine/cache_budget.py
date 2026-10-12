@@ -223,7 +223,9 @@ def plan_cache_budget(
 
     hi = min(total_experts, max_slots)
     # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
-    # slots; disable it (and lower the floor) if the cap cannot fit that.
+    # slots; disable it (and lower the floor) if the cap cannot fit that. The on-demand
+    # path without overlap stages synchronously and borrows ONE buffer, so it only needs
+    # the plain num_experts floor.
     overlap = prefill_overlap and hi >= 2 * num_experts
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"

@@ -270,6 +270,23 @@ def born_pinned_default() -> bool:
     return False
 
 
+_UNSET = object()  # lazy direct-fd marker
+
+_PREAD_POOL = None
+
+
+def _pread_pool():
+    """Shared pread workers for file-backed bank row gathers (lazy, daemon threads)."""
+    global _PREAD_POOL
+    if _PREAD_POOL is None:
+        import concurrent.futures
+
+        _PREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="bank-pread"
+        )
+    return _PREAD_POOL
+
+
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
@@ -286,7 +303,7 @@ class HostBank:
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
     __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked",
-                 "_fd", "_file_off", "_file_len")
+                 "_fd", "_file_off", "_file_len", "_dfd", "_file_path")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None, file: str | None = None, offset: int = 0):
@@ -304,6 +321,8 @@ class HostBank:
         self._fd = None
         self._file_off = 0
         self._file_len = 0
+        self._dfd = _UNSET
+        self._file_path = file
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -381,18 +400,49 @@ class HostBank:
         except (AttributeError, OSError):
             pass
 
-    def willneed_rows(self, row_ids: list[int], row_bytes: int) -> None:
-        """FADV_WILLNEED only the given expert rows: row-granular readahead for the
-        on-demand prefill gather. The kernel reads the ranges in the background, so
-        the gather's page faults become page-cache waits served by large clustered
-        reads instead of one synchronous 4 KiB read per fault."""
-        if self._fd is None:
-            return
-        try:
-            for e in row_ids:
-                os.posix_fadvise(self._fd, self._file_off + e * row_bytes, row_bytes, os.POSIX_FADV_WILLNEED)
-        except (AttributeError, OSError):
-            pass
+    def read_rows(self, row_ids: list[int], row_bytes: int, out_rows) -> None:
+        """Parallel read of the given expert rows into ``out_rows`` (a [len(row_ids),
+        row_bytes] uint8 numpy view): position ``i`` receives row ``row_ids[i]``.
+
+        Reading through an fd sidesteps the mmap fault storm -- a gather through the
+        mapping faults one 4 KiB page at a time on the calling thread while a read
+        request per expert keeps the NVMe queue deep. Row-sized requests on a
+        block-multiple row go out O_DIRECT (past the page cache: 60 GiB of buffered
+        row reads thrash a cache that the pinned banks already starve, and direct
+        reads measured 4-5x the buffered rate on the sidecar volume); anything
+        unaligned falls back to the buffered fd, where alignment is a perf choice."""
+        assert self._fd is not None, "read_rows needs a file-backed bank"
+        fd = self._direct_fd()
+        if fd is not None:
+            base = out_rows.ctypes.data
+            if (base % _BLK or row_bytes % _BLK or self._file_off % _BLK
+                    or any((e * row_bytes) % _BLK for e in row_ids)):
+                fd = None  # an unaligned row set takes the buffered path
+        if fd is None:
+            fd = self._fd
+        pool = _pread_pool()
+        futs = [
+            pool.submit(os.preadv, fd, [memoryview(out_rows[i])], self._file_off + e * row_bytes)
+            for i, e in enumerate(row_ids)
+        ]
+        for i, f in enumerate(futs):
+            got = f.result()
+            if got != row_bytes:
+                raise RuntimeError(
+                    f"short read for expert row {row_ids[i]}: {got} of {row_bytes} bytes"
+                )
+
+    def _direct_fd(self):
+        """Lazily opened unbuffered fd for read_rows (None where the volume refuses
+        O_DIRECT or on platforms without it)."""
+        if self._dfd is _UNSET:
+            self._dfd = None
+            if getattr(os, "O_DIRECT", 0):
+                try:
+                    self._dfd = os.open(self._file_path, os.O_RDONLY | os.O_DIRECT)
+                except OSError:
+                    self._dfd = None
+        return self._dfd
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.

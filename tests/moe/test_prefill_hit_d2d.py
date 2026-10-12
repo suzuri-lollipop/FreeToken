@@ -413,3 +413,103 @@ def test_prefill_ondemand_stages_file_tier_rows_pageably():
     for view, (name, per_layer) in zip(views2, sources.items()):
         for e in touched:
             assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)
+
+
+@CUDA
+def test_prefill_ondemand_reads_file_backed_rows_by_pread(tmp_path):
+    """The file-tier move reads the touched rows straight from the backing file
+    with parallel preads into pinned staging (no mmap faults): the routed buffer
+    rows must byte-match the file, untouched rows stay zero, and the bank's mmap
+    pages are never touched (a poisoned mapping proves the read bypassed it)."""
+    import os
+
+    from freetoken.moe.host_banks import HostBank
+
+    dev = torch.device("cuda")
+    spec = (32, 8)  # bf16 rows
+    row_bytes = spec[0] * spec[1] * 2
+    # one aligned file holding layer 0's rows; a different byte pattern per expert
+    layer_rows = torch.randn(E, *spec, dtype=torch.bfloat16)
+    off = 4096
+    path = tmp_path / "shard.bin"
+    with open(path, "wb") as f:
+        f.write(b"\x00" * off)
+        f.write(layer_rows.contiguous().view(torch.uint8).numpy().tobytes())
+    hb = HostBank((E, *spec), torch.bfloat16, backing="file", file=str(path), offset=off)
+    assert hb.tensor.shape == (E, *spec)
+    # poison the mapping: any gather that reads through it sees wrong bytes
+    hb.tensor.fill_(float("nan"))
+    down_spec = (8, 16)
+    down_rows = torch.randn(E, *down_spec, dtype=torch.bfloat16)
+    down_path = tmp_path / "shard_down.bin"
+    with open(down_path, "wb") as f:
+        f.write(b"\x00" * off)
+        f.write(down_rows.contiguous().view(torch.uint8).numpy().tobytes())
+        f.write(b"\x00" * ((-(off + down_rows.numel() * 2)) % 4096))  # block-pad the window
+    hb_down = HostBank((E, *down_spec), torch.bfloat16, backing="file", file=str(down_path), offset=off)
+    hb_down.tensor.fill_(float("nan"))
+
+    sources = {
+        "gate_up": [hb.tensor, torch.randn(E, *spec, dtype=torch.bfloat16).pin_memory(),
+                    torch.randn(E, *spec, dtype=torch.bfloat16).pin_memory()],
+        "down": [hb_down.tensor, torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory(),
+                 torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory()],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=CACHE_SIZE,
+        device=dev, prefill_overlap=False,
+    )
+    cache.cpu_layer_ids = {0}
+    cache.set_bank_sources(
+        sources, layer_residency=["disk", "pinned", "pinned"],
+        file_banks={"gate_up": [hb, None, None], "down": [hb_down, None, None]},
+    )
+    topk = torch.tensor([[1, 3, 0, 5], [5, 7, 1, 6]], dtype=torch.int32, device=dev)
+    views = cache.plan_prefill_layer_ondemand(0, topk)
+    cache.move_prefill_layer_ondemand(0)
+    torch.cuda.synchronize()
+    touched = (0, 1, 3, 5, 6, 7)
+    for view, ref in ((views[0], layer_rows), (views[1], down_rows)):
+        for e in touched:
+            # the rows came from the FILE bytes, not the poisoned mmap mapping
+            assert torch.equal(view[e].cpu(), ref[e].cpu()), e
+        assert not bool(torch.isnan(view.float()[list(touched)]).any())
+    # staging exists and is pinned; the second chunk reuses it and re-reads the file
+    assert cache._prefill_pinned_staging["gate_up"].is_pinned()
+    views = cache.plan_prefill_layer_ondemand(0, topk)
+    cache.move_prefill_layer_ondemand(0)
+    torch.cuda.synchronize()
+    for view, ref in ((views[0], layer_rows), (views[1], down_rows)):
+        for e in touched:
+            assert torch.equal(view[e].cpu(), ref[e].cpu()), e
+    hb.release()
+    hb_down.release()
+
+
+@CUDA
+def test_prefill_ondemand_single_buffer_below_double_floor():
+    """The on-demand path without overlap borrows ONE expert-layer buffer, so a
+    slot cache sized between num_experts and 2 * num_experts (the auto sizer's
+    plain floor -- measured on the NVFP4 rig as 575 of 576) still stages; the
+    hit threshold tracks the actual buffer region, not a hardcoded 2 * E."""
+    dev = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=3 * E // 2,  # 12: E..2E
+        device=dev, prefill_overlap=False,
+    )
+    cache.set_bank_sources(sources)
+    assert cache.prefill_bank_buffers  # 1 buffer despite 12 < 16
+    assert cache._prefill_num_buffers == 1
+    topk = torch.tensor([[1, 3, 0, 5], [5, 7, 1, 6]], dtype=torch.int32, device=dev)
+    for layer in range(3):  # odd layer ids must not index a second buffer
+        views = cache.plan_prefill_layer_ondemand(layer, topk)
+        cache.move_prefill_layer_ondemand(layer)
+        torch.cuda.synchronize()
+        touched = (0, 1, 3, 5, 6, 7)
+        for view, (name, per_layer) in zip(views, sources.items()):
+            for e in touched:
+                assert torch.equal(view[e].cpu(), per_layer[layer][e]), (layer, name, e)

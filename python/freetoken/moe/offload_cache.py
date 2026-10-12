@@ -13,6 +13,8 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
 # base address are not 16-byte aligned.
 _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+_PAGEABLE_TIMING = os.getenv("FREETOKEN_PAGEABLE_TIMING", "0") not in ("", "0", "false")
+_PREFILL_STAGING_ROWS = int(os.getenv("FREETOKEN_PREFILL_STAGING_ROWS", "64") or 64)
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
@@ -326,6 +328,8 @@ class OffloadMoeCache:
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self._file_banks: dict = {}  # disk-tier HostBanks by role (set_bank_sources)
+        self._prefill_pinned_staging: dict = {}  # per-bank pinned pread blocks (lazy)
+        self._pageable_timing = {"item_ms": 0.0, "rows_ms": 0.0, "read_ms": 0.0, "h2d_ms": 0.0, "layers": 0, "rows": 0}
         # expert-profile hot copies by layer/role (set_bank_sources -> cpu executor)
         self.hot_bank_sources: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = None
         self.layer_residency: list[str] = []
@@ -500,7 +504,7 @@ class OffloadMoeCache:
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap or (
-            self.device.type == "cuda" and self.cache_size >= 2 * self.num_experts
+            self.device.type == "cuda" and self.cache_size >= self.num_experts
         ):
             # The on-demand prefill path stages routed rows into the double buffers
             # even when the whole-layer overlap path is off (a disk-tier split has no
@@ -766,10 +770,16 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
-        # The double buffers borrow the slot cache's first 2 * num_experts slots
-        # (one full expert layer per buffer), one view per registered bank.
+        # The staging buffers borrow the slot cache's first N * num_experts slots
+        # (one full expert layer per buffer), one view per registered bank. N is 2
+        # for the whole-layer overlap path (copy of layer L+1 runs while L's GEMM
+        # reads the other buffer); the on-demand path issues its gathers on the
+        # compute stream, strictly ordered around the GEMMs, so ONE buffer is enough
+        # and a cache too small to lend 2 * num_experts slots still qualifies.
+        self._prefill_num_buffers = 2 if self.prefill_overlap else 1
+        nb = self._prefill_num_buffers
         self.prefill_bank_buffers = [
-            cache[: 2 * self.num_experts].view(2, self.num_experts, *cache.shape[1:])
+            cache[: nb * self.num_experts].view(nb, self.num_experts, *cache.shape[1:])
             for _, cache in self.banks
         ]
         # Zero the borrowed region once. A row no gather ever staged is read by the
@@ -1221,7 +1231,7 @@ class OffloadMoeCache:
         ), "on-demand prefill needs the fused copy plan (or a file-tier layer)"
         from freetoken.moe.offload_kernels import prefill_ondemand_compact
 
-        buffer_id = layer_id % 2
+        buffer_id = layer_id % self._prefill_num_buffers
         touched = self._prefill_touched
         touched.zero_()
         touched.scatter_(0, topk_ids.reshape(-1).long(), 1)
@@ -1242,7 +1252,11 @@ class OffloadMoeCache:
                         f"prev&cur/cur = {ov}/{tv} = {ov / max(tv, 1):.3f}"
                     )
                 self._probe_acc.zero_()
-        prefill_ondemand_compact(self, layer_id, buffer_id, touched, pcie_frac_q16=pcie_frac_q16)
+        prefill_ondemand_compact(
+            self, layer_id, buffer_id, touched,
+            threshold=self._prefill_num_buffers * self.num_experts,
+            pcie_frac_q16=pcie_frac_q16,
+        )
         if self.auto_promote and self._promote_pin is not None:
             # chunk totals for the policy feedback (harvested at the next chunk begin);
             # stream-ordered after the compact kernel that wrote the per-layer counts.
@@ -1292,27 +1306,89 @@ class OffloadMoeCache:
         )
 
     def _move_prefill_layer_ondemand_pageable(self, layer_id: int) -> None:
-        """Touched-only gather for an unpinned layer: host ``index_select`` off the
-        bank rows (faulting cold pages in from the shard file) then ONE pageable H2D
-        per bank into the routed buffer rows -- the same bytes the whole-layer
-        materialize would move, just the routed subset, so a skewed chunk reads a
-        fraction of the layer's NVMe traffic."""
-        buffer_id = layer_id % 2
+        """Touched-only gather for an unpinned layer. File-backed rows come in by
+        parallel pread into a pinned staging row block (no mmap fault storm, no
+        pageable-H2D page locking) and land in the routed buffer rows with one async
+        H2D plus a D2D scatter; OS-locked rows are already resident, so they keep the
+        plain host gather. Either way the chunk only moves the bytes its routing
+        touched, not the whole layer."""
+        import time as _time
+
+        t0 = _time.perf_counter()
+        buffer_id = layer_id % self._prefill_num_buffers
         num = int(self._prefill_miss_num.item())
+        t_item = _time.perf_counter()
         if num == 0:
             return
         src_rows = self._prefill_miss_src[:num].to("cpu").long()
         dst_rows = self._prefill_miss_dst[:num].to(self.device).long()
         rows = src_rows.tolist()
+        t_rows = _time.perf_counter()
+        read_ms = h2d_ms = 0.0
         for name, (per_layer, _cache), buffer in zip(self.bank_schema, self.banks, self.prefill_bank_buffers):
             per_file = self._file_banks.get(name)
             file_bank = per_file[layer_id] if per_file is not None else None
-            # kick the kernel's readahead on the touched rows first: the fault storm
-            # below then waits on clustered background reads, not serial NVMe faults
             if file_bank is not None:
-                file_bank.willneed_rows(rows, per_layer[layer_id][0].nbytes)
-            staged = per_layer[layer_id][src_rows]
-            buffer[buffer_id].index_copy_(0, dst_rows, staged.to(self.device))
+                staging = self._pageable_staging(name, per_layer[layer_id])
+                cap = staging.shape[0]
+                row_bytes = per_layer[layer_id][0].nbytes
+                # batched stream: a fixed small pinned block serves any touched-set
+                # size (a whole layer per bank would pin another ~2 GiB, which the
+                # pin budget's headroom cannot absorb after the banks themselves)
+                for i in range(0, num, cap):
+                    n = min(cap, num - i)
+                    out_rows = staging[:n].view(torch.uint8).numpy().reshape(n, -1)
+                    _tr = _time.perf_counter()
+                    file_bank.read_rows(rows[i:i + n], row_bytes, out_rows)
+                    read_ms += _time.perf_counter() - _tr
+                    _th = _time.perf_counter()
+                    gpu_rows = staging[:n].to(self.device, non_blocking=True)
+                    # uint8 views: fp8 scale banks have no index_copy kernel, the raw
+                    # bytes scatter identically
+                    buffer[buffer_id].view(torch.uint8).index_copy_(
+                        0, dst_rows[i:i + n], gpu_rows.view(torch.uint8)
+                    )
+                    h2d_ms += _time.perf_counter() - _th
+            else:
+                _th = _time.perf_counter()
+                staged = per_layer[layer_id][src_rows]
+                buffer[buffer_id].index_copy_(0, dst_rows, staged.to(self.device))
+                h2d_ms += _time.perf_counter() - _th
+        acc = self._pageable_timing
+        acc["item_ms"] += (t_item - t0) * 1e3
+        acc["rows_ms"] += (t_rows - t_item) * 1e3
+        acc["read_ms"] += read_ms * 1e3
+        acc["h2d_ms"] += h2d_ms * 1e3
+        acc["layers"] += 1
+        acc["rows"] += num
+        if _PAGEABLE_TIMING and layer_id == self.num_layers - 1:
+            logger.info_rank0(
+                f"[pageable] chunk: layers={acc['layers']} rows={acc['rows']} "
+                f"item={acc['item_ms']:.0f}ms rows={acc['rows_ms']:.0f}ms "
+                f"read={acc['read_ms']:.0f}ms h2d={acc['h2d_ms']:.0f}ms"
+            )
+            for k in acc:
+                acc[k] = 0
+
+    def _pageable_staging(self, name: str, layer_tensor: "torch.Tensor") -> "torch.Tensor":
+        """Pinned [cap_rows, *spec] staging block for one bank's file-tier rows,
+        allocated once on first use and reused by every later chunk and batch: pread
+        targets it directly, so its pages fault once and the H2D never re-locks them.
+        The row cap (FREETOKEN_PREFILL_STAGING_ROWS) bounds the pinned commitment;
+        the move streams any touched-set size through it in batches."""
+        staging = self._prefill_pinned_staging.get(name)
+        if staging is None:
+            cap = min(self.num_experts, _PREFILL_STAGING_ROWS)
+            staging = torch.empty(
+                (cap, *layer_tensor.shape[1:]),
+                dtype=layer_tensor.dtype, pin_memory=True,
+            )
+            self._prefill_pinned_staging[name] = staging
+            logger.info_rank0(
+                f"MoE file-tier prefill staging: {staging.nbytes / 2**20:.0f} MiB pinned "
+                f"for bank {name!r} (batched pread target, {cap} rows)"
+            )
+        return staging
 
     @property
     def prefill_cpu_mask(self) -> "torch.Tensor | None":
