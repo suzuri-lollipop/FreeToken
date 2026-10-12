@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import errno
 import gc
+import json
 import math
 import os
+import shutil
 import warnings
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -1303,20 +1305,37 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
+        # The disk tier runs FIRST: its layers never occupy RAM by construction, so the
+        # pin-budget guard and the CPU-layer pick below reason about the pinned share.
+        disk_layer_ids = _resolve_disk_layers(
+            config, num_moe_layers, reserved=self._host_tables_bytes, method=method
+        )
+        hot_experts = _resolve_hot_experts(
+            config, disk_layer_ids, num_moe_layers, method=method
+        )
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
-        _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
+        cpu_layer_ids = cpu_layer_ids | disk_layer_ids
+        _check_pin_budget(
+            config, reserved=self._host_tables_bytes, method=method, disk_layer_ids=disk_layer_ids
+        )
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
             decode_target = "gpu"
+        if disk_layer_ids and decode_target == "gpu":
+            # unpinned (disk) layers decode on the CPU executor, so the cache needs the
+            # executor attached even though no --moe-cpu-layers was given
+            decode_target = "cpu"
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-strategy cpu; all-locked under a cap = --moe-strategy offload --moe-cpu-layers 1.0
+        # a disk-tier split needs the same treatment on ANY host: its layers are
+        # unregistered, and the disk-backed banks only exist as an FTW sidecar
+        pin_capped = _pin_budget_bytes(self._host_tables_bytes) is not None
         split_residency = (
-            bool(cpu_layer_ids)
-            and config.moe_strategy in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
-        )
+            (bool(cpu_layer_ids) and config.moe_strategy in ("offload", "hybrid"))
+            or bool(disk_layer_ids)
+        ) and (bool(disk_layer_ids) or pin_capped)
         if config.moe_strategy == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
@@ -1335,7 +1354,7 @@ class Engine:
             # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
             logger.info_rank0(
                 "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "(locked/disk layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
@@ -1345,20 +1364,35 @@ class Engine:
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
+        banks_path = None
         if split_residency:
             from freetoken.moe.host_banks import HostResidency, set_lock_plan
 
+            # LOCKED only where the pin quota forces it: a disk-tier split on an
+            # uncapped host can still pin its resident share (the prefill double
+            # buffer wants registered banks; strategy-cpu layers read pinned banks
+            # through the executor the same as locked ones)
             requested_residency = [
-                HostResidency.LOCKED.value if i in cpu_layer_ids
-                else HostResidency.PINNED.value
+                HostResidency.DISK.value if i in disk_layer_ids
+                else (
+                    HostResidency.LOCKED.value
+                    if i in cpu_layer_ids and pin_capped
+                    else HostResidency.PINNED.value
+                )
                 for i in range(config.model_config.num_moe_layers)
             ]
-            # pinned and locked banks both stay resident, so both spend the page-lock quota the raise buys
+            # pinned and locked banks both stay resident, so both spend the page-lock quota the raise buys;
+            # disk-tier banks do not, so only their share is left out of the raise
             bank_bytes = _bank_bytes(config, method)
             if bank_bytes:
-                set_lock_plan(resident_bytes=bank_bytes)
+                per_layer = bank_bytes / max(1, config.model_config.num_moe_layers)
+                set_lock_plan(resident_bytes=int(bank_bytes - per_layer * len(disk_layer_ids)))
         try:
             with _weight_load_context():
+                # the one-time sidecar repack reads the checkpoint like the load does,
+                # so its failures surface as WeightLoadError too
+                if disk_layer_ids and not config.use_dummy_weight:
+                    banks_path = _ensure_disk_banks(config, method, device=self.device)
                 banks = load_expert_banks(
                     config.model_path,
                     config.model_config,
@@ -1369,6 +1403,8 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    banks_path=banks_path,
+                    hot_experts=hot_experts,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -1434,7 +1470,10 @@ class Engine:
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         try:
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            cache.set_bank_sources(
+                banks.sources, layer_residency=banks.layer_residency,
+                file_banks=banks.file_banks, hot=banks.hot,
+            )
         except torch.OutOfMemoryError as exc:
             # The driver refused what the sizing measured as free; say which number to
             # distrust and which flags shrink the plan, instead of a bare bank size.
@@ -2939,10 +2978,16 @@ def _pin_hint(reserved: int) -> str:
     )
 
 
-def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> None:
-    """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
+def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None,
+                      disk_layer_ids: frozenset[int] = frozenset()) -> None:
+    """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read.
+
+    The disk tier's layers never occupy RAM, so their bytes are subtracted first: a
+    boot that spills cannot also refuse to start."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
+    if disk_layer_ids:
+        return  # the disk tier absorbed the excess (the RAM check ran in _resolve_disk_layers)
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
     if bank_bytes and bank_bytes > budget:
@@ -2950,6 +2995,218 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
             f"{budget / 2**30:.1f} GiB (WDDM caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
         )
+
+
+def _disk_ram_budget(reserved: int = 0) -> int | None:
+    """Bytes of host RAM this boot may pin for expert banks, or None when unmeasurable.
+
+    The tighter of what the OS could still give back (MemAvailable) and the CUDA pin
+    quota where one applies (WDDM), minus headroom for everything else that grows on
+    top of the banks during and after the load: the process itself (dense host staging,
+    CUDA context, tokenizer), the reader's in-flight chunks, pin-lag banks the settle
+    thread has not registered yet, and a page-cache floor for the disk tier. A flat
+    headroom was measured too tight on a 121 GiB box (banks 6 GiB under MemAvailable
+    still OOMed: the load's working set is several GiB on top of the banks), so it
+    scales with RAM and never drops below 10 GiB."""
+    from freetoken.moe.host_banks import mem_available_bytes
+
+    avail = mem_available_bytes()
+    quota = _pin_budget_bytes(reserved)
+    if avail is None and quota is None:
+        return None
+    ram = _host_ram_bytes()
+    headroom = max(10 << 30, int(ram * 0.10)) if ram else (10 << 30)
+    candidates = []
+    if avail is not None:
+        candidates.append(avail - headroom - reserved)
+    if quota is not None:
+        candidates.append(quota)
+    return max(0, min(candidates))
+
+
+def _resolve_disk_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0,
+                         method=None) -> frozenset[int]:
+    """MoE layer ids whose banks spill to the NVMe disk tier instead of host RAM.
+
+    ``--moe-disk-tier auto`` (the default) engages when the banks exceed what this host
+    could pin: those layers' banks are memory-mapped from a repacked FTW sidecar (never
+    read into RAM at load), their decode runs on the CPU executor, and their prefill is
+    a whole-layer pageable copy with kernel readahead one layer ahead. The layers that
+    still fit stay pinned and decode on the GPU offload path. ``all`` forces every layer
+    onto the disk (nothing pinned); ``off`` restores the always-pinned behavior.
+
+    The spill set is head+tail (the same shape ``--moe-cpu-layers`` uses), which keeps
+    the surviving GPU block run contiguous in the middle of the model.
+    """
+    from freetoken.moe import is_offload_moe_strategy
+
+    mode = getattr(config, "moe_disk_tier", "auto")
+    if mode == "off" or num_moe_layers <= 0:
+        return frozenset()
+    if not is_offload_moe_strategy(config.moe_strategy):
+        return frozenset()  # fused keeps its experts on the GPU; there are no banks
+    bank_bytes = _bank_bytes(config, method)
+    if not bank_bytes:
+        return frozenset()
+    if mode == "all":
+        logger.info_rank0(
+            f"--moe-disk-tier all: all {num_moe_layers} MoE layers' banks "
+            f"({bank_bytes / 2**30:.2f} GiB) mapped from the disk tier, nothing pinned"
+        )
+        return frozenset(range(num_moe_layers))
+    budget = _disk_ram_budget(reserved)
+    if budget is None or bank_bytes <= budget:
+        return frozenset()
+    # an expert profile moves a slice of the budget from whole-layer pinning to the
+    # hottest experts of the file layers (uniform coverage is a wash; the profile's
+    # measured ranking is the win), so the pinned-layer count shrinks by that slice
+    hot_budget = 0
+    profile_path = getattr(config, "moe_bank_profile", None)
+    if profile_path:
+        frac = float(getattr(config, "moe_hot_frac", 0.25))
+        hot_budget = int(budget * frac)
+    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - (budget - hot_budget) / bank_bytes)))
+    head = (n + 1) // 2
+    ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+    per_layer = bank_bytes / num_moe_layers
+    logger.info_rank0(
+        f"MoE disk tier: banks {bank_bytes / 2**30:.2f} GiB exceed the {budget / 2**30:.2f} GiB "
+        f"host RAM budget; mapping {n} head+tail MoE layers from the NVMe sidecar "
+        f"({per_layer * len(ids) / 2**30:.2f} GiB, CPU decode, readahead prefetch), pinning the "
+        f"other {num_moe_layers - len(ids)} layers ({per_layer * (num_moe_layers - len(ids)) / 2**30:.2f} GiB)"
+    )
+    return ids
+
+
+def _load_bank_profile(config: EngineConfig, num_moe_layers: int) -> list[tuple[int, int]] | None:
+    """The configured expert profile, validated against this model, or None.
+
+    A profile whose (layers, experts) do not match the model is a hard error, not a
+    warning: it would pin the WRONG experts' rows (every id still in range) and
+    silently serve cold banks from RAM.
+    """
+    from freetoken.moe.expert_profile import load_profile
+
+    path = getattr(config, "moe_bank_profile", None)
+    if not path:
+        return None
+    ranked, num_layers, num_experts = load_profile(path)
+    want_experts = int(getattr(config.model_config, "num_experts", 0) or 0)
+    if num_layers != num_moe_layers or (want_experts and num_experts != want_experts):
+        raise ValueError(
+            f"--moe-bank-profile {path} ranks {num_layers} layers x {num_experts} "
+            f"experts; this model has {num_moe_layers} x {want_experts}"
+        )
+    return ranked
+
+
+def _resolve_hot_experts(
+    config: EngineConfig, disk_layer_ids: frozenset[int], num_moe_layers: int, *, method=None,
+) -> dict[int, list[int]] | None:
+    """The disk layers' hot expert lists from the profile, or None without one.
+
+    Walks the ranking in order and takes the pairs of the DISK layers while the hot
+    budget (``moe_hot_frac`` of the host RAM budget) lasts; each layer's list keeps
+    profile order, which is the compact bank's row order. Pinned layers are skipped:
+    their experts are all resident already.
+    """
+    if not disk_layer_ids:
+        return None
+    ranked = _load_bank_profile(config, num_moe_layers)
+    if not ranked:
+        return None
+    budget = _disk_ram_budget()
+    if budget is None:
+        return None
+    hot_budget = int(budget * float(getattr(config, "moe_hot_frac", 0.25)))
+    if hot_budget <= 0:
+        return None
+    num_experts = int(getattr(config.model_config, "num_experts", 0) or 1)
+    per_expert = _bank_bytes(config, method) // (num_moe_layers * num_experts)
+    hot: dict[int, list[int]] = {}
+    used = 0
+    n_hot = 0
+    for l, e in ranked:
+        if l not in disk_layer_ids or e in hot.setdefault(l, []):
+            continue
+        if used + per_expert > hot_budget:
+            break
+        hot[l].append(e)
+        used += per_expert
+        n_hot += 1
+    hot = {l: ids for l, ids in hot.items() if ids}
+    if not hot:
+        return None
+    logger.info_rank0(
+        f"expert profile: {used / 2**30:.2f} GiB of hot experts ({n_hot} of the disk "
+        f"layers' pairs, by rank) pinned in compact host banks; cold rows stay mapped"
+    )
+    return hot
+
+
+def _disk_banks_dir(model_path: str) -> str:
+    """Where the banks-only FTW sidecar of ``model_path`` lives: a sibling directory.
+
+    Next to the model (never inside an HF cache revision the hub tooling owns), so the
+    big file lands on the same volume as the checkpoint; FREETOKEN_BANKS_DIR overrides."""
+    override = os.environ.get("FREETOKEN_BANKS_DIR")
+    if override:
+        return override
+    return model_path.rstrip("/\\") + "-ftw-banks"
+
+
+def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
+    """The FTW the disk-tier banks come from: the model's own FTW, or a banks-only sidecar.
+
+    Building the sidecar is a one-time repack of the routed experts (the dense weights
+    are not duplicated). A stale sidecar (fingerprint mismatch) is rebuilt; the FTW
+    writer only lists the shards it wrote, so stale extra shards are removed with the
+    directory."""
+    from freetoken.checkpoint.convert import convert_banks_sidecar
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+    from freetoken.distributed import try_get_tp_info
+    from freetoken.utils import download_hf_weight
+
+    if config.use_dummy_weight:
+        return config.model_path
+    local = download_hf_weight(config.model_path)
+    if is_ftw_checkpoint(local):
+        return local
+    sidecar = _disk_banks_dir(local)
+    index_path = os.path.join(sidecar, "freetoken_weight.json")
+    if os.path.isfile(index_path):
+        from freetoken.checkpoint.convert import _source_fingerprint
+
+        try:
+            with open(index_path) as f:
+                meta = json.load(f)
+            if meta.get("fingerprint") == _source_fingerprint(
+                local, config.model_config, device=device
+            ):
+                return sidecar
+        except (OSError, ValueError):
+            pass  # unreadable index: rebuild
+        logger.info_rank0(
+            "MoE disk tier: the banks sidecar is stale (source checkpoint changed); rebuilding"
+        )
+        if os.path.basename(sidecar).endswith("-ftw-banks"):
+            shutil.rmtree(sidecar, ignore_errors=True)  # our own sidecar naming, never the model
+    tp = try_get_tp_info()
+    if tp is not None and tp.size > 1:
+        raise ValueError(
+            "MoE disk tier: the repacked banks sidecar does not exist yet and it is built "
+            f"single-process, but this server runs TP size={tp.size}. Serve once with "
+            "--tp-size 1 (or run `ft checkpoint`) to build "
+            f"{sidecar}, then restart with TP."
+        )
+    logger.info_rank0(
+        f"MoE disk tier: repacking the routed experts into {sidecar} (one-time, "
+        "~the size of the expert banks; dense weights are not copied)"
+    )
+    convert_banks_sidecar(
+        local, sidecar, model_config=config.model_config, method=method, device=device
+    )
+    return sidecar
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
@@ -2987,6 +3244,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
+    "moe_disk_tier": "off",
+    "moe_bank_profile": None,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,

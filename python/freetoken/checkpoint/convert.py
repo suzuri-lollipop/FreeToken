@@ -324,4 +324,112 @@ def convert_checkpoint(
     return index
 
 
-__all__ = ["convert_checkpoint"]
+def convert_banks_sidecar(
+    model_path: str,
+    out_dir: str,
+    *,
+    model_config,
+    method,
+    device: str | None = None,
+    shard_limit: int = DEFAULT_SHARD_LIMIT,
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """Write ONLY ``model_path``'s repacked expert banks as an FTW at ``out_dir``.
+
+    The disk tier mmaps these banks straight off the shard files, so the sidecar is the
+    model's third copy of nothing but the routed experts (no dense weights, no metadata
+    copy -- the server keeps reading those from ``model_path``). Returns the index dict.
+
+    Same constraints as :func:`convert_checkpoint`: single process, TP unset or 1.
+    """
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.moe.expert_banks import load_expert_banks
+    from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
+    from freetoken.utils.progress import byte_bar
+    from .ftw import FTWWriter, is_ftw_checkpoint
+
+    if is_ftw_checkpoint(model_path):
+        raise SystemExit(f"{model_path} is already an FTW checkpoint")
+    tp = try_get_tp_info()
+    if tp is None:
+        set_tp_info(rank=0, size=1)
+    elif tp.size != 1:
+        raise SystemExit(
+            f"FTW conversion runs single-process and the format records no TP layout, "
+            f"but TP is already set to size={tp.size}"
+        )
+    dev = torch.device(device or "cuda:0")
+    torch.cuda.set_device(dev)
+    torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
+
+    names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name))
+    writer = FTWWriter(out_dir, shard_limit=shard_limit)
+    sink = _ConvertSink(writer, desc="Converting expert banks (disk-tier sidecar)", names=names)
+    banks = load_expert_banks(
+        model_path, model_config, method=method, device=dev, dtype=dtype, layer_sink=sink
+    )
+    quant_format = banks.quant_format
+    n_bank = n_alpha = 0
+    if banks.streamed:
+        sink.close()
+        num_layers = sink.num_layers
+        n_bank = sink.n_written
+        assert num_layers > 0, (
+            "provider reported streamed=True but the sink never fired -- the sidecar "
+            "would silently have no expert banks"
+        )
+        for an in ("gate_up_alpha", "down_alpha"):
+            alpha = getattr(banks, an, None)
+            if alpha is not None:
+                writer.add_tensor(an, alpha, kind="experts_bank")
+                n_alpha += 1
+    else:
+        # The on-disk format keeps one contiguous region per bank and the writer only
+        # has whole-tensor add_tensor, so the per-layer sources reassemble into one
+        # flat tensor (a per-bank host RAM spike during conversion).
+        items = []
+        names = legacy_bank_names(quant_format)
+        num_layers = None
+        for name, per_layer in banks.sources.items():
+            if num_layers is None:
+                num_layers = len(per_layer)
+            else:
+                assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
+            items.append((names.get(name, name), torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
+        for an in ("gate_up_alpha", "down_alpha"):
+            if getattr(banks, an, None) is not None:
+                items.append((an, getattr(banks, an)))
+        total_bytes = sum(t.numel() * t.element_size() for _, t in items)
+        bar = byte_bar(total_bytes, "Converting expert banks (disk-tier sidecar)")
+        done_bytes = 0
+        _progress("experts", 0, total_bytes)
+        for name, tensor in items:
+            writer.add_tensor(name, tensor, kind="experts_bank")
+            nbytes = tensor.numel() * tensor.element_size()
+            bar.update(nbytes)
+            done_bytes += nbytes
+            _progress("experts", done_bytes, total_bytes)
+            n_bank += name not in ("gate_up_alpha", "down_alpha")
+            n_alpha += name in ("gate_up_alpha", "down_alpha")
+        bar.close()
+
+    _progress("finalize")
+    try:
+        fingerprint = _source_fingerprint(model_path, model_config, device=dev)
+    except Exception:
+        fingerprint = None
+    index = writer.finalize({
+        "source_model_path": os.path.abspath(model_path),
+        "fingerprint": fingerprint,
+        "quant_format": quant_format,
+        "expert_bank_num_layers": num_layers,
+        "counts": {"weight": 0, "experts_bank": n_bank + n_alpha},
+        "copied_metadata": [],
+        "side_files": [],
+        # marks the sidecar as banks-only: dense weights stay in the source dir
+        "banks_only": True,
+    })
+    return index
+
+
+__all__ = ["convert_checkpoint", "convert_banks_sidecar"]

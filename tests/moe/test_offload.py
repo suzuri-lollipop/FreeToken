@@ -1617,3 +1617,46 @@ def test_residency_split_separates_working_set_from_warm_cache():
                             usage=torch.full((8,), 99, dtype=torch.int64),
                             step=torch.tensor(100, dtype=torch.int64), num_layers=4)
     assert OffloadMoeCache.residency_split(empty) == (0, 0)
+
+
+def test_materialize_layer_prefetches_the_next_disk_layer(tmp_path, monkeypatch):
+    """The disk tier's prefill whole-layer copy faults cold pages serially, so the
+    cache fadvise-WILLNEEDs the NEXT layer's file-backed banks while the current
+    layer streams (materialize_layer itself is CUDA-only and stubbed here)."""
+    import freetoken.moe.offload_kernels as offload_kernels
+    from freetoken.moe.host_banks import HostBank
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    monkeypatch.setattr(offload_kernels, "materialize_layer", lambda cache, layer_id: None)
+    L, E = 3, 4
+    sources, file_banks = {}, {}
+    for base, shape in (("gate_up", (E, 32, 8)), ("down", (E, 8, 16))):
+        sources[base], file_banks[base] = [], []
+        for layer in range(L):
+            t = torch.randn(shape)
+            path = tmp_path / f"{base}_{layer}.bin"
+            # an FTW shard pads every entry to ALIGN; the window stops at the file end
+            raw = t.contiguous().numpy().tobytes()
+            path.write_bytes(raw + b"\0" * (-len(raw) % 4096))
+            bank = HostBank(shape, t.dtype, backing="file", file=str(path))
+            sources[base].append(bank.tensor)
+            file_banks[base].append(bank)
+
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=8, device=torch.device("cpu")
+    )
+    cache.cpu_layer_ids = frozenset(range(L))  # disk layers are CPU-executor layers
+    cache.set_bank_sources(sources, layer_residency=["disk"] * L, file_banks=file_banks)
+
+    called = []
+    monkeypatch.setattr(HostBank, "willneed", lambda self: called.append(id(self)))
+    cache.materialize_layer(0)
+    assert sorted(called) == sorted(id(b) for b in (file_banks["gate_up"][1], file_banks["down"][1]))
+    cache.materialize_layer(1)
+    assert sorted(called) == sorted(
+        id(b) for b in (file_banks["gate_up"][1], file_banks["down"][1],
+                        file_banks["gate_up"][2], file_banks["down"][2])
+    )
+    cache.materialize_layer(L - 1)  # no next layer: nothing more to prefetch
+    assert len(called) == 4

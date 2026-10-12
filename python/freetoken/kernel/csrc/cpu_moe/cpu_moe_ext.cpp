@@ -1257,15 +1257,6 @@ q4dot_fn select_q4dot() {
 
 enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
 
-// Each ctor pointer arg is the address of a CPU int64 array of length
-// num_layers (one base address per layer, built by cpu_executor.py's
-// _make_table), not a single flat bank. tbl_at resolves
-// tbl[layer_id] once per task/pass; a null table (bank unused by this fmt, ptr
-// arg 0) resolves to nullptr without dereferencing.
-inline const void* tbl_at(const uint64_t* tbl, int layer_id) {
-  return tbl ? reinterpret_cast<const void*>(tbl[layer_id]) : nullptr;
-}
-
 struct CpuMoeExecutor {
   int num_threads;
   int num_layers, num_experts, top_k;
@@ -1273,16 +1264,29 @@ struct CpuMoeExecutor {
   int act, apply_on_input;
   int fmt;                // WFmt
   bool needs_di = false;  // pre-deinterleave activations to fp32 (nvfp4/ds_fp4)
-  // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
-  // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
-  // table (down_tbl likewise for down); which reinterpretation applies is picked by
-  // fmt at each resolve site (see gemm1_dot/gemm2_dot/do_pass1_mxfp4/do_pass1_dsfp4).
+  // Per-(layer, expert) entry tables: each ctor pointer arg is the address of a
+  // CPU int64 array of length num_layers * num_experts (one ROW-BASE address per
+  // pair, built by cpu_executor.py's _make_table), not a single flat bank.
+  // entry_at resolves tbl[layer_id * num_experts + e]; the base is where that
+  // expert's rows start, so the row math below indexes rows from 0 (the dot
+  // helpers' `e` row factor is always passed 0). A null table (bank unused by
+  // this fmt, ptr arg 0) resolves to nullptr without dereferencing. Splitting
+  // rows per expert is what lets a layer mix pinned rows with file-mapped ones
+  // (the expert profile's hot copy). gate_up_tbl doubles as the bf16 gate_up
+  // table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up table (down_tbl
+  // likewise for down); the reinterpretation is picked by fmt at each site.
   const uint64_t* gate_up_tbl;   // bf16: [E,2I,H] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* down_tbl;      // bf16: [E,H,I] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* gu_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,2I,*] block scales
   const uint64_t* gu_global_tbl; // nvfp4: [E,2I] fp16 row globals
   const uint64_t* dn_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,H,*] block scales
   const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
+
+  inline const void* entry_at(const uint64_t* tbl, int layer_id, int e) const {
+    return tbl ? reinterpret_cast<const void*>(
+                     tbl[(size_t)layer_id * (size_t)num_experts + (size_t)e])
+               : nullptr;
+  }
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
   float swiglu_alpha;
@@ -1634,12 +1638,13 @@ struct CpuMoeExecutor {
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
     const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
-    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
-    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    // Resolve this entry's row bases once (per expert); the dot helpers index
+    // rows from 0 off these.
+    const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(entry_at(gate_up_tbl, t->layer_id, e));
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(entry_at(gate_up_tbl, t->layer_id, e));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(entry_at(gu_scale_tbl, t->layer_id, e));
     const uint16_t* gu_global_l =
-        reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+        reinterpret_cast<const uint16_t*>(entry_at(gu_global_tbl, t->layer_id, e));
     const bf16_t* x_row = t->x + (size_t)tok * H;
     const float* xe = needs_di ? xe_scratch.data() + (size_t)tok * (H / 2) : nullptr;
     const float* xo = needs_di ? xo_scratch.data() + (size_t)tok * (H / 2) : nullptr;
@@ -1657,8 +1662,8 @@ struct CpuMoeExecutor {
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
       float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
-      float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
+          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, 0, i, x_row, xe, xo, xi8, xas) * w_in;
+      float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, 0, I + i, x_row,
                            xe, xo, xi8, xas) * w_in;
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
@@ -1688,18 +1693,19 @@ struct CpuMoeExecutor {
     const int tok = static_cast<int>(p / n_hblk);
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const bf16_t* down_l = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
-    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
-    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
-    const uint16_t* dn_global_l =
-        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
         const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
         if (e < 0 || e >= num_experts) continue;
+        // Resolve this entry's row bases (per expert); the dot helper indexes
+        // rows from 0 off these.
+        const bf16_t* down_l = reinterpret_cast<const bf16_t*>(entry_at(down_tbl, t->layer_id, e));
+        const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(entry_at(down_tbl, t->layer_id, e));
+        const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(entry_at(dn_scale_tbl, t->layer_id, e));
+        const uint16_t* dn_global_l =
+            reinterpret_cast<const uint16_t*>(entry_at(dn_global_tbl, t->layer_id, e));
         const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
         const size_t gr = (size_t)tok * top_k + k;
         const bf16_t* g_row = g_scratch.data() + gr * I;
@@ -1709,7 +1715,7 @@ struct CpuMoeExecutor {
         const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
                          : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
                                       : nullptr;
-        acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
+        acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, 0, h, g_row, ge, go, gi8,
                          gas) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
@@ -1732,10 +1738,10 @@ struct CpuMoeExecutor {
     const int tok = static_cast<int>(tk / top_k);
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
-    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
-    const bf16_t* gu_bias_l = reinterpret_cast<const bf16_t*>(tbl_at(gu_bias_tbl, t->layer_id));
+    // Resolve this entry's row bases once (per expert).
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(entry_at(gate_up_tbl, t->layer_id, e));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(entry_at(gu_scale_tbl, t->layer_id, e));
+    const bf16_t* gu_bias_l = reinterpret_cast<const bf16_t*>(entry_at(gu_bias_tbl, t->layer_id, e));
     const int N2 = 2 * I;            // gate_up output width (gate/up interleaved)
     const int Hh = H / 2;            // packed-K rows
     const int i0 = static_cast<int>(ib) * IBLK;
@@ -1744,11 +1750,11 @@ struct CpuMoeExecutor {
     const int col0 = 2 * i0;         // first gate_up column
     const int ncol = 2 * nunit;      // gate_up columns owned by this tile
     const bf16_t* x_row = t->x + (size_t)tok * H;
-    const uint8_t* blk_e = gu_packed_l + (size_t)e * Hh * N2;
-    const uint8_t* scl_e = gu_scale_l + (size_t)e * (size_t)(H / 32) * N2;
+    const uint8_t* blk_e = gu_packed_l;  // entry base: this expert's packed rows
+    const uint8_t* scl_e = gu_scale_l;
     float gu[2 * IBLK];
     mxgemv(gu, blk_e + col0, scl_e + col0, x_row, Hh, N2, ncol, e2m1_lut, e8m0_lut);
-    const bf16_t* bias_e = gu_bias_l + (size_t)e * N2 + col0;
+    const bf16_t* bias_e = gu_bias_l + col0;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int j = 0; j < nunit; ++j) {
@@ -1769,22 +1775,22 @@ struct CpuMoeExecutor {
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
     const int nh = h1 - h0;
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
-    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
-    const bf16_t* dn_bias_l = reinterpret_cast<const bf16_t*>(tbl_at(dn_bias_tbl, t->layer_id));
     float acc[HBLK];
     for (int c = 0; c < nh; ++c) acc[c] = 0.0f;
     for (int k = 0; k < top_k; ++k) {
       const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
       if (e < 0 || e >= num_experts) continue;
+      // Resolve this entry's row bases (per expert).
+      const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(entry_at(down_tbl, t->layer_id, e));
+      const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(entry_at(dn_scale_tbl, t->layer_id, e));
+      const bf16_t* dn_bias_l = reinterpret_cast<const bf16_t*>(entry_at(dn_bias_tbl, t->layer_id, e));
       const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
       const bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
-      const uint8_t* blk_e = dn_packed_l + (size_t)e * Ih * H;
-      const uint8_t* scl_e = dn_scale_l + (size_t)e * (size_t)(I / 32) * H;
+      const uint8_t* blk_e = dn_packed_l;  // entry base: this expert's packed rows
+      const uint8_t* scl_e = dn_scale_l;
       float part[HBLK];
       mxgemv(part, blk_e + h0, scl_e + h0, g_row, Ih, H, nh, e2m1_lut, e8m0_lut);
-      const bf16_t* bias_e = dn_bias_l + (size_t)e * H + h0;
+      const bf16_t* bias_e = dn_bias_l + h0;
       for (int c = 0; c < nh; ++c) acc[c] += (part[c] + bf16_to_f32(bias_e[c])) * wt;
     }
     bf16_t* y_row = t->y + (size_t)tok * H;
@@ -1803,15 +1809,15 @@ struct CpuMoeExecutor {
     const int tok = static_cast<int>(tk / top_k);
     const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
-    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    // Resolve this entry's row bases once (per expert).
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(entry_at(gate_up_tbl, t->layer_id, e));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(entry_at(gu_scale_tbl, t->layer_id, e));
     const int N2 = 2 * I, Hh = H / 2, Hs = H / 32;
     // fp8-roundtripped input, pre-deinterleaved to fp32 even/odd halves.
     const float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
     const float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
-    const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
-    const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
+    const uint8_t* gp = gu_packed_l;  // entry base: this expert's packed rows
+    const uint8_t* gs = gu_scale_l;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
@@ -1857,20 +1863,20 @@ struct CpuMoeExecutor {
     const int Ih = I / 2, Is = I / 32;
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
-    // Resolve this task's layer base once; row indexing below is layer-local (e).
-    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
-    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
         const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
         if (e < 0 || e >= num_experts) continue;
+        // Resolve this entry's row bases (per expert).
+        const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(entry_at(down_tbl, t->layer_id, e));
+        const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(entry_at(dn_scale_tbl, t->layer_id, e));
         const float wt = t->w[static_cast<size_t>(tok) * top_k + k];
         const float* ge = ge_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
         const float* go = go_scratch.data() + ((size_t)tok * top_k + k) * (I / 2);
-        const uint8_t* dp = dn_packed_l + (size_t)e * (size_t)H * Ih + (size_t)h * Ih;
-        const uint8_t* ds = dn_scale_l + (size_t)e * (size_t)H * Is + (size_t)h * Is;
+        const uint8_t* dp = dn_packed_l + (size_t)h * Ih;
+        const uint8_t* ds = dn_scale_l + (size_t)h * Is;
         // The reference rounds each route's weighted down output to bf16 before the
         // fp32 sum over routes (down [T, top_k, H] bf16 -> .sum(dim=1)).
         acc += bf16_to_f32(f32_to_bf16(dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut) * wt));

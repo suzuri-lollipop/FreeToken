@@ -75,6 +75,14 @@ class ExpertBanks:
     down_alpha: torch.Tensor | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
+    # disk-tier banks: {base_name: [HostBank | None per layer]} for the layers whose
+    # backing is the FTW shard file itself (mmap, fault-on-touch); None unless a
+    # disk-tier load produced them. The cache uses them for readahead prefetch.
+    file_banks: dict[str, list] | None = field(default=None)
+    # expert-profile hot copies: {layer_id: {canonical_role: (compact tensor, slot
+    # map)}} -- the profile's pinned rows of otherwise file-mapped layers; the CPU
+    # executor's per-(layer, expert) table prefers them over the mmap
+    hot: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -351,12 +359,15 @@ def load_expert_banks(
     layer_sink=None,
     layer_residency: list[str] | None = None,
     resident: bool = False,
+    banks_path: str | None = None,
+    hot_experts: dict[int, list[int]] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
 
-    * **Fast path (FTW)**: if ``model_path`` is a converted FTW checkpoint, read its
-      repacked banks directly (contiguous chunked O_DIRECT). No auto-conversion.
+    * **Fast path (FTW)**: if ``model_path`` (or ``banks_path``, the disk tier's repacked
+      sidecar) is a converted FTW checkpoint, read its repacked banks directly (contiguous
+      chunked O_DIRECT; DISK-labeled layers mmap their shard instead). No auto-conversion.
     * **Slow path** (the original checkpoint): auto-pick **parallel** (the common parallel chunked
       O_DIRECT reader) when experts are stored as many small tensors -- the serial read is
       slow there -- else the **serial baseline** (packed experts: serial already saturates,
@@ -377,17 +388,21 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
 
     ``resident`` (with ``method``): the banks land on ``device`` for the resident 'fused' experts; no host bank outlives the load.
+
+    ``banks_path``: where the repacked banks live when they are not inside ``model_path``
+    itself -- the disk tier's sidecar FTW. Dense weights still come from ``model_path``.
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
 
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
+    ftw_banks_path = banks_path or model_path
     # FTW banks are repacked for the shard split they were converted with, so an uneven
     # (bandwidth-weighted) split cannot replay them.
     uneven = method is not None and getattr(method.cfg, "uneven_tp_shard", False)
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
+    if ftw_banks_path and is_ftw_checkpoint(ftw_banks_path) and not dummy:
         if resident:
-            banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
+            banks = load_ftw_banks_to_device(ftw_banks_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
         elif uneven:
             banks = None
             logger.warning_rank0(
@@ -396,11 +411,11 @@ def load_expert_banks(
             )
         else:
             banks = load_ftw_banks(
-                model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-                layer_residency=layer_residency,
+                ftw_banks_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                layer_residency=layer_residency, hot_experts=hot_experts,
             )
         if banks is not None:
-            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {ftw_banks_path})")
             return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:

@@ -349,6 +349,17 @@ class FTWReader:
         if remaining:
             raise ValueError("tensor range exceeds FTW shards")
 
+    def entry_source(self, entry: dict) -> tuple[str, int] | None:
+        """``(shard_file, offset_in_file)`` when ``entry`` lies wholly inside one shard
+        file, else None. An mmap needs one contiguous file range, so the disk tier can
+        only back entries this returns; the writer keeps per-layer entries whole in one
+        shard (tensors no larger than ``shard_limit`` never split)."""
+        pieces = list(self._pieces(entry["global_off"], entry["nbytes"]))
+        if len(pieces) != 1:
+            return None
+        file, file_off, _dest_off, _take = pieces[0]
+        return file, file_off
+
     def read_into(self, dest: memoryview, entry: dict, *, workers: int = 8,
                   chunk: int = _DEFAULT_CHUNK) -> None:
         """Read one tensor's bytes into ``dest`` (length >= entry nbytes rounded to ALIGN)."""
@@ -503,14 +514,20 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
 
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
-    layer_residency: list[str] | None = None,
+    layer_residency: list[str] | None = None, hot_experts: dict[int, list[int]] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
     HostBank per layer per bank; see ``moe.offload_cache.set_bank_sources``).
 
-    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
-    The applied labels are echoed back on ``ExpertBanks.layer_residency``.
+    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent), DISK -> a memory-mapped view of the entry's shard file, never read at load (the pages fault from the file on first touch; the CPU executor and the whole-layer pageable prefill copy read them). The applied labels are echoed back on ``ExpertBanks.layer_residency``, and the file-backed banks on ``ExpertBanks.file_banks`` for prefetch.
+
+    ``hot_experts`` (per layer, the expert ids to pin, hottest first) upgrades the
+    disk tier from whole-layer placement to the expert profile's: a DISK layer with
+    hot experts still mmaps its full entry, but its hot rows are also read (aligned
+    window per expert, straight off the shard file) into a compact pinned copy the
+    CPU executor's per-(layer, expert) table prefers -- ``ExpertBanks.hot``. Flat
+    regions cannot be hot-gathered (same windowing caveat as the mmap itself).
 
     Two on-disk row layouts, distinguished per bank name (a file never mixes them for
     the same name -- checked below):
@@ -572,6 +589,12 @@ def load_ftw_banks(
     row_view_args: dict[str, list] = {}
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
+    # file-backed (disk-tier) banks by base name, per layer; a role missing here or an
+    # entry the layout could not back leaves None and the layer reads/prefaults instead
+    file_banks: dict[str, list] = {}
+    hot_hb: dict[str, list] = {}   # compact pinned HostBanks, per layer (hot rows)
+    hot_jobs = []  # (base, compact, entry, layer_id, hot_list, row_shape, dtype, row_bytes)
+    _flat_disk_warned = False
 
     for e in flat_entries:
         name = e["name"]
@@ -589,6 +612,13 @@ def load_ftw_banks(
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
+            if residency[layer_id] == HostResidency.DISK.value and not _flat_disk_warned:
+                _flat_disk_warned = True
+                logger.warning(
+                    "MoE disk tier: bank %r is a flat FTW region, which cannot be "
+                    "memory-mapped per layer; reading it instead (re-convert with a "
+                    "per-layer streaming format to keep this layer on disk)", name
+                )
             bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
             row_hb[name].append(bank)
             row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
@@ -597,20 +627,43 @@ def load_ftw_banks(
     for base, by_layer in per_layer_groups.items():
         row_hb[base] = []
         row_view_args[base] = []
+        file_banks.setdefault(base, [None] * num_layers)
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
+            if residency[layer_id] == HostResidency.DISK.value:
+                src = reader.entry_source(e)
+                if src is not None:
+                    bank = HostBank(
+                        tuple(e["shape"]), _dtype_of(e["dtype"]),
+                        backing="file", file=os.path.join(reader.dir, src[0]), offset=src[1],
+                    )
+                    row_hb[base].append(bank)
+                    row_view_args[base].append(None)
+                    file_banks[base][layer_id] = bank
+                    hot_list = (hot_experts or {}).get(layer_id) or []
+                    total, *row_shape = e["shape"]
+                    dtype = _dtype_of(e["dtype"])
+                    if hot_list and row_shape:
+                        # the profile's pinned copy of this layer's hottest experts;
+                        # rows stay hot-list-ordered in the compact bank
+                        compact = HostBank((len(hot_list), *row_shape), dtype)
+                        hot_hb.setdefault(base, [None] * num_layers)[layer_id] = compact
+                        row_bytes = (math.prod(row_shape) if row_shape else 1) * _elsize(dtype)
+                        hot_jobs.append((base, compact, e, layer_id, hot_list, tuple(row_shape), dtype, row_bytes))
+                    continue  # no full read: cold rows fault from the shard on demand
             bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
+    file_banks = {k: v for k, v in file_banks.items() if any(b is not None for b in v)}
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
-    n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs)
+    n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs) + len(hot_jobs)
     try:
         with PinPipeline() as pins:
 
@@ -633,10 +686,37 @@ def load_ftw_banks(
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
+            def _read_hot(job):
+                base, compact, entry, layer_id, hot_list, row_shape, dtype, row_bytes = job
+                # one page-aligned scratch window per expert: the row itself is
+                # rarely ALIGN-aligned inside the entry, so read its enclosing
+                # window and carve -- the flat layout's per-layer idiom, per expert
+                scratch = HostBank((_align_up(row_bytes + ALIGN),), torch.uint8)
+                smv = scratch.memoryview()
+                ct = compact.tensor
+                for i, e_id in enumerate(hot_list):
+                    off = entry["global_off"] + e_id * row_bytes
+                    win_off = (off // ALIGN) * ALIGN
+                    win_len = _align_up(off + row_bytes) - win_off
+                    head = off - win_off
+                    reader.read_into(smv[:win_len], {"global_off": win_off, "nbytes": win_len},
+                                     workers=workers, chunk=chunk)
+                    # the weight-load context runs under inference_mode (thread-local,
+                    # so this pool thread is NOT in it); the compact bank is an
+                    # inference tensor, and only inference mode may mutate one
+                    with torch.inference_mode():
+                        ct[i].copy_(
+                            scratch.tensor[head:head + row_bytes].view(dtype).view(*row_shape)
+                        )
+                scratch.release()
+                pins.submit(compact)  # the compact copy pins even on a DISK layer
+                bar.update(len(hot_list) * row_bytes)
+
             with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
                 futures = [ex.submit(_read_alpha, e) for e in alpha_entries]
                 futures += [ex.submit(_read_row, job) for job in row_jobs]
                 futures += [ex.submit(_read_layer, job) for job in layer_jobs]
+                futures += [ex.submit(_read_hot, job) for job in hot_jobs]
                 for f in futures:
                     f.result()
     finally:
@@ -660,6 +740,15 @@ def load_ftw_banks(
 
     # the file names the banks the legacy way; the quant_format tag names the (kind, kernel) they were packed for
     sources = {canonical_role(name): views for name, views in sources.items()}
+    hot_sources: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] = {}
+    for name, banks in hot_hb.items():
+        role = canonical_role(name)
+        for layer_id, compact in enumerate(banks):
+            if compact is None:
+                continue
+            hot_list = hot_experts[layer_id]
+            slot = {e: i for i, e in enumerate(hot_list)}
+            hot_sources.setdefault(layer_id, {})[role] = (compact.tensor, slot)
     quant_format = reader.meta("quant_format")
     kind, kernel = kind_kernel_for(quant_format) if quant_format is not None else (None, None)
 
@@ -677,9 +766,16 @@ def load_ftw_banks(
             for layer_id, bank in enumerate(banks):
                 by_layer[layer_id] += bank.nbytes
         locked = [i for i in unpinned if applied[i] == HostResidency.LOCKED.value]
-        pageable = [i for i in unpinned if i not in set(locked)]
+        disk = [i for i in unpinned if applied[i] == HostResidency.DISK.value]
+        pageable = [i for i in unpinned if i not in set(locked) and i not in set(disk)]
         pinned_b = sum(b for i, b in enumerate(by_layer) if i not in set(unpinned))
         locked_b = sum(by_layer[i] for i in locked)
+        disk_part = ""
+        if disk:
+            disk_b = sum(by_layer[i] for i in disk)
+            disk_part = (
+                f" + {disk_b / 2**30:.2f} GiB on disk ({len(disk)} CPU layers: {disk})"
+            )
         pageable_part = ""
         if pageable:
             pageable_b = sum(by_layer[i] for i in pageable)
@@ -692,15 +788,25 @@ def load_ftw_banks(
             f"({'born-pinned cudaHostAlloc' if born else 'cudaHostRegister'}, "
             f"{num_layers - len(unpinned)} GPU layers) + "
             f"{locked_b / 2**30:.2f} GiB OS-locked ({len(locked)} CPU layers: {locked})"
-            f"{pageable_part}"
+            f"{pageable_part}{disk_part}"
         )
 
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    if hot_sources:
+        hot_b = sum(
+            c.nbytes for banks in hot_hb.values() for c in banks if c is not None
+        ) / 2**30
+        n_hot = sum(len(slot) for roles in hot_sources.values() for _t, slot in roles.values())
+        logger.info(
+            f"expert profile: {hot_b:.2f} GiB of hot experts pinned compactly "
+            f"({n_hot} experts across {len(hot_sources)} file layers)"
+        )
     return ExpertBanks(
         quant_format, sources, **alpha_kw,
         layer_residency=applied, kind=kind, kernel=kernel,
+        file_banks=file_banks or None, hot=hot_sources or None,
     )
 
 

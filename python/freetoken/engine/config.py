@@ -82,6 +82,21 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-strategy cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # NVMe disk tier for the expert banks (--moe-disk-tier): "auto" (default) maps the
+    # head+tail MoE layers' banks from a repacked FTW sidecar once the banks exceed
+    # what the host can pin, keeping the remaining layers pinned and on the GPU path;
+    # those disk layers decode on the CPU executor and prefill with readahead. "all"
+    # puts every layer on disk, "off" restores always-pinned. FREETOKEN_BANKS_DIR
+    # overrides the sidecar location.
+    moe_disk_tier: str = "auto"
+    # Expert profile (--moe-bank-profile): an FTXP ranking of (layer, expert) pairs.
+    # With the disk tier auto-engaged, moe_hot_frac of the host RAM budget goes to the
+    # profile's hottest experts of the file layers (compact pinned copies the CPU
+    # executor's per-entry table prefers) instead of more whole layers; None keeps
+    # whole-layer placement (uniform coverage -- a measured profile is what pays).
+    moe_bank_profile: str | None = None
+    # Fraction of the host RAM budget spent on the profile's hot experts (0..1).
+    moe_hot_frac: float = 0.25
     # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -125,13 +140,16 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
-        if self.moe_backend is None:
-            return
-        if self.moe_strategy != "auto":
-            raise ValueError("moe_backend is the old name of moe_strategy; pass only moe_strategy")
-        logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
-        object.__setattr__(self, "moe_strategy", self.moe_backend)
-        object.__setattr__(self, "moe_backend", None)
+        if self.moe_backend is not None:
+            if self.moe_strategy != "auto":
+                raise ValueError("moe_backend is the old name of moe_strategy; pass only moe_strategy")
+            logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
+            object.__setattr__(self, "moe_strategy", self.moe_backend)
+            object.__setattr__(self, "moe_backend", None)
+        if self.moe_disk_tier not in ("auto", "off", "all"):
+            raise ValueError(f"moe_disk_tier must be auto/off/all, not {self.moe_disk_tier!r}")
+        if not 0.0 <= self.moe_hot_frac <= 1.0:
+            raise ValueError(f"moe_hot_frac must be within [0, 1], not {self.moe_hot_frac!r}")
 
     @cached_property
     def hf_config(self):

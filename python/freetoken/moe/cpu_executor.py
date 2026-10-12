@@ -219,8 +219,10 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        hot_sources = getattr(cache, "hot_bank_sources", None)
         ptrs, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
+            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt,
+            hot_sources,
         )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
@@ -354,22 +356,63 @@ class CpuMoeExecutor:
             f"spin_wait={self.spin_wait}"
         )
 
-    def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
-        """Build a CPU int64 tensor of per-layer base addresses for one bank.
+    def _hot_layers(self, hot, role):
+        """``_make_table``'s ``hot_layers`` list for one role, or None."""
+        if not hot:
+            return None
+        out = []
+        for l in range(self.num_layers):
+            layer_hot = hot.get(l)
+            out.append(layer_hot.get(role) if layer_hot and role in layer_hot else None)
+        if not any(h is not None for h in out):
+            return None
+        return out
+
+    def _make_table(self, layers: list[torch.Tensor],
+                    hot_layers: list[tuple[torch.Tensor, dict[int, int]] | None] | None = None,
+                    ) -> torch.Tensor:
+        """Build a CPU int64 tensor of per-(layer, expert) row-base addresses.
 
         ``layers`` is one ``[num_experts, ...]`` tensor per layer (the per-layer host
-        bank contract). The C++ side stores this table's pointer and indexes
-        ``tbl[layer_id]`` at call time; both the table and the layer tensors are kept
-        on ``self._banks`` (GC guard) so the raw pointers stay valid for the
-        executor's lifetime.
+        bank contract); the C++ side stores the table's pointer and resolves
+        ``tbl[layer_id * num_experts + e]`` per task. A hot expert's entry points at
+        its row inside ``hot_layers[l]``'s compact tensor (the expert profile's
+        pinned copy) instead of the layer tensor -- one table serves pinned and
+        file-mapped rows of the same layer. The table and every tensor it points
+        into are kept on ``self._banks`` (GC guard) so the raw pointers stay valid
+        for the executor's lifetime.
         """
         assert len(layers) == self.num_layers, (len(layers), self.num_layers)
-        table = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
+        num_experts = int(layers[0].shape[0])
+        ptrs: list[int] = []
+        for l, t in enumerate(layers):
+            assert int(t.shape[0]) == num_experts, (l, t.shape, num_experts)
+            file_base = t.data_ptr()
+            file_row = t.stride(0) * t.element_size()
+            hot = hot_layers[l] if hot_layers is not None else None
+            if hot is None:
+                ptrs.extend(file_base + e * file_row for e in range(num_experts))
+                continue
+            compact, slot = hot
+            assert int(compact.shape[0]) == len(slot), (l, compact.shape, len(slot))
+            hot_base = compact.data_ptr()
+            hot_row = compact.stride(0) * compact.element_size()
+            for e in range(num_experts):
+                i = slot.get(e)
+                if i is None:
+                    ptrs.append(file_base + e * file_row)
+                else:
+                    ptrs.append(hot_base + i * hot_row)
+        table = torch.tensor(ptrs, dtype=torch.int64)
         self._banks.append(table)
         self._banks.extend(layers)
+        if hot_layers is not None:
+            self._banks.extend(c for c, _ in (h for h in hot_layers if h is not None))
         return table
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
+    def _resolve_banks(self, banks: dict, fmt: str,
+                        hot: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = None,
+                        ) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
         ``banks[name]`` is a list of ``num_layers`` ``[num_experts, ...]`` tensors
@@ -390,8 +433,8 @@ class CpuMoeExecutor:
             assert gate_up[0].shape[1] == 2 * I
             assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
             ptrs = dict(
-                gate_up_ptr=self._make_table(gate_up).data_ptr(),
-                down_ptr=self._make_table(down).data_ptr(),
+                gate_up_ptr=self._make_table(gate_up, self._hot_layers(hot, "gate_up")).data_ptr(),
+                down_ptr=self._make_table(down, self._hot_layers(hot, "down")).data_ptr(),
                 gate_up_scale_ptr=0,
                 gate_up_global_ptr=0,
                 down_scale_ptr=0,
@@ -425,12 +468,12 @@ class CpuMoeExecutor:
         assert tuple(dns[0].shape[1:]) == (H, I // 16), (dns[0].shape, H, I)
         assert tuple(gug[0].shape[1:]) == (2 * I,) and tuple(dng[0].shape[1:]) == (H,)
         ptrs = dict(
-            gate_up_ptr=self._make_table(gup).data_ptr(),
-            down_ptr=self._make_table(dnp).data_ptr(),
-            gate_up_scale_ptr=self._make_table(gus).data_ptr(),
-            gate_up_global_ptr=self._make_table(gug).data_ptr(),
-            down_scale_ptr=self._make_table(dns).data_ptr(),
-            down_global_ptr=self._make_table(dng).data_ptr(),
+            gate_up_ptr=self._make_table(gup, self._hot_layers(hot, "gate_up")).data_ptr(),
+            down_ptr=self._make_table(dnp, self._hot_layers(hot, "down")).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gus, self._hot_layers(hot, "gate_up_scale")).data_ptr(),
+            gate_up_global_ptr=self._make_table(gug, self._hot_layers(hot, "gate_up_global")).data_ptr(),
+            down_scale_ptr=self._make_table(dns, self._hot_layers(hot, "down_scale")).data_ptr(),
+            down_global_ptr=self._make_table(dng, self._hot_layers(hot, "down_global")).data_ptr(),
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
         )

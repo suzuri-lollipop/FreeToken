@@ -804,6 +804,47 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-tier",
+        type=str,
+        default=ServerArgs.moe_disk_tier,
+        choices=["auto", "off", "all"],
+        help=(
+            "NVMe tier for the expert banks when they exceed host RAM. 'auto' (default): "
+            "map the head+tail MoE layers' banks from a repacked FTW sidecar (built "
+            "one-time on first serve; FREETOKEN_BANKS_DIR overrides the location), "
+            "keeping the layers that still fit pinned on the GPU path; disk layers "
+            "decode on the CPU executor and prefill with kernel readahead. 'all': every "
+            "layer on disk, nothing pinned. 'off': never (the old always-pinned "
+            "behavior, which OOMs when banks exceed RAM)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-bank-profile",
+        type=str,
+        default=ServerArgs.moe_bank_profile,
+        help=(
+            "FTXP expert profile (ft-profile write-round-robin / inspect) ranking every "
+            "(layer, expert) pair. With --moe-disk-tier auto and a profile given, a "
+            "fraction (--moe-hot-frac, default 0.25) of the host RAM budget pins the "
+            "profile's hottest experts of the disk layers into compact host banks "
+            "instead of more whole layers; the CPU executor prefers them over the "
+            "memory-mapped rows. Measured profiles (routing counts of your workload) "
+            "are what make this pay; round-robin is only a placeholder."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-frac",
+        type=float,
+        default=ServerArgs.moe_hot_frac,
+        help=(
+            "Fraction of the host RAM budget spent on the profile's hot experts "
+            "(0..1; default 0.25). The rest keeps pinning whole layers."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

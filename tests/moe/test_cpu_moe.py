@@ -690,3 +690,57 @@ def test_resolve_threads_splits_cores_across_tp_ranks(monkeypatch):
     assert n0 == 8 and n1 == 8
     assert set(c0).isdisjoint(c1)
     assert sorted(c0 + c1) == all_cores
+
+
+@pytest.mark.parametrize("bs", [1, 3])
+def test_cpu_decode_hot_split_banks_match_plain(bs):
+    """A hot-split layer (profile's compact pinned rows + plain rows for the rest)
+    must decode exactly like the whole-layer banks: the per-(layer, expert) table
+    just points some entries into the compact tensor."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(7)
+    L, E, H, I, top_k = 2, 16, 1024, 512, 4
+    layer = 1
+    hot = [1, 5, 9, 14]
+    dev = torch.device("cuda")
+    plain = _make_nvfp4_cache(L, E, H, I, seed=5)
+
+    compact_sources = {}
+    for role, per_layer in plain.bank_sources.items():
+        whole = per_layer[layer]
+        compact = whole[hot].contiguous()
+        assert compact.data_ptr() != whole[hot].data_ptr() or True
+        compact_sources.setdefault(layer, {})[role] = (
+            compact, {e: i for i, e in enumerate(hot)}
+        )
+
+    hot_cache = SimpleNamespace(
+        quant_format="nvfp4",
+        bank_sources={r: list(v) for r, v in plain.bank_sources.items()},
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+        hot_bank_sources=compact_sources,
+    )
+
+    ex_plain = CpuMoeExecutor(
+        plain, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=0, max_tokens=bs, device=dev,
+    )
+    ex_hot = CpuMoeExecutor(
+        hot_cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=0, max_tokens=bs, device=dev,
+    )
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    # route through hot AND cold experts
+    rows = [[1, 2, 5, 9], [0, 14, 3, 7], [11, 4, 6, 1]]
+    ids = torch.tensor(rows[:bs], device=dev, dtype=torch.int32)
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+
+    out_plain = ex_plain.decode(layer, hidden, w, ids)
+    out_hot = ex_hot.decode(layer, hidden, w, ids)
+    torch.cuda.synchronize()
+    assert torch.equal(out_plain, out_hot)

@@ -153,6 +153,9 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
+| `--moe-disk-tier` | auto | `auto`: when the expert banks exceed host RAM, map the head+tail MoE layers' banks from a repacked FTW sidecar on NVMe (built one-time on first serve, next to the model; `FREETOKEN_BANKS_DIR` overrides), pin what still fits; disk layers decode on CPU and prefill with readahead. `all` = every layer on disk; `off` = never (OOMs when banks exceed RAM) |
+| `--moe-bank-profile` | none | FTXP expert profile (build with `ft profile write-round-robin`, inspect with `ft profile inspect`); with the disk tier, spend `--moe-hot-frac` of the host RAM budget on the profile's hottest experts of the disk layers (compact pinned banks the CPU executor prefers over the mmap) instead of more whole layers. A profile measured on your workload's routing is what pays; round-robin is a placeholder |
+| `--moe-hot-frac` | 0.25 | Fraction (0..1) of the host RAM budget given to the profile's hot experts |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

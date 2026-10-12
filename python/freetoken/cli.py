@@ -16,6 +16,7 @@ Commands:
   daemon      Run the FreeToken supervisor (persistent engine service)
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
+  profile     Write or inspect an expert profile (FTXP; see --moe-bank-profile)
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
 
 Use "ft <command> --help" for command-specific options.
@@ -47,6 +48,12 @@ def _run_checkpoint(argv: list[str]) -> int:
     from freetoken.checkpoint.__main__ import main
 
     return main(argv, prog="ft checkpoint")
+
+
+def _run_profile(argv: list[str]) -> int:
+    from freetoken.moe.expert_profile import _main
+
+    return _main(argv)
 
 
 def _run_ctl(argv: list[str]) -> int:
@@ -97,6 +104,7 @@ COMMANDS = {
     "daemon": "_run_daemon",
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
+    "profile": "_run_profile",
     "bench": "_run_bench",
 }
 

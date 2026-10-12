@@ -51,6 +51,35 @@ These families accept image input by default; pass `--text-model-only` to skip t
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it. Unified-memory GPUs differ, see below.
 
+### Expert banks larger than RAM (disk tier)
+
+#### Expert profiles (hot experts of the disk layers)
+
+`--moe-bank-profile` (an FTXP file; `ft profile write-round-robin` bootstraps one,
+`ft profile inspect` prints it) ranks every `(layer, expert)` pair. With the disk
+tier engaged, `--moe-hot-frac` (default 0.25) of the host RAM budget pins the
+profile's hottest experts of the disk layers into compact host banks instead of
+pinning more whole layers; the CPU executor's per-(layer, expert) table serves
+those rows from RAM and the cold rows from the mmap. Whole-layer placement and a
+round-robin profile cover the same bytes under a uniform router, so a measured
+ranking (routing counts of texts like your workload, `rank_by_counts`) is what
+makes the profile pay.
+
+When the routed experts do not fit host RAM pinned (GLM-5.3-Flash's banks are
+~171 GiB), `--moe-disk-tier auto` (the default) does not OOM: the head+tail
+MoE layers' banks are memory-mapped from a repacked FTW sidecar on NVMe, never
+read into RAM at load, and the layers that still fit the RAM budget stay pinned
+on the GPU offload path. Disk layers decode on the CPU executor (their pages
+fault from the file; the kernel's page cache acts as an OS-managed RAM tier
+above NVMe) and prefill with whole-layer copies plus one-layer readahead
+(`posix_fadvise(WILLNEED)`).
+
+The sidecar (an FTW of the banks only, ~the expert size) is built one-time on
+first serve, next to the model dir (`FREETOKEN_BANKS_DIR` overrides); `all`
+forces every layer onto it, `off` restores the always-pinned behavior. A
+streamable expert format is required (nvfp4 triton native among them); plain
+Linux only needs the default — nothing to pass.
+
 ### Unified-memory GPUs (GB10 / DGX Spark)
 
 The GPU and the CPU share one DRAM, so offload only copies experts between two

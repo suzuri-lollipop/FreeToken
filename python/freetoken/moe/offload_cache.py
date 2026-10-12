@@ -325,6 +325,9 @@ class OffloadMoeCache:
         self.bank_caches: dict[str, torch.Tensor] = {}
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
+        self._file_banks: dict = {}  # disk-tier HostBanks by role (set_bank_sources)
+        # expert-profile hot copies by layer/role (set_bank_sources -> cpu executor)
+        self.hot_bank_sources: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = None
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
@@ -415,6 +418,8 @@ class OffloadMoeCache:
         self,
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
+        file_banks: dict[str, list] | None = None,
+        hot: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -428,6 +433,13 @@ class OffloadMoeCache:
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
         Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        DISK labels behave like PAGEABLE here (their banks are mmap'd shard files, no
+        device address until something pins them); ``file_banks`` carries their
+        ``HostBank`` objects for readahead prefetch (see :meth:`materialize_layer`).
+
+        ``hot`` is the expert profile's compact pinned copies of DISK layers' hot
+        experts ({layer: {role: (tensor, slot map)}}); stored on
+        ``hot_bank_sources`` for the CPU executor's per-(layer, expert) table.
         """
         from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
@@ -454,10 +466,14 @@ class OffloadMoeCache:
             if self.prefill_overlap:
                 raise ValueError(
                     "prefill overlap DMAs from registered banks; it must be disabled "
-                    "when any layer is LOCKED/PAGEABLE (the engine does this)"
+                    "when any layer is LOCKED/PAGEABLE/DISK (the engine does this)"
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        # disk-tier banks by role -> [HostBank | None per layer]; the prefill path
+        # fadvise-WILLNEEDs the next layer's banks while this one streams in
+        self._file_banks = {canonical_role(n): per_layer for n, per_layer in (file_banks or {}).items()}
+        self.hot_bank_sources = hot
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -1413,6 +1429,16 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
+        # Disk tier: kick the kernel's readahead on the NEXT layer's shard pages while
+        # this layer's whole-layer pageable copy runs -- the copy faults cold pages in
+        # serially, so one layer of NVMe latency is already hidden behind the current
+        # layer's copy + GEMM.
+        nxt = layer_id + 1
+        if nxt < self.num_layers and self._file_banks:
+            for per_layer in self._file_banks.values():
+                bank = per_layer[nxt] if nxt < len(per_layer) else None
+                if bank is not None:
+                    bank.willneed()
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache

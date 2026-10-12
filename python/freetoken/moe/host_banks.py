@@ -45,11 +45,18 @@ class HostResidency(str, Enum):
 
     Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
     The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
+
+    DISK extends PAGEABLE to banks whose backing is a repacked bank file (an FTW
+    sidecar): the layer never occupies RAM by construction, its pages fault from
+    the file on first touch and the kernel reclaims them under pressure (the page
+    cache is the RAM tier). A DISK layer can still be pinned at settle time when
+    the budget allows -- the registration faults the file pages in and pins them.
     """
 
     PINNED = "pinned"
     LOCKED = "locked"
     PAGEABLE = "pageable"
+    DISK = "disk"
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -268,22 +275,35 @@ class HostBank:
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
+    * ``"file"`` -- MAP_PRIVATE window over ``[offset, offset + nbytes)`` of ``file``; the
+      bytes are never read at load, they fault from the file on first touch (the disk
+      tier). ``pin()`` registers the window -- cudaHostRegister faults the file pages in
+      and page-locks them, so a pinned file-backed bank is a RAM tier that still matches
+      the file. ``release()`` drops the pages back to the file. Banks are read-only after
+      conversion, and MAP_PRIVATE keeps any stray write private instead of corrupting the
+      checkpoint.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked",
+                 "_fd", "_file_off", "_file_len")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, file: str | None = None, offset: int = 0):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+        assert backing in ("mmap", "cuda", "file"), backing
+        if backing == "file":
+            assert file is not None, "file-backed banks need file="
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
+        self._fd = None
+        self._file_off = 0
+        self._file_len = 0
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -296,12 +316,40 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+        elif backing == "file":
+            # mmap requires an aligned mapping start; a per-layer FTW entry is ALIGN-
+            # aligned by the writer, but map the enclosing window anyway so unaligned
+            # offsets (head-padded flat regions) work too. The window covers exactly
+            # [align_down(offset), align_up(offset + nbytes)) -- never the O_DIRECT
+            # block rounding, which can run past the end of the file.
+            win_off = (offset // _BLK) * _BLK
+            win_len = ((offset + self.nbytes - win_off + _BLK - 1) // _BLK) * _BLK
+            self._fd = os.open(file, os.O_RDONLY)
+            # ACCESS_COPY = MAP_PRIVATE: reads fault from the file, writes stay private
+            # (a bank must never write back into the checkpoint).
+            self._buf = mmap.mmap(self._fd, win_len, access=mmap.ACCESS_COPY, offset=win_off)
+            _LIVE_BUFFERS.append(self._buf)
+            head = offset - win_off
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf)) + head
+            self._pinned = False
+            self._file_off = offset
+            self._file_len = self.nbytes
+            # a view with element size > 1 needs the head to be a whole number of
+            # elements; the disk tier's per-layer entries are page-aligned (head 0),
+            # so this only guards a hand-built unaligned window
+            assert head % elsize == 0, (offset, head, elsize)
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
-        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+        # window heads can be unaligned (flat regions carved mid-page), so view through a
+        # frombuffer of the whole buffer then slice the head off in bytes
+        if backing == "file" and self.addr % _BLK:
+            base = torch.frombuffer(self._buf, dtype=torch.uint8, count=len(self._buf))
+            self.tensor = base[self.addr % _BLK: self.addr % _BLK + self.nbytes].view(dtype).view(*shape)
+        else:
+            self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
 
     @property
@@ -315,9 +363,29 @@ class HostBank:
     def memoryview(self) -> memoryview:
         return memoryview(self._buf)
 
+    def _buffer_base(self) -> int:
+        """Page-aligned base of the whole underlying buffer (the mapping window)."""
+        return ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+
+    def willneed(self) -> None:
+        """Ask the kernel to fault this bank's pages in ahead of use (FADV_WILLNEED).
+
+        File-backed banks only: readahead pulls the bytes from the backing file while
+        the current layer computes, so the next layer's first touch is a page-cache
+        hit instead of an NVMe read. No-op elsewhere (and on platforms without
+        posix_fadvise)."""
+        if self._fd is None:
+            return
+        try:
+            os.posix_fadvise(self._fd, self._file_off, self._file_len, os.POSIX_FADV_WILLNEED)
+        except (AttributeError, OSError):
+            pass
+
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
 
+        Registration covers the whole mapping window (page-aligned), not ``addr``
+        (a file-backed bank can carry an unaligned head inside its window).
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
         if self._pinned:
             return
@@ -326,7 +394,7 @@ class HostBank:
         from freetoken.kernel.pinned import host_register
 
         try:
-            host_register(self.addr, len(self._buf))
+            host_register(self._buffer_base(), len(self._buf))
         except RuntimeError as exc:
             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
@@ -349,7 +417,7 @@ class HostBank:
         if _os_lock_failed:
             return  # the quota is exhausted for good; skip the syscall spam
         try:
-            _os_lock(self.addr, len(self._buf))
+            _os_lock(self._buffer_base(), len(self._buf))
         except (OSError, ImportError) as exc:
             _os_lock_failed = True
             _os_lock_refusal_reason = str(exc)
@@ -570,7 +638,11 @@ def requested_residency(labels: list[str] | None):
 
 
 def _settle(bank: HostBank, residency: str) -> None:
-    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
+    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap).
+
+    DISK leaves the bank alone: file-backed banks fault their pages from the backing
+    file on demand (the disk tier), and pinning them is a deliberate later step the
+    budget-driven split performs, not the settle default."""
     if residency == HostResidency.PINNED.value:
         bank.pin()
     elif residency == HostResidency.LOCKED.value:
