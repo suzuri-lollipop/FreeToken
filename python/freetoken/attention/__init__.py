@@ -133,7 +133,13 @@ def create_dsv41_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
+    BackendInfo(
+        supported_types=frozenset({AttnType.MLA, AttnType.DSA}),
+        # The kernels are shape-generic over head count, and the only TP-registered
+        # DSA family (glm5_next) replicates its attention tower across ranks (see
+        # models/glm5_next/weight.py), so TP does not shard heads here.
+        supports_tp=True,
+    ),
 )
 def create_dsa_backend(config: ModelConfig):
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.

@@ -164,6 +164,22 @@ def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]
             yield "visual." + name[len("model.visual.") :], reader.get(name).to(torch.bfloat16)
 
 
+def _vocab_shard(t: torch.Tensor, tp) -> torch.Tensor:
+    """This rank's ceil-divided vocab rows for the vocab-parallel embed / lm_head.
+    The last rank's rows are zero-padded so every rank holds the same local width
+    (the module's masked gather never selects a padded id)."""
+    if tp.size < 2:
+        return t
+    n = t.shape[0]
+    per = -(-n // tp.size)
+    lo = tp.rank * per
+    piece = t[lo : lo + per]
+    if piece.shape[0] < per:
+        pad = torch.zeros(per - piece.shape[0], *t.shape[1:], dtype=t.dtype)
+        piece = torch.cat([piece, pad], dim=0)
+    return piece
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -176,11 +192,11 @@ def iter_weights(
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
-    if get_tp_info().size > 1:
-        # The loader emits full fused KDA/DSA tensors; TP sharding (per-head q|k|v|b
-        # splits, replicated f_a|g_a, row-parallel o_proj) is not implemented yet --
-        # same status as every other linear-hybrid / offload-family model in tree.
-        raise NotImplementedError("glm5_next weight loading currently supports TP=1 only")
+    # TP keeps the dense tower replicated on every rank (KDA/DSA/MLP build
+    # LinearReplicated layers, so identical full weights give identical outputs) and
+    # shards only what the vocab-parallel head/embed need plus the routed expert
+    # banks, which the nvfp4 pack slices per rank on its own. Replicated dense
+    # compute is redundant at TP=2 but costs microseconds next to the MoE step.
     config = parse_config(cached_load_hf_config(model_path))
     args: Glm5NextArgs = config.glm5_args
     folder = download_hf_weight(model_path)
@@ -227,11 +243,14 @@ def iter_weights(
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
 
-        yield f"{_MODEL}.embed_tokens.weight", reader.get(
-            f"{_CKPT}.embed_tokens.weight"
-        ).to(torch.bfloat16)
+        tp = get_tp_info()
+        yield f"{_MODEL}.embed_tokens.weight", _vocab_shard(
+            reader.get(f"{_CKPT}.embed_tokens.weight").to(torch.bfloat16), tp
+        )
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        yield "lm_head.weight", _vocab_shard(
+            reader.get("lm_head.weight").to(torch.bfloat16), tp
+        )
         if include_vision:
             yield from _iter_vision(reader, weight_map)
     finally:

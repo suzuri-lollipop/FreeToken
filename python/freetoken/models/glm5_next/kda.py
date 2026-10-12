@@ -65,6 +65,10 @@ class Glm5NextKDA(BaseOP):
         self._in_proj_split = [p, p, p, h, d, d]
         self.in_proj = LinearColParallelMerged(
             args.hidden_size, self._in_proj_split, has_bias=False,
+            # TP keeps the KDA tower replicated (see weight.py): pin the local split
+            # to the full widths so this rank holds the whole fused q|k|v|b|f_a|g_a
+            # instead of the even head cut the layer would otherwise take.
+            local_output_sizes=self._in_proj_split,
             quant_config=config.quant, prefix=f"{prefix}.in_proj",
         )
         # Low-rank gate up-projections (128 -> 8192): forget gate and output gate.

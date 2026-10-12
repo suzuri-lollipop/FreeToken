@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 import torch
 
 from freetoken.distributed import try_get_tp_info
+
+import hashlib
+import tempfile
+import time
+from pathlib import Path
 from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
@@ -243,16 +248,83 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
+def _tp_build_fence(before: bool, model_path: str) -> None:
+    """Serialize the per-rank bank builds through a marker-file chain: rank r waits
+    for r-1's fresh marker before its own build and writes one after it.
+
+    Two ranks materializing ~80 GiB of expert banks each peak the host's RAM at
+    roughly twice the single-rank footprint -- on a box whose pin budget is sized
+    for the whole model once, the OOM killer takes both ranks at the same
+    milestone. A barrier would time out at the group's 60 s default (a build runs
+    minutes), so the chain is files: mtime must be newer than the waiter's start
+    (a stale marker from a crashed boot is ignored), the last rank unlinks the
+    chain, and a rank whose predecessor died raises after the deadline instead of
+    waiting forever."""
+    info = try_get_tp_info()
+    if info is None or info.size < 2:
+        return
+    key = hashlib.sha1(model_path.encode()).hexdigest()[:12]
+    marker = lambda r: Path(tempfile.gettempdir()) / f"freetoken-bank-build-{key}-{r}.done"  # noqa: E731
+
+    if before:
+        if info.rank == 0:
+            return
+        path = marker(info.rank - 1)
+        floor = time.time() - 15.0
+        deadline = time.time() + 1800.0
+        while True:
+            try:
+                if path.stat().st_mtime >= floor:
+                    return
+            except FileNotFoundError:
+                pass
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"timed out waiting for TP rank {info.rank - 1} to finish its expert bank build ({path})"
+                )
+            time.sleep(2.0)
+
+    path = marker(info.rank)
+    path.write_text("")
+    if info.rank == info.size - 1:
+        for r in range(info.size):
+            try:
+                marker(r).unlink()
+            except FileNotFoundError:
+                pass
+        return
+    # The last rank still has ~a build of work; the first collectives after the load
+    # (the auto cache-size all_reduce) time out at the group's 60 s default, so every
+    # rank waits here for the chain's tail and the ranks leave the build together.
+    tail = marker(info.size - 1)
+    floor = time.time() - 15.0
+    deadline = time.time() + 1800.0
+    while True:
+        try:
+            if tail.stat().st_mtime >= floor:
+                return
+        except FileNotFoundError:
+            pass
+        if time.time() > deadline:
+            raise RuntimeError(
+                f"timed out waiting for TP rank {info.size - 1} to finish its expert bank build ({tail})"
+            )
+        time.sleep(2.0)
+
+
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
     if dummy:
         return build_expert_banks(method, num_layers, None, device=device, dummy=True, resident=resident)
+    _tp_build_fence(before=True, model_path=model_path)
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, resident=resident)
+    banks = build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, resident=resident)
+    _tp_build_fence(before=False, model_path=model_path)
+    return banks
 
 
 def _mem_available_bytes() -> int | None:
