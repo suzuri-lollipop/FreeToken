@@ -95,15 +95,17 @@ def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
 
 def _cpu_skip_mask(topk_weights, on_gpu, minw: float, keep: int):
     """[T, K] bool: CPU-owned routes to drop (weight < minw * row total and outside
-    the row's top ``keep``). None when nothing qualifies. All device-side, so the
-    decode CUDA graph captures it like the rest of the hybrid split."""
+    the row's top ``keep``). None only for a disabled knob (a host constant). Pure
+    device-side elementwise math -- no host syncs, so the decode CUDA graph captures
+    it exactly like the rest of the hybrid split."""
+    if minw <= 0.0:
+        return None
     small = topk_weights < minw * topk_weights.sum(-1, keepdim=True)
     if keep > 0:
         k = min(keep, topk_weights.shape[-1])
         kth = topk_weights.topk(k, dim=-1).values[..., k - 1 : k]
         small = small & (topk_weights < kth)
-    drop = small & (~on_gpu)
-    return drop if bool(drop.any()) else None
+    return small & (~on_gpu)
 
 
 class MoELayer(BaseOP):
