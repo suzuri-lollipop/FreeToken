@@ -1151,13 +1151,15 @@ class Engine:
             num_experts,
             getattr(banks, "layer_residency", None),
             prefill_overlap=config.moe_prefill_overlap,
+            hot_layers=frozenset((getattr(banks, "hot", None) or {}).keys()),
         )
         max_slots = method.slot_limit() if method is not None else None
         if slot_cap < total_experts:
             max_slots = slot_cap if max_slots is None else min(max_slots, slot_cap)
             logger.info_rank0(
-                f"--moe-cache-auto: only the PINNED layers' experts can hold a GPU slot; "
-                f"capping the slot cache at {slot_cap} of {total_experts} slots "
+                f"--moe-cache-auto: only the PINNED and compact-backed layers' experts "
+                f"can hold a GPU slot; capping the slot cache at {slot_cap} of "
+                f"{total_experts} slots "
                 f"({mem_GB((total_experts - slot_cap) * per_expert_bytes)} left for the KV pool)"
             )
         kv_reserve_tokens = max(config.kv_reserve_tokens, min_reserve)

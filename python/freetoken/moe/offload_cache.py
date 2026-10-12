@@ -484,6 +484,10 @@ class OffloadMoeCache:
         # fadvise-WILLNEEDs the next layer's banks while this one streams in
         self._file_banks = {canonical_role(n): per_layer for n, per_layer in (file_banks or {}).items()}
         self.hot_bank_sources = hot
+        # per-layer [num_experts] int32 compact-row map (-1 = cold, CPU-only), or None
+        # when every row is layer-local (pinned banks) -- the hybrid fetch kernel and its
+        # CPU mirror read it to decide which misses can DMA at all
+        self._hot_row_of: list[torch.Tensor | None] = self._build_hot_row_of(hot)
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -519,6 +523,39 @@ class OffloadMoeCache:
             # costs one zeroing pass. A cache too small to lend 2 * num_experts slots
             # (the cpu backend's pinned geometry) keeps the old no-buffer state.
             self._init_prefill_overlap_buffers()
+
+    def _build_hot_row_of(self, hot) -> list:
+        """One [num_experts] int32 row map per layer from the profile's compact slot
+        maps. None for pinned layers (row == expert id) and for disk layers without a
+        compact (nothing fetchable). The kernel consumes rows for the copy plan, so a
+        disk layer with a map joins the GPU slot LRU through its registered compact."""
+        maps: list[torch.Tensor | None] = []
+        for layer_id in range(self.num_layers):
+            roles = (hot or {}).get(layer_id)
+            if roles is None or layer_id not in self._unpinned_layers:
+                maps.append(None)
+                continue
+            slot = None
+            for name in self.bank_schema:
+                entry = roles.get(name)
+                if entry is None:
+                    continue
+                this = entry[1]  # already {expert: compact row}
+                if slot is None:
+                    slot = this
+                elif slot != this:
+                    raise ValueError(
+                        f"layer {layer_id}: hot compacts disagree on membership across "
+                        f"banks ({name}); the fetch row map must be bank-independent"
+                    )
+            if not slot:
+                maps.append(None)
+                continue
+            m = torch.full((self.num_experts,), -1, dtype=torch.int32)
+            for e, i in slot.items():
+                m[e] = i
+            maps.append(m.to(self.device))
+        return maps
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -564,14 +601,25 @@ class OffloadMoeCache:
 
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
-        for per_layer, cache in self.banks:
+        for name, (per_layer, cache) in zip(self.bank_schema, self.banks):
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
                 if layer_id in self._unpinned_layers:
-                    # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
-                    # a 0 placeholder keeps the descriptor shape
+                    if self._hot_row_of[layer_id] is not None:
+                        # a compact-backed disk layer: its hot rows ARE registered (the
+                        # loader pinned the compact), so the fused copy DMAs them into
+                        # slots exactly like a pinned layer's rows; src rows are compact
+                        # rows (see _hot_row_of)
+                        src_dev = device_ptr(self.hot_bank_sources[layer_id][name][0])
+                        if src_dev % 16 != 0:
+                            return
+                        layer_src_ptrs[layer_id].append(src_dev)
+                        continue
+                    # unregistered layer: no device alias exists, and the row is never
+                    # consumed (CPU decode; pageable prefill); a 0 placeholder keeps the
+                    # descriptor shape
                     layer_src_ptrs[layer_id].append(0)
                     continue
                 # The kernel dereferences these on the GPU, so store each host bank's
@@ -1740,18 +1788,20 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer2 if plan else self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self._unpinned_layers:
-            if not self._pending_whole_layer:
-                raise RuntimeError(
-                    f"layer {layer_id} is unpinned: its only copy is the whole-layer "
-                    f"pageable materialize (position == expert id); ensure_experts's "
-                    f"LRU slot remap cannot be honored without a device alias"
-                )
-            # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
-            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
+        if layer_id in self._unpinned_layers and self._pending_whole_layer:
+            # the prefill materialize: the whole layer into slots [0, num_experts) with
+            # position == expert id -- a plain synchronous pageable H2D copy (never
+            # CUDA-graph captured; prefill is not captured)
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
+        if layer_id in self._unpinned_layers and self._hot_row_of[layer_id] is None:
+            # a disk layer without hot compacts has no registered row anywhere: the
+            # fetch plan's kernel would dereference the 0 placeholder in the descriptor
+            raise RuntimeError(
+                f"layer {layer_id} is unpinned without hot compacts: no device alias "
+                f"exists for a slot fetch (decode must route it to the CPU executor)"
+            )
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -1776,11 +1826,20 @@ class OffloadMoeCache:
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for per_layer, cache in self.banks:
+        for name, (per_layer, cache) in zip(self.bank_schema, self.banks):
+            if layer_id in self._unpinned_layers:
+                if self._hot_row_of[layer_id] is None:
+                    raise RuntimeError(
+                        f"layer {layer_id} is unpinned without hot compacts: no device "
+                        f"alias exists for a fetch copy"
+                    )
+                src = self.hot_bank_sources[layer_id][name][0]
+            else:
+                src = per_layer[layer_id]
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,
-                per_layer[layer_id],
+                src,
                 self.src_indices,
                 self.num_indices,
             )

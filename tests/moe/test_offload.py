@@ -1698,3 +1698,70 @@ def test_dump_bank_profile_ranks_by_routed_counts(tmp_path):
     pairs = pairs[:4]
     assert pairs[0] == (0, 3) and pairs[1] == (1, 1)
     assert set(pairs[2:]) == {(0, 0), (0, 2)}
+
+
+@_cuda_skip
+def test_compact_backed_disk_layer_decodes_hybrid(tmp_path):
+    """A disk layer with pinned hot compacts joins the GPU slot LRU: hot misses fetch
+    from the compact's registered rows (src_indices = compact rows) into slots, cold
+    experts have no registered row and always route to the CPU (-1), and num_missing_full
+    still reports every miss. copy_missing lands the compact bytes in the slot."""
+    import torch
+
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    _init_tp()
+    E, cache_size = 4, 12
+    sources = {
+        "gate_up": [torch.randn(E, 16, 8) for _ in range(2)],
+        "down": [torch.randn(E, 8, 16) for _ in range(2)],
+    }
+    # disk layer 0 with hot experts {1, 3}: compact rows in profile order
+    hot_list = [3, 1]
+    compacts = {
+        0: {
+            "gate_up": (torch.randn(len(hot_list), 16, 8).pin_memory(), {e: i for i, e in enumerate(hot_list)}),
+            "down": (torch.randn(len(hot_list), 8, 16).pin_memory(), {e: i for i, e in enumerate(hot_list)}),
+        }
+    }
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=E, cache_size=cache_size,
+        device=torch.device("cuda"), prefill_overlap=False,
+        hybrid_max_fetch=8,
+    )
+    cache.cpu_layer_ids = frozenset({0})  # layer 0 is a disk layer
+    cache.set_bank_sources(sources, layer_residency=["disk", "pinned"], hot=compacts)
+    assert cache._hot_row_of[0] is not None and cache._hot_row_of[1] is None
+    row_map = cache._hot_row_of[0].tolist()
+    assert row_map == [-1, 1, -1, 0]
+
+    # routes: hot 1, hot 3, cold 2 (disk layer 0)
+    ids = torch.tensor([[1, 3, 2]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts_hybrid(0, ids)  # kernel + the copy plan state
+    torch.cuda.synchronize()
+    fetched = int(cache.num_indices.item())
+    missing_full = int(cache.num_missing_full.item())
+    assert missing_full == 3  # every miss, fetchable or not
+    assert fetched == 2      # the cold expert cannot DMA
+    got = ids.tolist()[0]
+    assert got[2] == -1  # cold 2 -> CPU
+    for pos, e in ((0, 1), (1, 3)):  # hot routes rewritten to their slots
+        assert got[pos] == int(cache.slot_for_id[0, e].item()) >= 0
+    src_rows = cache.src_indices[:fetched].tolist()
+    assert sorted(src_rows) == [0, 1]  # compact rows, not expert ids
+
+    # the fetch copies the compact rows into the freshly assigned slots
+    slot = int(cache.slot_for_id[0, 3].item())
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    for e in (1, 3):
+        slot = int(cache.slot_for_id[0, e].item())
+        row = row_map[e]
+        assert torch.equal(cache.bank_caches["gate_up"][slot].cpu(), compacts[0]["gate_up"][0][row])
+        assert torch.equal(cache.bank_caches["down"][slot].cpu(), compacts[0]["down"][0][row])
+
+    # recurrence hits the slot: no refetch, no copy plan
+    ids2 = torch.tensor([[3]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts_hybrid(0, ids2)
+    torch.cuda.synchronize()
+    assert int(cache.num_indices.item()) == 0
+    assert ids2.tolist() == [[slot]]  # recurrence: same slot, no refetch

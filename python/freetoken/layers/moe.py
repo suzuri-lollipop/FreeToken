@@ -389,7 +389,14 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.is_cpu_layer(self.layer_id):
+        # A compact-backed disk layer decodes hybrid like a pinned layer: its hot rows
+        # are registered, so the kernel fetches them into VRAM slots (LRU hits at HBM
+        # speed on recurrence) and only its cold rows take the CPU executor. A layer
+        # without compacts (no profile, or the pure CPU strategy) keeps the direct
+        # executor call.
+        hot_rows = getattr(cache, "_hot_row_of", None)
+        hybrid_capable = bool(hot_rows) and hot_rows[self.layer_id] is not None
+        if cache.is_cpu_layer(self.layer_id) and not hybrid_capable:
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             if cache.collect_decode_freq:

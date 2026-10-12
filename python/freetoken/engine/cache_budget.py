@@ -34,6 +34,7 @@ def slot_cache_expert_cap(
     layer_residency: "list[str] | None",
     *,
     prefill_overlap: bool,
+    hot_layers: "frozenset[int] | set[int] | None" = None,
 ) -> int:
     """Slots the GPU expert cache can ever fill, given each host bank layer's residency.
 
@@ -56,7 +57,13 @@ def slot_cache_expert_cap(
     pinned = sum(1 for r in layer_residency if r == HostResidency.PINNED.value)
     if pinned == num_layers:
         return total_experts
-    return (pinned * num_experts) + staging
+    # A DISK layer whose hot compacts are pinned+registered can fetch those rows into
+    # slots, so its experts count toward the fillable ceiling too (the compact's row
+    # map decides per expert; the cap is the upper bound).
+    compacted = sum(
+        1 for l in (hot_layers or ()) if 0 <= l < num_layers
+    )
+    return (min(pinned + compacted, num_layers) * num_experts) + staging
 
 
 def has_explicit_cache_sizing(moe_cache_size: int, moe_cache_rate: "float | None") -> bool:

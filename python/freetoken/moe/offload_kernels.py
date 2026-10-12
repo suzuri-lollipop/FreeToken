@@ -59,9 +59,13 @@ def ensure_experts_hybrid(
     pre-cap miss count (stats)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+    # A disk layer's fetchable rows live in its pinned hot compact at remapped row
+    # indices (None = every layer-local row is fetchable, the whole-bank case).
+    hot_rows = getattr(cache, "_hot_row_of", None)
+    hot_row = hot_rows[layer_id] if hot_rows else None
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16, hot_row)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, hot_row)
 
 
 def promote_touched(
@@ -194,13 +198,15 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    hot_row: "torch.Tensor | None" = None,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
+        hot_row,
         cache.slot_for_id,
         cache.id_of_slot,
         cache.usage,
@@ -220,12 +226,14 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        HAS_HOT=hot_row is not None,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    hot_row: "torch.Tensor | None" = None,
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
@@ -254,13 +262,20 @@ def _ensure_experts_hybrid_cpu(
         missing.sort(key=lambda e: (-rec[e], e))
     else:
         missing.sort()
+    # num_missing_full is the PRE-filter count (the stat's meaning is unchanged: every
+    # miss, fetchable or not)
+    num_full = len(missing)
+    # a compact-backed layer cannot fetch cold experts (no registered row); see the kernel
+    if hot_row is not None:
+        row_map = hot_row.tolist()
+        missing = [e for e in missing if row_map[e] >= 0]
     if frac_q16 > 0:
         m, q = len(missing), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
     num_fetch = min(len(missing), int(max_fetch))
-    cache.num_missing_full.fill_(len(missing))
+    cache.num_missing_full.fill_(num_full)
     cache.num_indices.fill_(num_fetch)
 
     usage = cache.usage.tolist()
@@ -275,7 +290,10 @@ def _ensure_experts_hybrid_cpu(
         cache.usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
-        cache.src_indices[idx] = expert  # layer-local row
+        if hot_row is not None:
+            cache.src_indices[idx] = int(row_map[expert])  # compact row
+        else:
+            cache.src_indices[idx] = expert  # layer-local row
 
     if _HYBRID_FETCH_BY_RECENCY:
         for expert in seen:
@@ -389,6 +407,7 @@ def _materialize_layer_kernel(
 @triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
+    hot_row_of_ptr,  # [num_experts] int32 compact-row map; -1 = CPU-only (no fetch)
     slot_for_id_ptr,
     id_of_slot_ptr,
     usage_ptr,
@@ -408,6 +427,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    HAS_HOT: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -440,18 +460,27 @@ def _ensure_experts_hybrid_kernel(
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
+    # A compact-backed layer can only fetch experts whose hot row exists (>= 0 in the
+    # map); its cold experts have no registered row to DMA from, so they always take
+    # the CPU route regardless of the fetch budget.
+    if HAS_HOT:
+        hrow = tl.load(hot_row_of_ptr + off_e, mask=e_mask, other=-1)
+        is_fetchable = is_missing & (hrow >= 0)
+    else:
+        is_fetchable = is_missing
+    n_cand = tl.sum(is_fetchable.to(tl.int32))
     # Cap the fetches; the overflow misses are computed on the CPU (left non-resident).
     if fetch_frac_q16 > 0:
         # Bandwidth-matched split (fetch_frac = pcie_bw / cpu_bw): fetch time scales with
         # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick
         # the integer neighbor that minimizes the slower (max) side of the overlap.
-        lo = (num_missing * fetch_frac_q16) >> 16
-        cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
+        lo = (n_cand * fetch_frac_q16) >> 16
+        cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (n_cand - lo) * fetch_frac_q16)
         cost_hi = tl.maximum(
-            (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
+            (lo + 1) * ((1 << 16) - fetch_frac_q16), (n_cand - lo - 1) * fetch_frac_q16
         )
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
-    num_fetch = tl.minimum(num_missing, max_fetch)
+    num_fetch = tl.minimum(n_cand, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     is_hit = is_active & (slot >= 0)
@@ -463,10 +492,10 @@ def _ensure_experts_hybrid_kernel(
     if BY_RECENCY:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
-            is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            is_fetchable, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
         ).to(tl.int64)
     else:
-        missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+        missing_rank = tl.cumsum(is_fetchable.to(tl.int32)) - 1
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
@@ -493,7 +522,10 @@ def _ensure_experts_hybrid_kernel(
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
+            if HAS_HOT:
+                tl.store(src_indices_ptr + i, tl.load(hot_row_of_ptr + e))  # compact row
+            else:
+                tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
