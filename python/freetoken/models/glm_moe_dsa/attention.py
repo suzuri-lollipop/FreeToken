@@ -151,6 +151,9 @@ class GlmMoeDsaAttention(BaseOP):
             quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
         )
         assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
+        # the W8A16 finalize would free this bf16 master, but prepare_for_runtime
+        # repacks THIS weight (not a forward GEMM) into the bmm operands
+        self.kv_b_proj.w8a16_decode_ok = False
         self.o_proj = LinearReplicated(
             self.num_heads * self.v_head_dim, args.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",

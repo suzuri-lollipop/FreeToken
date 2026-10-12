@@ -343,3 +343,30 @@ def test_ingest_global_reciprocal():
     g = torch.tensor(4.0)
     assert _ingest_global(_NVFP4_CT_SOURCE_SPEC, g).item() == 0.25
     assert _ingest_global(_NVFP4_SOURCE_SPEC, g).item() == 4.0
+
+
+def test_kv_b_proj_survives_the_w8a16_finalize():
+    """The MLA absorption repacks kv_b_proj.weight into bmm operands at
+    prepare_for_runtime; the W8A16 finalize used to free the bf16 master first
+    and _kv_b() crashed on None (RedHatAI/GLM-5.3-Flash-NVFP4 ships kv_b in
+    bf16, so the replacement fired on a plain `ft serve`)."""
+    import torch
+
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.quantization.linear.unquantized import w8a16_decode_candidate
+    from freetoken.models.glm5_next.attention import Glm5NextAttention
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    cfg = parse_config(_hf_config())
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        attn = Glm5NextAttention(cfg, _DSA_IDS[0], prefix="model.layers.3.self_attn")
+    finally:
+        torch.set_default_dtype(prev)
+    # 32768x512 = 16.7M elements: past the size floor, excluded only by the flag
+    assert attn.kv_b_proj.weight.numel() >= 2_000_000
+    assert w8a16_decode_candidate(attn.kv_b_proj) is False
+    assert attn.kv_b_proj.weight is not None
+    assert attn.kv_b_proj.weight.dtype == torch.bfloat16
