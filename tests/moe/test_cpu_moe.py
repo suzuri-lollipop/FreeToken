@@ -744,3 +744,30 @@ def test_cpu_decode_hot_split_banks_match_plain(bs):
     out_hot = ex_hot.decode(layer, hidden, w, ids)
     torch.cuda.synchronize()
     assert torch.equal(out_plain, out_hot)
+
+
+def test_cpu_skip_mask_drops_small_cpu_routes_only():
+    """The skip mask drops exactly the CPU-owned routes under the fraction of the
+    token's routed total, never the top-2 (even when small), never GPU routes."""
+    import torch
+
+    from freetoken.layers.moe import _cpu_skip_mask
+
+    dev = torch.device("cuda")
+    # rows: [0.70, 0.20, 0.05, 0.05] (top-2 big), [0.34, 0.33, 0.33, 0.0] (flat)
+    w = torch.tensor([[0.70, 0.20, 0.05, 0.05], [0.34, 0.33, 0.33, 0.0]],
+                     device=dev, dtype=torch.float32)
+    # row 0: GPU owns 0+1, CPU owns 2+3; row 1: CPU owns everything
+    on_gpu = torch.tensor([[True, True, False, False], [False, False, False, False]],
+                          device=dev)
+    drop = _cpu_skip_mask(w, on_gpu, 0.10, 2)
+    # row 0: CPU routes 2,3 are 0.05 < 0.10*1.0 and outside top-2 -> both dropped
+    # row 1: every route is 0.33 >= 0.10 and top-2 keeps 0,1; route 3 (0.0) drops
+    assert torch.equal(drop.cpu(), torch.tensor([[False, False, True, True],
+                                                 [False, False, False, True]]))
+    # threshold 0: nothing qualifies
+    assert _cpu_skip_mask(w, on_gpu, 0.0, 2) is None
+    # keep 0: a small GPU... route below threshold drops even if it is the max
+    drop_all = _cpu_skip_mask(w, on_gpu, 0.50, 0)
+    # row 0 CPU routes 2,3 (0.05 < 0.5) drop; row 1: 0.33 < 0.5 all drop
+    assert bool(drop_all[1].all())

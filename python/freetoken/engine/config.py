@@ -97,6 +97,11 @@ class EngineConfig:
     moe_bank_profile: str | None = None
     # Fraction of the host RAM budget spent on the profile's hot experts (0..1).
     moe_hot_frac: float = 0.25
+    # Hybrid-decode expert skip: drop CPU-computed routes whose weight is under
+    # moe_skip_minw of the token's routed total (top moe_skip_keep always kept).
+    # 0.0 keeps every route (exact decode); 0.1 matches the Strata-GLM default.
+    moe_skip_minw: float = 0.0
+    moe_skip_keep: int = 2
     # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -150,6 +155,10 @@ class EngineConfig:
             raise ValueError(f"moe_disk_tier must be auto/off/all, not {self.moe_disk_tier!r}")
         if not 0.0 <= self.moe_hot_frac <= 1.0:
             raise ValueError(f"moe_hot_frac must be within [0, 1], not {self.moe_hot_frac!r}")
+        if not 0.0 <= self.moe_skip_minw <= 1.0:
+            raise ValueError(f"moe_skip_minw must be within [0, 1], not {self.moe_skip_minw!r}")
+        if self.moe_skip_keep < 0:
+            raise ValueError(f"moe_skip_keep must be >= 0, not {self.moe_skip_keep!r}")
 
     @cached_property
     def hf_config(self):

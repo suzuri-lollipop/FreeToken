@@ -1520,6 +1520,14 @@ class Engine:
             # the streaming path still guards chunk sizes nobody has measured, and
             # configs that cannot stage per row (no fused copy plan, unpinned banks, no
             # double buffers) never reach this branch at all.
+            cache.cpu_skip_minw = config.moe_skip_minw
+            cache.cpu_skip_keep = max(0, int(config.moe_skip_keep))
+            if cache.cpu_skip_minw > 0:
+                logger.info_rank0(
+                    "MoE expert skip: CPU routes under "
+                    f"{cache.cpu_skip_minw:.2f} of the token's routed total are dropped "
+                    f"(top {cache.cpu_skip_keep} always kept)"
+                )
             cache.ondemand_prefill = True
             cache.ondemand_max_tokens = max(
                 0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "8192"))

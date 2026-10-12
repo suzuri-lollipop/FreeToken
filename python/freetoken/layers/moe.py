@@ -93,6 +93,19 @@ def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):
     return executor, cache.prefill_pcie_frac_q16()
 
 
+def _cpu_skip_mask(topk_weights, on_gpu, minw: float, keep: int):
+    """[T, K] bool: CPU-owned routes to drop (weight < minw * row total and outside
+    the row's top ``keep``). None when nothing qualifies. All device-side, so the
+    decode CUDA graph captures it like the rest of the hybrid split."""
+    small = topk_weights < minw * topk_weights.sum(-1, keepdim=True)
+    if keep > 0:
+        k = min(keep, topk_weights.shape[-1])
+        kth = topk_weights.topk(k, dim=-1).values[..., k - 1 : k]
+        small = small & (topk_weights < kth)
+    drop = small & (~on_gpu)
+    return drop if bool(drop.any()) else None
+
+
 class MoELayer(BaseOP):
     """Resident routed experts.
 
@@ -589,7 +602,17 @@ class OffloadMoELayer(MoELayer):
         raw_ids = topk_ids.clone()
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)
         on_gpu = topk_ids >= 0
-        cpu_ids = torch.where(on_gpu, -1, raw_ids).contiguous()
+        cpu_ids = torch.where(on_gpu, -1, raw_ids)
+        # Expert skip (Strata-GLM port): a CPU-owned route whose weight is under
+        # skip_minw of its token's routed total contributes little to the output but
+        # costs a full host-bank GEMV (or an NVMe row read on the file tier); drop it,
+        # always keeping the top skip_keep routes per token. Off unless configured.
+        minw, keep = cache.cpu_skip_minw, cache.cpu_skip_keep
+        if minw > 0.0:
+            drop = _cpu_skip_mask(topk_weights, on_gpu, minw, keep)
+            if drop is not None:
+                cpu_ids = torch.where(drop, -1, cpu_ids)
+        cpu_ids = cpu_ids.contiguous()
         gpu_w = torch.where(on_gpu, topk_weights, 0.0).contiguous()
         gpu_slots = topk_ids
         if cache.collect_stats:

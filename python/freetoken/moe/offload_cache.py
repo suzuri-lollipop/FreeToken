@@ -329,6 +329,9 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self._file_banks: dict = {}  # disk-tier HostBanks by role (set_bank_sources)
         self._prefill_pinned_staging: dict = {}  # per-bank pinned pread blocks (lazy)
+        # hybrid-decode expert skip (0.0 = off; see _cpu_skip_mask)
+        self.cpu_skip_minw: float = 0.0
+        self.cpu_skip_keep: int = 2
         self._pageable_timing = {"item_ms": 0.0, "rows_ms": 0.0, "read_ms": 0.0, "h2d_ms": 0.0, "layers": 0, "rows": 0}
         # expert-profile hot copies by layer/role (set_bank_sources -> cpu executor)
         self.hot_bank_sources: dict[int, dict[str, tuple[torch.Tensor, dict[int, int]]]] | None = None

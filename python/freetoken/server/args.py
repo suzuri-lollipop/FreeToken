@@ -845,6 +845,25 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-skip-minw",
+        type=float,
+        default=ServerArgs.moe_skip_minw,
+        help=(
+            "Hybrid decode expert skip: drop CPU-computed routes whose routing weight "
+            "is under this fraction of the token's routed total (top --moe-skip-keep "
+            "routes always stay). 0 (default) computes every route exactly; 0.1 "
+            "matches the Strata-GLM tuned default (30 percent decode gain there, KL ~0.02)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-skip-keep",
+        type=int,
+        default=ServerArgs.moe_skip_keep,
+        help="Routes per token the expert skip never drops (default 2).",
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,
