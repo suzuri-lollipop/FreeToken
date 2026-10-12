@@ -381,6 +381,19 @@ class HostBank:
         except (AttributeError, OSError):
             pass
 
+    def willneed_rows(self, row_ids: list[int], row_bytes: int) -> None:
+        """FADV_WILLNEED only the given expert rows: row-granular readahead for the
+        on-demand prefill gather. The kernel reads the ranges in the background, so
+        the gather's page faults become page-cache waits served by large clustered
+        reads instead of one synchronous 4 KiB read per fault."""
+        if self._fd is None:
+            return
+        try:
+            for e in row_ids:
+                os.posix_fadvise(self._fd, self._file_off + e * row_bytes, row_bytes, os.POSIX_FADV_WILLNEED)
+        except (AttributeError, OSError):
+            pass
+
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
 

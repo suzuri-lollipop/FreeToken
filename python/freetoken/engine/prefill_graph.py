@@ -99,6 +99,10 @@ class PrefillGraphRunner:
         cache = getattr(engine, "moe_offload_cache", None)
         if cache is None or getattr(cache, "promote_auto_frac", 0.0) <= 0:
             return False  # the captured MoE branch is the slot-direct promoted one
+        if getattr(cache, "_unpinned_layers", None):
+            # the file-tier on-demand gather is host-driven (miss plan -> pageable
+            # H2D per bank), which a graph replay cannot run; keep those chunks eager
+            return False
         from freetoken.layers.moe import _PREFILL_SLOT_DIRECT
 
         if not _PREFILL_SLOT_DIRECT:

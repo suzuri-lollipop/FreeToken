@@ -362,3 +362,54 @@ def test_promote_guard_keeps_fresh_cache_out_of_buffer_slots():
     torch.cuda.synchronize()
     for e in (0, 1, 2, 3):
         assert int(cache.slot_for_id[0, e].item()) >= 2 * E
+
+
+@CUDA
+def test_prefill_ondemand_stages_file_tier_rows_pageably():
+    """A disk-tier layer (no device alias, overlap off) still gets touched-only
+    staging: the plan runs device-side, the move gathers the routed rows from the
+    host banks pageably into the double buffer, and untouched rows stay zero."""
+    dev = torch.device("cuda")
+    # layer 0's banks are pageable host tensors (an mmap'd shard row in the real
+    # loader); layers 1-2 are pinned like a normal resident share
+    sources = {
+        "gate_up": [
+            torch.randn(E, 32, 8, dtype=torch.bfloat16),
+            torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory(),
+            torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory(),
+        ],
+        "down": [
+            torch.randn(E, 8, 16, dtype=torch.bfloat16),
+            torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory(),
+            torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory(),
+        ],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS, num_experts=E, cache_size=CACHE_SIZE,
+        device=dev, prefill_overlap=False,
+    )
+    cache.cpu_layer_ids = {0}
+    cache.set_bank_sources(sources, layer_residency=["disk", "pinned", "pinned"])
+    # overlap is off, but the on-demand staging buffers exist for the file tier
+    assert not cache.prefill_overlap
+    assert cache.prefill_bank_buffers
+
+    topk = torch.tensor([[1, 3, 0, 5], [5, 7, 1, 6]], dtype=torch.int32, device=dev)
+    views = cache.plan_prefill_layer_ondemand(0, topk)
+    cache.move_prefill_layer_ondemand(0)
+    torch.cuda.synchronize()
+    touched = (0, 1, 3, 5, 6, 7)
+    for view, (name, per_layer) in zip(views, sources.items()):
+        for e in touched:
+            assert torch.equal(view[e].cpu(), per_layer[0][e]), (name, e)
+    # untouched buffer rows keep their init-zero bytes
+    for view in views:
+        assert not bool(torch.count_nonzero(view[list(set(range(E)) - set(touched))]))
+    # buffer alternation: layer 2 (pinned, buffer 0 again after 0->2 % 2 == 0? no:
+    # layer 2 % 2 == 0) -- plan for a PINNED layer still uses the fused path
+    views2 = cache.plan_prefill_layer_ondemand(2, topk)
+    cache.move_prefill_layer_ondemand(2)
+    torch.cuda.synchronize()
+    for view, (name, per_layer) in zip(views2, sources.items()):
+        for e in touched:
+            assert torch.equal(view[e].cpu(), per_layer[2][e]), (name, e)

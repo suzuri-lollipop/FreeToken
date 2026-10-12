@@ -1490,14 +1490,16 @@ class Engine:
             ) from exc
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if (
-            cache.prefill_overlap
+            (cache.prefill_overlap or cache._unpinned_layers)
             and cache._copy_fused_ok
-            and not cache._unpinned_layers
             and self.device.type == "cuda"
         ):
             # Touched-only staging for prefill chunks: skewed routing means a ~150-token
             # chunk selects ~30% of a layer's experts, so gathering just those (hits D2D,
             # misses over PCIe) beats streaming every non-resident row of the whole layer.
+            # A disk-tier split also qualifies (prefill_overlap is off, but the file
+            # layers' routed rows page across PCIe pageably; whole-layer materialize
+            # moves every row of the layer from NVMe instead).
             # The streaming path also copies each layer's SMALL banks (the nvfp4 scale and
             # global rows, ~0.16 MB/expert) whole-layer even on a full hit, because a
             # sub-256KB entry makes cudaMemcpyBatchAsync degrade to a synchronous copy --

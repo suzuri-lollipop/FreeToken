@@ -499,7 +499,15 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
-        if self.prefill_overlap:
+        if self.prefill_overlap or (
+            self.device.type == "cuda" and self.cache_size >= 2 * self.num_experts
+        ):
+            # The on-demand prefill path stages routed rows into the double buffers
+            # even when the whole-layer overlap path is off (a disk-tier split has no
+            # registered banks to DMA whole layers from, but its touched rows still
+            # cross PCIe pageably); the buffers are slot-cache views, so building them
+            # costs one zeroing pass. A cache too small to lend 2 * num_experts slots
+            # (the cpu backend's pinned geometry) keeps the old no-buffer state.
             self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
@@ -1207,8 +1215,10 @@ class OffloadMoeCache:
         slots >= 2E are gathered, and the buffer slots' stale ids are invalidated
         exactly like the streaming path does.
         """
-        assert self.prefill_overlap and self.prefill_bank_buffers
-        assert self._copy_fused_ok, "on-demand prefill needs the fused copy plan"
+        assert self.prefill_bank_buffers, "on-demand prefill needs the staging buffers"
+        assert (
+            self._copy_fused_ok or layer_id in self._unpinned_layers
+        ), "on-demand prefill needs the fused copy plan (or a file-tier layer)"
         from freetoken.moe.offload_kernels import prefill_ondemand_compact
 
         buffer_id = layer_id % 2
@@ -1252,6 +1262,13 @@ class OffloadMoeCache:
         """
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
+        if layer_id in self._unpinned_layers:
+            # File-tier (unregistered) rows: the SM copy kernel dereferences device
+            # aliases that mmap'd shard rows do not have, and promotion is skipped
+            # for these layers so hits cannot exist either -- every touched row is a
+            # miss that the pageable path below gathers.
+            self._move_prefill_layer_ondemand_pageable(layer_id)
+            return
         # Hits gather D2D over ALL banks (the SM kernel has no small-row caveat,
         # unlike the streaming path's batch memcpy, so scales/globals come from
         # their cache slots too); misses gather H2D from the host banks. D2D
@@ -1273,6 +1290,29 @@ class OffloadMoeCache:
             self._prefill_miss_src,
             self._prefill_miss_num,
         )
+
+    def _move_prefill_layer_ondemand_pageable(self, layer_id: int) -> None:
+        """Touched-only gather for an unpinned layer: host ``index_select`` off the
+        bank rows (faulting cold pages in from the shard file) then ONE pageable H2D
+        per bank into the routed buffer rows -- the same bytes the whole-layer
+        materialize would move, just the routed subset, so a skewed chunk reads a
+        fraction of the layer's NVMe traffic."""
+        buffer_id = layer_id % 2
+        num = int(self._prefill_miss_num.item())
+        if num == 0:
+            return
+        src_rows = self._prefill_miss_src[:num].to("cpu").long()
+        dst_rows = self._prefill_miss_dst[:num].to(self.device).long()
+        rows = src_rows.tolist()
+        for name, (per_layer, _cache), buffer in zip(self.bank_schema, self.banks, self.prefill_bank_buffers):
+            per_file = self._file_banks.get(name)
+            file_bank = per_file[layer_id] if per_file is not None else None
+            # kick the kernel's readahead on the touched rows first: the fault storm
+            # below then waits on clustered background reads, not serial NVMe faults
+            if file_bank is not None:
+                file_bank.willneed_rows(rows, per_layer[layer_id][0].nbytes)
+            staged = per_layer[layer_id][src_rows]
+            buffer[buffer_id].index_copy_(0, dst_rows, staged.to(self.device))
 
     @property
     def prefill_cpu_mask(self) -> "torch.Tensor | None":

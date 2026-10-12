@@ -661,12 +661,15 @@ class OffloadMoELayer(MoELayer):
                 # hit/miss totals + this chunk's promote gate); layer 0 runs once per
                 # prefill forward, mirroring begin_prefill's hook on the streaming path.
                 cache.ondemand_chunk_begin()
-            if cache.prefill_promote_fraction > 0:
+            if cache.prefill_promote_fraction > 0 and self.layer_id not in cache._unpinned_layers:
                 # Slot-assign + H2D the recency-top share of this layer's misses BEFORE
                 # the plan, so the plan gathers them D2D as hits and the rows survive
                 # the chunk (repeated content stops re-streaming). See promote_prefill_misses.
                 cache.promote_prefill_misses(self.layer_id, topk_ids)
-            elif getattr(cache, "promote_auto_frac", 0.0) > 0:
+            elif (
+                getattr(cache, "promote_auto_frac", 0.0) > 0
+                and self.layer_id not in cache._unpinned_layers
+            ):
                 # Auto-promote policy: same contract, but the gate is decided per chunk
                 # from measured reuse (ondemand_chunk_begin) and the promotion runs the
                 # mask-driven fast path -- the route-sized ensure kernel behind
