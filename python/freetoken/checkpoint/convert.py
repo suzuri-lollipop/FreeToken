@@ -353,11 +353,9 @@ def convert_banks_sidecar(
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
-    elif tp.size != 1:
-        raise SystemExit(
-            f"FTW conversion runs single-process and the format records no TP layout, "
-            f"but TP is already set to size={tp.size}"
-        )
+    # TP>1: each rank converts its OWN local expert slice into a rank-specific out_dir
+    # (the caller scopes the path per rank); the FTW format records no TP layout, so the
+    # sidecar is only valid for the size/rank that wrote it. The load below is rank-local.
     dev = torch.device(device or "cuda:0")
     torch.cuda.set_device(dev)
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)

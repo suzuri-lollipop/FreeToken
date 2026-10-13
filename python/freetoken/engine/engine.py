@@ -3207,15 +3207,16 @@ def _resolve_hot_experts(
     return hot
 
 
-def _disk_banks_dir(model_path: str) -> str:
+def _disk_banks_dir(model_path: str, *, rank: int = 0, size: int = 1) -> str:
     """Where the banks-only FTW sidecar of ``model_path`` lives: a sibling directory.
 
     Next to the model (never inside an HF cache revision the hub tooling owns), so the
-    big file lands on the same volume as the checkpoint; FREETOKEN_BANKS_DIR overrides."""
+    big file lands on the same volume as the checkpoint; FREETOKEN_BANKS_DIR overrides
+    the base. At TP>1 each rank's banks are a distinct slice and the FTW format records
+    no TP layout, so the sidecar is rank-specific (``-tp{size}r{rank}``)."""
     override = os.environ.get("FREETOKEN_BANKS_DIR")
-    if override:
-        return override
-    return model_path.rstrip("/\\") + "-ftw-banks"
+    base = override if override else model_path.rstrip("/\\") + "-ftw-banks"
+    return base if size <= 1 else f"{base}-tp{size}r{rank}"
 
 
 def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
@@ -3235,7 +3236,10 @@ def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
     local = download_hf_weight(config.model_path)
     if is_ftw_checkpoint(local):
         return local
-    sidecar = _disk_banks_dir(local)
+    tp = try_get_tp_info()
+    rank = getattr(tp, "rank", 0) if tp is not None else 0
+    size = tp.size if tp is not None else 1
+    sidecar = _disk_banks_dir(local, rank=rank, size=size)
     index_path = os.path.join(sidecar, "freetoken_weight.json")
     if os.path.isfile(index_path):
         from freetoken.checkpoint.convert import _source_fingerprint
@@ -3252,19 +3256,16 @@ def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
         logger.info_rank0(
             "MoE disk tier: the banks sidecar is stale (source checkpoint changed); rebuilding"
         )
-        if os.path.basename(sidecar).endswith("-ftw-banks"):
+        if "-ftw-banks" in os.path.basename(sidecar):
             shutil.rmtree(sidecar, ignore_errors=True)  # our own sidecar naming, never the model
-    tp = try_get_tp_info()
-    if tp is not None and tp.size > 1:
-        raise ValueError(
-            "MoE disk tier: the repacked banks sidecar does not exist yet and it is built "
-            f"single-process, but this server runs TP size={tp.size}. Serve once with "
-            "--tp-size 1 (or run `ft checkpoint`) to build "
-            f"{sidecar}, then restart with TP."
-        )
+    # At TP>1 each rank builds its OWN rank-local sidecar (a distinct expert slice); the
+    # builds are staggered by the bank fence inside convert_banks_sidecar's load. This is
+    # a one-time repack per rank -- subsequent boots mmap the file-backed disk tier off it
+    # instead of holding anonymous (swappable) banks in RAM, which is what made TP=2 thrash.
     logger.info_rank0(
-        f"MoE disk tier: repacking the routed experts into {sidecar} (one-time, "
-        "~the size of the expert banks; dense weights are not copied)"
+        f"MoE disk tier: repacking the routed experts into {sidecar} (one-time"
+        + (f", rank {rank}/{size}" if size > 1 else "")
+        + "; ~the size of the expert banks, dense weights are not copied)"
     )
     convert_banks_sidecar(
         local, sidecar, model_config=config.model_config, method=method, device=device

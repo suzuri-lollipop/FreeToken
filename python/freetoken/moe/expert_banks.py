@@ -479,26 +479,18 @@ def load_expert_banks(
         assert method is not None and layer_sink is None and layer_residency is None
     ftw_banks_path = banks_path or model_path
     # FTW banks are repacked for the shard split they were converted with, so an uneven
-    # (bandwidth-weighted) split cannot replay them.
+    # (bandwidth-weighted) split cannot replay them. At TP>1 the disk-tier sidecar is
+    # built per rank (rank-local expert slices), so the fast path replays it correctly;
+    # only an uneven split still has to rebuild from the source checkpoint.
     uneven = method is not None and getattr(method.cfg, "uneven_tp_shard", False)
-    # The disk-tier sidecar is always repacked single-process (TP=1), so its expert banks
-    # are full-width. At TP>1 the kernel wants each rank's own slice of the expert
-    # intermediate (e.g. nvfp4 gate_up rows (2048, 2048), not the sidecar's (4096, 2048)),
-    # so the fast path cannot replay a TP=1 sidecar; fall back to the slow path, which
-    # packs rank-local slices from the source checkpoint.
-    from freetoken.distributed import try_get_tp_info
-
-    _tp = try_get_tp_info()
-    tp_sliced = _tp is not None and _tp.size > 1
     if ftw_banks_path and is_ftw_checkpoint(ftw_banks_path) and not dummy:
         if resident:
             banks = load_ftw_banks_to_device(ftw_banks_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
-        elif uneven or tp_sliced:
+        elif uneven:
             banks = None
             logger.warning_rank0(
-                "expert banks: FTW fast path skipped ("
-                + ("uneven bandwidth-weighted expert shard" if uneven else "TP>1 needs rank-local expert slices, the sidecar is full-width")
-                + "); rebuilding from the source checkpoint"
+                "expert banks: FTW fast path skipped (uneven bandwidth-weighted expert "
+                "shard); rebuilding from the source checkpoint"
             )
         else:
             # the same build fence as the slow path: two ranks reading the sidecar
