@@ -33,12 +33,19 @@ def _linear_local_dims(
 
     info = try_get_tp_info()
     rank = getattr(info, "rank", 0)
-    local_k_heads = dense_local_heads(group.num_key_heads, rank, tp_size)
-    if local_k_heads is None:
-        local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
-        local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
+    if getattr(group, "replicate_state", False):
+        # The model replicates its linear-attention tower across TP ranks (every rank
+        # holds all heads), so the state is full-width -- matching the op's in_proj,
+        # which is pinned to the full local_output_sizes instead of an even head cut.
+        local_k_heads = group.num_key_heads
+        local_v_heads = group.num_value_heads
     else:
-        local_v_heads = dense_local_heads(group.num_value_heads, rank, tp_size)
+        local_k_heads = dense_local_heads(group.num_key_heads, rank, tp_size)
+        if local_k_heads is None:
+            local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
+            local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
+        else:
+            local_v_heads = dense_local_heads(group.num_value_heads, rank, tp_size)
     local_conv_dim = 2 * local_k_heads * group.key_head_dim + local_v_heads * group.value_head_dim
     return len(group.layer_ids), local_conv_dim, local_v_heads
 

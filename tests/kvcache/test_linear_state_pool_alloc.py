@@ -189,3 +189,20 @@ def test_slot_state_bytes_for_the_real_geometry():
     delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
         linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def test_linear_local_dims_replicate_state():
+    """replicate_state keeps the conv/recurrent state full-width at TP>1: the op's
+    in_proj is pinned to the full local_output_sizes, so the state must not shard."""
+    from freetoken.kvcache.linear_state_pool import _linear_local_dims
+
+    base = dict(name="linear", layer_ids=(0, 1), num_key_heads=2, num_value_heads=4,
+                key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu")
+    sharded = LinearGatedDeltaGroupConfig(**base)
+    replicated = LinearGatedDeltaGroupConfig(**base, replicate_state=True)
+    # tp_size=2: sharded halves the heads (conv 2*1*16 + 2*16 = 64, v_heads 2);
+    # replicated keeps them whole (conv 2*2*16 + 4*16 = 128, v_heads 4).
+    assert _linear_local_dims(sharded, 2)[1:] == (64, 2)
+    assert _linear_local_dims(replicated, 2)[1:] == (128, 4)
+    # replicate_state is a no-op at tp_size=1.
+    assert _linear_local_dims(replicated, 1)[1:] == _linear_local_dims(sharded, 1)[1:]

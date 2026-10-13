@@ -168,6 +168,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         conv_kernel_dim=args.linear_conv_kernel_dim,
         output_gate="sigmoid",  # KDA o_norm gates with sigmoid (kda.py)
         variant="kda",
+        # The KDA tower is replicated across TP ranks (kda.py pins in_proj to the full
+        # q|k|v|b|f_a|g_a widths), so its conv/recurrent state is full-width, not sharded.
+        replicate_state=True,
     )
     full_group = FullAttentionGroupConfig(
         name="full",

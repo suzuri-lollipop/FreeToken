@@ -198,6 +198,10 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     # "gdn" and "kda" share the same state geometry (one LinearStatePool serves
     # both); the variant selects the kernels.
     variant: Literal["gdn", "kda"] = "gdn"
+    # The model replicates its linear-attention tower across TP ranks (every rank holds
+    # all heads, e.g. glm5_next KDA), so the conv/recurrent state is full-width instead
+    # of sharded by tp_size. Must match the op's in_proj wiring (full local_output_sizes).
+    replicate_state: bool = False
 
 
 @dataclass(frozen=True)
