@@ -3069,7 +3069,12 @@ def _disk_ram_budget(reserved: int = 0, *, config: EngineConfig | None = None, s
     headroom = max(10 << 30, int(ram * 0.10)) if ram else (10 << 30)
     candidates = []
     if avail is not None:
-        candidates.append((avail - headroom - reserved) // share)
+        # headroom is PER-RANK overhead (dense staging, CUDA context, reader buffers,
+        # mamba host cache), so reserve it for every rank instead of once machine-wide.
+        # Dividing it by share left only ~12 GiB total at TP=2 on a 121 GiB box: the
+        # aggregate pin hit ~105 GiB, the driver's cudaHostRegister failed under the
+        # pressure ("Cannot map memory" in dmesg) and the whole session got killed.
+        candidates.append(max(0, (avail - reserved) // share - headroom))
     if quota is not None:
         candidates.append(quota)
     return max(0, min(candidates))

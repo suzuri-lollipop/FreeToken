@@ -243,12 +243,13 @@ def test_ram_budget_auto_stays_headroom_sized(monkeypatch):
 
 
 def test_ram_budget_divides_across_tp_ranks(monkeypatch):
-    """MemAvailable and the explicit cap are machine-wide: each rank takes 1/size."""
+    """MemAvailable and the explicit cap are machine-wide: each rank takes 1/size.
+    The auto path also reserves the headroom PER RANK (not once machine-wide)."""
     from freetoken.moe import host_banks as _hb
 
     monkeypatch.setattr(_hb, "mem_available_bytes", lambda: 100 << 30)
     monkeypatch.setattr(engine_mod, "_host_ram_bytes", lambda: 121 << 30)
     monkeypatch.setattr(engine_mod, "_pin_budget_bytes", lambda reserved=0: None)
-    assert engine_mod._disk_ram_budget(size=2) == ((100 << 30) - (121 << 30) // 10) // 2
+    assert engine_mod._disk_ram_budget(size=2) == (100 << 30) // 2 - (121 << 30) // 10
     cfg = SimpleNamespace(moe_ram_budget=80.0)
     assert engine_mod._disk_ram_budget(config=cfg, size=2) == 40 << 30
