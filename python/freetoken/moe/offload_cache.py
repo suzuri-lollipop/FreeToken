@@ -329,6 +329,11 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self._file_banks: dict = {}  # disk-tier HostBanks by role (set_bank_sources)
         self._prefill_pinned_staging: dict = {}  # per-bank pinned pread blocks (lazy)
+        # GPU-only decode (FREETOKEN_GPU_ONLY_DECODE): a dedicated VRAM buffer holding the
+        # cold routes' staged rows, lazily allocated; the cold GEMM reads from it so the
+        # CPU executor never runs. Capped at the host staging depth (bs*top_k cold routes).
+        self._cold_stage_vram: dict | None = None
+        self._cold_stage_cap = _PREFILL_STAGING_ROWS
         # hybrid-decode expert skip (0.0 = off; see _cpu_skip_mask)
         self.cpu_skip_minw: float = 0.0
         self.cpu_skip_keep: int = 2
@@ -1448,6 +1453,59 @@ class OffloadMoeCache:
             )
         return staging
 
+    def cold_stage_views(self) -> tuple:
+        """Per-bank VRAM cold-staging views in registration order (the GPU-only decode
+        GEMM reads the staged cold rows from here)."""
+        assert self._cold_stage_vram is not None, "gpu_stage_cold must run first"
+        return tuple(self._cold_stage_vram[n] for n in self.bank_schema)
+
+    def gpu_stage_cold(self, layer_id: int, cpu_ids: "torch.Tensor"):
+        """GPU-only decode: stage the cold routes' expert rows into a dedicated VRAM
+        buffer so the grouped GEMM computes them on the GPU instead of the CPU executor.
+
+        ``cpu_ids`` is [M, top_k] with the raw expert id at cold positions and -1
+        elsewhere (the complement of the slot-resident routes). Each cold position gets
+        its own staging row (no dedup; bs*top_k is small). The rows are pread from the
+        layer's file-backed bank into the pinned host staging, then copied to VRAM.
+        Eager-only (the host pread cannot be CUDA-graph captured). Returns [M, top_k]
+        staging-row ids (-1 at non-cold positions), or None when there are no cold routes."""
+        cold_mask = cpu_ids >= 0
+        n_cold = int(cold_mask.sum().item())
+        if n_cold == 0:
+            return None
+        cap = self._cold_stage_cap
+        if n_cold > cap:
+            raise RuntimeError(
+                f"gpu-only decode: {n_cold} cold routes in one layer exceed the {cap}-row "
+                f"staging cap (lower the batch size or raise FREETOKEN_PREFILL_STAGING_ROWS)"
+            )
+        cold_experts = cpu_ids[cold_mask].tolist()
+        if self._cold_stage_vram is None:
+            self._cold_stage_vram = {}
+        idx_cpu = torch.tensor(cold_experts, dtype=torch.long)
+        for name in self.bank_schema:
+            src = self.bank_sources[name][layer_id]
+            per_file = self._file_banks.get(name)
+            file_bank = per_file[layer_id] if per_file is not None else None
+            host = self._pageable_staging(name, src)
+            vram = self._cold_stage_vram.get(name)
+            if vram is None:
+                vram = torch.empty((cap, *src.shape[1:]), dtype=src.dtype, device=self.device)
+                self._cold_stage_vram[name] = vram
+            row_bytes = src[0].nbytes
+            out = host[:n_cold].view(torch.uint8).numpy().reshape(n_cold, -1)
+            if file_bank is not None:
+                file_bank.read_rows(cold_experts, row_bytes, out)
+            else:
+                # a pinned layer has no cold routes in practice, but stay correct: gather
+                # the resident rows straight from the (registered) host bank.
+                with torch.inference_mode():
+                    host[:n_cold].copy_(src.index_select(0, idx_cpu.to(src.device)))
+            vram[:n_cold].copy_(host[:n_cold], non_blocking=True)
+        stage_ids = torch.full_like(cpu_ids, -1)
+        stage_ids[cold_mask] = torch.arange(n_cold, device=cpu_ids.device, dtype=cpu_ids.dtype)
+        return stage_ids
+
     @property
     def prefill_cpu_mask(self) -> "torch.Tensor | None":
         """[num_experts] int32 verdict of the last ``prefetch_prefill_layer_ondemand``:
@@ -1593,8 +1651,13 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        frac = self.hybrid_fetch_fraction
+        if os.environ.get("FREETOKEN_GPU_ONLY_DECODE", "").strip().lower() in ("1", "true", "yes", "on"):
+            # Warehouse mode: fetch every compact-backed miss to a slot so only the truly
+            # cold rows (no registered compact) fall through to gpu_stage_cold's pread.
+            frac = 1.0
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, frac
         )
 
     def materialize_layer(self, layer_id: int) -> None:

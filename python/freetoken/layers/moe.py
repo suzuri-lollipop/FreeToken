@@ -24,6 +24,12 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# GPU-only decode (warehouse mode): stage the cold routes (no registered compact) into a
+# dedicated VRAM buffer and compute them on the GPU instead of the CPU executor, so RAM
+# and disk are pure expert storage. Eager-only (the host pread cannot be graph captured);
+# requires a backend with no per-slot alphas (triton/bf16 nvfp4), since the staged rows
+# are not tracked in the slot LRU's id_of_slot.
+_GPU_ONLY_DECODE = os.getenv("FREETOKEN_GPU_ONLY_DECODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 # Dual-microbatch decode: blocks/bank for each half's miss gather. Narrow grids
 # saturate the PCIe link (measured: 1-2 blocks/bank reach link rate) while leaving
@@ -650,6 +656,31 @@ class OffloadMoELayer(MoELayer):
         dbg = _debug_stats.probe()
         if dbg is not None:
             dbg.decode_step(topk_ids, cpu_ids)
+        if _GPU_ONLY_DECODE:
+            # Warehouse mode: no CPU executor. Fetch the compact-backed misses to LRU
+            # slots, stage the cold routes into a dedicated VRAM buffer, and run both
+            # grouped GEMMs on the GPU. Eager-only; needs a backend with no per-slot
+            # alphas (the staged rows are not tracked in the slot LRU's id_of_slot).
+            assert cache.alphas_for_slots(self.layer_id) is None, (
+                "FREETOKEN_GPU_ONLY_DECODE needs a backend without per-slot alphas "
+                "(use --quant-backend moe.nvfp4=triton); marlin's alphas index the slot LRU"
+            )
+            inactive_ok = self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots
+            cache.copy_missing()
+            g_slots = gpu_slots if inactive_ok else gpu_slots.clamp_min(0)
+            out = self._expert_gemm(
+                cache, hidden_states, gpu_w, g_slots, views=cache.bank_views(),
+                n=None, alphas=None, is_prefill=False,
+            )
+            stage_ids = cache.gpu_stage_cold(self.layer_id, cpu_ids)
+            if stage_ids is not None:
+                cold_w = torch.where(stage_ids >= 0, topk_weights, 0.0).contiguous()
+                c_slots = stage_ids if inactive_ok else stage_ids.clamp_min(0)
+                out = out + self._expert_gemm(
+                    cache, hidden_states, cold_w, c_slots, views=cache.cold_stage_views(),
+                    n=None, alphas=None, is_prefill=False,
+                )
+            return out
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
