@@ -3035,8 +3035,8 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None,
         )
 
 
-def _disk_ram_budget(reserved: int = 0) -> int | None:
-    """Bytes of host RAM this boot may pin for expert banks, or None when unmeasurable.
+def _disk_ram_budget(reserved: int = 0, *, config: EngineConfig | None = None, size: int = 1) -> int | None:
+    """Bytes of host RAM this rank may pin for expert banks, or None when unmeasurable.
 
     The tighter of what the OS could still give back (MemAvailable) and the CUDA pin
     quota where one applies (WDDM), minus headroom for everything else that grows on
@@ -3045,21 +3045,41 @@ def _disk_ram_budget(reserved: int = 0) -> int | None:
     thread has not registered yet, and a page-cache floor for the disk tier. A flat
     headroom was measured too tight on a 121 GiB box (banks 6 GiB under MemAvailable
     still OOMed: the load's working set is several GiB on top of the banks), so it
-    scales with RAM and never drops below 10 GiB."""
+    scales with RAM and never drops below 10 GiB.
+
+    ``config.moe_ram_budget`` (GiB) overrides the MemAvailable heuristic outright: the
+    caller asked for a deterministic ceiling, so the heuristic's headroom is not
+    subtracted again (the number must already leave room for everything else). The
+    override and MemAvailable are both machine-wide, so each TP rank takes a ``size``
+    share -- ranks that each sized themselves against the whole box pinned 2x the RAM
+    and OOMed. The pin quota is per-process and caps the share as-is."""
     from freetoken.moe.host_banks import mem_available_bytes
 
-    avail = mem_available_bytes()
+    cap = float(getattr(config, "moe_ram_budget", 0.0) or 0.0) if config is not None else 0.0
     quota = _pin_budget_bytes(reserved)
+    share = max(1, size)
+    if cap > 0:
+        total = int(cap * (1 << 30))
+        return total // share if quota is None else max(0, min(total // share, quota))
+
+    avail = mem_available_bytes()
     if avail is None and quota is None:
         return None
     ram = _host_ram_bytes()
     headroom = max(10 << 30, int(ram * 0.10)) if ram else (10 << 30)
     candidates = []
     if avail is not None:
-        candidates.append(avail - headroom - reserved)
+        candidates.append((avail - headroom - reserved) // share)
     if quota is not None:
         candidates.append(quota)
     return max(0, min(candidates))
+
+
+def _tp_size_for_budget() -> int:
+    from freetoken.distributed import try_get_tp_info
+
+    info = try_get_tp_info()
+    return info.size if info is not None else 1
 
 
 def _resolve_disk_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0,
@@ -3092,7 +3112,7 @@ def _resolve_disk_layers(config: EngineConfig, num_moe_layers: int, *, reserved:
             f"({bank_bytes / 2**30:.2f} GiB) mapped from the disk tier, nothing pinned"
         )
         return frozenset(range(num_moe_layers))
-    budget = _disk_ram_budget(reserved)
+    budget = _disk_ram_budget(reserved, config=config, size=_tp_size_for_budget())
     if budget is None or bank_bytes <= budget:
         return frozenset()
     # an expert profile moves a slice of the budget from whole-layer pinning to the
@@ -3153,7 +3173,7 @@ def _resolve_hot_experts(
     ranked = _load_bank_profile(config, num_moe_layers)
     if not ranked:
         return None
-    budget = _disk_ram_budget()
+    budget = _disk_ram_budget(config=config, size=_tp_size_for_budget())
     if budget is None:
         return None
     hot_budget = int(budget * float(getattr(config, "moe_hot_frac", 0.25)))

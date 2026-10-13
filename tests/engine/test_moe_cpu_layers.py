@@ -79,7 +79,9 @@ def _disk_cfg(mode):
 
 def _sizes(monkeypatch, bank_bytes, budget):
     monkeypatch.setattr(engine_mod, "_bank_bytes", lambda config, method=None: bank_bytes)
-    monkeypatch.setattr(engine_mod, "_disk_ram_budget", lambda reserved=0: budget)
+    monkeypatch.setattr(
+        engine_mod, "_disk_ram_budget", lambda reserved=0, *, config=None, size=1: budget
+    )
 
 
 def test_disk_tier_off_never_spills(monkeypatch):
@@ -148,7 +150,9 @@ def test_resolve_hot_experts_from_profile(tmp_path, monkeypatch):
     engine_mod = importlib.import_module("freetoken.engine.engine")
     # 0.5 MiB per expert (16 MiB / 32 pairs) -> 2.5 MiB hot budget = 5 experts
     _sizes(monkeypatch, bank_bytes=16 << 20, budget=10 << 20)
-    monkeypatch.setattr(engine_mod, "_disk_ram_budget", lambda reserved=0: 10 << 20)
+    monkeypatch.setattr(
+        engine_mod, "_disk_ram_budget", lambda reserved=0, *, config=None, size=1: 10 << 20
+    )
 
     counts = [[0] * 8 for _ in range(4)]
     counts[3][5] = 9   # hottest, but layer 3 stays pinned -> skipped
@@ -215,3 +219,36 @@ def test_resolve_disk_layers_budget_shrinks_with_profile(tmp_path, monkeypatch):
     # hot budget 12.5 MiB leaves 37.5 for whole layers -> 7 layers spill
     assert len(hot) == 7
     assert hot > plain
+
+
+def test_ram_budget_cap_replaces_heuristic(monkeypatch):
+    """An explicit --moe-ram-budget is the pin ceiling verbatim (no headroom re-subtracted)."""
+    from freetoken.moe import host_banks as _hb
+
+    monkeypatch.setattr(_hb, "mem_available_bytes", lambda: 100 << 30)
+    monkeypatch.setattr(engine_mod, "_host_ram_bytes", lambda: 121 << 30)
+    monkeypatch.setattr(engine_mod, "_pin_budget_bytes", lambda reserved=0: None)
+    cfg = SimpleNamespace(moe_ram_budget=64.0)
+    assert engine_mod._disk_ram_budget(config=cfg) == 64 << 30
+
+
+def test_ram_budget_auto_stays_headroom_sized(monkeypatch):
+    """The auto path keeps the MemAvailable-minus-headroom heuristic at TP=1."""
+    from freetoken.moe import host_banks as _hb
+
+    monkeypatch.setattr(_hb, "mem_available_bytes", lambda: 100 << 30)
+    monkeypatch.setattr(engine_mod, "_host_ram_bytes", lambda: 121 << 30)
+    monkeypatch.setattr(engine_mod, "_pin_budget_bytes", lambda reserved=0: None)
+    assert engine_mod._disk_ram_budget() == (100 << 30) - (121 << 30) // 10
+
+
+def test_ram_budget_divides_across_tp_ranks(monkeypatch):
+    """MemAvailable and the explicit cap are machine-wide: each rank takes 1/size."""
+    from freetoken.moe import host_banks as _hb
+
+    monkeypatch.setattr(_hb, "mem_available_bytes", lambda: 100 << 30)
+    monkeypatch.setattr(engine_mod, "_host_ram_bytes", lambda: 121 << 30)
+    monkeypatch.setattr(engine_mod, "_pin_budget_bytes", lambda reserved=0: None)
+    assert engine_mod._disk_ram_budget(size=2) == ((100 << 30) - (121 << 30) // 10) // 2
+    cfg = SimpleNamespace(moe_ram_budget=80.0)
+    assert engine_mod._disk_ram_budget(config=cfg, size=2) == 40 << 30

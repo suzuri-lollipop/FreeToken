@@ -97,6 +97,9 @@ class EngineConfig:
     moe_bank_profile: str | None = None
     # Fraction of the host RAM budget spent on the profile's hot experts (0..1).
     moe_hot_frac: float = 0.25
+    # Machine-wide host RAM ceiling (GiB) the expert banks may pin, 0 = auto from
+    # MemAvailable. A TP boot divides it across the ranks.
+    moe_ram_budget: float = 0.0
     # Hybrid-decode expert skip: drop CPU-computed routes whose weight is under
     # moe_skip_minw of the token's routed total (top moe_skip_keep always kept).
     # 0.0 keeps every route (exact decode); 0.1 matches the Strata-GLM default.
@@ -158,6 +161,8 @@ class EngineConfig:
             raise ValueError(f"moe_disk_tier must be auto/off/all, not {self.moe_disk_tier!r}")
         if not 0.0 <= self.moe_hot_frac <= 1.0:
             raise ValueError(f"moe_hot_frac must be within [0, 1], not {self.moe_hot_frac!r}")
+        if self.moe_ram_budget < 0.0:
+            raise ValueError(f"moe_ram_budget must be >= 0 GiB, not {self.moe_ram_budget!r}")
         if not 0.0 <= self.moe_skip_minw <= 1.0:
             raise ValueError(f"moe_skip_minw must be within [0, 1], not {self.moe_skip_minw!r}")
         if self.moe_skip_keep < 0:

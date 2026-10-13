@@ -846,6 +846,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-ram-budget",
+        type=float,
+        default=ServerArgs.moe_ram_budget,
+        help=(
+            "Machine-wide host RAM ceiling in GiB the expert banks may pin "
+            "(0 = auto from MemAvailable minus headroom). Raise it only with room "
+            "for the dense staging, KV host caches and page cache that ride on top; "
+            "a tensor-parallel boot divides the figure across its ranks."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-frac",
         type=float,
         default=ServerArgs.moe_hot_frac,
