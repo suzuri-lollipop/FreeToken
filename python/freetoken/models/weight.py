@@ -142,6 +142,12 @@ def iter_expert_tensors_parallel(
                 yield name, (t.view(*meta["shape"]) if meta["shape"] else t)
             bar.update(shard_sz)
             del mv, buf  # freed once the consumer drops the last yielded tensor of this shard
+            # the consumer has placed this whole shard into the banks by now; force the
+            # buffered bank writes out before yielding the next shard. Two TP ranks
+            # building concurrently otherwise let ~2x the dirty limit pile up (each
+            # throttles on its own writes while the other's O_DIRECT reads starve
+            # writeback) until host memory available hits zero and the ranks die.
+            os.sync()
     finally:
         bar.close()
         th.join()

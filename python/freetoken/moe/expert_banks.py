@@ -263,6 +263,8 @@ def _tp_build_fence(before: bool, model_path: str) -> None:
     info = try_get_tp_info()
     if info is None or info.size < 2:
         return
+    if os.environ.get("FREETOKEN_TP_BANK_STAGGER", "1").strip().lower() in ("0", "false", "no", "off"):
+        return  # concurrent builds fit once the per-shard writeback sync keeps dirty pages bounded
     key = hashlib.sha1(model_path.encode()).hexdigest()[:12]
     marker = lambda r: Path(tempfile.gettempdir()) / f"freetoken-bank-build-{key}-{r}.done"  # noqa: E731
 

@@ -349,6 +349,17 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Seconds a TP rank waits on a collectives barrier/all-reduce before the "
+            "watchdog tears the group down. Ranks that build or load for minutes "
+            "(a large expert-bank tier split) need this above the 60 s default."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
