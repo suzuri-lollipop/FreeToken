@@ -1406,7 +1406,11 @@ class OffloadMoeCache:
             else:
                 _th = _time.perf_counter()
                 staged = per_layer[layer_id][src_rows]
-                buffer[buffer_id].index_copy_(0, dst_rows, staged.to(self.device))
+                # uint8 views: fp8 scale banks have no index_copy kernel, the raw
+                # bytes scatter identically (same workaround as the file-bank branch)
+                buffer[buffer_id].view(torch.uint8).index_copy_(
+                    0, dst_rows, staged.to(self.device).view(torch.uint8)
+                )
                 h2d_ms += _time.perf_counter() - _th
         acc = self._pageable_timing
         acc["item_ms"] += (t_item - t0) * 1e3
