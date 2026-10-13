@@ -517,7 +517,7 @@ def _ensure_experts_hybrid_kernel(
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
-                e = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
+                e = tl.sum(tl.where((missing_rank == i) & is_fetchable, off_e, 0))
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)

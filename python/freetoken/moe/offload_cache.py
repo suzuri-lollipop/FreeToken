@@ -1814,6 +1814,35 @@ class OffloadMoeCache:
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
             src_indices, evict_slots, num_indices = self._plan_buffers(plan)
+            if os.environ.get("FREETOKEN_COPY_DIAG") == "1":
+                # Diagnostic: turn the cryptic async CUDA illegal-access into a precise
+                # Python error pinpointing the OOB layer/bank/index. Eager-only (uses
+                # .item()); gated so production is unaffected.
+                n = int(num_indices.item())
+                if n > 0:
+                    smax = int(src_indices[:n].max().item())
+                    dmax = int(evict_slots[:n].max().item())
+                    sptrs = self._copy_src_ptrs[layer_id].tolist()
+                    hot = (self.hot_bank_sources or {}).get(layer_id)
+                    crow = [(hot[nm][0].shape[0] if (hot and nm in hot) else None) for nm in self.bank_schema]
+                    cstride = [(hot[nm][0].stride(0) if (hot and nm in hot) else None) for nm in self.bank_schema]
+                    if dmax >= self.cache_size:
+                        raise RuntimeError(f"[copy-diag] OOB dst L{layer_id}: dst_max={dmax} >= cache_size={self.cache_size}")
+                    zb = [self.bank_schema[i] for i, p in enumerate(sptrs) if p == 0]
+                    if zb:
+                        raise RuntimeError(f"[copy-diag] null src L{layer_id}: banks {zb} have src_ptr=0 with n={n} fetches")
+                    for bi, nm in enumerate(self.bank_schema):
+                        if crow[bi] is not None and smax >= crow[bi]:
+                            raise RuntimeError(f"[copy-diag] OOB src L{layer_id} bank={nm}: src_max={smax} >= compact_rows={crow[bi]}")
+                    if not hasattr(self, "_copy_diag_logged"):
+                        self._copy_diag_logged = set()
+                    if layer_id not in self._copy_diag_logged:
+                        self._copy_diag_logged.add(layer_id)
+                        logger.info_rank0(
+                            f"[copy-diag] L{layer_id} n={n} src_max={smax} dst_max={dmax} cache_size={self.cache_size} "
+                            f"feat={self._copy_feat_bytes.tolist()} compact_rows={crow} compact_stride0={cstride} "
+                            f"unpinned={layer_id in self._unpinned_layers}"
+                        )
             if blocks_per_bank is None:
                 # the grid width measured for this host's link, not the kernel's default
                 blocks_per_bank = self._copy_blocks_per_bank
