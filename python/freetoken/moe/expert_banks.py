@@ -265,7 +265,13 @@ def _tp_build_fence(before: bool, model_path: str) -> None:
         return
     if os.environ.get("FREETOKEN_TP_BANK_STAGGER", "1").strip().lower() in ("0", "false", "no", "off"):
         return  # concurrent builds fit once the per-shard writeback sync keeps dirty pages bounded
-    key = hashlib.sha1(model_path.encode()).hexdigest()[:12]
+    # The fence key must be SHARED across ranks. A rank-specific disk-tier sidecar
+    # (...-ftw-banks-tp2r0 vs -tp2r1) would give each rank a different key, so the chain
+    # deadlocks (each rank waits on a marker the other never writes). Strip the
+    # -tp{size}r{rank} suffix so both ranks fence on the common base path.
+    suffix = f"-tp{info.size}r{info.rank}"
+    shared = model_path[: -len(suffix)] if model_path.endswith(suffix) else model_path
+    key = hashlib.sha1(shared.encode()).hexdigest()[:12]
     marker = lambda r: Path(tempfile.gettempdir()) / f"freetoken-bank-build-{key}-{r}.done"  # noqa: E731
 
     if before:
