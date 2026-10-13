@@ -289,11 +289,9 @@ def _tp_build_fence(before: bool, model_path: str) -> None:
     path = marker(info.rank)
     path.write_text("")
     if info.rank == info.size - 1:
-        for r in range(info.size):
-            try:
-                marker(r).unlink()
-            except FileNotFoundError:
-                pass
+        # Do NOT unlink here: earlier ranks poll for this marker every 2 s and the
+        # write->unlink window is microseconds, so they would almost always miss it
+        # and hang until the deadline. Rank 0 cleans the chain after observing it.
         return
     # The last rank still has ~a build of work; the first collectives after the load
     # (the auto cache-size all_reduce) time out at the group's 60 s default, so every
@@ -304,7 +302,7 @@ def _tp_build_fence(before: bool, model_path: str) -> None:
     while True:
         try:
             if tail.stat().st_mtime >= floor:
-                return
+                break
         except FileNotFoundError:
             pass
         if time.time() > deadline:
@@ -312,6 +310,15 @@ def _tp_build_fence(before: bool, model_path: str) -> None:
                 f"timed out waiting for TP rank {info.size - 1} to finish its expert bank build ({tail})"
             )
         time.sleep(2.0)
+    # Safe to clean now: the last rank has written its marker and returned, and no
+    # other rank polls the chain anymore. Stale markers from a crashed boot are
+    # ignored by the mtime freshness floor, so leftovers are harmless either way.
+    if info.rank == 0:
+        for r in range(info.size):
+            try:
+                marker(r).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
