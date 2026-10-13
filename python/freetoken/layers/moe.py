@@ -411,7 +411,15 @@ class OffloadMoELayer(MoELayer):
             if self.layer_id == 0:
                 cache._profile_dump_step()
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid" and hidden_states.shape[0] >= cache.hybrid_min_bs:
+        # A compact-backed disk layer (hybrid_capable) MUST decode through the hybrid
+        # path at ANY batch size: its cold rows have no registered source, so the
+        # fall-through GPU-slot path (ensure_experts, which writes layer-local expert
+        # ids as src_indices) would index past the compact and read out of bounds.
+        # Only a pinned layer (every row fetchable from the whole bank) can take the
+        # small-batch fall-through below.
+        if cache.decode_target == "hybrid" and (
+            hidden_states.shape[0] >= cache.hybrid_min_bs or hybrid_capable
+        ):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         # hybrid below hybrid_min_bs falls through to the GPU slot-cache path: a small
         # batch misses too few experts per layer for the CPU round trip to pay off.
