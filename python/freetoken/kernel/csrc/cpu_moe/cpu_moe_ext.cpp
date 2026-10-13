@@ -461,22 +461,38 @@ __attribute__((target("avx2,avxvnni,fma")))
 float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float global,
                         const int8_t* asi8, int K, const float* e4m3, const float* asb) {
   const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2));
-  __m256 accF = _mm256_setzero_ps();
   const int nb = K / 16;
+  // Four independent accumulator chains (8 blocks/iter). The decode -> dpbusd -> cvt ->
+  // fmadd path is long; a single accumulator serializes on the loop-carried fmadd and
+  // leaves the core latency-bound, so the weight stream cannot be kept at peak bandwidth
+  // (the AVX-512 path runs several chains for the same reason). The fp32 sum order changes
+  // vs the single-accumulator version, which is far inside the W4A8 tolerance.
+#define NVFP4_GRP2(acc, bb) do {                                                              \
+    __m128i wb  = nvfp4_decode_block_i8(packed + (size_t)(bb) * 8, lut);                      \
+    __m128i wb1 = nvfp4_decode_block_i8(packed + (size_t)((bb) + 1) * 8, lut);                \
+    __m256i w  = _mm256_set_m128i(wb1, wb);                          /* [blk bb | blk bb+1] */ \
+    __m256i a  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(asi8 + (size_t)(bb) * 16)); \
+    __m256i aw = _mm256_sign_epi8(w, w);                             /* |w| (u8 operand)   */ \
+    __m256i sa = _mm256_sign_epi8(a, w);                             /* sign(w)*a (s8)     */ \
+    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);                     \
+    __m256 scv = _mm256_blend_ps(_mm256_set1_ps(e4m3[scale[bb]] * asb[bb]),                   \
+                                 _mm256_set1_ps(e4m3[scale[(bb) + 1]] * asb[(bb) + 1]), 0xF0); \
+    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), scv, acc);                                  \
+  } while (0)
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
   int b = 0;
-  for (; b + 2 <= nb; b += 2) {
-    __m128i wb = nvfp4_decode_block_i8(packed + (size_t)b * 8, lut);
-    __m128i wb1 = nvfp4_decode_block_i8(packed + (size_t)(b + 1) * 8, lut);
-    __m256i w = _mm256_set_m128i(wb1, wb);                              // [blk b | blk b+1]
-    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(asi8 + (size_t)b * 16));
-    __m256i aw = _mm256_sign_epi8(w, w);                               // |w| (u8 operand)
-    __m256i sa = _mm256_sign_epi8(a, w);                               // sign(w)*a (s8 operand)
-    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);
-    __m256 scv = _mm256_blend_ps(_mm256_set1_ps(e4m3[scale[b]] * asb[b]),
-                                 _mm256_set1_ps(e4m3[scale[b + 1]] * asb[b + 1]), 0xF0);
-    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), scv, accF);
+  for (; b + 8 <= nb; b += 8) {
+    NVFP4_GRP2(acc0, b);
+    NVFP4_GRP2(acc1, b + 2);
+    NVFP4_GRP2(acc2, b + 4);
+    NVFP4_GRP2(acc3, b + 6);
   }
-  float s = hsum256(accF);
+  for (; b + 2 <= nb; b += 2) {
+    NVFP4_GRP2(acc0, b);
+  }
+#undef NVFP4_GRP2
+  float s = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
   for (; b < nb; ++b) {  // tail (odd block count)
     const uint8_t* pk = packed + (size_t)b * 8;
     const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
