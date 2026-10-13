@@ -1838,9 +1838,13 @@ class OffloadMoeCache:
                         self._copy_diag_logged = set()
                     if layer_id not in self._copy_diag_logged:
                         self._copy_diag_logged.add(layer_id)
+                        hrow = self._hot_row_of[layer_id]
+                        hstat = (f"max={int(hrow.max().item())} nneg={int((hrow >= 0).sum().item())} "
+                                 f"shape={tuple(hrow.shape)} dev={hrow.device}") if hrow is not None else "None"
                         logger.info_rank0(
                             f"[copy-diag] L{layer_id} n={n} src_max={smax} dst_max={dmax} cache_size={self.cache_size} "
                             f"is_disk={is_disk} has_map={has_map} src_rows={srows} feat={self._copy_feat_bytes.tolist()} "
+                            f"src_indices={src_indices[:n].tolist()} hot_row_of[{hstat}] "
                             f"src_ptrs_zero={[self.bank_schema[i] for i, p in enumerate(sptrs) if p == 0]}"
                         )
                     if dmax >= self.cache_size:
