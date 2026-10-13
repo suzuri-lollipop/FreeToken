@@ -484,10 +484,18 @@ def load_expert_banks(
                 "shard); rebuilding from the source checkpoint"
             )
         else:
-            banks = load_ftw_banks(
-                ftw_banks_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-                layer_residency=layer_residency, hot_experts=hot_experts,
-            )
+            # the same build fence as the slow path: two ranks reading the sidecar
+            # and settling (cudaHostRegister) concurrently drop the load from
+            # ~6 GB/s to well under 1 (they share one NVMe queue and the driver's
+            # serialized pin path), so rank r+1 waits for rank r's marker.
+            _tp_build_fence(before=True, model_path=ftw_banks_path)
+            try:
+                banks = load_ftw_banks(
+                    ftw_banks_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                    layer_residency=layer_residency, hot_experts=hot_experts,
+                )
+            finally:
+                _tp_build_fence(before=False, model_path=ftw_banks_path)
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {ftw_banks_path})")
             return banks
