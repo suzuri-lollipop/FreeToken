@@ -18,6 +18,7 @@ Commands:
   checkpoint  Convert an HF safetensors checkpoint to FTW
   profile     Write or inspect an expert profile (FTXP; see --moe-bank-profile)
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
+  calibrate   Measure --speculative lookup on this PC; write its config and start script
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",
@@ -80,6 +81,12 @@ Use "ft bench <subcommand> --help" for subcommand-specific options.""",
     )
 
 
+def _run_calibrate(argv: list[str]) -> int:
+    from freetoken.calibrate_lookup import main
+
+    return main(argv)
+
+
 def _run_bench(argv: list[str]) -> int:
     if not argv:
         _print_bench_help(sys.stderr)
@@ -106,6 +113,7 @@ COMMANDS = {
     "checkpoint": "_run_checkpoint",
     "profile": "_run_profile",
     "bench": "_run_bench",
+    "calibrate": "_run_calibrate",
 }
 
 

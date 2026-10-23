@@ -189,12 +189,12 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "total_slots": tr.moe_total_slots}
         if tr.moe_total_slots > 0 else None
     )
-    # MTP is keyed off the config, not the counters: the point of this section is telling "no
+    # The spec section is keyed off the config, not the counters: the point is telling "no
     # speculative decoding" apart from "drafting enabled and nothing ever qualified". drafted
     # is the coverage the acceptance rate cannot show: the share of decode steps that ran as
     # spec steps, so a switched-off-after-16 verifies request is not mistaken for a bad head.
     spec = None
-    if getattr(config, "speculative", "none") == "mtp":
+    if getattr(config, "speculative", "none") in ("mtp", "lookup"):
         steps, decode_steps = tr.spec_steps, tr.spec_decode_steps
         spec = {
             "verifies": tr.spec_verifies, "accepted": tr.spec_accepted,
@@ -207,6 +207,10 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
                 round(steps / (steps + decode_steps), 3)
                 if (steps + decode_steps) else None),
         }
+        if config.speculative == "lookup":
+            # MTP clients already know the backend from the flag; lookup is new, and its
+            # counters are per draft rather than per verify, so name it explicitly.
+            spec["backend"] = "lookup"
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),

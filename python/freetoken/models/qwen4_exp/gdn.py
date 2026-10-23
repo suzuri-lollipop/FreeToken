@@ -178,7 +178,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             if fla.spec_state_indices is not None:
                 states = pool.conv_states[li]
                 before = states.index_select(0, fla.cache_indices.long())
-                middle = torch.cat([before[..., 1:], conv_in[:1].unsqueeze(-1)], -1)
+                # One conv window per verify sequence, seeded from that sequence's first row.
+                first_rows = fla.cu_seqlens[:-1].long()
+                middle = torch.cat([before[..., 1:], conv_in[first_rows].unsqueeze(-1)], -1)
                 states.index_copy_(0, fla.spec_state_indices, middle.to(states.dtype))
                 mixed = self._conv_prefill(
                     conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)

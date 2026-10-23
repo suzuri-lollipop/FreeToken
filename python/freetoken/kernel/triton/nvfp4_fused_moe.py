@@ -317,7 +317,6 @@ def _prefill_nvfp4_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
-    lut_ptr,
     slot_map_ptr,      # [E] int32 expert id -> LRU slot (USE_SLOT_MAP only)
     N,
     K,
@@ -380,16 +379,20 @@ def _prefill_nvfp4_moe_kernel(
 
         p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
         bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-        lo = bytes_ & 0xF
-        hi = (bytes_ >> 4) & 0xF
         sblk = byte_idx // 8
         s_ptrs = scale_base + sblk[:, None] * stride_sblk
         if e4m3_native_cx():
             scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
         else:
             scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
+        # fp16 bit-trick dequant instead of the LUT gather (which serialized the LSU; see
+        # nvfp4_linear._nvfp4_pair_f32): low nibble (even k) -> bits [3:0], high (odd k) ->
+        # [19:16]; scale * 2^14 undoes the codes' folded 2^-14 exactly, bit-identical product.
+        v = (bytes_ & 0xF) | ((bytes_ & 0xF0) << 12)
+        b_lo, b_hi = _nvfp4_pair_f32(v)
+        scale = scale * 16384.0
+        b_lo = b_lo * scale  # [BLOCK_KB, BLOCK_N]
+        b_hi = b_hi * scale
 
         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)

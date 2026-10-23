@@ -133,6 +133,12 @@ def test_stats_reports_mtp_tallies_whether_or_not_anything_drafts():
         "verifies": 64, "accepted": 37, "acceptance_rate": 0.578, "declined": {},
         "steps": 16, "decode_steps": 64, "cold_seeds": 0, "drafted_ratio": 0.2,
     }
+    # lookup counts drafts, not verify batches, and names itself so a client can tell the
+    # sections apart without also reading the launch flags
+    lookup = doc("lookup", verifies=40, accepted=34)
+    assert lookup["backend"] == "lookup"
+    assert (lookup["verifies"], lookup["accepted"]) == (40, 34)
+    assert lookup["acceptance_rate"] == 0.85
 
 
 def test_stats_tracker_keeps_the_last_mtp_snapshot():

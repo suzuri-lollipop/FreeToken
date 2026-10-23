@@ -34,6 +34,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from freetoken.engine.config import mtp_cold_start, mtp_stash_budget
+from freetoken.engine.lookup import LookupState, lookup_debug
 from freetoken.engine.spec_sample import (
     debug_traced, sampled_graph_enabled, sampling_path_enabled, spec_supported)
 from .io import SchedulerIOMixin
@@ -148,6 +149,13 @@ class ForwardInput(NamedTuple):
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+
+
+def _spec_backend_of(config) -> str:
+    """Which drafter a config selects: "none" | "mtp" | "lookup". Module-level so the unit
+    stubs that exercise drain/report helpers need only carry ``config.speculative``."""
+    backend = getattr(config, "speculative", "none")
+    return backend if backend in ("mtp", "lookup") else "none"
 
 
 class Scheduler(SchedulerIOMixin):
@@ -271,7 +279,7 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
-        if getattr(config, "speculative", "none") == "mtp":
+        if _spec_backend_of(self.config) != "none":
             self._report_spec_config()
 
         # Initialize the I/O mixin
@@ -282,7 +290,7 @@ class Scheduler(SchedulerIOMixin):
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         # A short burst never reaches the verify window, so drain it here instead of leaving its
         # numbers stranded until some later request crosses the window.
-        if getattr(self.config, "speculative", "none") == "mtp":
+        if _spec_backend_of(self.config) != "none":
             self._report_spec_tally(force=True)
         self.cache_manager.check_integrity()
 
@@ -616,7 +624,7 @@ class Scheduler(SchedulerIOMixin):
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         spec_two_row = getattr(batch, "spec_mode", None) == "verify"
-        if getattr(self.config, "speculative", "none") == "mtp":
+        if _spec_backend_of(self.config) != "none":
             # counted on the drain, where the batch shape is known: a spec batch IS a decode
             # step (the verify rides phase="prefill" for the extend machinery), and the split
             # between the two is the coverage the acceptance numbers do not show
@@ -732,7 +740,7 @@ class Scheduler(SchedulerIOMixin):
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
-        spec = getattr(self.config, "speculative", "none") == "mtp"
+        spec = _spec_backend_of(self.config) != "none"
         if reply:
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
@@ -1176,13 +1184,26 @@ class Scheduler(SchedulerIOMixin):
         return " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "-"
 
     def _report_spec_config(self) -> None:
-        """Say, once at startup, what MTP will consider draftable -- before any traffic exists.
+        """Say, once at startup, what speculation will consider draftable -- before any traffic.
 
         Every eligibility rule that lives only in a gate downstream (prompt size, single-chunk
         cold prefills, one-request decode batches, the per-kind graph captures) otherwise has to
         be inferred from a line that needs verifies to print, so an unqualified workload reads
         as a broken engine. The stash size is spelled out in bytes too: the cap is prompt-sized
         and its unit is the residual row width, not tokens."""
+        if _spec_backend_of(self.config) == "lookup":
+            probe = LookupState.from_env()
+            logger.info_rank0(
+                f"Lookup spec: enabled | draft={probe.max_draft} "
+                f"min_match={probe.drafter.min_match} min_context={probe.min_context} "
+                f"window={probe.accept_window} "
+                f"min_acceptance={probe.min_acceptance:.2f} "
+                f"(FREETOKEN_LOOKUP_*) | draftable: greedy decode batches up to "
+                f"{int(ENV.LOOKUP_MAX_BATCH.value)} requests whose suffix repeats an earlier "
+                f"trigram; no head, no prompt stash; "
+                f"declines: nongreedy, mm, no_room, low_acceptance"
+            )
+            return
         cfg = self.config
         budget = mtp_stash_budget()
         hidden = getattr(cfg.model_config, "hidden_size", None)
@@ -1210,7 +1231,7 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _report_spec_tally(self, force: bool = False) -> None:
-        """Print the MTP tally: lifetime verify/accept, the span since the last line, and the
+        """Print the spec tally: lifetime verify/accept, the span since the last line, and the
         decline breakdown.
 
         Driven by three things, because verifies alone were not enough to make a run readable:
@@ -1245,7 +1266,8 @@ class Scheduler(SchedulerIOMixin):
             if n
             else "no verifies"
         )
-        logger.info_rank0(f"MTP spec: {tally} | declined: {self._spec_reject_summary()}")
+        label = "Lookup spec" if _spec_backend_of(self.config) == "lookup" else "MTP spec"
+        logger.info_rank0(f"{label}: {tally} | declined: {self._spec_reject_summary()}")
 
     def _spec_coverage(self) -> str:
         """``drafted s/(s+d)``: the share of decode steps that ran as spec steps.
@@ -1279,7 +1301,7 @@ class Scheduler(SchedulerIOMixin):
 
         One snapshot per batch, and the decline map is copied rather than aliased: it keeps
         growing while the frontend serializes the replies that carry it."""
-        if getattr(self.config, "speculative", "none") != "mtp":
+        if _spec_backend_of(self.config) == "none":
             return None
         return (
             getattr(self, "_spec_verifies", 0),
@@ -1300,6 +1322,10 @@ class Scheduler(SchedulerIOMixin):
         req.spec_draft = None
         req.spec_residual = None
         req.spec_draft_probs = None
+        # A lookup request that reached this point is permanently off (its gate fired, or the
+        # request finished): drop the trigram index instead of parking it for the answer.
+        if req.spec_off:
+            req.lookup = None
         if req.spec_slot_idx is not None:
             pool = self.engine.linear_state_pool
             if pool is not None:
@@ -1307,7 +1333,7 @@ class Scheduler(SchedulerIOMixin):
             req.spec_slot_idx = None
 
     def _spec_reject(self, req: Req, reason: str) -> None:
-        """Turn MTP off for one request, release its scratch state, and count the reason.
+        """Turn speculation off for one request, release its scratch state, and count the reason.
 
         Counting happens on the transition only: a request declined every decode step
         (because the batch is never size 1) would otherwise bury the counters."""
@@ -1367,6 +1393,32 @@ class Scheduler(SchedulerIOMixin):
                         f"{_MTP_MIN_ACCEPTANCE:.2f}, drafting disabled"
                     )
                     self._spec_reject(req, "low_acceptance")
+
+    def _tally_lookup_verify(self, req: Req, accepted: int, drafts: int) -> None:
+        """Fold one lookup verify into the shared tally and the request's own gate.
+
+        Counters are per DRAFT, not per verify batch: a 4-draft verify that lands 3 is 3/4,
+        which is the number that predicts whether the widened step pays. Lookup drafts are
+        free to produce but a miss still costs the extra target rows, so the request-local gate
+        (``FREETOKEN_LOOKUP_MIN_ACCEPTANCE``, window ``FREETOKEN_LOOKUP_ACCEPT_WINDOW``) ends
+        drafting for that request rather than the MTP-style stand-down: there is no head state
+        to keep warm, and the index is cheap to rebuild if the request is ever eligible again.
+        """
+        self._spec_verifies = getattr(self, "_spec_verifies", 0) + drafts
+        self._spec_accepted = getattr(self, "_spec_accepted", 0) + int(accepted)
+        self._spec_win_verifies = getattr(self, "_spec_win_verifies", 0) + drafts
+        self._spec_win_accepted = getattr(self, "_spec_win_accepted", 0) + int(accepted)
+        req.spec_verifies += drafts
+        req.spec_accepted += int(accepted)
+        if self._spec_win_verifies >= 64:
+            self._report_spec_tally(force=True)
+        state = req.lookup
+        if state is not None and not state.record_many(int(accepted), drafts):
+            logger.info_rank0(
+                f"Lookup spec: req {req.uid} {state.off_reason}, drafting disabled "
+                f"(lifetime {state.accepted}/{state.offered})"
+            )
+            self._spec_reject(req, "low_acceptance")
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
@@ -1538,6 +1590,7 @@ class Scheduler(SchedulerIOMixin):
         # in-graph gather of out_loc hits the page-table rows allocate_paged just filled.
         spec_graphed = (
             getattr(batch, "spec_mode", None) == "verify"
+            and getattr(batch, "spec_source", "mtp") == "mtp"
             and self.engine.spec_graph_will_replay(getattr(batch, "spec_sample", False))
         )
         if batch.is_decode:
@@ -1659,9 +1712,9 @@ class Scheduler(SchedulerIOMixin):
                     _dbg.host_phase("sched.upgrade", time.perf_counter() - _tu)
                 if upgraded is not None:
                     batch = upgraded
-                elif getattr(self.config, "speculative", "none") == "mtp":
-                    # A regular decode batch runs the graph and never feeds the head, so
-                    # every row placed here is a row the head will never see.
+                elif _spec_backend_of(self.config) != "none":
+                    # A regular decode batch runs the graph and never feeds the drafter, so
+                    # every row placed here is a row it will never see.
                     for req in getattr(batch, "reqs", ()):
                         self._on_regular_decode(req)
         if batch is None:
@@ -1702,6 +1755,13 @@ class Scheduler(SchedulerIOMixin):
         cold start is on."""
         if req.spec_off:
             return
+        if _spec_backend_of(self.config) == "lookup":
+            # No head and no stash to reconcile: the index is fed from committed tokens at the
+            # next eligible schedule, and a draft computed before a mixed batch is simply stale.
+            if req.spec_suspend:
+                req.spec_suspend -= 1
+            req.spec_draft = None
+            return
         if req.spec_suspend:
             # standing down by the acceptance floor: the head is falling behind ON PURPOSE, so
             # neither the lag nor the batch shape may turn that pause into the terminal
@@ -1740,16 +1800,24 @@ class Scheduler(SchedulerIOMixin):
                 self._spec_reject(req, "lag_overflow")
 
     def _as_spec_batch(self, batch: Batch) -> Batch | None:
-        """Upgrade a single-request decode batch into an MTP spec batch, or None to keep it regular.
+        """Upgrade a decode batch into a spec batch, or None to keep it regular.
 
-        Only a single request with room for two output tokens is eligible; its sampling is
-        verified by id comparison (greedy) or by rejection sampling (non-greedy).
-        The draft is staged after the last placed token; both rows use the extend
-        attention path, with intermediate GDN/PLE state saved for rejection. Every decline
-        that is final for the request goes through ``_spec_reject`` so it is counted and
+        MTP handles a single request: it verifies its draft by id comparison (greedy) or
+        rejection sampling. Lookup is greedy-only and can upgrade up to
+        ``FREETOKEN_LOOKUP_MAX_BATCH`` requests, each with its own draft width and scratch
+        snapshot. The drafts are staged after each request's last placed token; all rows use
+        the extend attention path, with intermediate GDN/PLE state saved for rejection. Every
+        decline that is final for a request goes through ``_spec_reject`` so it is counted and
         its scratch state released.
         """
-        if getattr(self.config, "speculative", "none") != "mtp" or len(batch.reqs) != 1:
+        backend = _spec_backend_of(self.config)
+        if backend == "none":
+            return None
+        if backend == "lookup":
+            if len(batch.reqs) == 1:
+                return self._as_lookup_batch(batch, batch.reqs[0])
+            return self._as_lookup_batch_multi(batch)
+        if len(batch.reqs) != 1:
             return None
         req = batch.reqs[0]
         if req.spec_off or not req.can_decode:
@@ -1836,6 +1904,176 @@ class Scheduler(SchedulerIOMixin):
             # produces the first draft from the row it is decoding
         return batch
 
+    def _as_lookup_batch(self, batch: Batch, req: Req) -> Batch | None:
+        """Upgrade one greedy decode batch with suffix-drafter drafts.
+
+        The drafts are the tokens that followed the longest earlier occurrence of the request's
+        current suffix, computed on the host from committed tokens only (``req.device_len``
+        includes the row about to be decoded, which is the suffix's last token). The verify is
+        the same extend step MTP uses, widened to ``1 + K`` rows; the GDN state after row 0 is
+        saved, so a partial accept rolls back to the single verified token and discards the
+        rest. A miss costs nothing here -- regular decoding continues and the next step looks
+        again -- so only terminal ineligibility is counted.
+        """
+        if req.spec_off or not req.can_decode:
+            return None
+        if req.spec_suspend:
+            return None
+        if not req.sampling_params.is_greedy:
+            self._spec_reject(req, "nongreedy")
+            return None
+        if getattr(req, "mm_items", None):
+            self._spec_reject(req, "mm")
+            return None
+        if req.remain_len < 2:
+            # A verify must pay out at least the draft plus the bonus; one row left cannot.
+            self._spec_reject(req, "no_room")
+            return None
+        if req.lookup is None:
+            req.lookup = LookupState.from_env()
+        if req.device_len < req.lookup.min_context:
+            # Short history: the decode step is cheap enough that the wide verify's fixed
+            # cost dominates. Not a decline -- drafting starts if the request grows past it.
+            return None
+        req.lookup.sync(req.input_ids, req.device_len)
+        # Leave room for the bonus: K drafts stage K rows, so K+1 rows must fit.
+        k = min(req.lookup.max_draft, req.remain_len - 1)
+        drafts = req.lookup.propose_many(k)
+        if not drafts:
+            return None
+        if req.spec_slot_idx is None:
+            pool = self.engine.linear_state_pool
+            if pool is not None:
+                try:
+                    req.spec_slot_idx = pool.alloc(1)[0]
+                except RuntimeError:
+                    # Scratch is opportunistic (no fixed reserve): under pressure, skip this
+                    # step instead of permanently disabling lookup; the next decode retries.
+                    if lookup_debug():
+                        logger.info_rank0(
+                            f"Lookup spec: no free GDN state slot for req {req.uid}, "
+                            "keeping the regular step"
+                        )
+                    return None
+        batch.spec_mode = "verify"
+        batch.spec_source = "lookup"
+        batch.spec_sample = False
+        batch.spec_draft_id = drafts[0]
+        batch.spec_draft_ids = tuple(drafts)
+        batch.spec_prefix_len = req.device_len - 1
+        batch.phase = "prefill"
+        # Staged into both stores: the pool feeds the forward rows, the host buffer feeds the
+        # PLE extend fill. On a full accept the drafts are the placed tokens and only the
+        # bonus is appended; a partial accept restores row 0 and rewrites the first slot.
+        for draft in drafts:
+            self.token_pool[req.table_idx, req.device_len] = draft
+            req.append_host(torch.tensor([draft], dtype=torch.int32))
+            req.device_len += 1
+        req.spec_draft = drafts[0]
+        return batch
+
+    def _release_lookup_scratch_all(self, reqs) -> None:
+        for req in reqs:
+            if req.spec_slot_idx is not None:
+                self._release_spec_scratch(req)
+
+    def _as_lookup_batch_multi(self, batch: Batch) -> Batch | None:
+        """Upgrade a whole small decode batch with one lookup verify per request.
+
+        Every request gets its own draft width, scratch GDN slot and post-row-0 snapshot, so
+        each accepts or rolls back independently in the shared extend forward. The batch is
+        upgraded only when all of its requests are eligible: mixing a speculative row group
+        with a regular decode row would need two different batch shapes in one forward.
+
+        ``FREETOKEN_LOOKUP_MAX_BATCH`` (default 2) caps the upgraded width; a larger batch
+        falls back to regular decoding and releases any parked scratch slots.
+        """
+        reqs = batch.reqs
+        limit = max(1, int(ENV.LOOKUP_MAX_BATCH.value))
+        if len(reqs) < 2 or len(reqs) > limit:
+            self._release_lookup_scratch_all(reqs)
+            return None
+
+        plans = []
+        for req in reqs:
+            if req.spec_off or not req.can_decode or req.spec_suspend:
+                self._release_lookup_scratch_all(reqs)
+                return None
+            if not req.sampling_params.is_greedy:
+                self._spec_reject(req, "nongreedy")
+                self._release_lookup_scratch_all(reqs)
+                return None
+            if getattr(req, "mm_items", None):
+                self._spec_reject(req, "mm")
+                self._release_lookup_scratch_all(reqs)
+                return None
+            if req.remain_len < 2:
+                self._spec_reject(req, "no_room")
+                self._release_lookup_scratch_all(reqs)
+                return None
+            if req.lookup is None:
+                req.lookup = LookupState.from_env()
+            if req.device_len < req.lookup.min_context:
+                # Not a decline: drafting starts once the request has enough history to
+                # make the wider verify pay. The whole batch stays regular until then.
+                self._release_lookup_scratch_all(reqs)
+                return None
+            req.lookup.sync(req.input_ids, req.device_len)
+            k = min(req.lookup.max_draft, req.remain_len - 1)
+            drafts = req.lookup.propose_many(k)
+            if not drafts:
+                self._release_lookup_scratch_all(reqs)
+                return None
+            plans.append((req, tuple(drafts)))
+
+        pool = self.engine.linear_state_pool
+        newly = []
+        if pool is not None:
+            for req, _drafts in plans:
+                if req.spec_slot_idx is not None:
+                    continue
+                try:
+                    req.spec_slot_idx = pool.alloc(1)[0]
+                    newly.append(req)
+                except RuntimeError:
+                    for done in newly:
+                        self._release_spec_scratch(done)
+                    self._release_lookup_scratch_all(reqs)
+                    if lookup_debug():
+                        logger.info_rank0(
+                            f"Lookup spec: no free GDN state slot for req {req.uid}, "
+                            "keeping the regular batch"
+                        )
+                    return None
+
+        batch.spec_mode = "verify"
+        batch.spec_source = "lookup"
+        batch.spec_sample = False
+        batch.spec_items = []
+        first = True
+        for req, drafts in plans:
+            prefix = req.device_len - 1
+            for draft in drafts:
+                self.token_pool[req.table_idx, req.device_len] = draft
+                req.append_host(torch.tensor([draft], dtype=torch.int32))
+                req.device_len += 1
+            req.spec_draft = drafts[0]
+            batch.spec_items.append(
+                {"req": req, "drafts": drafts, "prefix": prefix}
+            )
+            if first:
+                batch.spec_draft_id = drafts[0]
+                batch.spec_draft_ids = drafts
+                batch.spec_prefix_len = prefix
+                first = False
+        batch.phase = "prefill"
+        if lookup_debug():
+            logger.info_rank0(
+                f"[lookup-t] multi verify reqs={len(plans)} "
+                f"widths={[len(it['drafts']) for it in batch.spec_items]}"
+            )
+        return batch
+
     def _build_spec_prologue(self, req: Req) -> Batch:
         """The head-only catch-up batch over the rows the head has not seen.
 
@@ -1866,66 +2104,108 @@ class Scheduler(SchedulerIOMixin):
         pb.out_loc = self.engine.page_table[req.table_idx, 0:t]
         return pb
 
-    def _restore_spec_prefix(self, batch: Batch) -> None:
-        req = batch.reqs[0]
-        # the scratch slot a rollback restores from is freed only after the commit (see
-        # _drain_spec): a None here means something reordered the tally ahead of the rollback
-        # and the pool copy below would fail as a tensor-shape error on the engine stream
-        assert req.spec_slot_idx is not None, "spec rollback without a scratch slot"
-        self.engine.linear_state_pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
-        req.cached_len = req.device_len - 1
-        if batch.spec_pages:
+    def _restore_spec_prefix(self, batch: Batch, keep: int = 1, req: Req | None = None,
+                              prefix: int | None = None, pages: list | None = None) -> None:
+        """Roll the request back to ``keep`` verified rows (1 for every current draft path).
+
+        The scratch slot holds the state after row 0. A lookup verify may have staged K rows;
+        on a partial accept the host view is truncated back to the one committed token and the
+        pool slot is repaired by the caller. Non-hybrid models have no linear pool and no state
+        to restore, so lookup can run there with spec_slot_idx=None.
+        """
+        req = req or batch.reqs[0]
+        if req.spec_slot_idx is not None:
+            self.engine.linear_state_pool.copy_from(req.spec_slot_idx, req.linear_slot_idx)
+        if prefix is None:
+            prefix = getattr(batch, "spec_prefix_len", 0)
+        if prefix:
+            # Lookup staged K rows: roll back to the cached length before staging plus the
+            # `keep` verified rows, then drop the rest of the staged host rows.
+            req.cached_len = prefix + keep
+            req.device_len = req.cached_len + 1
+            req.truncate_host(req.device_len)
+        else:
+            # MTP staged one draft: the post-row-0 state and one committed input token.
+            req.cached_len = req.device_len - 1
+        if pages is None:
+            pages = batch.spec_pages
+        if pages:
             first_unused = div_ceil(req.cached_len, self.config.page_size)
             unused = [(table, max(lo, first_unused), hi)
-                      for table, lo, hi in batch.spec_pages if hi > first_unused]
+                      for table, lo, hi in pages if hi > first_unused]
             if unused:
                 self.cache_manager.release_paged(unused)
 
     def _drain_spec(self, batch: Batch, spec: dict | None,
                     reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
-        """Commit one or two verified inputs and emit the corresponding target tokens."""
-        req = batch.reqs[0]
+        """Commit verified inputs and emit the corresponding target tokens."""
+        items = getattr(batch, "spec_items", None)
+        if items:
+            if spec is None or "items" not in spec:
+                raise RuntimeError("lookup spec step returned no per-request payload")
+            payloads = spec["items"]
+            if len(payloads) != len(items):
+                raise RuntimeError(
+                    f"lookup payload count {len(payloads)} != batch spec items {len(items)}"
+                )
+            for item, payload in zip(items, payloads):
+                self._drain_lookup_one(batch, item, payload, reply, finished_out)
+            return
+        self._drain_spec_single(batch, spec, reply, finished_out)
+
+    def _drain_lookup_one(self, batch: Batch, item: dict, spec: dict,
+                          reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
+        """Drain one request from a multi-request lookup verify."""
+        req = item["req"]
+        prefix = int(item.get("prefix", 0))
+        pages = [
+            (table, lo, hi)
+            for table, lo, hi in (batch.spec_pages or ())
+            if table == req.table_idx
+        ]
         if req in self.finished_reqs:
             return
         if req.aborted:
-            self._restore_spec_prefix(batch)
+            self._restore_spec_prefix(batch, req=req, prefix=prefix, pages=pages)
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
             finished_out.add(req)
             return
-        if spec is None:
-            raise RuntimeError("MTP spec step returned no payload")
-        if spec["accept"]:
+        ids = spec["ids"]
+        accepted = int(spec["accept"])
+        drafts = len(ids) - 1
+        if accepted == drafts:
             req.complete_one()
-            req.spec_draft = spec.get("draft")
-            tokens = (spec["y1"], spec["y2"])
-            skip_first_append = True
+            req.spec_draft = None
+            tokens = tuple(ids)
+            skip_count = drafts
         else:
-            # The scratch slot holds the state AFTER row 0, so a reject commits one
-            # input token and can verify again without re-running the main model.
-            self._restore_spec_prefix(batch)
-            self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
-            req.input_ids[req.device_len - 1] = spec["y1"]  # the staged draft slot
-            req.spec_draft = spec.get("draft")
-            tokens = (spec["y1"],)
-            skip_first_append = True
-        # The tally runs last because it can end the draft: a request that trips the
-        # low-acceptance floor is turned off through _spec_reject, which frees the scratch
-        # slot the rollback above restores FROM. Doing it first hands the pool a None index
-        # (a shape error out of the GDN copy, on the engine stream, mid-decode).
-        if batch.spec_mode == "verify":
-            self._tally_verify(req, bool(spec["accept"]))
-        if debug_traced():
+            # The state after row 0 is exact, but no later row was saved. Keep the verified
+            # first token and discard the rest (all-or-nothing per request).
+            self._restore_spec_prefix(batch, req=req, prefix=prefix, pages=pages)
+            self.token_pool[req.table_idx, req.device_len - 1] = ids[0]
+            req.input_ids[req.device_len - 1] = ids[0]
+            req.spec_draft = None
+            tokens = (ids[0],)
+            skip_count = 1
+        self._tally_lookup_verify(req, accepted, drafts)
+        if lookup_debug():
             logger.info_rank0(
-                f"[mtp] {batch.spec_mode} accept={spec['accept']} y1={spec['y1']} "
-                f"y2={spec.get('y2')} draft={spec.get('draft')} emit={tokens} "
-                f"lens=({req.cached_len},{req.device_len}) host={req.input_ids.tolist()[-4:]}"
+                f"[lookup] verify uid={req.uid} accept={accepted}/{drafts} "
+                f"emit={tokens} lens=({req.cached_len},{req.device_len})"
             )
+        self._emit_spec_tokens(req, tokens, skip_count, reply, finished_out)
+
+    def _emit_spec_tokens(self, req: Req, tokens: tuple, skip_count: int,
+                          reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
         finished = False
         for tok_i, tok in enumerate(tokens):
-            if not (tok_i == 0 and skip_first_append):
+            if tok_i >= skip_count:
                 req.append_host(torch.tensor([tok], dtype=torch.int32))
-            hit_length = not req.can_decode
+            # device_len already covers every emitted token (complete_one reserved the bonus),
+            # so "no room left" only means the LAST token hit the budget. Testing it per token
+            # would drop the rest of a verify that exactly fills max_tokens.
+            hit_length = tok_i == len(tokens) - 1 and not req.can_decode
             hit_eos = not req.sampling_params.ignore_eos and tok in self.eos_token_ids
             matched_stop = (
                 self._match_stop_str(req)
@@ -1960,6 +2240,63 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
             finished_out.add(req)
+
+    def _drain_spec_single(self, batch: Batch, spec: dict | None,
+                           reply: List[DetokenizeMsg], finished_out: Set[Req]) -> None:
+        """Single-request drain (MTP, or one-request lookup)."""
+        req = batch.reqs[0]
+        if req in self.finished_reqs:
+            return
+        if req.aborted:
+            self._restore_spec_prefix(batch)
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            finished_out.add(req)
+            return
+        if spec is None:
+            raise RuntimeError("MTP spec step returned no payload")
+        source = getattr(batch, "spec_source", "mtp")
+        if source == "lookup":
+            ids = spec["ids"]
+            accepted = int(spec["accept"])
+            drafts = len(ids) - 1
+            if accepted == drafts:
+                req.complete_one()
+                req.spec_draft = None
+                tokens = tuple(ids)
+                skip_count = drafts
+            else:
+                self._restore_spec_prefix(batch)
+                self.token_pool[req.table_idx, req.device_len - 1] = ids[0]
+                req.input_ids[req.device_len - 1] = ids[0]
+                req.spec_draft = None
+                tokens = (ids[0],)
+                skip_count = 1
+            self._tally_lookup_verify(req, accepted, drafts)
+        elif spec["accept"]:
+            req.complete_one()
+            req.spec_draft = spec.get("draft")
+            tokens = (spec["y1"], spec["y2"])
+            skip_count = 1
+        else:
+            # The scratch slot holds the state AFTER row 0, so a reject commits one
+            # input token and can verify again without re-running the main model.
+            self._restore_spec_prefix(batch)
+            self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
+            req.input_ids[req.device_len - 1] = spec["y1"]
+            req.spec_draft = spec.get("draft")
+            tokens = (spec["y1"],)
+            skip_count = 1
+        if batch.spec_mode == "verify" and source != "lookup":
+            self._tally_verify(req, bool(spec["accept"]))
+        if debug_traced() or (source == "lookup" and lookup_debug()):
+            logger.info_rank0(
+                f"[{source}] {batch.spec_mode} accept={spec.get('accept')} "
+                f"y1={spec.get('y1')} y2={spec.get('y2')} draft={spec.get('draft')} "
+                f"emit={tokens} lens=({req.cached_len},{req.device_len}) "
+                f"host={req.input_ids.tolist()[-4:]}"
+            )
+        self._emit_spec_tokens(req, tokens, skip_count, reply, finished_out)
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.

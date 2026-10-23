@@ -60,7 +60,13 @@ def _setup(req, mode="verify", pages=None):
         finished_reqs=set(),
     )
     req.spec_slot_idx = 3
-    sched._restore_spec_prefix = lambda b: Scheduler._restore_spec_prefix(sched, b)
+    sched._restore_spec_prefix = lambda b, **kw: Scheduler._restore_spec_prefix(sched, b, **kw)
+    sched._drain_spec_single = lambda b, sp, r, f: Scheduler._drain_spec_single(
+        sched, b, sp, r, f
+    )
+    sched._emit_spec_tokens = lambda req, toks, skip, r, f: Scheduler._emit_spec_tokens(
+        sched, req, toks, skip, r, f
+    )
     sched._count_spec_rejection = lambda reason, r=None: Scheduler._count_spec_rejection(sched, reason, r)
     sched._log_spec_decline = lambda reason, r: Scheduler._log_spec_decline(sched, reason, r)
     sched._decline_detail = lambda r: Scheduler._decline_detail(sched, r)
@@ -131,16 +137,17 @@ def test_eos_on_the_first_token_drops_the_bonus_and_finishes():
 
 def test_length_finish_on_the_second_token():
     req = Req(input_ids=torch.arange(P + 2, dtype=torch.int32), table_idx=0,
-              cached_len=P, output_len=0, uid=7,
+              cached_len=P, output_len=1, uid=7,
               sampling_params=SamplingParams(temperature=0.0), cache_handle=None)
-    # max_device_len = P+2: the staged draft already exhausts the budget, so the
-    # accept's complete_one leaves no room and the first emitted token finishes
+    # max_device_len = P+3, so both accepted tokens fit and only the bonus (the second
+    # emitted token) exhausts the budget. device_len already includes the staged draft.
     req.device_len = P + 2
     sched, batch, _calls, _pool = _setup(req)
     reply, finished = _drain(sched, batch,
                              {"y1": 41, "y2": 42, "accept": True, "draft": 77})
-    assert [m.next_token for m in reply] == [41]
-    assert reply[0].finished and reply[0].finish_reason == "length"
+    assert [m.next_token for m in reply] == [41, 42]
+    assert [m.finished for m in reply] == [False, True]
+    assert reply[-1].finish_reason == "length"
     assert req in finished
 
 

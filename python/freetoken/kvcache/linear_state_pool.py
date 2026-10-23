@@ -336,18 +336,26 @@ def _linear_pp_reserve(config) -> int:
 
 
 def _linear_spec_reserve(config) -> int:
-    """Slots held back for MTP speculative scratch: one per running request.
+    """Slots held back for speculative scratch.
 
     A verify clones the live slot into a scratch slot before the accept decision (the
-    scheduler clones once and keeps it across steps), so a full batch of spec-eligible
-    requests needs one spare slot each ON TOP of the sizing below. Without the reserve
-    the alloc lands in the middle of a decode step, where the scheduler has no clean way
-    back out and the whole step dies."""
-    if getattr(config, "speculative", "none") != "mtp":
+    scheduler clones once and keeps it across steps), so the pool needs a spare on top of
+    the sizing below. MTP still reserves one per running request.
+
+    Lookup reserves **no** slot: its scratch slots are allocated opportunistically from the
+    pool's spare snapshots at verify time and the batch falls back to regular decoding if one
+    is unavailable. A fixed reserve shrinks the GDN pool even at four-way concurrency, where
+    the default lookup ceiling does not verify at all -- the same fixed-cost mistake as the
+    old max_running_req reserve. The pool keeps enough spare capacity at normal occupancy
+    (measured 7/22 slots at four running requests) for the one- or two-request verify."""
+    backend = getattr(config, "speculative", "none")
+    if backend not in ("mtp", "lookup"):
         return 0
     model_config = getattr(config, "model_config", None)
     if model_config is None or model_config.linear_attention_group() is None:
         return 0  # no GDN state pool, so no scratch slot to reserve
+    if backend == "lookup":
+        return 0
     return config.max_running_req
 
 
@@ -355,8 +363,8 @@ def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix steady-state peak is 2 slots per running
     request (1 live + 1 committed snapshot locked through decode); the chunk-track
     ping-pong pair rides a shared reserve sized by _linear_pp_reserve (returned at the
-    decode transition), plus a cross-request snapshot cache, the MTP scratch reserve and
-    a padding sink. Naive GDN keeps the old (max_running_req + 1)."""
+    decode transition), plus a cross-request snapshot cache, the speculative scratch reserve
+    and a padding sink. Naive GDN keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
     reserve = _linear_spec_reserve(config)
     if config.cache_type != "hybrid_radix":

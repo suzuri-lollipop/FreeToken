@@ -294,10 +294,11 @@ def test_linear_state_pool_prices_itself():
     assert state_pool_bytes(config) == 0
 
 
-def test_mtp_scratch_reserve_is_priced_into_the_state_pool():
-    """--speculative mtp clones one GDN slot per running request per verify, so the reserve
-    has to show up in the slot count, in the floor a rebuild refuses to go below, and in the
-    byte estimate the budget plans with (state_pool_bytes follows the slot count)."""
+def test_spec_scratch_reserve_is_priced_into_the_state_pool():
+    """MTP clones one GDN slot per running request per verify; lookup reserves no slot because
+    its scratch is opportunistic. MTP's reserve has to show up in the slot count, in the floor
+    a rebuild refuses to go below, and in the byte estimate the budget plans with
+    (state_pool_bytes follows the slot count); lookup must leave the plain pool untouched."""
     from freetoken.kvcache.linear_state_pool import (
         _linear_pool_min_slots, _linear_pool_num_slots, _linear_spec_reserve, state_pool_bytes,
     )
@@ -325,6 +326,15 @@ def test_mtp_scratch_reserve_is_priced_into_the_state_pool():
         assert _linear_pool_min_slots(mtp) == _linear_pool_min_slots(plain) + 4
         # the VRAM estimate follows, so the KV budget shrinks instead of the pool
         assert state_pool_bytes(mtp) > state_pool_bytes(plain)
+        lookup = cfg(cache_type)
+        lookup.speculative = "lookup"
+        # lookup takes its scratch from the pool's spare snapshots at verify time; a fixed
+        # reserve shrank the GDN pool even when the default ceiling means no verify at four
+        # running requests (the old max_running_req reserve was the 22 -> 26 slot difference).
+        assert _linear_spec_reserve(lookup) == 0
+        assert _linear_pool_num_slots(lookup) == _linear_pool_num_slots(plain)
+        assert _linear_pool_min_slots(lookup) == _linear_pool_min_slots(plain)
+        assert state_pool_bytes(lookup) == state_pool_bytes(plain)
     # a model with no GDN state has nothing to reserve
     no_linear = cfg("hybrid_radix")
     no_linear.speculative = "mtp"

@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
+    from freetoken.engine.lookup import LookupState
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -82,6 +83,10 @@ class Req:
     # Pending draft token id (host int) predicted for the position after the current input
     # token; None until the head has produced one.
     spec_draft: int | None = None
+    # --speculative lookup: the per-request suffix index and acceptance gate. Built on the first
+    # eligible decode step from the committed prefix; None until then, and again once the gate
+    # switches the request off.
+    lookup: "LookupState | None" = None
     # Permanently disables spec for this request: non-greedy sampling under the kill switch, an
     # image row, a stash that cannot cover the prompt (only with cold start off), or the
     # acceptance floor with FREETOKEN_MTP_RESUME_AFTER=0. Regular decoding continues untouched.
@@ -141,6 +146,11 @@ class Req:
         assert m <= self.max_device_len
         self._ids_buf[n:m] = next_token
         self.input_ids = self._ids_buf[:m]
+
+    def truncate_host(self, n: int) -> None:
+        """Drop staged speculative rows from the host view after a partial accept."""
+        assert n <= self.input_ids.numel()
+        self.input_ids = self._ids_buf[:n]
 
     @property
     def can_decode(self) -> bool:
@@ -207,8 +217,18 @@ class Batch:
     # None for regular batches; prologue_decode catches up head KV from the prompt
     # residuals, then verify processes [last placed token, draft] in one main forward.
     spec_mode: str | None = field(default=None, init=False)
+    # "mtp" for the checkpoint's draft head, "lookup" for the prompt-lookup drafter. The
+    # two-row verify and the drain are shared; only the draft source differs.
+    spec_source: str = field(default="mtp", init=False)
     # "verify" only: the host draft id under test (the engine's accept decision input).
     spec_draft_id: int = field(default=-1, init=False)
+    # Lookup only: every staged draft, in order (spec_draft_id is the first, for logs), and the
+    # cached length before staging (the rollback target on a partial accept).
+    spec_draft_ids: tuple[int, ...] = field(default=(), init=False)
+    spec_prefix_len: int = field(default=0, init=False)
+    # Multi-request lookup: one entry per upgraded request, each {"req", "drafts", "prefix"}.
+    # Single-request and MTP batches leave this None.
+    spec_items: list | None = field(default=None, init=False)
     # Non-greedy MTP: verify runs rejection sampling against the head's carried-over density
     # instead of comparing ids. Set by the scheduler alongside spec_mode.
     spec_sample: bool = field(default=False, init=False)

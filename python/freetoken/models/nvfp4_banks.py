@@ -36,7 +36,19 @@ def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
 def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
-    return tensor.to(torch.float16)
+    out = tensor.to(torch.float16)
+    # The banks keep globals in fp16. Real ModelOpt globals reach ~2e-5 (fp16 subnormal:
+    # degraded but usable; fp32 banks are the fix, not refusal), so only refuse the hard
+    # failures: overflow to inf/nan, or a nonzero scale flushing to zero (Strata measured
+    # 2-12% output errors when globals land past the FP16 range).
+    bad = ~torch.isfinite(out) | ((out == 0) != (tensor == 0))
+    if bool(bad.any()):
+        src = tensor.float().abs()
+        raise ValueError(
+            f"{spec.desc}: {int(bad.sum())} weight_scale_2 value(s) outside the fp16 range "
+            f"(source |min|={src.min().item():.3e}, |max|={src.max().item():.3e})"
+        )
+    return out
 
 
 def _num_moe_layers(config) -> int:

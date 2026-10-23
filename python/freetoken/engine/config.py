@@ -208,8 +208,11 @@ class EngineConfig:
             from freetoken.models.qwen4_exp.config import extend_config_for_mtp
 
             model_config = extend_config_for_mtp(model_config)
-        elif self.speculative != "none":
-            raise ValueError(f"unknown --speculative backend {self.speculative!r} (none | mtp)")
+        elif self.speculative not in ("none", "lookup"):
+            # "lookup" needs no model change: its drafts come from the request's own text.
+            raise ValueError(
+                f"unknown --speculative backend {self.speculative!r} (none | mtp | lookup)"
+            )
         return model_config
 
     @cached_property

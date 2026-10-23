@@ -32,6 +32,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig, mtp_cold_start, mtp_stash_budget, tp_preflight_error
 from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
 from .graph import GraphRunner, get_free_memory
+from .lookup import lookup_debug
 from .sample import BatchSamplingArgs, Sampler
 from .spec_sample import debug_traced, sampled_graph_enabled, spec_supported
 from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
@@ -2139,6 +2140,66 @@ class Engine:
         return runner.graph is not None
 
     @torch.inference_mode()
+    def _forward_lookup(self, batch: Batch) -> ForwardOutput:
+        """Prompt-lookup verify (--speculative lookup): 1 + K rows per request, no draft head.
+
+        Row 0 is the last placed token, rows 1..K the suffix drafter's proposal. The target's
+        argmax at each row decides the accept; a full hit also emits row K's next token as the
+        bonus. Unlike MTP there is no head pass and no residual: the next draft is looked up
+        from the text the drain just committed, so this path works on any checkpoint.
+
+        A multi-request verify is one extend batch whose sequences each carry their own draft
+        width; ``spec_items`` names them in row order. The GDN/PLE snapshot takes the first row
+        of each sequence, so every request can roll back independently.
+        """
+        model = self.model
+        assert batch.spec_mode == "verify", "lookup step shape"
+        items = getattr(batch, "spec_items", None)
+        if not items:
+            drafts = batch.spec_draft_ids or (batch.spec_draft_id,)
+            items = [{"req": batch.reqs[0], "drafts": tuple(drafts)}]
+        debug = lookup_debug()
+        if debug:
+            import time as _time
+
+            _t0 = _time.perf_counter()
+        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
+            mixed, _residual = model.model.forward_with_residual(batch.input_ids, batch)
+            logits = model.greedy_ids(mixed)
+            vals = logits.tolist()
+        if _deferred_fill is not None:
+            self._pending_host_fill = _deferred_fill
+
+        payloads = []
+        next_ids = []
+        offset = 0
+        for item in items:
+            drafts = tuple(item["drafts"])
+            rows = vals[offset:offset + len(drafts) + 1]
+            offset += len(drafts) + 1
+            accept = 0
+            while accept < len(drafts) and rows[accept] == drafts[accept]:
+                accept += 1
+            full = accept == len(drafts)
+            # On a full hit row K is the target's bonus token; on a miss row 0 is the
+            # committed token. The drain uses these ids; next_tokens is only staging.
+            next_ids.append(rows[len(drafts)] if full else rows[0])
+            payloads.append({"ids": rows, "accept": accept, "full": full,
+                             "y1": rows[0], "y2": rows[1] if len(rows) > 1 else None})
+            if debug:
+                logger.info_rank0(
+                    f"[lookup-t] verify req={item['req'].uid} "
+                    f"pre={(_time.perf_counter() - _t0) * 1e3:.1f}ms "
+                    f"drafts={drafts} accept={accept}/{len(drafts)} vals={rows[:4]}"
+                )
+        next_tokens_gpu = torch.tensor(next_ids, dtype=torch.int32, device=self.device)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        payload = payloads[0] if len(payloads) == 1 else {"items": payloads}
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
+
+    @torch.inference_mode()
     def _forward_spec(self, batch: Batch) -> ForwardOutput:
         """MTP spec step (single request, greedy or rejection-sampled; --speculative mtp).
 
@@ -2152,6 +2213,8 @@ class Engine:
         keeps it eager). Eager fallbacks: :meth:`_spec_sampled_step`, and the prologue/seed
         steps which are variable-length and never captured.
         """
+        if getattr(batch, "spec_source", "mtp") == "lookup":
+            return self._forward_lookup(batch)
         model = self.model
         req = batch.reqs[0]
         assert len(batch.reqs) == 1, "spec steps run a single request"

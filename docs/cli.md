@@ -162,7 +162,15 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
-### Speculative decoding (MTP)
+### Speculative decoding (MTP and prompt lookup)
+
+Two drafters share one two-row verify. `--speculative mtp` builds the checkpoint's MTP head and
+drafts the next token with it; `--speculative lookup` has no weights and drafts the token that
+followed the last earlier occurrence of the current suffix (Strata's prompt lookup). Both verify the
+draft inside the same forward, so one step costs two target rows and emits one or two tokens, and
+greedy output stays token-identical to non-speculative decoding.
+
+#### MTP
 
 `--speculative mtp` builds the checkpoint's MTP head, drafts the next token with it and verifies the
 draft inside the same forward, so one step costs two target rows and emits one or two tokens. Only a
@@ -265,6 +273,69 @@ What to read when MTP appears to do nothing:
   `cold_seeds` that had no catch-up pass behind them), and `spec` is `null` when speculative
   decoding is off -- which is how "not enabled" and "enabled, and nothing ever qualified" tell each
   other apart without reading a log.
+
+#### Prompt lookup
+
+`--speculative lookup` needs no draft head, so it serves any text checkpoint and any quantization.
+The drafter is the user's own history: every trigram in the prompt plus the accepted output is
+indexed with its four most recent end positions; the longest earlier occurrence of the current
+suffix (at least 3 tokens, extended backwards up to 32) proposes the tokens that followed it (up
+to `FREETOKEN_LOOKUP_MAX_DRAFT`). That is
+the mechanism Strata ships as `--suffix-draft`, and it is most useful exactly where MTP is weakest:
+code edits, refactors, quoted patches and repeated boilerplate.
+
+Two constraints come from the verify path, not from the drafter:
+
+- **Greedy only.** A lookup draft is a token id, with no density to rejection-sample against, so a
+  sampled request is declined (`nongreedy`) rather than verified incorrectly. Greedy verification
+  compares ids and every emitted token is the target's argmax for its position.
+- **All-or-nothing at width K.** Each verified request is an extend of `1 + K` rows (`K =
+  FREETOKEN_LOOKUP_MAX_DRAFT`, default 4) and its GDN/PLE state saved for rollback is the one
+  after row 0. A full hit emits all K drafts plus the target's next token; a partial hit keeps
+  only the first verified token and discards the rest, then decodes on from there. Saving a state per row (which
+  would let a partial hit keep `r` tokens) is the next step if the discarded work ever matters.
+
+Lookup reserves **no** fixed GDN scratch slot: it takes one (or, for a two-request verify, two)
+slots from the pool's spare snapshots at verify time and keeps the regular step if none is free.
+The batch path therefore stays at the no-spec slot count. Reserving `--max-running-requests` slots
+added unused state-pool bytes and cost 10-12% batch throughput at four requests even with zero
+verifies. `FREETOKEN_LOOKUP_MAX_BATCH` (default 2) caps how many requests one verify upgrades.
+
+Width matters more than it looks. At depth 1 a verify is two target rows and measured 2.13 decode
+steps, so even acceptance 1.0 cannot pay for it. A wider extend amortizes the fixed per-step cost:
+on 2x RTX PRO 4000 Blackwell with Qwen3.8-Flash-Next NVFP4, a 2.4K-token copy-heavy code edit
+(979 greedy output tokens, warm prefix cache, two runs) measured 59.6 tok/s plain and 84.0 with
+four drafts (+41%, acceptance 0.86 per draft, 3.3 tokens per step); prose copy went 53.8 -> 70.3
+(+31%). A creative haiku prompt with almost no repeats is the reason for the 256-token context
+floor: drafting its 32-token prompt cost ~7%, while disallowing it leaves that request at baseline
+speed. Three drafts measured +20% on the code edit and five was within noise of four on code
+(slightly better on prose); four is the default because it keeps the discarded work and the gate's
+sample size smaller. The gain grows with context (the decode step it replaces is longer) and
+disappears on text that does not repeat, where the drafter rarely proposes and the gate turns the
+request off. A 2,000-token greedy code edit produced byte-identical output in both arms.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `FREETOKEN_LOOKUP_MIN_MATCH` | 3 | Shortest suffix match that may propose; lower matches too often to be evidence |
+| `FREETOKEN_LOOKUP_MAX_MATCH` | 32 | How far back a match may be extended to beat a newer shorter one |
+| `FREETOKEN_LOOKUP_MIN_CONTEXT` | 256 | Placed tokens required before drafting starts; below this the decode step is cheap enough that the wide verify loses. Not a decline: a request that grows past it starts drafting |
+| `FREETOKEN_LOOKUP_CAPACITY` | 131072 | Unique trigrams indexed per request; once full, new suffixes stop being indexed but known trigrams still draft (the table is memory-bounded, ~one dict entry per token) |
+| `FREETOKEN_LOOKUP_MAX_DRAFT` | 4 | Drafts staged per verify (`K`); the verify extends `1 + K` rows |
+| `FREETOKEN_LOOKUP_MAX_BATCH` | 2 | Largest decode batch one verify upgrades. 1 keeps the old single-request gate; 2 (default) verifies two requests together; larger batches fall back to plain decoding |
+| `FREETOKEN_LOOKUP_ACCEPT_WINDOW` | 128 | Drafts per gate window (floor 8), i.e. 32 verifies at the default width |
+| `FREETOKEN_LOOKUP_MIN_ACCEPTANCE` | 0.8 | Below this per-draft acceptance in one window the request stops drafting for good; `0` disables the check. With four drafts and a ~2.4-step verify the payout is `1 + 4p^4`, so break-even is `p ~= 0.77`; long contexts can lower it |
+| `FREETOKEN_LOOKUP_DEBUG` | off | Per-step `[lookup]` accept/reject and `[lookup-t]` verify timing; reads the value for truth, so `0` is off |
+
+The width is the one value that most needs measuring on the machine that will serve: run
+`ft calibrate` (see [calibration.md](calibration.md)) to sweep it with the minimum match, the
+context floor, the acceptance floor and the number of parallel requests, and to write a launch JSON
+and start script with the values that won there.
+
+Declines are the MTP terminal ones minus the head-specific reasons: `nongreedy`, `mm`, `no_room`,
+`exhausted` (no GDN scratch slot) and `low_acceptance`; a request with no repeated suffix is not
+counted. `Lookup spec: enabled ...` at start-up names the rules, the tally line reads
+`Lookup spec: acceptance <a>/<n> = <rate>`, and `GET /v1/stats` reports the same counters with
+`"backend": "lookup"` under `spec`.
 
 ### API behaviour
 

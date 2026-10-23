@@ -83,10 +83,17 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     track = _build_track_metadata(reqs, cu_host, device, pin)
     spec_indices = None
     if getattr(batch, "spec_mode", None) == "verify":
-        assert len(reqs) == 1 and lens == [2]
-        spec_indices = torch.tensor(
-            [reqs[0].spec_slot_idx], dtype=torch.int64, **pin
-        ).to(device, non_blocking=True)
+        # A verify extends each upgraded request by its last placed token plus K drafts; the
+        # decode kernel walks every sequence and snapshots the state after its first token.
+        assert reqs and all(n >= 2 for n in lens), (len(reqs), lens)
+        # A lookup verify on a non-hybrid model has no linear state to save; only hybrid
+        # checkpoints allocate the scratch slot (MTP always has one).
+        slots = [r.spec_slot_idx for r in reqs]
+        if any(s is not None for s in slots):
+            assert all(s is not None for s in slots), slots
+            spec_indices = torch.tensor(slots, dtype=torch.int64, **pin).to(
+                device, non_blocking=True
+            )
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

@@ -79,6 +79,10 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Lookup can verify up to this many requests in one extend batch. 1 keeps the old
+    # one-request gate; 2 enables the multi-request path (default). Scratch slots are
+    # allocated opportunistically at verify time, never reserved from this value.
+    LOOKUP_MAX_BATCH = EnvInt(2)
 
     def __new__(cls):
         # single instance
