@@ -955,6 +955,7 @@ class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
     ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
+        "flint": ThinkReasoningParser,
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": ThinkReasoningParser,

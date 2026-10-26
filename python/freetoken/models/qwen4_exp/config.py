@@ -43,6 +43,8 @@ class Qwen4ExpArgs:
     index_budget: int
     index_ratio: int
     image_token_id: int | None = None
+    # GGUF stores ssm_out with its value-head columns in llama.cpp's tiled order
+    gdn_out_heads_tiled: bool = False
     # MTP speculative head (text_config.mtp). Record-only: 0 layers when the block is
     # absent, and nothing is built until speculative serving opts in. The head shares
     # embed/lm_head and adds full_attention layers at indices [num_layers, ...).

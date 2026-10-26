@@ -4,7 +4,6 @@ import os
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, nvtx_annotate
@@ -21,8 +20,12 @@ def set_w8a16_embed_default(enabled: bool) -> None:
 
 
 class VocabParallelEmbedding(BaseOP):
-    # Module-level W8A16 default, resolved from --no-embed-fp8 by the engine before the
-    # model is built (embeddings have no config handle to consult).
+    """The vocab table, sharded over TP: its ``quant_method`` owns the table, looks rows up, and serves a tied LM head's product."""
+
+    quant_layer_kind = LayerKind.EMBEDDING
+
+    # W8A16 default for the input table, resolved from --no-embed-fp8 by the engine
+    # before the model is built (the embedding has no config handle to consult).
     _W8A16_EMBED_DEFAULT = True
 
     def __init__(
@@ -30,6 +33,9 @@ class VocabParallelEmbedding(BaseOP):
         num_embeddings: int,
         embedding_dim: int,
         embed_scale: float | None = None,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         tp_info = get_tp_info()
@@ -40,7 +46,12 @@ class VocabParallelEmbedding(BaseOP):
         start_idx = self.num_embeddings_tp * tp_rank
         finish_idx = min(start_idx + self.num_embeddings_tp, num_embeddings)
         self.vocab_range = (start_idx, finish_idx - start_idx)
-        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim)
+        self.embedding_dim = embedding_dim
+        # the LM head subclass is a linear and builds its own method
+        self.quant_method = None
+        if self.quant_layer_kind is LayerKind.EMBEDDING:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            self.quant_method.create_weights(self)
         # Gemma scales embeddings by sqrt(hidden_size). The scale is materialized in
         # the weight dtype (bf16) to match HF, which downcasts the scalar. The GPU
         # scalar is built lazily (model __init__ runs on the meta device) and cached
@@ -54,61 +65,20 @@ class VocabParallelEmbedding(BaseOP):
         # expert slot cache. The decode gather then reads one fp8 row per token and
         # dequantizes on the fly -- the absolute byte saving per token is tiny (2 rows'
         # worth), so this is a MISS-byte / slot-capacity lever, not an embed-read lever.
+        # The indexing kernel owns the rewrite; the attributes live here so they exist
+        # on the meta device too, before any kernel looks at them.
         self.w8a16_embed_ok = VocabParallelEmbedding._W8A16_EMBED_DEFAULT
         self._w8a16_weight: torch.Tensor | None = None
         self._w8a16_scale: torch.Tensor | None = None
         self._w8a16_dtype: torch.dtype = torch.bfloat16
 
     def finalize(self) -> None:
-        """Quantize the input-embedding table to per-row fp8-e4m3 and drop the bf16 master.
-
-        Reuses the linear W8A16 quantizer: for a [vocab, hidden] table the per-row axis is
-        the hidden dim, exactly matching its per-output-channel semantics. Prefill gathers
-        also dequantize on the fly (the whole table is rewritten only once at load)."""
-        if not self.w8a16_embed_ok or self.weight is None or not self.weight.is_cuda:
-            return
-        from freetoken.kernel.triton.w8a16_linear import quantize_weight_w8a16
-        from freetoken.utils import init_logger
-
-        if not _EMBED_LOGGED[0]:
-            _EMBED_LOGGED[0] = True
-            init_logger(__name__).info_rank0("W8A16 embed: input-embedding table quantized to fp8")
-        self._w8a16_dtype = self.weight.dtype
-        w8, scale = quantize_weight_w8a16(self.weight)
-        self._w8a16_weight = w8
-        self._w8a16_scale = scale  # [V] fp32, gathered 1-D then unsqueezed in forward
-        self.weight = None
+        if self.quant_method is not None:
+            self.quant_method.finalize(self)
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel import indexing
-
-        if self._w8a16_weight is not None:
-            # Gather the fp8 rows, then dequantize with the per-row scale. The scale is
-            # gathered 1-D with plain torch indexing (the JIT `indexing` kernel rejects
-            # 4-byte rows); its vocab_range mask mirrors index.cu's, then it is unsqueezed
-            # to broadcast against the row gather.
-            w8 = indexing(
-                weights=self._w8a16_weight,
-                indices=x,
-                vocab_range=self.vocab_range if self.tp_size > 1 else None,
-            )
-            if self.tp_size > 1 and self.vocab_range is not None:
-                start, length = self.vocab_range
-                local = x.long() - start
-                valid = (local >= 0) & (local < length)
-                s = self._w8a16_scale[local.clamp(0, self._w8a16_scale.shape[0] - 1)]
-                s = s.masked_fill(~valid, 0.0)
-            else:
-                s = self._w8a16_scale[x.long()]
-            y = (w8.float() * s[:, None]).to(self._w8a16_dtype)
-        else:
-            y = indexing(
-                weights=self.weight,
-                indices=x,
-                vocab_range=self.vocab_range if self.tp_size > 1 else None,
-            )
-
+        y = self.quant_method.embed(self, x)
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
         if self._embed_scale is not None:
@@ -145,7 +115,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.in_features = embedding_dim
         self.out_features = self.num_embeddings_tp
         self.output_sizes = (self.num_embeddings_tp,)
-        self.quant_method = None
         # W8A16 opt-in for the UNTIED head: it is the largest bf16 decode read on the
         # rank (vocab/tp x hidden), and its fp8 replacement frees ~0.3 GiB straight
         # into the expert slot cache. Sampled forward only ever sees M <= running
@@ -198,13 +167,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Logit columns of this rank's vocab shard, for any number of rows.
 
         Goes through the head's own projection: an untied head's weight is replaced by
-        its fp8 form in :meth:`finalize` (leaving ``weight`` as None), so a caller must
-        never multiply against ``weight`` directly. Speculative decoding reaches for
-        this with more rows than the running batch, which is why it sits outside
-        :meth:`forward`'s last-token selection.
+        its fp8 form in ``finalize`` (leaving ``weight`` as None), and a tied head's
+        table belongs to the input embedding's method, so a caller must never multiply
+        against ``weight`` directly. Speculative decoding reaches for this with more
+        rows than the running batch, which is why it sits outside :meth:`forward`'s
+        last-token selection.
         """
         if self.tied_embedding is not None:
-            return F.linear(x, self.tied_embedding.weight, self.bias)
+            method = getattr(self.tied_embedding, "quant_method", None)
+            if method is not None:
+                return method.logits(self.tied_embedding, x, self.bias)
+            # a table with no method (a meta-device stub, a plain nn.Embedding) multiplies directly
+            return torch.nn.functional.linear(x, self.tied_embedding.weight, self.bias)
         return self.quant_method.apply(self, x)
 
     @nvtx_annotate("LMHead")

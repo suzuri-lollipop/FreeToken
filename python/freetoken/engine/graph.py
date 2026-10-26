@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import functools
 import gc
 import os
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
@@ -123,6 +126,30 @@ def _determine_cuda_graph_bs(
 
 def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
+
+
+@functools.cache
+def _cu_graph_upload():
+    if sys.platform != "linux" or torch.version.hip is not None:
+        return None
+    fn = ctypes.CDLL("libcuda.so.1").cuGraphUpload
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
+    """Upload the graph at capture time.
+
+    Otherwise the first replay pushes every node behind the graph's own stream WAIT, and a large graph then blocks cudaGraphLaunch until the WAIT is released. PLE wait-sync releases it only after the launch returns, so that deadlocks.
+    """
+    upload = _cu_graph_upload()
+    if upload is None:
+        return
+    rc = upload(graph.raw_cuda_graph_exec(), stream.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"cuGraphUpload failed with CUresult {rc}")
+    stream.synchronize()
 
 
 class GraphRunner:
@@ -303,6 +330,9 @@ class GraphRunner:
                     # CUDA graph capture to replay cold-cache expert copies.
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                         self.buffer.logits[:bs] = model.forward()
+                    # Upload at capture time: otherwise the first replay pushes every node
+                    # behind the graph's own stream WAIT and a large graph blocks launch.
+                    _upload_graph(graph, self.stream)
                     self._reset_moe_offload_cache()
             finally:
                 if dual:

@@ -122,7 +122,12 @@ def test_spec_snapshot_matches_one_token_ple_and_ngram_state():
     context = torch.tensor([[7, 8], [11, 12], [13, 14], [15, 16]])
     context_before = context.clone()
     meta = _meta([[21, 22]], [[7, 8]], slots=[0])
-    fla = SimpleNamespace(spec_state_indices=torch.tensor([2]), track_boundary_row=None)
+    fla = SimpleNamespace(
+        spec_state_indices=torch.tensor([2]),
+        track_boundary_row=None,
+        # the spec verify pass hands over its query indptr; one query here
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+    )
     batch = SimpleNamespace(fla_metadata=fla)
     got = layer.forward(residual, batch, meta, states)
     commit_ngram_context(meta, fla, context)

@@ -102,8 +102,8 @@ def test_modelopt_dialect_pieces_are_bit_exact(tmp_path, monkeypatch):
     for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
         assert torch.equal(piece[role][0], raw[f"{base}.{proj}.weight"])
         assert torch.equal(piece[f"{role}_scale"][0], raw[f"{base}.{proj}.weight_scale"])
-        expected = raw[f"{base}.{proj}.weight_scale_2"].reshape(-1).to(torch.float16)
-        assert piece[f"{role}_global"].dtype is torch.float16
+        expected = raw[f"{base}.{proj}.weight_scale_2"].reshape(-1).to(torch.float32)
+        assert piece[f"{role}_global"].dtype is torch.float32
         assert torch.equal(piece[f"{role}_global"].reshape(-1), expected)
     # per-projection globals stay separate (no cross-wiring, no folding into weights)
     assert piece["gate_global"].item() != piece["up_global"].item() != piece["down_global"].item()
@@ -124,7 +124,7 @@ def test_ct_dialect_reciprocal_is_bit_exact(tmp_path, monkeypatch):
     for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
         assert torch.equal(piece[role][0], raw[f"{base}.{proj}.weight_packed"])
         assert torch.equal(piece[f"{role}_scale"][0], raw[f"{base}.{proj}.weight_scale"])
-        expected = (1.0 / raw[f"{base}.{proj}.weight_global_scale"].float()).reshape(-1).to(torch.float16)
+        expected = (1.0 / raw[f"{base}.{proj}.weight_global_scale"].float()).reshape(-1)
         assert torch.equal(piece[f"{role}_global"].reshape(-1), expected)
 
 
@@ -137,32 +137,3 @@ def test_missing_expert_tensor_is_refused(tmp_path, monkeypatch):
     expected = (LAYERS - DENSE) * E * 9
     with pytest.raises(ValueError, match=f"expected {expected}"):
         list(iter_nvfp4_expert_pieces(folder, _config(), spec, primary=False))
-
-
-@pytest.mark.parametrize(
-    "dialect, global_scale",
-    [
-        ("modelopt", 1e30),   # fp32 -> fp16 overflow
-        ("modelopt", 1e-9),   # flushes to zero in fp16
-        ("ct", 1e-30),        # reciprocal overflows fp16
-    ],
-)
-def test_global_scale_out_of_fp16_range_is_refused(tmp_path, monkeypatch, dialect, global_scale):
-    _select(monkeypatch, _MODELOPT_QUANT if dialect == "modelopt" else _CT_QUANT)
-    folder = _folder(tmp_path, _raw(dialect, global_scale=global_scale))
-    spec = nvfp4_expert_spec(folder, _config())
-    with pytest.raises(ValueError, match="fp16"):
-        list(iter_nvfp4_expert_pieces(folder, _config(), spec, primary=False))
-
-
-def test_real_world_subnormal_global_scale_is_accepted(tmp_path, monkeypatch):
-    """nvidia's ModelOpt exports carry weight_scale_2 down to ~2.2e-5 (fp16 subnormal);
-    the guard must not refuse those -- degraded precision, but the checkpoints are real."""
-    _select(monkeypatch, _MODELOPT_QUANT)
-    raw = _raw("modelopt", global_scale=2.17e-5)
-    folder = _folder(tmp_path, raw)
-    spec = nvfp4_expert_spec(folder, _config())
-    by_expert = _pieces_by_expert(iter_nvfp4_expert_pieces(folder, _config(), spec, primary=False))
-    got = by_expert[(0, 0)]["gate_global"].reshape(-1)[0]
-    assert got != 0 and got.dtype is torch.float16
-    assert abs(float(got) - 2.17e-5) / 2.17e-5 < 0.01  # subnormal keeps ~1% precision

@@ -24,16 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Tuple
 
-# Layer-type strings used by the checkpoint's ``layer_types`` field.
+# Layer-type strings after transformers' legacy remap, which renames the checkpoint's deepseek_sparse_attention.
 KDA_LAYER = "linear_attention"
-DSA_LAYER = "deepseek_sparse_attention"
+DSA_LAYER = "indexed_attention"
+# the checkpoint spelling, renamed by transformers' legacy remap on newer releases
+LEGACY_DSA_LAYER = "deepseek_sparse_attention"
 
 
 @dataclass(frozen=True)
 class Glm5NextArgs:
     hidden_size: int
     num_heads: int
-    # ---- MLA (the 11 "deepseek_sparse_attention" layers) ----
+    # ---- MLA (the 11 "indexed_attention" layers) ----
     q_lora_rank: int
     kv_lora_rank: int
     qk_nope_head_dim: int
@@ -119,8 +121,13 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
     are accepted as fallbacks."""
     text = _get(hf_config, "text_config", hf_config)
 
+    from transformers.configuration_utils import remap_legacy_layer_types
+
     num_layers = int(text.num_hidden_layers)
-    layer_types = tuple(_get(text, "layer_types", ()) or ())
+    # transformers renames the checkpoint's legacy spellings in newer releases only;
+    # older ones pass deepseek_sparse_attention through unchanged
+    layer_types = remap_legacy_layer_types(list(_get(text, "layer_types", ()) or ()))
+    layer_types = tuple(DSA_LAYER if t == LEGACY_DSA_LAYER else t for t in layer_types)
     if not layer_types:
         raise ValueError("glm5_next config is missing layer_types")
     if len(layer_types) != num_layers:

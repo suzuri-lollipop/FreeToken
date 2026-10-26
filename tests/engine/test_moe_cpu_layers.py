@@ -127,7 +127,7 @@ def test_disk_tier_no_bank_bytes_never_spills(monkeypatch):
 def test_check_pin_budget_skips_when_disk_absorbs(monkeypatch):
     """A plain offload boot whose banks exceed the pin budget normally stops before
     reading anything; with the disk tier engaged it must be allowed to start."""
-    monkeypatch.setattr(engine_mod, "_bank_bytes", lambda config, method=None: 100)
+    monkeypatch.setattr(engine_mod, "_bank_bytes", lambda config, method=None, layer_methods=None: 100)
     monkeypatch.setattr(engine_mod, "_pin_budget_bytes", lambda reserved=0: 50)
     cfg = _disk_cfg("auto")
     with pytest.raises(ValueError, match="pin budget"):

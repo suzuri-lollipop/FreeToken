@@ -116,6 +116,11 @@ def _elsize(dt: torch.dtype) -> int:
     return torch.empty((), dtype=dt).element_size()
 
 
+def _is_nvfp4_global(name: str) -> bool:
+    m = _LAYER_ENTRY_RE.match(name)
+    return (m["base"] if m else name).endswith(("gate_up_global", "down_global", ".weight_global"))
+
+
 def is_ftw_checkpoint(path: str) -> bool:
     """True if ``path`` is a directory holding a FreeToken Weight (FTW) index."""
     return os.path.isfile(os.path.join(path, INDEX_NAME))
@@ -236,6 +241,12 @@ class FTWReader:
         self.dir = path
         self.shards = sorted(self.index["shards"], key=lambda s: s["global_off"])
         self.tensors = {t["name"]: t for t in self.index["tensors"]}
+        fp16_globals = [n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)]
+        if fp16_globals:
+            raise ValueError(
+                f"{path!r} stores NVFP4 global scales as fp16 (e.g. {fp16_globals[0]!r}) but FreeToken reads them as fp32; "
+                "reconvert it from the source checkpoint with `ft checkpoint`"
+            )
         # An unbuffered read (DMA straight from disk, past the page cache) is the fast path but a
         # perf choice, not a correctness one. POSIX spells it os.O_DIRECT, and some filesystems
         # reject that at open with EINVAL (tmpfs, many overlay/network mounts). Windows has no
@@ -504,11 +515,18 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
 
     mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
     assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
+    # experts of several formats: a layer stores only the banks its kernel reads
+    several = reader.meta("layer_quant_formats") is not None
+    assert not (several and flat_entries), "experts of several formats are stored per layer"
     for base, by_layer in per_layer_groups.items():
-        assert sorted(by_layer) == list(range(num_layers)), (
-            f"FTW bank {base!r} has per-layer entries for layers {sorted(by_layer)}, "
+        layers = sorted(by_layer)
+        assert (set(layers) <= set(range(num_layers))) if several else layers == list(range(num_layers)), (
+            f"FTW bank {base!r} has per-layer entries for layers {layers}, "
             f"expected exactly range({num_layers})"
         )
+    if several:
+        covered = set().union(*(by_layer.keys() for by_layer in per_layer_groups.values()))
+        assert covered == set(range(num_layers)), f"FTW expert banks have no entries for layers {sorted(set(range(num_layers)) - covered)}"
     return bank_entries, alpha_entries, flat_entries, per_layer_groups
 
 
@@ -624,12 +642,17 @@ def load_ftw_banks(
             row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
             row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
 
+    num_experts = next((e["shape"][0] for by_layer in per_layer_groups.values() for e in by_layer.values()), None)
     for base, by_layer in per_layer_groups.items():
         row_hb[base] = []
         row_view_args[base] = []
         file_banks.setdefault(base, [None] * num_layers)
         for layer_id in range(num_layers):
-            e = by_layer[layer_id]
+            e = by_layer.get(layer_id)
+            if e is None:  # experts of several formats: this layer's kernel reads no such bank
+                row_hb[base].append(None)
+                row_view_args[base].append("placeholder")
+                continue
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
             if residency[layer_id] == HostResidency.DISK.value:
                 src = reader.entry_source(e)
@@ -723,10 +746,15 @@ def load_ftw_banks(
         bar.close()
         reader.close()
 
+    from freetoken.moe.offload_cache import placeholder_bank
+
     sources: dict[str, list] = {}
     for name, banks in row_hb.items():
         views = []
         for bank, view_args in zip(banks, row_view_args[name]):
+            if view_args == "placeholder":
+                views.append(placeholder_bank(num_experts))
+                continue
             if view_args is None:  # per-layer entry: already shaped [num_experts, ...]
                 views.append(bank.tensor)
                 continue
@@ -756,6 +784,8 @@ def load_ftw_banks(
     applied = list(residency)
     for banks in row_hb.values():
         for layer_id, bank in enumerate(banks):
+            if bank is None:
+                continue
             if (applied[layer_id] == HostResidency.LOCKED.value
                     and bank.residency is not HostResidency.LOCKED):
                 applied[layer_id] = HostResidency.PAGEABLE.value
@@ -764,7 +794,7 @@ def load_ftw_banks(
         by_layer = [0] * num_layers
         for name, banks in row_hb.items():
             for layer_id, bank in enumerate(banks):
-                by_layer[layer_id] += bank.nbytes
+                by_layer[layer_id] += bank.nbytes if bank is not None else 0
         locked = [i for i in unpinned if applied[i] == HostResidency.LOCKED.value]
         disk = [i for i in unpinned if applied[i] == HostResidency.DISK.value]
         pageable = [i for i in unpinned if i not in set(locked) and i not in set(disk)]
@@ -794,6 +824,7 @@ def load_ftw_banks(
     # alphas are the small per-expert scale vectors, distinguished by their reserved names
     # (not a separate kind); everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
+    layer_formats = reader.meta("layer_quant_formats")
     if hot_sources:
         hot_b = sum(
             c.nbytes for banks in hot_hb.values() for c in banks if c is not None
@@ -807,6 +838,7 @@ def load_ftw_banks(
         quant_format, sources, **alpha_kw,
         layer_residency=applied, kind=kind, kernel=kernel,
         file_banks=file_banks or None, hot=hot_sources or None,
+        layer_tags=layer_formats, layer_formats=layer_formats,
     )
 
 
@@ -821,6 +853,8 @@ def load_ftw_banks_to_device(path: str, *, num_layers: int, device: torch.device
         split = _split_bank_entries(reader, path, num_layers)
         if split is None:
             return None
+        if reader.meta("layer_quant_formats") is not None:
+            raise ValueError(f"{path!r} holds experts of several formats, which are served from the offload slot cache only")
         bank_entries, alpha_entries, flat_entries, per_layer_groups = split
 
         # (name, layer_id or None for an alpha, read offset, read length, head pad, shape, dtype)

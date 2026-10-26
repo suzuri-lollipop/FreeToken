@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.layers import BaseOP, GemmaRMSNorm, LinearColParallelMerged, LinearOProj
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import div_even, nvtx_annotate
 
@@ -50,10 +50,8 @@ class Qwen3_5Attention(BaseOP):
             config.hidden_size, [d * tp_size for d in self._qkv_split], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
-        # into the stored weight (GemmaRMSNorm scales by the raw weight).
-        self.q_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaPlusOneRMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaPlusOneRMSNorm(head_dim, eps=config.rms_norm_eps)
         self.rotary = get_rope(
             head_dim=head_dim,
             rotary_dim=config.rotary_config.rotary_dim,

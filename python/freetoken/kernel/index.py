@@ -46,7 +46,7 @@ def indexing(
     vocab_range: Tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
     if output is None:
-        output = weights.new_empty(indices.shape[0], weights.shape[1])
+        output = weights.new_empty(indices.shape[0], weights.shape[1], device=indices.device)
 
     if not weights.is_cuda:
         # The JIT launcher is CUDA-only: handing it host pointers corrupts the heap
