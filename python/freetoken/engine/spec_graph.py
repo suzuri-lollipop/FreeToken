@@ -24,6 +24,7 @@ import torch
 
 from freetoken.attention.linear import FLAMetadata
 from freetoken.core import Batch
+from freetoken.engine.config import SPEC_PROB_FP
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -74,9 +75,10 @@ class SpecGraphRunner:
         self.c_t2r = torch.tensor([0, 0], dtype=torch.int32, device=d)
         self.c_last = torch.tensor([1], dtype=torch.int32, device=d)
         self.c_true = torch.tensor([True], device=d)
-        self.d_payload = torch.empty(4, dtype=torch.int64, device=d)
+        # slot 4: fixed-point top-1 density of the carried draft, -1 when not carried
+        self.d_payload = torch.zeros(5, dtype=torch.int64, device=d)
         self.d_next = torch.empty(1, dtype=torch.int32, device=d)
-        self.payload_cpu = torch.empty(4, dtype=torch.int64, pin_memory=True)
+        self.payload_cpu = torch.zeros(5, dtype=torch.int64, pin_memory=True)
         self.next_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
 
         shadow = SimpleNamespace(
@@ -197,13 +199,16 @@ class SpecGraphRunner:
         y1, y2 = ids[0], ids[1]
         draft_in = torch.stack([y1, y2]).to(torch.int32)
         accepted = y1 == self.d_scal[S_DRAFT]
-        d = model.draft(residual, draft_in, batch,
-                        select_row=accepted.to(torch.int64).view(1))
+        head_logits = model.draft(residual, draft_in, batch,
+                                  select_row=accepted.to(torch.int64).view(1),
+                                  return_logits=True)
         accept = accepted.to(torch.int64)
         self.d_payload[0] = y1
         self.d_payload[1] = y2
-        self.d_payload[2] = d[0]
+        self.d_payload[2] = head_logits.argmax(-1)[0]
         self.d_payload[3] = accept
+        top_logp = head_logits.max(-1).values - torch.logsumexp(head_logits, -1)
+        self.d_payload[4] = (top_logp.exp() * SPEC_PROB_FP).to(torch.int64)[0]
         self.d_next.copy_(y2.view(1).to(torch.int32))
         # the accepted bonus token lands at position device_len (the scheduler's write
         # tuple targets the same slot; writing it here keeps the graph self-contained)
@@ -257,6 +262,8 @@ class SpecGraphRunner:
         self.d_payload[1] = bonus[0]
         self.d_payload[2] = draft_id[0]
         self.d_payload[3] = acc64[0]
+        # the sampled path carries no density floor input; -1 keeps a stale greedy slot out
+        self.d_payload[4].fill_(-1)
         self.d_next.copy_(bonus32)
         # same pool write the greedy body makes: the accepted bonus belongs at device_len,
         # and on a rejection the drain overwrites the draft's slot with the emitted token
@@ -314,7 +321,8 @@ class SpecGraphRunner:
             torch.cuda.synchronize(self.device)
             got = [int(v) for v in self.d_payload.tolist()]
             want = [eager_payload["y1"], eager_payload["y2"], eager_payload["draft"],
-                    int(bool(eager_payload["accept"]))]
+                    int(bool(eager_payload["accept"])),
+                    int(eager_payload["prob"] * SPEC_PROB_FP)]
             if got != want:
                 raise RuntimeError(f"spec graph replay diverged from eager: {got} != {want}")
             self.graph = graph
@@ -380,7 +388,7 @@ class SpecGraphRunner:
             table.fill_spec_rows(req)
             graph.replay()
             torch.cuda.synchronize(self.device)
-            got = [int(v) for v in self.d_payload.tolist()]
+            got = [int(v) for v in self.d_payload[:4].tolist()]
             want = [eager_payload["y1"], eager_payload["y2"], eager_payload["draft"],
                     int(bool(eager_payload["accept"]))]
             if got != want:

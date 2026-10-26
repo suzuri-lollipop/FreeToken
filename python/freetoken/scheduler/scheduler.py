@@ -35,7 +35,7 @@ from freetoken.utils import (
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
-from freetoken.engine.config import mtp_cold_start, mtp_stash_budget
+from freetoken.engine.config import SPEC_PROB_FP, mtp_cold_start, mtp_min_p, mtp_stash_budget
 from freetoken.engine.lookup import LookupState, lookup_debug
 from freetoken.engine.spec_sample import (
     debug_traced, sampled_graph_enabled, sampling_path_enabled, spec_supported)
@@ -120,6 +120,9 @@ _MTP_RESUME_AFTER = (
 # few steps are worth more spent decoding. 0 disables the stand-down.
 _MTP_REJECT_STREAK = max(0, int(os.environ.get("FREETOKEN_MTP_REJECT_STREAK", "3")))
 _MTP_SKIP_STEPS = max(1, int(os.environ.get("FREETOKEN_MTP_SKIP_STEPS", "8")))
+# The third gate, per draft and before the verify is even staged: the head's own top-1
+# density for the draft (Strata --spec-min-p). 0 disables; greedy drafts only.
+_MTP_MIN_P = mtp_min_p()
 # Rows a request may decode without the head seeing them (because the batch grew beyond
 # one request) before its prompt residual stash is written off as too stale to catch up.
 # Bounded so a request that never runs alone cannot pin its stash for its whole life.
@@ -628,8 +631,11 @@ class Scheduler(SchedulerIOMixin):
         if spec_payload is None and getattr(fout, "spec_cpu", None) is not None:
             # graphed spec step: the pinned payload row landed with the copy_done event
             v = fout.spec_cpu.tolist()
+            # slot 4 carries the draft density fixed-point; negative means not carried
+            p64 = int(v[4])
             spec_payload = {"y1": int(v[0]), "y2": int(v[1]), "draft": int(v[2]),
-                            "accept": bool(v[3])}
+                            "accept": bool(v[3]),
+                            "prob": p64 / SPEC_PROB_FP if p64 >= 0 else None}
         # Signal the in-flight batch's PLE rows at the earliest safe instant: its
         # readback event is a hair past this copy_done point, and every host us
         # spent here before the fill is a us the replay idles at its captured WAIT.
@@ -746,6 +752,7 @@ class Scheduler(SchedulerIOMixin):
                 for req in batch.reqs:
                     if req.table_idx != -1 and not req.aborted:
                         req.spec_draft = spec_payload.get("draft")
+                        req.spec_draft_prob = spec_payload.get("prob")
 
         self.finished_reqs = new_finished_reqs
         self._account_prefill_debt(batch)
@@ -1921,6 +1928,14 @@ class Scheduler(SchedulerIOMixin):
                 reason = "no_stash"
             self._spec_reject(req, reason)
             return None
+        if (mode == "verify" and _MTP_MIN_P > 0.0 and req.spec_draft_prob is not None
+                and req.spec_draft_prob < _MTP_MIN_P):
+            # Do not pay a verify for a draft the head itself scored below the floor: one
+            # decode step instead, and the next head pass re-seeds a stronger draft.
+            req.spec_draft = None
+            req.spec_draft_prob = None
+            self._count_spec_rejection("low_prob", req)
+            return None
         if req.spec_slot_idx is None:
             pool = self.engine.linear_state_pool
             if pool is None:
@@ -2330,6 +2345,7 @@ class Scheduler(SchedulerIOMixin):
         elif spec["accept"]:
             req.complete_one()
             req.spec_draft = spec.get("draft")
+            req.spec_draft_prob = spec.get("prob")
             tokens = (spec["y1"], spec["y2"])
             skip_count = 1
         else:
@@ -2339,6 +2355,7 @@ class Scheduler(SchedulerIOMixin):
             self.token_pool[req.table_idx, req.device_len - 1] = spec["y1"]
             req.input_ids[req.device_len - 1] = spec["y1"]
             req.spec_draft = spec.get("draft")
+            req.spec_draft_prob = spec.get("prob")
             tokens = (spec["y1"],)
             skip_count = 1
         if batch.spec_mode == "verify" and source != "lookup":

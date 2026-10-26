@@ -108,13 +108,16 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
+# HF's Qwen4ExpTextConfig.__post_init__ rewrites the checkpoint's full_attention to its own
+# name for the sparse layers, and that name moved: qwen_sparse_attention up to transformers
+# 5.17, indexed_attention from 5.18. Both are this repo's full_attention group.
+_HF_FULL_ATTENTION = frozenset({"qwen_sparse_attention", "indexed_attention"})
+
+
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
-        # HF Qwen4ExpTextConfig rewrites full_attention to qwen_sparse_attention in __post_init__.
-        return [
-            "full_attention" if t == "qwen_sparse_attention" else t for t in layer_types
-        ]
+        return ["full_attention" if t in _HF_FULL_ATTENTION else t for t in layer_types]
     # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
     interval = int(getattr(text, "full_attention_interval", 4))
     n = int(text.num_hidden_layers)

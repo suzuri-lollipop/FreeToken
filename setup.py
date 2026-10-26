@@ -191,11 +191,16 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
-def _cxx_flags(*, pthread: bool = False, std: str = "c++17") -> list[str]:
-    """Host compile flags: GCC/Clang spellings on Linux, the MSVC equivalents on Windows."""
+def _cxx_flags(*, pthread: bool = False) -> list[str]:
+    """Host compile flags: GCC/Clang spellings on Linux, the MSVC equivalents on Windows.
+
+    c++20 is not a choice here: every one of these sources includes torch/extension.h, and
+    torch 2.14's headers #error out below C++20. It is also what makes clang-cl accept
+    MSVC's <atomic> in the cpu_moe sources.
+    """
     if MSVC:
-        return ["/O2", f"/std:{std}", "/EHsc"]
-    flags = ["-O3", f"-std={std}"]
+        return ["/O2", "/std:c++20", "/EHsc"]
+    flags = ["-O3", "-std=c++20"]
     if pthread:
         flags.append("-pthread")
     return flags
@@ -434,9 +439,8 @@ setup(
                 include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
                 library_dirs=runtime_library_dirs,
                 libraries=[runtime_lib],
-                # c++20 is what makes clang-cl accept MSVC's <atomic> here (see _cxx_flags).
                 extra_compile_args={
-                    "cxx": _cxx_flags(pthread=True, std="c++20" if MSVC else "c++17"),
+                    "cxx": _cxx_flags(pthread=True),
                     "nvcc": device_compile,
                 },
                 extra_link_args=runtime_link_args,

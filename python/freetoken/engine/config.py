@@ -434,3 +434,18 @@ def mtp_cold_start() -> bool:
     spec path entirely. Off by default until measured against the declines it replaces.
     """
     return os.environ.get("FREETOKEN_MTP_COLD_START", "0") not in ("", "0")
+
+
+# 2**40 keeps every payload value exact through the int64 spec payload and its float64 decode.
+SPEC_PROB_FP = 1 << 40
+
+
+def mtp_min_p() -> float:
+    """Host floor on the head's own top-1 probability for a drafted token (Strata --spec-min-p).
+
+    A verify costs about two decode steps and a draft the head itself scored near zero lands
+    rarely, so skipping it buys back the step it would have burned. The gate is per draft on
+    the host and covers greedy drafts only; sampled drafts carry a density row instead and
+    their rejection test already prices the head's uncertainty. 0 disables the floor.
+    """
+    return min(1.0, max(0.0, float(os.environ.get("FREETOKEN_MTP_MIN_P", "0"))))

@@ -23,8 +23,9 @@ _PREFILL_STAGING_ROWS = int(os.getenv("FREETOKEN_PREFILL_STAGING_ROWS", "64") or
 # call still moves bytes at full PCIe rate but stalls the host, which un-hides the
 # GEMM under the copy in transition-zone workloads (gpt-oss 2048tok: -22% e2e).
 # Banks whose rows are smaller than this ship as ONE whole-layer entry (their
-# whole layer is tiny) and are excluded from the hit gather, so every per-run
-# entry the batch sees is >= this size.
+# whole layer is tiny) and are excluded from the streaming path's hit gather, so
+# every per-run entry the batch sees is >= this size. The on-demand path's gathers
+# are SM copies, not batch memcpys, so they take every bank regardless.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
@@ -458,6 +459,9 @@ class OffloadMoeCache:
         # _stage_tails[g][b]: the pad after buffer b's rows in layout g
         self._stage_tails: list[list[list[torch.Tensor]]] = []
         self._inval: list[slice | torch.Tensor] = []
+        # the split of _inval[b] by which of its slots may take the step+1 stamp (see _slice_pools)
+        self._inval_deprio: list[slice | torch.Tensor] = []
+        self._inval_evict: list[slice | torch.Tensor] = []
         self.prefill_copy_stream: torch.cuda.Stream | None = None
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
@@ -539,7 +543,24 @@ class OffloadMoeCache:
             max((min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)) if rows[k][p]), default=0)
             for p, s in enumerate(self.pool_sizes)
         ]
-        self._inval = []
+
+        def compact(mask: torch.Tensor) -> slice | torch.Tensor:
+            idx = mask.nonzero().flatten()
+            if idx.numel() == 0 or int(idx[-1] - idx[0]) + 1 == idx.numel():
+                return slice(int(idx[0]), int(idx[-1]) + 1) if idx.numel() else slice(0, 0)
+            return idx.to(self.device)
+
+        # A borrowed slot is stamped step+1 so decode's LRU pick prefers the pool's own
+        # regular slots (see _invalidate_prefill_buffer), but lru_ensure drops usage == step
+        # from its victim argmin: stamp more of a pool than size - num_experts of them and an
+        # ensure with that many misses has NO victim, and argmin over an all-max array returns
+        # index 0 on every iteration, so all of its misses collapse onto one slot. One ensure
+        # misses at most num_experts distinct ids, so capping the stamp there always leaves it
+        # a victim per miss; the borrowed slots above the cap stay evict-first.
+        depriable = torch.zeros(self.cache_size, dtype=torch.bool)
+        for base, s in spans:
+            depriable[base : base + max(s - E, 0)] = True
+        self._inval, self._inval_deprio, self._inval_evict = [], [], []
         for b in range(2):
             mask = torch.zeros(self.cache_size, dtype=torch.bool)
             for k in range(len(rows)):
@@ -550,11 +571,9 @@ class OffloadMoeCache:
                     first = max((lo - offsets[k][p]) // rows[k][p], 0)
                     end = min(-(-(hi - offsets[k][p]) // rows[k][p]), s)
                     mask[base + first : base + max(first, end)] = True
-            idx = mask.nonzero().flatten()
-            if idx.numel() == 0 or int(idx[-1] - idx[0]) + 1 == idx.numel():
-                self._inval.append(slice(int(idx[0]), int(idx[-1]) + 1) if idx.numel() else slice(0, 0))
-            else:
-                self._inval.append(idx.to(self.device))
+            self._inval.append(compact(mask))
+            self._inval_deprio.append(compact(mask & depriable))
+            self._inval_evict.append(compact(mask & ~depriable))
         self._stage_dirty = [False, False]
         if not self.banks:
             self._pool_bank_views, self._stage_views, self._stage_tails = [], [], []
@@ -592,7 +611,12 @@ class OffloadMoeCache:
         """
         if not self._stage_views or not self._stage_fits(1):
             return []
-        return [[views[k] for views in self._stage_views[0]] for k in range(len(self.banks))]
+        views = self._stage_views[0]
+        # A cache between num_experts and 2 * num_experts slots lends ONE buffer, which is
+        # all the on-demand path borrows (it has no second layer in flight); the second
+        # entry is None there, so it must not be indexed.
+        n = sum(v is not None for v in views)
+        return [[views[b][k] for b in range(n)] for k in range(len(self.banks))]
 
     def stage_views(self, layer_id: int, buffer_id: int) -> tuple[torch.Tensor, ...]:
         """Per-bank ``[num_experts, ...]`` views of prefill staging buffer ``buffer_id`` in ``layer_id``'s layout; row == expert id."""
@@ -885,9 +909,10 @@ class OffloadMoeCache:
         self._copy_feat_bytes = [ptrs(rows) for rows in self._row_bytes]
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
-        # hit-D2D gather serves only the big banks; small banks are whole-layer
-        # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
-        # The gather copies cache rows of the layer's pool into its staging buffer, row == expert id.
+        # The STREAMING path's hit-D2D gather serves only the big banks; small banks are
+        # whole-layer H2D entries there (see _SMALL_BANK_FEAT_BYTES), so their rows never
+        # need D2D. The gather copies cache rows of the layer's pool into its staging
+        # buffer, row == expert id.
         self._gather_bank_ids = [[k for k, r in enumerate(rows) if r >= _SMALL_BANK_FEAT_BYTES] for rows in self._row_bytes]
         for g, ids in enumerate(self._gather_bank_ids):
             self._gather_feat_bytes.append(ptrs([self._row_bytes[g][k] for k in ids]) if ids else None)
@@ -897,28 +922,6 @@ class OffloadMoeCache:
         for p in range(len(self.pool_sizes)):
             ids = self._gather_bank_ids[self._pool_layout(p)]
             self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
-        # The same tables minus the banks the D2D hit gather already served, so an on-demand
-        # miss gather does not copy those from the host again. Every table is filtered in the
-        # SAME bank order the gather's own tables use, or the kernel would pair a bank's
-        # destination with another bank's source.
-        def keep(g: int, k: int) -> bool:
-            return k not in self._gather_bank_ids[g]
-
-        self._feat_bytes_without = [
-            ptrs([r for k, r in enumerate(rows) if keep(g, k)])
-            for g, rows in enumerate(self._row_bytes)
-        ]
-        self._src_ptrs_without = [
-            [ptrs([p for k, p in enumerate(values) if keep(g, k)]) for g in range(len(self.layouts))]
-            for values in layer_src_ptrs
-        ]
-        self._pool_ptrs_without = [
-            [
-                ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in range(len(dst_ptrs)) if keep(g, k)])
-                for p in range(len(self.pool_sizes))
-            ]
-            for g in range(len(self.layouts))
-        ]
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
@@ -1150,10 +1153,13 @@ class OffloadMoeCache:
         # invalidation wiped them (decode hit rate ~0 under mixed load, every interleaved
         # step re-fetched in full). step+1 outranks every LRU-touched row, so decode
         # evicts its own coldest regular slot and keeps residency the chunk plans never
-        # touch; the kernel's usage==step mask still falls back to these when every
-        # regular slot was used this step. Their slot_for_id entries are -1 above, so a
-        # route that still resolves to one is a miss and reloads.
-        self.usage[slots] = self.step + 1
+        # touch. Their slot_for_id entries are -1 above, so a route that still resolves to
+        # one is a miss and reloads.
+        #
+        # The stamp is capped per pool so one ensure always keeps a victim per miss; the
+        # borrowed slots over the cap stay evict-first (see _slice_pools).
+        self.usage[self._inval_deprio[buffer_id]] = self.step + 1
+        self.usage[self._inval_evict[buffer_id]] = 0
         # the pad may hold rows of a wider layout or of a pool; a cache without banks
         # (a CPU-side bookkeeping cache) has no staging views and nothing to clear
         if self._stage_tails:
@@ -1581,10 +1587,10 @@ class OffloadMoeCache:
                         f"prev&cur/cur = {ov}/{tv} = {ov / max(tv, 1):.3f}"
                     )
                 self._probe_acc.zero_()
-        layout = self.layer_layout[layer_id]
-        # A hit is only a hit if the D2D gather will actually serve it: without a bank wide
-        # enough for that gather, every touched expert takes the host (H2D) plan instead.
-        gatherable = bool(self._gather_bank_ids[layout]) and self._gather_stage_ptrs[layout] is not None
+        # A hit is only a hit if the D2D gather will actually serve it. That gather runs
+        # over EVERY bank (see move_), so the cut is the fused copy plan, not the batch
+        # memcpy's small-bank floor; without it every touched expert takes the host plan.
+        gatherable = self._copy_fused_ok
         prefill_ondemand_compact(
             self, layer_id, buffer_id, touched,
             # the pool-local slots the staging buffers own; above them a slot holds a real row
@@ -1618,33 +1624,28 @@ class OffloadMoeCache:
             self._move_prefill_layer_ondemand_pageable(layer_id)
             return
         layout, pool = self.layer_layout[layer_id], self.pool_of_layer[layer_id]
-        # Hits gather D2D over the banks wide enough to need it (the SM kernel has no
-        # small-row caveat, unlike the streaming path's batch memcpy, so scales/globals
-        # come from their cache slots too); misses gather H2D from the host banks, with
-        # the banks the D2D gather already served dropped from the host entry list (a
-        # no-op slice on the all-banks plan). D2D first: the HBM rate is ~40x PCIe.
-        banks = self._gather_bank_ids[layout] if self._gather_stage_ptrs[layout] is not None else []
-        if banks:
-            fast_index_copy_multi_jit(
-                self._gather_stage_ptrs[layout][0],
-                self._gather_pool_ptrs[pool],
-                self._gather_feat_bytes[layout],
-                self._prefill_hit_dst,
-                self._prefill_hit_src,
-                self._prefill_hit_num,
-                blocks_per_bank=64,
-            )
-        if banks:
-            # the D2D gather already served those banks; the host entry list drops them
-            dst = self._pool_ptrs_without[layout][pool]
-            src = self._src_ptrs_without[layer_id][layout]
-            feat = self._feat_bytes_without[layout]
-        else:
-            dst = self._copy_dst_ptrs_pool[pool]
-            src = self._copy_src_ptrs[layer_id]
-            feat = self._copy_feat_bytes[layout]
+        # Hits gather D2D from their cache slots, misses H2D from the host banks, and both
+        # run over EVERY bank: the SM copy kernel has no small-row caveat (unlike the
+        # streaming path's batch memcpy), so scales and globals come from their cache slots
+        # too. Leaving the narrow banks to the miss plan would strand their hit rows on an
+        # earlier chunk's bytes. D2D first: the HBM rate is ~40x PCIe.
+        #
+        # The plan's rows already carry the staging offset (buffer_id * num_experts + expert),
+        # so both gathers aim at the bank base; hit sources are pool-local slots, so they aim
+        # at the layer's pool.
         fast_index_copy_multi_jit(
-            dst, src, feat,
+            self._copy_dst_ptrs,
+            self._copy_dst_ptrs_pool[pool],
+            self._copy_feat_bytes[layout],
+            self._prefill_hit_dst,
+            self._prefill_hit_src,
+            self._prefill_hit_num,
+            blocks_per_bank=64,
+        )
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_src_ptrs[layer_id],
+            self._copy_feat_bytes[layout],
             self._prefill_miss_dst,
             self._prefill_miss_src,
             self._prefill_miss_num,

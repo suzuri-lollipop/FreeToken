@@ -236,6 +236,7 @@ paying that price for a draft that lands ~0.15 of the time.
 | `FREETOKEN_MTP_MIN_ACCEPTANCE` | 0.35 | Below this acceptance within one window the request stops drafting; `0` disables the check |
 | `FREETOKEN_MTP_REJECT_STREAK` | 3 | Consecutive rejected verifies that trigger a short stand-down (the per-step half of the floor); `0` disables |
 | `FREETOKEN_MTP_SKIP_STEPS` | 8 | Decode steps that stand-down lasts before drafting resumes |
+| `FREETOKEN_MTP_MIN_P` | 0 | Declines a verify when the head's own top-1 probability for the draft is below this floor (per-draft, greedy drafts only, counted as `low_prob`; Strata's `--spec-min-p` parity). `0` disables |
 | `FREETOKEN_MTP_RESUME_AFTER` | one window | Decode steps a suspended request waits before re-probing the floor; `0` makes the trip terminal |
 | `FREETOKEN_MTP_COLD_START` | off | Draft even when the prompt rows are gone (prefix hit) or over the stash budget: the head seeds its first draft from its own row instead of declining. Costs a few rejected verifies, buys back the multi-turn traffic that always hits the cache |
 | `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off, and before a stand-down's resume re-seeds the draft instead of verifying it (`suspend_hole`) |

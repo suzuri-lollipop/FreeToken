@@ -26,10 +26,30 @@ else:
     PyNCCLCommunicator = Any
 
 
+def _nccl_ldflags() -> list[str]:
+    """Link flags for the NCCL that torch actually loads.
+
+    ``-lnccl`` wants an unversioned ``libnccl.so`` on the linker path. The nvidia-nccl
+    wheel ships only ``libnccl.so.2``, and a CUDA toolkit's copy is whatever symlink the
+    installer left behind -- on a box whose toolkit symlink points at a deleted venv the
+    link fails outright. So resolve the wheel torch depends on and link its soname by
+    path; the rpath keeps a standalone dlopen of the built module working too. Falls
+    back to ``-lnccl`` where there is no wheel (a system NCCL, or RCCL on ROCm).
+    """
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.find_spec("nvidia")
+    for root in spec.submodule_search_locations if spec is not None else ():
+        for lib in sorted(Path(root).glob("nccl/lib/libnccl.so*")):
+            return [str(lib), f"-Wl,-rpath,{lib.parent}"]
+    return ["-lnccl"]
+
+
 @functools.cache
 def _load_nccl_module() -> Module:
     # TODO(ROCm): NCCL -> RCCL migration for multi-GPU tensor parallelism on AMD.
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=_nccl_ldflags())
 
 
 @functools.cache

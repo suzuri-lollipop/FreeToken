@@ -86,6 +86,9 @@ class Req:
     # Pending draft token id (host int) predicted for the position after the current input
     # token; None until the head has produced one.
     spec_draft: int | None = None
+    # The head's own top-1 probability for spec_draft (greedy drafts only; None when unknown).
+    # FREETOKEN_MTP_MIN_P declines verifies of drafts the head did not believe in.
+    spec_draft_prob: float | None = None
     # --speculative lookup: the per-request suffix index and acceptance gate. Built on the first
     # eligible decode step from the committed prefix; None until then, and again once the gate
     # switches the request off.

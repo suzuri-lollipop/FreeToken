@@ -142,8 +142,8 @@ def test_capture_replay_divergence_raises_and_disables():
             mock.patch.object(SpecGraphRunner, "restore_state", lambda *a: None):
         r._stream = mock.MagicMock()
         r._body = lambda engine, model: None  # leaves the payload at its staged zeros
-        r.d_payload = torch.zeros(4, dtype=torch.int64)
-        eager = {"y1": 41, "y2": 42, "draft": 77, "accept": True}
+        r.d_payload = torch.zeros(5, dtype=torch.int64)
+        eager = {"y1": 41, "y2": 42, "draft": 77, "accept": True, "prob": 0.25}
         import pytest
         # the divergence raises and the runner is disabled before the error is
         # re-wrapped for the caller (all-or-nothing adoption; no half-installed graph)
