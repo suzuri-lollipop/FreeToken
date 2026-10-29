@@ -150,7 +150,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   older build) is refused at load; reconvert it with `ft checkpoint`.
 - Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
   fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
-  already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
+  already added: the loader refuses it rather than serve the norms with the 1 applied twice;
+  reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
