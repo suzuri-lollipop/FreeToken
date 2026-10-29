@@ -374,7 +374,7 @@ def convert_banks_sidecar(
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     sink = _ConvertSink(writer, desc="Converting expert banks (disk-tier sidecar)", names=names)
     banks = load_expert_banks(
-        model_path, model_config, method=method, device=dev, dtype=dtype, layer_sink=sink
+        model_path, model_config, method=method, device=dev, layer_sink=sink
     )
     quant_format = banks.quant_format
     n_bank = n_alpha = 0
