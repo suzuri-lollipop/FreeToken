@@ -50,6 +50,35 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
+### Diagnostics
+
+| Env | Default | Meaning |
+|---|---|---|
+| `FREETOKEN_LATENCY` | off | Scheduler-loop latency profiler: one `[latency]` line per window splitting wall time into `recv` (idle/message wait), `sched` (batch build), `fwd_issue` (launch), `drain` (waiting on the previous batch's GPU work) plus queue depth and the spec-verify tally. Host timings only, never a device sync, CUDA-graph safe |
+| `FREETOKEN_LATENCY_EVERY_S` | 10 | Window between `[latency]` dumps |
+| `FREETOKEN_LATENCY_OUT` | off | Append each window as one JSON line to this path (what the launcher's calibration reads) |
+
+### Engine recovery
+
+The engine runs in worker processes that the serve supervises. When one exits after readiness, or
+hangs without exiting, the serve does not keep answering requests over a dead model: it closes
+admission (new requests get a retryable `503` with a `Retry-After` and a message naming the
+reload), re-spawns the workers and reloads the weights in place, and opens admission again when
+the new engine reports ready. In-flight requests of the lost engine end with an `engine_stopped`
+error rather than hanging. `GET /health` answers 200 throughout, because the server does answer,
+and says what is behind it: `loaded` (is there an engine to serve a request), `generation` (how
+many engines this serve process has started), `auto_load`, and `restarting` with `reason`,
+`attempt`/`tries`, and `state` (`pending`, `restarting`, `waiting`, `give_up`, `disabled`). After
+the tries run out the serve stays up and idle, and the next request starts another round.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `FREETOKEN_BACKEND_RESTART` | on | `0`/`off` restores the old behaviour: a worker death after readiness takes the serve down (10 s grace) instead of restarting the engine |
+| `FREETOKEN_BACKEND_RESTART_TRIES` | 3 | Consecutive failed revive rounds before the serve gives up and waits to be asked again |
+| `FREETOKEN_BACKEND_RESTART_RETRY_S` | 15 | Seconds between revive attempts, and how long an engine has to stay up before the failure count starts over |
+| `FREETOKEN_BACKEND_RESTART_JOIN_S` | 60 | Seconds a revive waits for the old workers to exit before SIGKILLing them. A rank that is merely hung holds the rendezvous port and the VRAM its replacement needs, so nothing is spawned until every one of them is gone |
+| `FREETOKEN_ENGINE_STALL_S` | 90 | How long an engine may owe an answer, use no CPU and no disk, and say nothing, before it is written off as frozen and revived. `0` disables the watch (a host whose GPU work leaves no CPU trace may want that) |
+
 ### Choosing a GPU
 
 For example, a machine with an RTX 5090 and an RTX 3060 Ti:
@@ -243,6 +272,8 @@ paying that price for a draft that lands ~0.15 of the time.
 | `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual is held for the head's catch-up pass (~20 KiB/row at this model's width, so ~320 MiB per draftable request; also how long the catch-up pass is) |
 | `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
 | `FREETOKEN_MTP_SAMPLED_GRAPH` | on | `0` keeps sampled verifies eager instead of replaying the captured graph -- the A/B switch for the capture itself |
+| `FREETOKEN_MTP_LOOKUP_CHAIN` | off | Continues the MTP draft with suffix-lookup continuations and verifies them as one wider eager window (greedy single-request steps only; a suffix miss keeps the plain two-row verify and its graph replay). Strata's `--lookup-chain` port; the head rides the same step, so the MTP cadence and reject rules are unchanged |
+| `FREETOKEN_MTP_CHAIN_K` | 2 | Continuation rows per chain verify at most: the payout past row 0 is all-or-nothing, so a wide window on a weak match costs rows it will not cash |
 | `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
 | `FREETOKEN_MTP_DECLINE_LOG` | 5 | Decline lines printed per reason; the counters keep counting past it |
 | `FREETOKEN_MTP_DEBUG` | off | Per-step trace: `[mtp]` decisions, `[mtp-s]` rejection ratios with the host uniforms that decided them (eager sampled steps), `[mtp-g]`/`[mtp-gs]` graph staging and replay timings, `[mtp-t]` step timings. Reads the value for truth, so `0` is off; the timing line synchronizes the device every spec step, so never leave it on for a throughput run |
@@ -398,7 +429,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--api-key KEY] [--timeout 10] [--json
 
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
-| `health` | `GET /health` | Server status, model, load progress |
+| `health` | `GET /health` | Server status, model, load progress, and whether an engine is behind the API (`loaded`, [Engine recovery](#engine-recovery)) |
 | `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, MTP draft tallies, accepted input modalities |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
