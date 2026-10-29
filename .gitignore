@@ -229,3 +229,4 @@ benchmarks/cross_framework
 /results/
 _scratch
 .triton-tools
+freetoken-launch.json
