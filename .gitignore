@@ -230,3 +230,4 @@ benchmarks/cross_framework
 _scratch
 .triton-tools
 freetoken-launch.json
+run.sh
