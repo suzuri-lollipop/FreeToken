@@ -252,6 +252,12 @@ class LookupState:
             return []
         return self.drafter.propose(self.max_draft if max_draft is None else max_draft)
 
+    def propose_after(self, extra: Iterable[int], max_k: int) -> list[int]:
+        """``propose_many`` continued past ``extra`` (the MTP chain's window rows)."""
+        if self.off:
+            return []
+        return self.drafter.propose_after(extra, max_k)
+
     @property
     def last_match(self) -> int:
         return self.drafter.last_match

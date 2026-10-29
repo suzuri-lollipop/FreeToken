@@ -130,6 +130,12 @@ _MTP_RESYNC_LAG = max(1, int(os.environ.get("FREETOKEN_MTP_RESYNC_LAG", "8")))
 # Decline lines per reason. A reason is terminal for a request so the counters stay small, but
 # a workload of thousands of declined requests still needs a ceiling on the log it writes.
 _MTP_DECLINE_LOG_CAP = max(0, int(os.environ.get("FREETOKEN_MTP_DECLINE_LOG", "5")))
+# Strata --lookup-chain: extend the MTP draft with suffix-lookup continuations and verify
+# 1 + 1 + K rows in one eager step. Greedy single-request verifies only; a suffix miss keeps
+# the plain two-row verify (and its graph replay). K capped: the payout beyond row 0 is
+# all-or-nothing, so a wide window on a weak match costs rows it will not cash.
+_MTP_LOOKUP_CHAIN = os.environ.get("FREETOKEN_MTP_LOOKUP_CHAIN", "0") not in ("", "0")
+_MTP_CHAIN_K = max(0, int(os.environ.get("FREETOKEN_MTP_CHAIN_K", "2")))
 
 
 def _mtp_report_interval_s() -> float:
@@ -1860,6 +1866,27 @@ class Scheduler(SchedulerIOMixin):
             else:
                 self._spec_reject(req, "lag_overflow")
 
+    def _mtp_chain_rows(self, req: Req) -> tuple:
+        """Suffix-lookup continuations after the MTP draft (Strata's --lookup-chain).
+
+        Empty tuple = no chain this step, so the verify stays the plain two-row shape (and
+        stays graph-replay eligible). The lookup gate's own off switch is respected, but a
+        chain miss never feeds its acceptance window -- the MTP rules own this cadence."""
+        if req.spec_draft is None or _MTP_CHAIN_K < 1:
+            return ()
+        if req.lookup is None:
+            req.lookup = LookupState.from_env()
+        lk = req.lookup
+        if lk.off or req.device_len < lk.min_context:
+            return ()
+        lk.sync(req.input_ids, req.device_len)
+        # the window is 1 (row 0) + 1 (mtp draft) + k, and a full hit also appends the
+        # bonus row: k + 2 rows must fit the remaining output budget
+        k = min(_MTP_CHAIN_K, lk.max_draft, req.remain_len - 2)
+        if k < 1:
+            return ()
+        return tuple(lk.propose_after([req.spec_draft], k))
+
     def _as_spec_batch(self, batch: Batch) -> Batch | None:
         """Upgrade a decode batch into a spec batch, or None to keep it regular.
 
@@ -1955,6 +1982,23 @@ class Scheduler(SchedulerIOMixin):
         batch.spec_mode = mode
         batch.spec_sample = not req.sampling_params.is_greedy
         if mode == "verify":
+            chain = (self._mtp_chain_rows(req)
+                     if _MTP_LOOKUP_CHAIN and not batch.spec_sample else ())
+            if chain:
+                # Chain verify: [mtp draft, *lookup continuations] staged like the lookup
+                # path (K-row extend, row-0 snapshot for rollback), drained under the MTP
+                # rules -- the head rides this same step, so the cadence keeps its draft.
+                rows = (req.spec_draft, *chain)
+                batch.spec_source = "chain"
+                batch.spec_draft_id = req.spec_draft
+                batch.spec_draft_ids = rows
+                batch.spec_prefix_len = req.device_len - 1
+                batch.phase = "prefill"
+                for draft in rows:
+                    self.token_pool[req.table_idx, req.device_len] = draft
+                    req.append_host(torch.tensor([draft], dtype=torch.int32))
+                    req.device_len += 1
+                return batch
             # The draft is staged into BOTH stores: the token pool feeds the forward
             # rows, and the host id buffer feeds the PLE extend fill (which builds this
             # batch's n-gram rows from req.input_ids[cached:device] -- without the host
@@ -2325,23 +2369,30 @@ class Scheduler(SchedulerIOMixin):
         if spec is None:
             raise RuntimeError("MTP spec step returned no payload")
         source = getattr(batch, "spec_source", "mtp")
-        if source == "lookup":
+        if source in ("lookup", "chain"):
             ids = spec["ids"]
             accepted = int(spec["accept"])
             drafts = len(ids) - 1
             if accepted == drafts:
                 req.complete_one()
-                req.spec_draft = None
                 tokens = tuple(ids)
                 skip_count = drafts
             else:
                 self._restore_spec_prefix(batch)
                 self.token_pool[req.table_idx, req.device_len - 1] = ids[0]
                 req.input_ids[req.device_len - 1] = ids[0]
-                req.spec_draft = None
                 tokens = (ids[0],)
                 skip_count = 1
-            self._tally_lookup_verify(req, accepted, drafts)
+            if source == "chain":
+                # The head rode this step: carry its draft into the next verify (no seed
+                # step between), and let the MTP rules -- not the lookup's terminal gate --
+                # judge the cadence, counting whether the MTP draft itself landed.
+                req.spec_draft = spec.get("draft")
+                req.spec_draft_prob = spec.get("prob")
+                self._tally_verify(req, accepted >= 1)
+            else:
+                req.spec_draft = None
+                self._tally_lookup_verify(req, accepted, drafts)
         elif spec["accept"]:
             req.complete_one()
             req.spec_draft = spec.get("draft")
@@ -2358,9 +2409,9 @@ class Scheduler(SchedulerIOMixin):
             req.spec_draft_prob = spec.get("prob")
             tokens = (spec["y1"],)
             skip_count = 1
-        if batch.spec_mode == "verify" and source != "lookup":
+        if batch.spec_mode == "verify" and source == "mtp":
             self._tally_verify(req, bool(spec["accept"]))
-        if debug_traced() or (source == "lookup" and lookup_debug()):
+        if debug_traced() or (source in ("lookup", "chain") and lookup_debug()):
             logger.info_rank0(
                 f"[{source}] {batch.spec_mode} accept={spec.get('accept')} "
                 f"y1={spec.get('y1')} y2={spec.get('y2')} draft={spec.get('draft')} "

@@ -169,6 +169,7 @@ def _upgrade_sched(req):
         _spec_decline_lines={},
     )
     sched._spec_reject = lambda r, reason: Scheduler._spec_reject(sched, r, reason)
+    sched._mtp_chain_rows = lambda r: Scheduler._mtp_chain_rows(sched, r)
     sched._count_spec_rejection = (
         lambda reason, r=None: Scheduler._count_spec_rejection(sched, reason, r))
     sched._log_spec_decline = lambda reason, r: Scheduler._log_spec_decline(sched, reason, r)
@@ -867,3 +868,161 @@ def test_a_regular_batch_still_prepares_and_samples():
     assert fi.input_tuple is not None and fi.sample_args == "ARGS"
     assert batch.positions is not None and calls["prepare_metadata"] == 1
 
+
+
+# ---------------------------------------------------------------- MTP + lookup chain
+#
+# FREETOKEN_MTP_LOOKUP_CHAIN widens the greedy single-request verify to
+# [mtp draft, *lookup continuations]: staged like the lookup path, drained under the MTP
+# rules (the head rides the same step, so the cadence keeps its draft and no seed step is
+# inserted). A suffix miss must fall back to the plain two-row verify -- that fallback is
+# what keeps the graph-replay path and the economics of a non-repetitive answer intact.
+
+HIST = [5, 6, 7, 30, 31, 5, 6]   # trigram (5,6,7) at 0..2 repeats at the suffix
+DRAFT = 7                         # the head's draft continues the earlier run -> 30, 31
+
+
+def _chain_state(**kw):
+    from freetoken.engine.lookup import LookupState
+    args = dict(min_match=3, max_match=8, capacity_tokens=64, max_draft=3,
+                accept_window=8, min_acceptance=0.0, min_context=0)
+    args.update(kw)
+    return LookupState(**args)
+
+
+def _chain_req(output_len=5, device_len=7, **spec):
+    req = _spec_req(len(HIST), output_len, len(HIST) - 1, device_len=device_len,
+                    spec_draft=DRAFT, **spec)
+    req.input_ids = torch.tensor(HIST, dtype=torch.int32)
+    req.lookup = _chain_state()
+    return req
+
+
+def test_chain_staging_widens_the_verify_window(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+
+    monkeypatch.setattr(sched_mod, "_MTP_LOOKUP_CHAIN", True)
+    monkeypatch.setattr(sched_mod, "_MTP_CHAIN_K", 2)
+    req = _chain_req()
+    sched, writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    out = Scheduler._as_spec_batch(sched, batch)
+    assert out is batch and batch.spec_mode == "verify"
+    assert batch.spec_source == "chain"
+    assert batch.spec_draft_ids == (7, 30, 31) and batch.spec_draft_id == 7
+    assert batch.spec_prefix_len == 6 and batch.phase == "prefill"
+    # all three rows staged in BOTH stores (pool feeds forward, host feeds the PLE fill)
+    assert req.device_len == 10
+    assert writes[(0, 7)] == 7 and writes[(0, 8)] == 30 and writes[(0, 9)] == 31
+    assert req.input_ids.tolist()[-3:] == [7, 30, 31]
+
+
+def test_chain_falls_back_to_the_plain_verify_without_a_match(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+
+    monkeypatch.setattr(sched_mod, "_MTP_LOOKUP_CHAIN", True)
+    monkeypatch.setattr(sched_mod, "_MTP_CHAIN_K", 2)
+    req = _chain_req()
+    req.input_ids = torch.tensor([5, 6, 7, 30, 31, 40, 41], dtype=torch.int32)  # no repeat
+    sched, writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    out = Scheduler._as_spec_batch(sched, batch)
+    assert out is batch and batch.spec_mode == "verify"
+    assert batch.spec_source == "mtp"          # the default: graph-replay eligible
+    assert req.device_len == 8 and writes[(0, 7)] == 7 and (0, 8) not in writes
+
+
+def test_chain_window_is_clamped_by_the_output_budget(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+
+    monkeypatch.setattr(sched_mod, "_MTP_LOOKUP_CHAIN", True)
+    monkeypatch.setattr(sched_mod, "_MTP_CHAIN_K", 2)
+    # remain_len == 3: the window needs k + 2 rows -> only one continuation fits
+    req = _chain_req(output_len=3)
+    sched, _writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    assert Scheduler._as_spec_batch(sched, batch) is batch
+    assert batch.spec_draft_ids == (7, 30)
+
+    # remain_len == 2: the plain verify's floor -- no room for any chain row
+    req2 = _chain_req(output_len=2)
+    sched2, _w2 = _upgrade_sched(req2)
+    batch2 = Batch(reqs=[req2], phase="decode")
+    assert Scheduler._as_spec_batch(sched2, batch2) is batch2
+    assert batch2.spec_source == "mtp" and req2.device_len == 8
+
+
+def test_chain_respects_the_lookup_off_switch(monkeypatch):
+    import freetoken.scheduler.scheduler as sched_mod
+    from freetoken.core import Batch
+
+    monkeypatch.setattr(sched_mod, "_MTP_LOOKUP_CHAIN", True)
+    req = _chain_req()
+    req.lookup.off = True
+    sched, _writes = _upgrade_sched(req)
+    batch = Batch(reqs=[req], phase="decode")
+    assert Scheduler._as_spec_batch(sched, batch) is batch
+    assert batch.spec_source == "mtp"          # a dead lookup gate never widens the window
+
+
+def _chain_setup(req, staged=3):
+    """_setup with the chain's staged rows already in the pool/host buffer."""
+    sched, batch, calls, pool = _setup(req, pages=[(0, 1, 2)])
+    batch.spec_source = "chain"
+    batch.spec_prefix_len = P
+    for i, tok in enumerate((41, 42, 43)[:staged]):
+        pool[0, P + 1 + i] = tok
+    pool[0, P + 1 + staged] = 44               # the engine's next-token write
+    return sched, batch, calls, pool
+
+
+def _chain_req_staged():
+    req = _req(host_len=P + 4)
+    req.input_ids[P + 1:P + 4] = torch.tensor([41, 42, 43], dtype=torch.int32)
+    req.device_len = P + 4
+    req.spec_draft = 41
+    req.lookup = _chain_state()
+    return req
+
+
+def test_chain_full_accept_commits_the_window_and_keeps_the_cadence():
+    req = _chain_req_staged()
+    sched, batch, calls, _pool = _chain_setup(req)
+    reply, finished = _drain(
+        sched, batch,
+        {"ids": [41, 42, 43, 44], "accept": 3, "full": True, "draft": 77, "prob": 0.4})
+    assert [m.next_token for m in reply] == [41, 42, 43, 44] and not finished
+    assert req.spec_draft == 77 and req.spec_draft_prob == 0.4   # the head rode this step
+    assert calls["copy_from"] == [] and calls["release"] == []   # nothing rolled back
+    # the MTP rules judged it, the lookup gate was never fed
+    assert req.spec_verifies == 1 and req.spec_accepted == 1
+    assert req.lookup.offered == 0 and not req.lookup.off
+
+
+def test_chain_partial_accept_rolls_back_but_keeps_the_mtp_draft():
+    req = _chain_req_staged()
+    sched, batch, calls, pool = _chain_setup(req)
+    reply, _finished = _drain(
+        sched, batch,
+        {"ids": [41, 99, 98, 97], "accept": 1, "full": False, "draft": 77, "prob": 0.2})
+    # all-or-nothing past row 0: one committed token, the scratch state restored
+    assert [m.next_token for m in reply] == [41]
+    assert calls["copy_from"] == [(3, 1)]
+    assert int(pool[0, P + 1]) == 41 and req.input_ids.numel() == P + 2
+    assert req.cached_len == P + 1 and req.device_len == P + 2
+    assert req.spec_draft == 77                 # cadence kept: next step verifies again
+    assert req.spec_verifies == 1 and req.spec_accepted == 1   # the MTP draft itself landed
+    assert req.lookup.offered == 0              # the chain miss must not trip the lookup gate
+
+
+def test_chain_miss_feeds_the_mtp_streak_not_the_lookup_gate():
+    req = _chain_req_staged()
+    sched, batch, _calls, _pool = _chain_setup(req)
+    _drain(sched, batch,
+           {"ids": [41, 99, 98, 97], "accept": 0, "full": False, "draft": 77, "prob": 0.1})
+    assert req.spec_rejects == 1 and not req.spec_suspend      # streak 1 of 3
+    assert req.spec_verifies == 1 and req.spec_accepted == 0
+    assert req.lookup.offered == 0 and not req.lookup.off

@@ -113,3 +113,16 @@ def test_state_off_short_circuits_indexing_and_recording():
     assert state.off
     assert not state.record(True)  # no window to fold into once off
     assert state.offered == 8
+
+def test_state_wrapper_propose_after_respects_the_off_switch():
+    """The chain calls the STATE wrapper, not the drafter: a gate that ended drafting for the
+    request must also stop its continuations from widening an MTP verify."""
+    from freetoken.engine.lookup import LookupState
+
+    st = LookupState(min_match=3, max_match=8, capacity_tokens=64, max_draft=3,
+                     accept_window=8, min_acceptance=0.0, min_context=0)
+    st.sync([5, 6, 7, 30, 31, 5, 6, 7], 8)
+    # (6,7,30) repeats at index 1..3 -> the continuation of [...,7]+[30] is 31,5
+    assert st.propose_after([30], 2) == [31, 5]
+    st.off = True
+    assert st.propose_after([30], 2) == []

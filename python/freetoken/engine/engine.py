@@ -2446,6 +2446,47 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
 
     @torch.inference_mode()
+    def _forward_chain(self, batch: Batch) -> ForwardOutput:
+        """Chained verify (FREETOKEN_MTP_LOOKUP_CHAIN): an MTP draft plus suffix-lookup
+        continuations, compared row by row like a lookup verify, then the head pass drafts the
+        NEXT MTP token off the last fully-correct row -- so a chain step keeps the MTP cadence
+        (no seed step in between) and one host read carries the whole payload.
+
+        The head contract mirrors the two-row verify: every row updates the head KV and
+        select_row picks the prefix the next draft continues (row K on a full hit, row 0 on a
+        miss -- the rollback case drafts exactly where the plain reject does)."""
+        model = self.model
+        assert batch.spec_mode == "verify", "chain step shape"
+        assert model.mtp is not None, "chain step without the MTP head (--speculative mtp)"
+        drafts = tuple(batch.spec_draft_ids or (batch.spec_draft_id,))
+        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
+            mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
+            ids = model.greedy_ids(mixed)
+            rows = ids.tolist()
+            accept = 0
+            while accept < len(drafts) and rows[accept] == drafts[accept]:
+                accept += 1
+            full = accept == len(drafts)
+            sel = torch.tensor([len(drafts) if full else 0], dtype=torch.int64,
+                               device=ids.device)
+            head_logits = model.draft(residual, ids.to(torch.int32), batch,
+                                      select_row=sel.view(1), return_logits=True)
+            top_logp = head_logits.max(-1).values - torch.logsumexp(head_logits, -1)
+            probs = (top_logp.exp() * SPEC_PROB_FP).to(torch.int64)
+            vals = torch.stack([head_logits.argmax(-1)[0], probs[0]]).tolist()
+        if _deferred_fill is not None:
+            self._pending_host_fill = _deferred_fill
+        next_id = rows[len(drafts)] if full else rows[0]
+        payload = {"ids": rows, "accept": accept, "full": full,
+                   "y1": rows[0], "y2": rows[1] if len(rows) > 1 else None,
+                   "draft": int(vals[0]), "prob": int(vals[1]) / SPEC_PROB_FP}
+        next_tokens_gpu = torch.tensor([next_id], dtype=torch.int32, device=self.device)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
+
+    @torch.inference_mode()
     def _forward_spec(self, batch: Batch) -> ForwardOutput:
         """MTP spec step (single request, greedy or rejection-sampled; --speculative mtp).
 
@@ -2459,8 +2500,11 @@ class Engine:
         keeps it eager). Eager fallbacks: :meth:`_spec_sampled_step`, and the prologue/seed
         steps which are variable-length and never captured.
         """
-        if getattr(batch, "spec_source", "mtp") == "lookup":
+        source = getattr(batch, "spec_source", "mtp")
+        if source == "lookup":
             return self._forward_lookup(batch)
+        if source == "chain":
+            return self._forward_chain(batch)
         model = self.model
         req = batch.reqs[0]
         assert len(batch.reqs) == 1, "spec steps run a single request"
