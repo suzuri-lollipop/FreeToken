@@ -79,6 +79,10 @@ class ZmqAsyncPushQueue(Generic[T]):
     ):
         self.context = zmq.asyncio.Context()
         self.socket = self.context.socket(zmq.PUSH)
+        # Dropping unsent bytes at close is the price of a stop() that returns: with the default
+        # LINGER=-1, a peer that died while this queue still held messages makes context.term()
+        # block forever, which is exactly a shutdown taken during an engine outage.
+        self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.bind(addr) if create else self.socket.connect(addr)
         self.encoder = encoder
 

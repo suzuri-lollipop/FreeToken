@@ -65,6 +65,36 @@ _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# Backend restart policy, ported from strata (serve/server.py: restart(tries=3),
+# RESTART_RETRY_S, and the lazy "the next request starts it again"): when a worker dies or
+# hangs, the gate closes, the serve stays up answering a retryable 503, and the workers are
+# rebuilt in-process. FREETOKEN_BACKEND_RESTART=0 restores the old exit-the-serve behaviour.
+BACKEND_RESTART = os.environ.get("FREETOKEN_BACKEND_RESTART", "1").strip().lower() not in (
+    "0", "off", "false", "no",
+)
+BACKEND_RESTART_TRIES = max(1, int(_env_number("FREETOKEN_BACKEND_RESTART_TRIES", 3.0)))
+BACKEND_RESTART_RETRY_S = max(0.0, _env_number("FREETOKEN_BACKEND_RESTART_RETRY_S", 15.0))
+# How long a dying scheduler may take to release its VRAM before the revive kills it and
+# retries; a weight-loaded process does not exit on SIGTERM instantly.
+BACKEND_RESTART_JOIN_S = max(5.0, _env_number("FREETOKEN_BACKEND_RESTART_JOIN_S", 60.0))
+# Grace after SIGKILL before the revive gives up on reaping. A killed process is already gone
+# from the GPU's point of view; this only waits out the kernel's bookkeeping.
+REAP_KILL_JOIN_S = 2.0
+# Frozen-engine watchdog (strata's STRATA_ENGINE_STALL_S): seconds a busy backend may stay
+# silent, using no CPU and no disk, before it is treated as ended. 0 turns the watch off.
+ENGINE_STALL_S = max(0.0, _env_number("FREETOKEN_ENGINE_STALL_S", 90.0))
+# Retry-After for the 503 a gated request gets while the engine is coming back. A load takes
+# minutes, so a loading caller is pointed at a short poll rather than at a fake ETA.
+LOADING_RETRY_AFTER_S = 5
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -105,15 +135,39 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
 
 def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
     """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
-    standing. Only the shell path needs this: it owns the process lifetime end to end (no
+    standing. The shell path needs it because it owns the process lifetime end to end (no
     outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
-    the GPU and the IPC sockets after the shell has already returned to the user's terminal."""
+    the GPU and the IPC sockets after the shell has already returned to the user's terminal.
+    A revive needs it more: a rank that is merely hung holds the fixed rendezvous port the
+    next rank 0 has to bind, so nothing may be spawned until every old rank is reaped.
+
+    ``timeout`` is a budget for the whole set, not per worker: they were all signalled at the
+    same instant, so the ones still alive after it are not waiting for anything."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    live: List[Any] = []
     for p in processes or []:
         try:
-            p.join(timeout=timeout)
             if p.is_alive():
-                p.kill()
+                live.append(p)
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
+            continue
+    for p in live:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            p.join(timeout=remaining)
+        except Exception:  # noqa: BLE001 -- a handle that cannot be joined is not one we can wait on
+            continue
+    for p in live:
+        try:
+            if p.is_alive():
+                logger.warning("Backend worker %s ignored SIGTERM; killing it", getattr(p, "name", "?"))
+                p.kill()
+                # Wait out the kill: a revive spawns right after this returns, and the new
+                # rank 0 cannot bind the rendezvous port while the old one is still on it.
+                p.join(timeout=REAP_KILL_JOIN_S)
+        except Exception:  # noqa: BLE001 -- nothing is left to do; the revive retries regardless
             continue
 
 
@@ -137,8 +191,16 @@ class GenerateRequest(BaseModel):
 @dataclass
 class FrontendManager:
     config: ServerArgs
+    # The parent's sockets, opened before the first worker was spawned and bound to ipc paths
+    # named after the PARENT pid, so every engine generation reconnects to these same sockets.
+    # A revive reuses them as they are: the listen() task holds the PULL, and libzmq brings the
+    # PUSH back on its own.
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
+    # Monotonic for the serve process, never reset per generation. A message still sitting in
+    # the PUSH pipe is delivered to whatever engine binds next, and uids a new generation can
+    # never hand out are what make that replay harmless: listen() drops a reply whose uid it
+    # does not have in ack_map.
     uid_counter: int = 0
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
@@ -206,6 +268,22 @@ class FrontendManager:
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
     # the shutdown flag before the ensuing deaths. See _terminate_backend_workers.
     backend_processes: List[Any] = field(default_factory=list)
+    # Which engine this serve process is on: 0 for the first backend, +1 for every revive.
+    # instance_id stays the identity of the PROCESS (the desktop keys on it); this counts the
+    # engine generations inside it, so a client can tell it is talking to a reloaded engine.
+    engine_generation: int = 0
+    # Monotonic ts of the last message that came back from the backend (set in listen()).
+    # The frozen-engine watch measures the engine's silence from here.
+    last_reply_at: float = field(default_factory=time.monotonic)
+    # Restart bookkeeping for /health: {reason, attempt, tries, state, retry_in_s}, or None
+    # while no restart is in progress. Written by the supervisor thread, read by HTTP handlers.
+    restart: Dict[str, Any] | None = None
+    # Whether a backend death is healed in-process. /health publishes it so a caller can tell
+    # "this comes back on its own" from "this needs someone to restart the server".
+    auto_load: bool = field(default_factory=lambda: BACKEND_RESTART)
+    # Strata's lazy re-arm: after the revive tries are used up the server waits for a request
+    # to ask for another round instead of exiting or spinning. Set by the admission gate.
+    restart_request: Any = field(default_factory=threading.Event)
     # Event loop the listener runs on, captured when the listener starts (_create_listener_once).
     # Lets a cross-thread caller — the supervisor thread's failure callback — marshal rebuild
     # future resolution back onto the loop (asyncio Futures are not thread-safe). None until the
@@ -258,8 +336,11 @@ class FrontendManager:
 
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
+            if self.maintenance_state == "failed":
+                self.request_restart()  # strata: the next request starts the engine again
             raise AdmissionClosedError(
-                f"server unavailable: engine is {self.maintenance_state}"
+                f"server unavailable: engine is {self.maintenance_state}",
+                retry_after=self.retry_after_s(),
             )
         uid = self.uid_counter
         self.uid_counter += 1
@@ -269,9 +350,109 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    def retry_after_s(self) -> int | None:
+        """Seconds until this gate is worth knocking on again, or None when nothing is coming
+        back to open it: a restart waiting on its back-off reports that, a load reports a short
+        poll, and with restarts disabled a refusal carries no promise."""
+        state = self.maintenance_state
+        if not BACKEND_RESTART:
+            return None
+        if state == "loading":
+            return LOADING_RETRY_AFTER_S
+        if state == "failed":
+            restart = self.restart or {}
+            wait = restart.get("retry_in_s")
+            if not wait:
+                # No back-off is pending: an attempt is running (or one waits for a request), so
+                # what the caller is really waiting for is the reload. Point it at a short poll.
+                return LOADING_RETRY_AFTER_S
+            return max(1, min(60, int(round(wait))))
+        return None
+
+    def engine_busy(self) -> bool:
+        """True while the backend owes an answer: a generation in flight or a cache rebuild
+        being applied. An idle engine is silent by design, so the stall watch must not arm."""
+        return bool(self.ack_map) or bool(self.rebuild_futures)
+
+    def engine_silence_s(self) -> float:
+        return max(0.0, time.monotonic() - self.last_reply_at)
+
+    def request_restart(self) -> None:
+        """Ask for another revive round (idempotent, non-blocking; a restart already running
+        simply ignores it). The supervisor thread consumes it."""
+        self.restart_request.set()
+
+    def take_restart_request(self) -> bool:
+        if not self.restart_request.is_set():
+            return False
+        self.restart_request.clear()
+        return True
+
+    def fail_pending_generations(self, message: str) -> None:
+        """End every in-flight generation with a terminal error ack. Without this a client
+        whose engine died mid-stream waits for its own timeout (or forever, on a stream with no
+        deadline) while the gate behind it already says "failed" - strata ends the turn the same
+        way when its engine goes away. Runs on the event loop like fail_pending_rebuilds:
+        asyncio Events are not thread-safe. The consumer's terminal ack pops its own map
+        entries, so nothing is removed here. Called again just before a revive, because the
+        gate is read on the loop and written by the supervisor thread, so a generation can be
+        admitted while the flip is in flight."""
+        loop = self._loop
+        if loop is None:
+            return
+        uids = list(self.ack_map)
+
+        def _end() -> None:
+            for uid in uids:
+                event = self.event_map.get(uid)
+                if event is None or uid not in self.ack_map:
+                    continue
+                self.ack_map[uid].append(
+                    UserReply(
+                        uid=uid,
+                        incremental_output="",
+                        finished=True,
+                        error=f"the engine stopped during this request: {message}",
+                        error_code="engine_stopped",
+                    )
+                )
+                event.set()
+                # The reply is terminal but carries no usage, so drop it from the in-flight set
+                # the way an abort would; accounting must not strand on a dead backend.
+                self.stats.on_abort(uid)
+                self.uid_created.pop(uid, None)
+
+        try:
+            loop.call_soon_threadsafe(_end)
+        except RuntimeError:
+            pass  # loop already closed (shutdown racing the crash): nothing left to wake
+
+    def forget_engine_geometry(self) -> None:
+        """Drop everything the backend told this generation about its memory. Every field here
+        is "0/None until the ("meta", …) ack", so clearing is the state a not-yet-loaded engine
+        is described by; leaving them would have /v1/meminfo, /v1/stats and the cache sliders
+        keep reporting the VRAM of a fleet that no longer exists. The new rank 0 re-seeds them
+        from its own ack, which is also why they must not be treated as constant across
+        generations: the pools are re-planned from a fresh post-weights free-VRAM sample."""
+        self.unit_bytes = None
+        self.free_vram_bytes = 0
+        self.cache_floors = None
+        self.cache_pools = None
+        self.cache_budget_bytes = 0
+        self.swa_full_tokens_ratio = 0.0
+        self.gpus = []
+        self.weights_bytes = 0
+        self.device_total_bytes = 0
+        self.nonpool_overhead_bytes = 0
+        self.rank_metas = {}
+        self.last_rebuild = None
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            # Any traffic from the backend ends its silence, whatever it is: the stall watch
+            # treats this as proof of life before it considers a live-but-hung engine ended.
+            self.last_reply_at = time.monotonic()
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
@@ -707,17 +888,35 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
 
+def _retry_after(state: FrontendManager) -> dict | None:
+    """Retry-After header for a gated refusal, or None when nothing will reopen the gate. Read
+    defensively: the /v1/cache/* routes are also driven with a bare state stand-in."""
+    retry_after = getattr(state, "retry_after_s", None)
+    seconds = retry_after() if callable(retry_after) else None
+    return None if seconds is None else {"Retry-After": str(seconds)}
+
+
 def _maintenance_rejection(state: FrontendManager, action: str) -> JSONResponse | None:
     """The /v1/cache/* refusal while the engine is not serving, or None to proceed."""
     if state.maintenance_state == "loading":
         return JSONResponse(
             {"status": "loading", "error": f"model is still loading; cannot {action} yet"},
             status_code=503,
+            headers=_retry_after(state),
         )
     if state.maintenance_state == "failed":
+        # Same lazy re-arm as the generation gate: a caller that finds the engine down asks the
+        # supervisor for another round instead of being told to restart the process by hand.
+        request_restart = getattr(state, "request_restart", None)
+        if callable(request_restart):
+            request_restart()
         return JSONResponse(
-            {"status": "failed", "error": "server latched in maintenance; restart required"},
+            {
+                "status": "failed",
+                "error": f"engine is down: {getattr(state, 'fatal_error', None) or 'backend stopped'}",
+            },
             status_code=503,
+            headers=_retry_after(state),
         )
     if state.maintenance_state == "rebuilding":
         return JSONResponse(
@@ -1153,13 +1352,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         ),
     )
 
-    from .supervisor import LoadProgress, run_backend_supervisor
+    from .supervisor import FrozenEngine, LoadProgress, run_backend_supervisor
 
     _GLOBAL_STATE.load_progress = LoadProgress()
     handle = start_backend()
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
+
+    frozen_watch = FrozenEngine(ENGINE_STALL_S)
 
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend
@@ -1168,6 +1369,14 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         if _GLOBAL_STATE.maintenance_state == "loading":
             _GLOBAL_STATE.maintenance_state = "serving"
             _GLOBAL_STATE.ready_at = time.monotonic()
+            # A revived generation answers for itself: the fatal latch and the restart bookkeeping
+            # belong to the generation that died, not to this one.
+            _GLOBAL_STATE.fatal_error = None
+            _GLOBAL_STATE.restart = None
+            # Both stall clocks start here, so a long silence before this engine existed cannot
+            # count against it.
+            _GLOBAL_STATE.last_reply_at = time.monotonic()
+            frozen_watch.reset()
             logger.info(f"API server is ready to serve on {host}:{port}")
 
     def _on_failure(message: str) -> None:
@@ -1177,10 +1386,100 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # Same for a stream cut mid-generation: it gets its terminal error ack instead of
+        # waiting out a reply that can no longer come.
+        _GLOBAL_STATE.fail_pending_generations(message)
+        # The fleet is gone; /meminfo, /v1/stats and the cache sliders must not keep showing
+        # the VRAM of ranks that no longer exist.
+        _GLOBAL_STATE.forget_engine_geometry()
+        _GLOBAL_STATE.restart = {
+            "reason": message,
+            "attempt": 0,
+            "tries": BACKEND_RESTART_TRIES,
+            "state": "pending" if BACKEND_RESTART else "disabled",
+            "retry_in_s": 0.0 if BACKEND_RESTART else None,
+            "generation": _GLOBAL_STATE.engine_generation,
+        }
+        if BACKEND_RESTART:
+            return  # the supervisor rebuilds the workers; the serve stays up and answers 503
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:
             _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
+
+    def _revive_backend(reason: str, attempt: int):
+        """Tear the dead worker set down and start it again with the same callback the process
+        booted with. Only the children own the ipc endpoints and the GPUs; the parent's ZMQ
+        sockets stay bound for the life of the serve, so the new workers reconnect to the
+        same pipes and the frontend needs no re-handshake."""
+        state = _GLOBAL_STATE
+        _terminate_backend_workers(state.backend_processes)
+        # A weight-loaded rank can sit in CUDA teardown for a while. Killing it earlier would
+        # strand VRAM the replacement has to allocate, so wait it out before escalating.
+        _reap_backend_workers(state.backend_processes, timeout=BACKEND_RESTART_JOIN_S)
+        # A generation admitted while the gate was flipping (new_user reads it on the loop, the
+        # flip happens on this thread) owes an answer this engine never promised; end it now
+        # rather than leaving the client waiting through a reload that will never reply.
+        state.fail_pending_generations(reason)
+        state.load_progress.reset()
+        state.forget_engine_geometry()
+        state.ready_at = None
+        state.maintenance_state = "loading"
+        state.engine_generation += 1
+        state.restart = {
+            "reason": reason,
+            "attempt": attempt,
+            "tries": BACKEND_RESTART_TRIES,
+            "state": "restarting",
+            "retry_in_s": None,
+            "generation": state.engine_generation,
+        }
+        logger.warning(
+            "Rebuilding the backend after: %s (attempt %d of %d, generation %d)",
+            reason,
+            attempt,
+            BACKEND_RESTART_TRIES,
+            state.engine_generation,
+        )
+        try:
+            new_handle = start_backend()
+        except Exception:
+            logger.exception("Backend rebuild failed")
+            state.restart = {**state.restart, "state": "waiting", "retry_in_s": BACKEND_RESTART_RETRY_S}
+            raise
+        state.backend_processes = list(getattr(new_handle, "processes", None) or [])
+        return new_handle
+
+    def _on_restart(reason: str, attempt: int, tries: int) -> None:
+        _GLOBAL_STATE.restart = {
+            "reason": reason,
+            "attempt": attempt,
+            "tries": tries,
+            "state": "restarting",
+            "retry_in_s": None,
+            "generation": _GLOBAL_STATE.engine_generation,
+        }
+
+    def _on_give_up(reason: str) -> None:
+        # /health keeps saying "error" and requests keep getting a 503, but nothing is coming
+        # back on its own: another round happens only when a request asks for one.
+        _GLOBAL_STATE.restart = {
+            **(_GLOBAL_STATE.restart or {"reason": reason, "tries": BACKEND_RESTART_TRIES}),
+            "reason": reason,
+            "state": "give_up",
+            "retry_in_s": None,
+        }
+
+    def _frozen_engine() -> str | None:
+        state = _GLOBAL_STATE
+        if state.maintenance_state not in ("serving", "rebuilding"):
+            frozen_watch.reset()  # a load or a rebuild-with-no-backend is silence by design
+            return None
+        return frozen_watch.check(
+            state.backend_processes,
+            busy=state.engine_busy(),
+            quiet_s=state.engine_silence_s(),
+        )
 
     def _on_meta(meta: dict) -> None:
         # Per-unit cache VRAM costs + the free-VRAM seed + per-pool floors + the actual pool
@@ -1222,6 +1521,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             # uvicorn's lifespan shutdown sets this on SIGINT/SIGTERM, so the workers'
             # expected exit during stop is not reported as a crash.
             "is_shutting_down": _SHUTTING_DOWN.is_set,
+            # The serve outlives its engine: instead of letting the API answer while nothing is
+            # behind it, the supervisor rebuilds the workers and keeps the gate shut meanwhile.
+            "revive": _revive_backend if BACKEND_RESTART else None,
+            "restart_tries": BACKEND_RESTART_TRIES,
+            "restart_retry_s": BACKEND_RESTART_RETRY_S,
+            "restart_when_asked": _GLOBAL_STATE.take_restart_request,
+            "frozen": _frozen_engine if ENGINE_STALL_S > 0 else None,
+            "on_restart": _on_restart,
+            "on_give_up": _on_give_up,
         },
         name="freetoken-backend-supervisor",
         daemon=True,

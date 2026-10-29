@@ -1,4 +1,6 @@
-"""CPU-only tests for the bounded prepare-stop accounting barrier."""
+"""CPU-only tests for the bounded prepare-stop accounting barrier, and for what the closed
+admission gate answers: a retryable 503, and a health doc that says whether an engine is behind
+the API at all."""
 
 from __future__ import annotations
 
@@ -17,7 +19,8 @@ from freetoken.server.accounting import (
     prepare_stop_accounting,
     register_accounting_routes,
 )
-from freetoken.server.api_server import FrontendManager
+from freetoken.server.api_server import BACKEND_RESTART, FrontendManager
+from freetoken.server.control_api import build_health
 from freetoken.server.stats import StatsTracker
 
 
@@ -172,3 +175,64 @@ def test_prepare_stop_route_rejects_non_loopback_without_closing_admission():
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
 def test_loopback_recognizes_ipv4_ipv6_and_mapped_ipv4(host):
     assert _is_loopback(host)
+
+
+def test_a_down_engine_answers_a_retryable_503_and_asks_for_another_round(monkeypatch):
+    """The state this exists for: the HTTP server answers and nothing is behind it. A knock on
+    the closed gate has to say when to come back, and buy a revive round with the knock (strata's
+    lazy restart), or a client that keeps posting only ever reads its own timeout."""
+    monkeypatch.setattr("freetoken.server.api_server.BACKEND_RESTART", True)
+    manager = FrontendManager(
+        config=SimpleNamespace(served_model_name="model-a"),
+        send_tokenizer=None,
+        recv_tokenizer=None,
+        maintenance_state="failed",
+        fatal_error="backend worker freetoken-TP0-scheduler exited",
+    )
+
+    app = FastAPI()
+    register_accounting_routes(app, lambda: manager)
+
+    @app.post("/generate")
+    async def _generate():
+        return {"uid": manager.new_user()}
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post("/generate")
+    assert response.status_code == 503
+    assert int(response.headers["Retry-After"]) >= 1
+    assert "engine is failed" in response.json()["error"]
+    assert manager.stats.active == 0
+    assert manager.take_restart_request() is True
+
+
+@pytest.mark.parametrize(
+    ("maintenance_state", "ready_at", "expect_status", "expect_loaded"),
+    [
+        ("loading", None, "loading", False),
+        ("serving", 1.0, "ok", True),
+        ("rebuilding", 1.0, "ok", True),
+        ("stopping", 1.0, "ok", False),
+        ("failed", 1.0, "error", False),
+    ],
+)
+def test_health_says_whether_there_is_an_engine_behind_the_api(
+    maintenance_state, ready_at, expect_status, expect_loaded
+):
+    """HTTP status stays 200 while the server itself answers, so a probe that reads only the
+    status reports an instance as ready with a dead engine: `loaded` is the answer it must read
+    instead, and `generation` lets it tell a first load from a revive."""
+    manager = FrontendManager(
+        config=SimpleNamespace(served_model_name="model-a"),
+        send_tokenizer=None,
+        recv_tokenizer=None,
+        maintenance_state=maintenance_state,
+        ready_at=ready_at,
+        fatal_error="backend worker freetoken-TP0-scheduler exited"
+        if maintenance_state == "failed"
+        else None,
+    )
+    doc = build_health(manager, "test-version")
+    assert doc["status"] == expect_status
+    assert doc["loaded"] is expect_loaded
+    assert doc["generation"] == 0
+    assert doc["auto_load"] is BACKEND_RESTART

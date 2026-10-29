@@ -22,6 +22,12 @@ from pydantic import BaseModel, Field
 class AdmissionClosedError(RuntimeError):
     """A generation tried to enter after the prepare-stop gate was closed."""
 
+    def __init__(self, message: str, *, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        # Seconds a caller should wait before trying again, sent as Retry-After. Set only when
+        # the gate is expected to reopen on its own (engine loading or being restarted).
+        self.retry_after = retry_after
+
 
 class AccountingDrainError(RuntimeError):
     """The engine could not reach a sealed accounting state within the bounded stop barrier."""
@@ -132,7 +138,8 @@ def _is_loopback(host: str | None) -> bool:
 
 def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> None:
     async def _admission_closed(_: Request, exc: AdmissionClosedError) -> JSONResponse:
-        return JSONResponse(status_code=503, content={"error": str(exc)})
+        headers = None if exc.retry_after is None else {"Retry-After": str(int(exc.retry_after))}
+        return JSONResponse(status_code=503, content={"error": str(exc)}, headers=headers)
 
     app.add_exception_handler(AdmissionClosedError, _admission_closed)
 

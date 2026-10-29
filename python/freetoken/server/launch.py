@@ -29,6 +29,29 @@ def _report_startup_error(ack_queue: mp.Queue, exc: BaseException) -> None:
         pass
 
 
+def _abandon_partial_spawn(processes: list) -> None:
+    """Tear down the children of a spawn that failed halfway through.
+
+    A rank 0 left alive holds the fixed rendezvous port (``distributed_addr``) every later
+    attempt has to bind, and the workers are non-daemon, so a half-spawned generation would
+    both poison the restart loop and keep the serve from ever exiting. Best-effort: terminate,
+    wait, kill, reap."""
+    for p in processes:
+        try:
+            if p.is_alive():
+                p.terminate()
+        except Exception:  # noqa: BLE001 -- never started / already gone
+            continue
+    for p in processes:
+        try:
+            p.join(timeout=10.0)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+        except Exception:  # noqa: BLE001 -- a handle that cannot be reaped is not ours to wait on
+            continue
+
+
 def _detach_process_group() -> None:
     """Shell mode only: move this worker out of the terminal's foreground process group.
 
@@ -189,57 +212,61 @@ def launch_server(
         ack_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
 
-        for i in range(world_size):
-            new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
+        def _start(name: str, target, args=(), kwargs=None) -> None:
             p = mp.Process(
-                target=_run_scheduler,
-                args=(new_args, ack_queue),
+                target=target,
+                args=args,
+                kwargs=kwargs or {},
                 daemon=False,
-                name=f"freetoken-TP{i}-scheduler",
+                name=name,
             )
-            p.start()
+            # Tracked before start(): a spawn that dies halfway must still hand the ranks that
+            # ARE up to _abandon_partial_spawn instead of losing track of them.
             processes.append(p)
+            p.start()
 
-        num_tokenizers = server_args.num_tokenizer
-        p = mp.Process(
-            target=_run_tokenize_worker,
-            kwargs={
-                "detach": detach,
-                "tokenizer_path": server_args.model_path,
-                "addr": server_args.zmq_detokenizer_addr,
-                "backend_addr": server_args.zmq_backend_addr,
-                "frontend_addr": server_args.zmq_frontend_addr,
-                "local_bs": 1,
-                "mm": server_args.mm,
-                "create": server_args.tokenizer_create_addr,
-                "tokenizer_id": num_tokenizers,
-                "ack_queue": ack_queue,
-            },
-            daemon=False,
-            name="freetoken-detokenizer-0",
-        )
-        p.start()
-        processes.append(p)
-        for i in range(num_tokenizers):
-            p = mp.Process(
-                target=_run_tokenize_worker,
+        try:
+            for i in range(world_size):
+                new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
+                _start(f"freetoken-TP{i}-scheduler", _run_scheduler, args=(new_args, ack_queue))
+
+            num_tokenizers = server_args.num_tokenizer
+            _start(
+                "freetoken-detokenizer-0",
+                _run_tokenize_worker,
                 kwargs={
                     "detach": detach,
                     "tokenizer_path": server_args.model_path,
-                    "addr": server_args.zmq_tokenizer_addr,
+                    "addr": server_args.zmq_detokenizer_addr,
                     "backend_addr": server_args.zmq_backend_addr,
                     "frontend_addr": server_args.zmq_frontend_addr,
                     "local_bs": 1,
                     "mm": server_args.mm,
                     "create": server_args.tokenizer_create_addr,
-                    "tokenizer_id": i,
+                    "tokenizer_id": num_tokenizers,
                     "ack_queue": ack_queue,
                 },
-                daemon=False,
-                name=f"freetoken-tokenizer-{i}",
             )
-            p.start()
-            processes.append(p)
+            for i in range(num_tokenizers):
+                _start(
+                    f"freetoken-tokenizer-{i}",
+                    _run_tokenize_worker,
+                    kwargs={
+                        "detach": detach,
+                        "tokenizer_path": server_args.model_path,
+                        "addr": server_args.zmq_tokenizer_addr,
+                        "backend_addr": server_args.zmq_backend_addr,
+                        "frontend_addr": server_args.zmq_frontend_addr,
+                        "local_bs": 1,
+                        "mm": server_args.mm,
+                        "create": server_args.tokenizer_create_addr,
+                        "tokenizer_id": i,
+                        "ack_queue": ack_queue,
+                    },
+                )
+        except Exception:  # noqa: BLE001 -- unwind the half-spawn, then let the real error travel
+            _abandon_partial_spawn(processes)
+            raise
 
         # Expected ready acks: 1 primary scheduler + num_tokenizers + 1 detokenizer.
         return BackendHandle(

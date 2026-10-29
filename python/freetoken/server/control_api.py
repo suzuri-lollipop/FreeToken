@@ -15,11 +15,28 @@ from fastapi import FastAPI
 
 
 def build_health(state: Any, version: str) -> dict:
-    """Full-lifecycle health doc: loading -> ok -> error."""
+    """Full-lifecycle health doc: loading -> ok -> error.
+
+    ``loaded`` answers the question the status code cannot: is there an engine behind this API
+    right now. The HTTP status stays 200 while the server itself answers (strata's contract), so
+    a caller that only checks the status must read this flag. ``generation`` counts engine
+    (re)starts inside one serve process, ``restarting`` says what the recovery is doing."""
     instance_id = getattr(state, "instance_id", None)
+    generation = int(getattr(state, "engine_generation", 0) or 0)
+    auto_load = bool(getattr(state, "auto_load", False))
     fatal = getattr(state, "fatal_error", None)
+    restarting = getattr(state, "restart", None)
+
+    def _recovery(doc: dict) -> dict:
+        doc["loaded"] = False
+        doc["generation"] = generation
+        doc["auto_load"] = auto_load
+        if restarting:
+            doc["restarting"] = dict(restarting)
+        return doc
+
     if fatal:
-        return {"status": "error", "message": fatal, "instance_id": instance_id}
+        return _recovery({"status": "error", "message": fatal, "instance_id": instance_id})
 
     mstate = getattr(state, "maintenance_state", "serving")
     config = getattr(state, "config", None)
@@ -27,7 +44,7 @@ def build_health(state: Any, version: str) -> dict:
 
     if mstate == "loading":
         lp = getattr(state, "load_progress", None)
-        return {
+        return _recovery({
             "status": "loading",
             "phase": lp.phase if lp is not None else "other",
             "progress": {
@@ -36,10 +53,12 @@ def build_health(state: Any, version: str) -> dict:
             },
             "model": model,
             "instance_id": instance_id,
-        }
+        })
 
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
+    # "rebuilding" still has a live engine (it is applying a cache resize); "stopping" does not
+    # take new work, so it is not loaded for a caller deciding whether to send one.
     return {
         "status": "ok",
         "model": model,
@@ -47,6 +66,9 @@ def build_health(state: Any, version: str) -> dict:
         "uptime_s": uptime_s,
         "maintenance": mstate,
         "version": version,
+        "loaded": mstate in ("serving", "rebuilding"),
+        "generation": generation,
+        "auto_load": auto_load,
     }
 
 
