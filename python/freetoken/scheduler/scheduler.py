@@ -384,9 +384,13 @@ class Scheduler(SchedulerIOMixin):
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
         from freetoken.moe import _debug_stats
+        from freetoken.engine import latency
 
         _dbg = _debug_stats.probe()
-        if _dbg is not None:
+        _lat = latency.probe()
+        if _lat is not None:
+            _lat.attach(self)
+        if _dbg is not None or _lat is not None:
             import time as _time
 
             _t = _time.perf_counter()
@@ -404,9 +408,12 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(msg)
         if _ct:
             _ct1 = time.perf_counter()
-        if _dbg is not None:
+        if _dbg is not None or _lat is not None:
             _n = _time.perf_counter()
-            _dbg.host_phase("recv", _n - _t)
+            if _dbg is not None:
+                _dbg.host_phase("recv", _n - _t)
+            if _lat is not None:
+                _lat.host_phase("recv", _n - _t)
             _t = _n
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
@@ -437,9 +444,12 @@ class Scheduler(SchedulerIOMixin):
         forward_input = self._schedule_next_batch()
         if _ct:
             _ct2 = time.perf_counter()
-        if _dbg is not None:
+        if _dbg is not None or _lat is not None:
             _n = _time.perf_counter()
-            _dbg.host_phase("sched", _n - _t)
+            if _dbg is not None:
+                _dbg.host_phase("sched", _n - _t)
+            if _lat is not None:
+                _lat.host_phase("sched", _n - _t)
             _t = _n
         ongoing_data = None
         if forward_input is not None:
@@ -464,9 +474,12 @@ class Scheduler(SchedulerIOMixin):
                         _n2 - _n1)
         if _ct:
             _ct3 = time.perf_counter()
-        if _dbg is not None:
+        if _dbg is not None or _lat is not None:
             _n = _time.perf_counter()
-            _dbg.host_phase("fwd_issue", _n - _t)
+            if _dbg is not None:
+                _dbg.host_phase("fwd_issue", _n - _t)
+            if _lat is not None:
+                _lat.host_phase("fwd_issue", _n - _t)
             _t = _n
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
@@ -487,12 +500,19 @@ class Scheduler(SchedulerIOMixin):
         if _ct:
             self._log_chunk_timing(last_data, (_ct1 - _ct0, _ct2 - _ct1,
                                                _ct3 - _ct2, time.perf_counter() - _ct3))
-        if _dbg is not None:
+        if _dbg is not None or _lat is not None:
             _n = _time.perf_counter()
-            _dbg.host_phase("drain", _n - _t)
+            if _dbg is not None:
+                _dbg.host_phase("drain", _n - _t)
+            if _lat is not None:
+                _lat.host_phase("drain", _n - _t)
             # device-syncing stats dump ONLY here: past the deferred fill, so no
             # un-signaled PLE WAIT can be queued ahead of the sync
-            _dbg.dump("loop")
+            if _dbg is not None:
+                _dbg.dump("loop")
+            # the latency probe is host-timing only, so the same safe point serves it
+            if _lat is not None:
+                _lat.maybe_dump()
         return ongoing_data
 
     def _log_chunk_timing(self, last_data, phases) -> None:
