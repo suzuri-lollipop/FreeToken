@@ -241,6 +241,15 @@ def _spec_for_model_path(model_path: str):
     return parse_config(hf_config), spec
 
 
+def _spec_for_ftw(model_path: str):
+    """The spec an FTW dir dispatches on, or None for a bare index carrying no config at all (a
+    test fixture). A checkpoint the engine serves always holds the config the converter copied in."""
+    try:
+        return get_model_spec(cached_load_hf_config(model_path).architectures[0])
+    except (OSError, ValueError):
+        return None
+
+
 def _model_override(spec, name: str):
     """The model module's same-named hook, if it defines one."""
     try:
@@ -274,6 +283,11 @@ def load_weight(
                 "runs iter_weights without include_mtp) or serve from safetensors"
             )
         weights = iter_ftw_weights(model_path, keep=keep)
+        # a family that needs its stored tensors vetted opts in with a check_ftw_weights hook
+        spec = _spec_for_ftw(model_path)
+        check = _model_override(spec, "check_ftw_weights") if spec is not None else None
+        if check is not None:
+            weights = check(weights)
     else:
         _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
