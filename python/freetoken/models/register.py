@@ -46,6 +46,9 @@ _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# dense Qwen3.5/3.8 (Qwen3_5ForConditionalGeneration) cuts the shared tower with the text tower; the MoE and GGUF
+# releases of the same arch read it at full width, so they keep the tuple above
+_QWEN3_5_TP_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), tp_sharded=True),)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -363,7 +366,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5ForConditionalGeneration",
         checkpoint_roots=_QWEN_VL_ROOTS,
         mm_processor=_QWEN_VL_PROCESSOR,
-        encoders=_QWEN_VL_ENCODERS,
+        encoders=_QWEN3_5_TP_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
         tp_supported=True,

@@ -14,12 +14,14 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from freetoken.checkpoint.ftw import FTWWriter
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import QuantKind, set_quant_config
 from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen3_5_moe.config import parse_config
 from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces, iter_weights, nvfp4_expert_spec
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
+from freetoken.models.weight import load_weight
 from freetoken.utils import cached_load_hf_config
 
 H, V = 128, 256  # hidden_size (every block-fp8 projection needs in/out multiples of 128), vocab
@@ -372,8 +374,8 @@ def test_bf16_fusions_slice_back_and_norms_load_as_stored(checkpoint):
     merged = loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
     assert _same(merged[:I], raw[f"{LM}.layers.1.mlp.shared_expert.gate_proj.weight"])
     assert _same(merged[I:], raw[f"{LM}.layers.1.mlp.shared_expert.up_proj.weight"])
-    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"] + 1.0)
-    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"] + 1.0)
+    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"])
+    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"])
     assert torch.equal(loaded["model.layers.0.linear_attn.norm.weight"], raw[f"{gdn}.norm.weight"])
     assert loaded["model.layers.0.linear_attn.A_log"].dtype is torch.float32
 
@@ -714,9 +716,9 @@ def test_tp_rank_reads_its_own_rows_and_columns(dense_folder, dense_raw):
     assert torch.equal(got[f"{gdn}.out_proj.weight"], tail_cols(raw(f"{gdn}.out_proj.weight")))
     assert torch.equal(got["model.embed_tokens.weight"], raw("model.embed_tokens.weight")[V // 2 :])
     assert torch.equal(got["lm_head.weight"], raw("lm_head.weight")[V // 2 :])
-    # per-head norms stay whole on every rank, with the loader's (1 + weight) bake-in
+    # per-head norms stay whole on every rank, and load as stored: the +1 is a runtime op
     assert torch.equal(got[f"{gdn}.norm.weight"], raw(f"{gdn}.norm.weight"))
-    assert torch.equal(got[f"{attn}.q_norm.weight"], raw(f"{attn}.q_norm.weight") + 1.0)
+    assert torch.equal(got[f"{attn}.q_norm.weight"], raw(f"{attn}.q_norm.weight"))
 
 
 def test_attention_refuses_kv_heads_that_cannot_split(dense_folder):
@@ -749,3 +751,30 @@ def test_routed_experts_of_this_family_are_still_refused(tmp_path):
         folder = _write(tmp_path, moe, quant, raw)
     with _tp_rank(0, 2), pytest.raises(NotImplementedError, match="routed experts"):
         _load(folder)
+
+
+# --------------------------------------------------------------------------- FTW replay
+
+
+def _write_ftw(folder, norm_weight: torch.Tensor) -> str:
+    """A minimal FTW of the family: one embedding, the given norm weight, and the config."""
+    writer = FTWWriter(str(folder))
+    writer.add_tensor("model.embed_tokens.weight", torch.zeros(V, H, dtype=torch.bfloat16))
+    writer.add_tensor("model.norm.weight", norm_weight)
+    writer.finalize({})
+    (folder / "config.json").write_text(json.dumps(_config_json(False, None)))
+    return str(folder)
+
+
+@pytest.mark.parametrize("baked", [False, True])
+def test_ftw_norms_must_not_carry_the_plus_one(tmp_path, baked):
+    """An FTW converted by a build that baked the +1 into the norms has to fail at load: replayed
+    as stored it stays wrong silently, replayed through the norms it gets the 1 twice."""
+    raw = torch.linspace(-0.3, 0.3, H, dtype=torch.bfloat16)
+    folder = tmp_path / ("baked" if baked else "stored")
+    path = _write_ftw(folder, raw + 1.0 if baked else raw)
+    if baked:
+        with pytest.raises(ValueError, match="Reconvert"):
+            dict(load_weight(path, torch.device("cpu")))
+    else:
+        assert torch.equal(dict(load_weight(path, torch.device("cpu")))["model.norm.weight"], raw)

@@ -22,6 +22,7 @@ from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
+from freetoken.models.qwen3_vl.vision import vision_module_leaf, vision_tp_shard
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 # bf16 checkpoints store the routed experts pre-stacked per layer
@@ -33,8 +34,11 @@ _EXPERT_KEY_RE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
-# Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
-_GEMMA_NORM_SUFFIXES = (
+# Zero-centred norm weights, loaded RAW: GemmaPlusOneRMSNorm / GemmaPlusOneRMSNormFused apply the
+# +1 in fp32 at runtime, so folding it into the bf16 weight here would apply it twice and round
+# away small |w|. The GDN gated norm (linear_attn.norm) is a plain weight*x norm and is not one.
+_ZERO_CENTRED_NORM_SUFFIXES = (
+    "model.norm.weight",
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
     ".self_attn.q_norm.weight",
@@ -262,13 +266,35 @@ def iter_weights(
         )
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     shard = tp_shard(config)
+    # the tower builds its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves,
+    # which the text tower's leaf table knows nothing about
+    vision = vision_tp_shard(config.vision_config) if include_vision and config.vision_config is not None else None
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]), shard) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision, shard=shard)
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision,
+                                shard=shard, vision=vision)
 
 
-def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
+def check_ftw_weights(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pass the FTW tensors through, refusing one whose norms were converted with the +1 baked in.
+
+    An FTW of this family converted before the +1 became a runtime op holds ``bf16(1 + w)``, and the
+    norms would add the 1 a second time and answer wrong without ever erroring. A zero-centred
+    weight straddles 0 while a baked one sits on 1, so the first norm read settles it.
+    """
+    checked = False
+    for name, tensor in weights:
+        if not checked and tensor.dtype is torch.bfloat16 and name.endswith(_ZERO_CENTRED_NORM_SUFFIXES):
+            checked = True
+            values = tensor.detach().float().reshape(-1)
+            if bool((values > 0.5).all()) and float(values.median()) > 0.9:
+                raise ValueError(
+                    f"{name!r} of this FTW checkpoint holds 1 + weight (median "
+                    f"{values.median().item():.3f}, nothing below 0.5), the layout older builds "
+                    "converted with; the norms add the 1 again at runtime. Reconvert it with "
+                    "`ft checkpoint` (docs/models.md), or serve the source safetensors or a GGUF"
+                )
+        yield name, tensor
 
 
 def _iter_shards(
@@ -279,6 +305,7 @@ def _iter_shards(
     stacked: bool,
     include_vision: bool,
     shard: TpShard | None = None,
+    vision: TpShard | None = None,
 ):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -299,9 +326,10 @@ def _iter_shards(
                 if emitted is not None:
                     yield from emitted
                 else:
-                    if _is_gemma_norm(name):
-                        tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
-                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
+                    if vision is not None and name.startswith(VISION_KEY_PREFIXES):
+                        yield name, vision.tensor(vision_module_leaf(name), tensor)
+                    else:
+                        yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
     if reader is not None and reader.pending:
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
