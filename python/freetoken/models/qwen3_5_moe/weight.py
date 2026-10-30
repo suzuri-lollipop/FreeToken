@@ -22,6 +22,7 @@ from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
+from freetoken.models.qwen3_vl.vision import vision_module_leaf, vision_tp_shard
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 # bf16 checkpoints store the routed experts pre-stacked per layer
@@ -262,9 +263,13 @@ def iter_weights(
         )
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     shard = tp_shard(config)
+    # the tower builds its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves,
+    # which the text tower's leaf table knows nothing about
+    vision = vision_tp_shard(config.vision_config) if include_vision and config.vision_config is not None else None
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]), shard) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision, shard=shard)
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision,
+                                shard=shard, vision=vision)
 
 
 def _is_gemma_norm(name: str) -> bool:
@@ -279,6 +284,7 @@ def _iter_shards(
     stacked: bool,
     include_vision: bool,
     shard: TpShard | None = None,
+    vision: TpShard | None = None,
 ):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -301,7 +307,10 @@ def _iter_shards(
                 else:
                     if _is_gemma_norm(name):
                         tensor = tensor + 1.0  # (1 + weight) baked into the stored norm weight
-                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
+                    if vision is not None and name.startswith(VISION_KEY_PREFIXES):
+                        yield name, vision.tensor(vision_module_leaf(name), tensor)
+                    else:
+                        yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
     if reader is not None and reader.pending:
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
