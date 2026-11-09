@@ -81,6 +81,8 @@ def _stub_scheduler(*, prefill_runnable: bool, decode_runnable: bool, pending: o
     sched._schedule_next_batch = lambda: None
     sched._process_last_data = lambda data: None
     sched._chunk_timing = False
+    sched._pipe = None
+    sched._pipe_take = None
     calls = []
 
     def _exec():

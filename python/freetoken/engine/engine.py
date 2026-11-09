@@ -595,7 +595,27 @@ class Engine:
         _ensure_expandable_segments(self.device)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
+        # Piped prefill (FREETOKEN_PIPED_PREFILL, Strata PIPED_CONCURRENT port): prefill
+        # chunks leave this stream entirely and run on engine.prefill_stream (default
+        # priority) from their own thread, so THIS stream -- decode graph replays -- gets
+        # the high-priority range: the GPU schedules decode kernels ahead of queued
+        # prefill work, which is the whole ITL story. Without piping the priority is a
+        # no-op (single stream, same order as before).
+        self.piped_prefill = os.environ.get("FREETOKEN_PIPED_PREFILL", "0") == "1"
+        try:
+            self.stream = torch.cuda.Stream(
+                device=self.device, priority=-1 if self.piped_prefill else 0
+            )
+        except (ValueError, RuntimeError):  # device exposes no priority range
+            self.stream = torch.cuda.Stream(device=self.device)
+            self.piped_prefill = False
+            logger.warning_rank0(
+                "FREETOKEN_PIPED_PREFILL: CUDA stream priorities unavailable on this "
+                "device, piping disabled (decode replays stay on the default priority)"
+            )
+        self.prefill_stream = (
+            torch.cuda.Stream(device=self.device) if self.piped_prefill else None
+        )
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
@@ -1595,6 +1615,7 @@ class Engine:
             not config.moe_prefill_hit_d2d
             and config.moe_prefill_overlap
             and config.moe_cache_size > 2 * config.model_config.num_experts
+            and not self.piped_prefill
         ):
             # Auto-enable the prefill hit/miss split whenever it can pay: cache-resident
             # experts gather device-side into the double buffer and only the misses cross
@@ -1615,7 +1636,12 @@ class Engine:
             cache_policy=config.moe_cache_policy,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
-            decode_fetch_overlap=config.decode_fetch_overlap,
+            # Piped prefill keeps the staging buffers single-writer: the double buffer
+            # and plan slot 1 belong to the pipe thread's chunks, so the decode graph is
+            # captured WITHOUT the K-split fetch overlap (it would stage into both).
+            decode_fetch_overlap=(
+                False if self.piped_prefill else config.decode_fetch_overlap
+            ),
             quant_format=banks.quant_format,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -1683,6 +1709,9 @@ class Engine:
                     f"{cache.cpu_skip_minw:.2f} of the token's routed total are dropped "
                     f"(top {cache.cpu_skip_keep} always kept)"
                 )
+            if self.piped_prefill:
+                # promotion writes the decode-owned LRU; keep it off while piping
+                cache.auto_promote = False
             cache.ondemand_prefill = True
             cache.ondemand_max_tokens = max(
                 0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "8192"))
@@ -1701,6 +1730,12 @@ class Engine:
                 # expert at T=150, where the weights stay in L2/L3 across an expert's tokens)
                 # and its PCIe cost with experts, so the CPU side is relatively cheaper here.
                 frac = os.getenv("FREETOKEN_PREFILL_FETCH_FRACTION", "").strip()
+                if self.piped_prefill and frac:
+                    logger.info_rank0(
+                        "piped prefill: FREETOKEN_PREFILL_FETCH_FRACTION ignored "
+                        "(CPU-executor split shares state with the decode loop)"
+                    )
+                    frac = ""
                 if frac:
                     parts = [float(x) for x in frac.split(",")]
                     picked = parts[min(config.tp_info.rank, len(parts) - 1)]
@@ -1714,6 +1749,13 @@ class Engine:
                 # re-streaming (the plan gathers promoted rows D2D as hits). Per-rank
                 # like the fetch fraction; 0 (default) keeps stream-and-discard.
                 promote = os.getenv("FREETOKEN_PREFILL_PROMOTE_FRAC", "").strip()
+                if self.piped_prefill and promote:
+                    # promotion LRU-assigns slots: the slot cache stays decode-owned
+                    # while piping, so prefill never promotes
+                    logger.info_rank0(
+                        "piped prefill: FREETOKEN_PREFILL_PROMOTE_FRAC forced to 0"
+                    )
+                    promote = ""
                 if promote:
                     parts = [float(x) for x in promote.split(",")]
                     picked = parts[min(config.tp_info.rank, len(parts) - 1)]
@@ -2238,7 +2280,10 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         from freetoken.moe import _debug_stats
 
-        self.run_pending_host_fill()
+        if torch.cuda.current_stream() is self.stream:
+            # the deferred-fill slot is the main loop's; a piped chunk's eager path
+            # stages PLE rows inline on its own stream and must not touch it
+            self.run_pending_host_fill()
         if batch.spec_mode is not None:
             # MTP spec step: dedicated eager path (no graph, no sampler -- the drain
             # consumes the dual-argmax payload instead).
@@ -2249,7 +2294,7 @@ class Engine:
             import time as _time
 
             _te0 = _time.perf_counter()
-        assert torch.cuda.current_stream() == self.stream
+        assert torch.cuda.current_stream() in (self.stream, self.prefill_stream)
         if _dbg is not None:
             _te1 = _time.perf_counter()
         if batch.mm_gather_plan:
@@ -2260,7 +2305,10 @@ class Engine:
         # replay returns a dummy ForwardOutput the ChunkedReq drain branch never reads.
         pg = None
         pg_before = None
-        if batch.is_prefill:
+        # the prefill-chunk graph path warms/captures on the calling thread; a piped
+        # chunk must stay eager (Strata's rule: the reader thread never captures --
+        # capture takes the driver lock and can wait for the device the windows use)
+        if batch.is_prefill and torch.cuda.current_stream() is self.stream:
             from .prefill_graph import prefill_graph_enabled
 
             if prefill_graph_enabled():
@@ -2316,7 +2364,11 @@ class Engine:
         # A failed launch skips this (exception unwinds past it): no WAIT is pending
         # for a replay that never launched, so the fill must not run -- same contract
         # the ple_disk ctx had when it ran the deferred callable at its own exit.
-        if _deferred_fill is not None:
+        if _deferred_fill is not None and torch.cuda.current_stream() is not self.stream:
+            # piped chunk: run its own fill before returning (the main loop's post-drain
+            # slot is single-owner and currently belongs to a decode replay)
+            _deferred_fill()
+        elif _deferred_fill is not None:
             if os.getenv("PLE_FILL_AT_EXIT") == "1":
                 # A/B knob: the historical at-exit execution point (blocks the issue
                 # loop on the readback event until the previous replay completes).
@@ -2347,7 +2399,9 @@ class Engine:
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
+        # record on the stream that RAN the forward: the drain waits this event whether
+        # the batch executed on the engine stream or the piped prefill stream
+        copy_done_event.record(torch.cuda.current_stream())
         if pg is not None:
             # Capture on THIS chunk's context after its eager result is sealed (the
             # drain consumes the eager output above; capture restores the GDN live

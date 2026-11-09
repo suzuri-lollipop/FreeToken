@@ -117,6 +117,10 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    # Engine-measured split of the prompt phase, for the request log: prefill-queue wait and
+    # the prefill forward. 0.0 when the engine never reported them.
+    queue_ms: float = 0.0
+    prefill_ms: float = 0.0
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -132,6 +136,8 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    queue_ms: float = 0.0
+    prefill_ms: float = 0.0
 
 
 @dataclass
@@ -571,15 +577,19 @@ def _record_generation(
     source: str | None,
     stream: bool,
     start: float,
+    arrival_s: float,
     prompt_tokens: int,
     completion_tokens: int,
     error: str | None,
     first_token_at: float | None = None,
+    queue_ms: float = 0.0,
+    prefill_ms: float = 0.0,
 ) -> None:
     """Log one generation request into the request ring. Every protocol adapter converges here,
     so token totals are captured whatever endpoint served the request — unlike the HTTP
     middleware, which for a stream records before the totals are known. `source is None` opts
-    out (those paths stay logged by the middleware)."""
+    out (those paths stay logged by the middleware). `arrival_s` and the engine's queue/prefill
+    pair are the row's only sub-second phase markers, so they are what /metrics can serve."""
     if source is None:
         return
     from .api_server import _served_model_name  # lazy: api_server imports this module
@@ -597,6 +607,9 @@ def _record_generation(
             completion_tokens=completion_tokens,
             stream=stream,
             error=error,
+            arrival_s=arrival_s,
+            queue_ms=round(queue_ms, 3) or None,
+            prefill_ms=round(prefill_ms, 3) or None,
         )
     )
 
@@ -608,8 +621,11 @@ async def generate_events(
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
     if the drop lands before `GenDone`, the only event carrying the totals."""
     start = time.monotonic()
+    arrival_s = time.time()
     prompt_tokens = 0
     completion_tokens = 0
+    queue_ms = 0.0
+    prefill_ms = 0.0
     first_token_at: float | None = None
     error: str | None = None
     try:
@@ -617,6 +633,8 @@ async def generate_events(
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
+                queue_ms = ev.queue_ms
+                prefill_ms = ev.prefill_ms
             elif first_token_at is None:
                 first_token_at = time.monotonic()
             yield ev
@@ -625,9 +643,9 @@ async def generate_events(
         raise
     finally:
         _record_generation(
-            source=source, stream=True, start=start,
+            source=source, stream=True, start=start, arrival_s=arrival_s,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            first_token_at=first_token_at, queue_ms=queue_ms, prefill_ms=prefill_ms,
         )
 
 
@@ -637,6 +655,7 @@ async def generate_full(
     """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
     a `GenerationError` as a failed row."""
     start = time.monotonic()
+    arrival_s = time.time()
     result: GenResult | None = None
     error: str | None = None
     try:
@@ -647,10 +666,12 @@ async def generate_full(
         raise
     finally:
         _record_generation(
-            source=source, stream=False, start=start,
+            source=source, stream=False, start=start, arrival_s=arrival_s,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
+            queue_ms=result.queue_ms if result else 0.0,
+            prefill_ms=result.prefill_ms if result else 0.0,
         )
 
 
@@ -758,12 +779,18 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    queue_ms = 0.0
+    prefill_ms = 0.0
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        # The pair rides every token of the request once the prompt is done; keep the last
+        # nonzero one (0.0 means this reply carried no measurement).
+        queue_ms = getattr(ack, "queue_ms", 0.0) or queue_ms
+        prefill_ms = getattr(ack, "prefill_ms", 0.0) or prefill_ms
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -846,6 +873,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        queue_ms=queue_ms, prefill_ms=prefill_ms,
     )
 
 
@@ -858,12 +886,16 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     cached_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    queue_ms = 0.0
+    prefill_ms = 0.0
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        queue_ms = getattr(ack, "queue_ms", 0.0) or queue_ms
+        prefill_ms = getattr(ack, "prefill_ms", 0.0) or prefill_ms
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -890,4 +922,6 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        queue_ms=queue_ms,
+        prefill_ms=prefill_ms,
     )

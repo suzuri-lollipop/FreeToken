@@ -71,6 +71,7 @@ def _setup():
         _gpu_mem_bytes=lambda: 0,
         _match_stop_str=lambda _req: None,
         _account_prefill_debt=lambda _batch: None,
+        _charge_prefill_time=lambda _batch: None,
         _observe_chunk_time=lambda _batch: None,
         _pending_abort_acks=set(),
         _last_data=None,

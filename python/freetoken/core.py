@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Tuple
@@ -120,6 +121,13 @@ class Req:
     spec_accepted: int = 0
     # Consecutive rejected verifies: the per-step signal behind the short stand-down.
     spec_rejects: int = 0
+    # Phase timings in ms, measured in the scheduler and reported to the frontend on the first
+    # sampled token: time held in the prefill queue, and the schedule->drain prefill window.
+    queue_ms: float = 0.0
+    prefill_ms: float = 0.0
+    # Tokens forwarded in the prefill batch currently in flight, snapshotted when it was
+    # scheduled: extend_len reads 0 by the time the drain splits that batch's wall time.
+    prefill_chunk_tokens: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -195,6 +203,11 @@ class Batch:
     # positions anywhere in a request's history snapshot those rows before a captured replay
     # (DSV4), since the next batch's allocate_paged mutates the live table.
     active_table_idx: "torch.Tensor | None" = None
+    # Running requests riding a phase="prefill" batch (FREETOKEN_MIXED_PREFILL_TOKENS):
+    # extend_len==1 rows of live decodes, not prompt chunks. The drain, the SWA drivers,
+    # the toolcall-anchor snapshot and the prefill-time charge branch on this membership,
+    # never on phase. None for a pure prefill / decode batch.
+    decoding_reqs: "List[Req] | None" = field(default=None, init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
@@ -286,21 +299,47 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # The active batch is per-thread for the piped-prefill thread (FREETOKEN_PIPED_PREFILL):
+    # a prefill forward runs there WHILE the main loop issues a decode step, and each
+    # forward's layers must read their own batch. The main thread keeps the plain instance
+    # slot, so capture, dual-decode swap_batch and every existing path are untouched; a
+    # registered pipe thread sees only its thread-local slot.
     _batch: Batch | None = field(default=None, init=False)
+    _pipe_tl: "threading.local | None" = field(default=None, init=False, repr=False)
+
+    def register_pipe_thread(self) -> None:
+        """Call ONCE from the piped-prefill worker thread; marks it as batch-scoped."""
+        if self._pipe_tl is None:
+            self._pipe_tl = threading.local()
+        self._pipe_tl.is_pipe = True
+
+    @property
+    def _active(self) -> "Batch | None":
+        if self._pipe_tl is not None and getattr(self._pipe_tl, "is_pipe", False):
+            return getattr(self._pipe_tl, "batch", None)
+        return self._batch
+
+    @_active.setter
+    def _active(self, batch: "Batch | None") -> None:
+        if self._pipe_tl is not None and getattr(self._pipe_tl, "is_pipe", False):
+            self._pipe_tl.batch = batch
+        else:
+            self._batch = batch
 
     @property
     def batch(self) -> Batch:
-        assert self._batch is not None, "No active batch in context"
-        return self._batch
+        cur = self._active
+        assert cur is not None, "No active batch in context"
+        return cur
 
     @contextmanager
     def forward_batch(self, batch: Batch):
-        assert self._batch is None, "Nested forward_batch is not allowed"
+        assert self._active is None, "Nested forward_batch is not allowed"
+        self._active = batch
         try:
-            self._batch = batch
             yield
         finally:
-            self._batch = None
+            self._active = None
 
     @contextmanager
     def swap_batch(self, batch: Batch):
@@ -308,12 +347,12 @@ class Context:
 
         The dual-microbatch decode driver swaps the half-batch views in and out
         under the engine's outer forward_batch scope (per half, per layer)."""
-        prev = self._batch
+        prev = self._active
+        self._active = batch
         try:
-            self._batch = batch
             yield
         finally:
-            self._batch = prev
+            self._active = prev
 
 
 _GLOBAL_CTX: Context | None = None

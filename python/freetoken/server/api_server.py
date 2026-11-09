@@ -774,6 +774,8 @@ class _RequestTimingMiddleware:
                         break
                 request_ring.record_request(
                     request_ring.RequestRecord(
+                        # arrival_s left unset: this row has no engine phase pair and stamps the
+                        # response start, so /metrics skips it.
                         ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         method=scope.get("method", ""),
                         path=path,

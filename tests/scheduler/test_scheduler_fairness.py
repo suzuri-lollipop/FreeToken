@@ -22,18 +22,19 @@ import torch
 
 def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float = 0.0,
                     debt: float = 0.0, chunk_target: float = 0.0,
-                    chunk_ema: float | None = None, budget: int = 99):
+                    chunk_ema: float | None = None, budget: int = 99,
+                    mixed_tokens: int = 0, running_uids: tuple = (1, 2)):
     from freetoken.scheduler.scheduler import Scheduler
 
     calls: list[str] = []
     budgets: list[int] = []
-    prefill_batch = SimpleNamespace(is_prefill=True, prompt_admissions=[])
     decode_batch = SimpleNamespace(is_prefill=False, prompt_admissions=[])
 
     def prefill(_budget):
         calls.append("prefill")
         budgets.append(_budget)
-        return prefill_batch
+        # fresh batch per pass: the mixed path appends ride-along rows to batch.reqs
+        return SimpleNamespace(is_prefill=True, spec_mode=None, prompt_admissions=[], reqs=[])
 
     def decode():
         calls.append("decode")
@@ -49,9 +50,11 @@ def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float =
     scheduler._last_data = None  # set per step by _inflight / _overlap_phases
     scheduler._chunk_target_s = chunk_target
     scheduler._chunk_ema_spt = chunk_ema
+    scheduler._mixed_prefill_tokens = mixed_tokens
     scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=prefill)
     scheduler.decode_manager = SimpleNamespace(
-        schedule_next_batch=decode, runnable=decode_runnable
+        schedule_next_batch=decode, runnable=decode_runnable,
+        running_reqs=[SimpleNamespace(uid=u) for u in running_uids],
     )
     scheduler._prepare_batch = lambda batch: batch
     scheduler._report_prompt_admissions = lambda batch: None
@@ -428,3 +431,133 @@ def test_effective_debt_follows_chunk_target_in_adaptive_mode():
     assert Scheduler._effective_debt_s(scheduler) == 2.0
     scheduler._chunk_target_s, scheduler._chunk_ema_spt = 0.5, None
     assert Scheduler._effective_debt_s(scheduler) == 2.0
+
+
+# ------------------------------------------- mixed prefill+decode (FREETOKEN_MIXED_PREFILL_TOKENS)
+
+
+def _mixed_phases(scheduler, n: int) -> list[list[int]]:
+    """Run n mixed-mode scheduling passes; return each launched batch's ride-along uids."""
+    from freetoken.scheduler.scheduler import Scheduler
+
+    rides = []
+    for _ in range(n):
+        launched = Scheduler._schedule_next_batch(scheduler)
+        assert launched.is_prefill
+        assert launched.spec_mode is None
+        rides.append([r.uid for r in launched.decoding_reqs])
+    return rides
+
+
+def test_mixed_batch_carries_every_running_decode_on_every_step():
+    # interval=2 would concede a pure decode step at step 3; in mixed mode the decodes
+    # ride the chunk instead, so no dedicated decode step is ever scheduled
+    scheduler, calls = _stub_scheduler(interval=2, mixed_tokens=1024)
+    rides = _mixed_phases(scheduler, 4)
+    assert rides == [[1, 2]] * 4
+    assert calls == ["prefill"] * 4  # decode_manager.schedule_next_batch never ran
+
+
+def test_mixed_batch_does_not_feed_the_prefill_streak():
+    scheduler, _calls = _stub_scheduler(interval=2, mixed_tokens=1024)
+    _mixed_phases(scheduler, 4)
+    assert scheduler._prefill_streak == 0
+
+
+def test_mixed_caps_the_chunk_but_off_mode_does_not():
+    scheduler, _ = _stub_scheduler(
+        interval=0, debt_s=0.0, mixed_tokens=1024, budget=8192
+    )
+    _mixed_phases(scheduler, 1)
+    assert scheduler.recorded_budgets == [1024]
+    off, _ = _stub_scheduler(interval=0, debt_s=0.0, budget=8192)
+    _phases(off, 1)
+    assert off.recorded_budgets == [8192]
+
+
+def test_mixed_needs_a_running_decode():
+    scheduler, _calls = _stub_scheduler(
+        interval=0, debt_s=0.0, decode_runnable=False, mixed_tokens=1024, budget=8192
+    )
+    phases = _phases(scheduler, 1)
+    assert phases == ["p"]
+    assert scheduler.recorded_budgets == [8192]  # uncapped: nobody to carry
+
+
+# ------------------------------------------------------------- FREETOKEN_ADMIT_SHORT_FIRST
+
+
+def _two_prompts():
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    long_p = PendingReq(
+        uid=1,
+        input_ids=torch.arange(40, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    short_p = PendingReq(
+        uid=2,
+        input_ids=torch.arange(8, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    return long_p, short_p
+
+
+def test_short_first_admits_the_short_prompt_queued_behind():
+    import time
+
+    from freetoken.scheduler.scheduler import _admit_short_first  # noqa: F401  (name guard)
+
+    _cache, _tables, prefill_manager = _build_managers(num_pages=512)
+    prefill_manager.short_first = 16
+    long_p, short_p = _two_prompts()
+    now = time.perf_counter()
+    long_p.enqueued_at, short_p.enqueued_at = now - 1.0, now
+    prefill_manager.pending_list = [long_p, short_p]
+
+    batch = prefill_manager.schedule_next_batch(1000)
+
+    assert [req.uid for req in batch.reqs] == [2, 1]
+
+
+def test_off_by_default_admits_in_arrival_order():
+    _cache, _tables, prefill_manager = _build_managers(num_pages=512)
+    long_p, short_p = _two_prompts()
+    prefill_manager.pending_list = [long_p, short_p]
+
+    batch = prefill_manager.schedule_next_batch(1000)
+
+    assert [req.uid for req in batch.reqs] == [1, 2]
+
+
+def test_a_long_prompt_that_waited_too_long_goes_first():
+    import time
+
+    _cache, _tables, prefill_manager = _build_managers(num_pages=512)
+    prefill_manager.short_first = 16
+    prefill_manager.admit_max_wait_s = 30.0
+    long_p, short_p = _two_prompts()
+    now = time.perf_counter()
+    long_p.enqueued_at, short_p.enqueued_at = now - 31.0, now
+    prefill_manager.pending_list = [long_p, short_p]
+
+    batch = prefill_manager.schedule_next_batch(1000)
+
+    assert [req.uid for req in batch.reqs] == [1, 2]
+
+
+def test_admission_order_keeps_chunk_continuations_first():
+    from types import SimpleNamespace as NS
+
+    from freetoken.scheduler.prefill import PrefillManager
+
+    manager = PrefillManager.__new__(PrefillManager)
+    manager.short_first = 8
+    manager.admit_max_wait_s = 30.0
+    cont = NS(chunked_req=object(), input_len=50_000, enqueued_at=0.0)
+    long_p = NS(chunked_req=None, input_len=9_000, enqueued_at=0.0)
+    short_p = NS(chunked_req=None, input_len=4, enqueued_at=0.0)
+    manager.pending_list = [long_p, cont, short_p]
+
+    assert manager._admission_order() == [cont, short_p, long_p]

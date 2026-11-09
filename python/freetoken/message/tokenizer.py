@@ -68,6 +68,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     spec_steps: int = 0
     spec_decode_steps: int = 0
     spec_cold_seeds: int = 0
+    # This request's phase timings in ms, measured in the scheduler: time spent in the prefill
+    # queue, and the prefill forward charged to it. Constant once its first token drains.
+    queue_ms: float = 0.0
+    prefill_ms: float = 0.0
 
 
 @dataclass
