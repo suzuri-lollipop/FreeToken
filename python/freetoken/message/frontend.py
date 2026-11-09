@@ -66,6 +66,10 @@ class UserReply(BaseFrontendMsg):
     spec_steps: int = 0
     spec_decode_steps: int = 0
     spec_cold_seeds: int = 0
+    # Engine-measured phase timings in ms, riding the first sampled token: the time this
+    # request waited in the prefill queue, and the prefill forward charged to it.
+    queue_ms: float = 0.0
+    prefill_ms: float = 0.0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

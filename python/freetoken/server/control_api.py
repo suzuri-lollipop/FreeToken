@@ -1,6 +1,7 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5), /v1/meminfo
-(VRAM breakdown) + /meminfo (its HTML dashboard).
+/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5), /metrics
+(per-request phase split for llm-launcher's bench), /v1/meminfo (VRAM breakdown) + /meminfo
+(its HTML dashboard).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -88,6 +89,33 @@ def register_control_routes(
         limit = max(1, min(limit, 512))
         entries, next_cursor = request_ring.requests_since(since, limit)
         return {"entries": entries, "next_cursor": next_cursor}
+
+    @app.get("/metrics")
+    async def phase_metrics(limit: int = 256):
+        """Per-request phase split in the shape llm-launcher's bench reads off strata: ``time``
+        is the wall-clock arrival, ``prompt_ms`` the engine's prefill forward, and
+        ``first_engine_token_s`` the time to the first token as the API measured it, so a client
+        that knows when it sent the request gets ``queue wait = first - prompt``. Rows the HTTP
+        middleware logged carry no arrival stamp and no engine pair, so they are left out."""
+        rows = []
+        for rec in request_ring.requests_phase_rows(max(1, min(limit, 512))):
+            prefill_s = rec["prefill_ms"] / 1000.0
+            first_s = None
+            if rec["ttft_ms"] is not None:
+                # Never below the prompt's own prefill: measurement noise would read to the
+                # caller as a negative queue wait.
+                first_s = max(rec["ttft_ms"] / 1000.0, prefill_s)
+            rows.append({
+                "time": rec["arrival_s"],
+                "prompt_ms": rec["prefill_ms"],
+                "first_engine_token_s": first_s,
+                "prompt_tokens": rec["prompt_tokens"],
+                "queue_ms": rec["queue_ms"],
+                "ttft_ms": rec["ttft_ms"],
+                "duration_ms": rec["duration_ms"],
+                "stream": rec["stream"],
+            })
+        return {"kind": "freetoken", "requests": rows}
 
     from .stats import build_stats
 

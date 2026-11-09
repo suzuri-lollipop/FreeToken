@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -63,7 +64,10 @@ class FakeState:
             yield reply
 
 
-def _ack(prompt: int = 0, completion: int = 0, out: str = "", finished: bool = False) -> UserReply:
+def _ack(
+    prompt: int = 0, completion: int = 0, out: str = "", finished: bool = False,
+    queue_ms: float = 0.0, prefill_ms: float = 0.0,
+) -> UserReply:
     return UserReply(
         uid=42,
         incremental_output=out,
@@ -71,6 +75,8 @@ def _ack(prompt: int = 0, completion: int = 0, out: str = "", finished: bool = F
         prompt_tokens_delta=prompt,
         completion_tokens_delta=completion,
         finish_reason="stop" if finished else None,
+        queue_ms=queue_ms,
+        prefill_ms=prefill_ms,
     )
 
 
@@ -169,7 +175,10 @@ def test_non_stream_records_the_request_with_real_token_totals():
 
 def test_stream_records_the_totals_from_gendone():
     request_ring.reset()
-    st = FakeState([_ack(prompt=7, completion=1, out="x"), _ack(completion=4, out="yz", finished=True)])
+    st = FakeState([
+        _ack(prompt=7, completion=1, out="x", queue_ms=4.25, prefill_ms=120.5),
+        _ack(completion=4, out="yz", finished=True),
+    ])
 
     async def drain():
         done = None
@@ -183,6 +192,12 @@ def test_stream_records_the_totals_from_gendone():
     row = _last_row()
     assert row["path"] == "/v1/messages" and row["stream"] is True
     assert (row["prompt_tokens"], row["completion_tokens"]) == (7, 5)
+    # The engine stamps the phase pair on the reply that samples the prompt's first token; the
+    # terminal reply does not repeat it, and the row must still carry it.
+    assert (row["queue_ms"], row["prefill_ms"]) == (4.25, 120.5)
+    # Wall epoch, not the monotonic clock the rest of this layer runs on: a caller pairs the
+    # row with the moment it sent the request.
+    assert row["arrival_s"] == pytest.approx(time.time(), abs=60.0)
 
 
 def test_stream_still_records_the_row_when_the_client_disconnects_mid_stream():
@@ -256,3 +271,21 @@ def test_ttft_mean_is_zero_without_samples():
     request_ring.reset()
     request_ring.record_request(_row(ttft_ms=None))
     assert request_ring.requests_ttft_mean_ms() == 0
+
+
+def test_phase_rows_are_only_the_ones_the_engine_stamped():
+    """GET /metrics answers from these. A middleware row has no arrival stamp and a generation
+    the engine never stamped has no prompt phase; either one reaching a caller would pair its
+    own send time with a phase nobody measured."""
+    request_ring.reset()
+    stamped = FakeState([
+        _ack(prompt=1, completion=1, out="a", finished=True, queue_ms=2.5, prefill_ms=40.0)
+    ])
+    asyncio.run(generate_full(42, _spec(), stamped, source="/v1/chat/completions"))
+    unstamped = FakeState([_ack(prompt=1, completion=1, out="a", finished=True)])
+    asyncio.run(generate_full(42, _spec(), unstamped, source="/v1/chat/completions"))
+    request_ring.record_request(_row(ttft_ms=50))  # what the HTTP middleware logs
+
+    rows = request_ring.requests_phase_rows(256)
+    assert [(r["queue_ms"], r["prefill_ms"]) for r in rows] == [(2.5, 40.0)]
+    assert rows[0]["arrival_s"] > 0

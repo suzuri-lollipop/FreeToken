@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import uuid
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from freetoken.core import SamplingParams
+from freetoken.core import Req, SamplingParams
 from freetoken.message import (
     AbortBackendMsg,
     BatchTokenizerMsg,
@@ -323,3 +324,58 @@ def test_listener_accounts_late_reply_after_ack_queue_was_removed():
     assert manager.stats.prompt_tokens_total == 5
     assert manager.stats.completion_tokens_total == 2
     assert manager.ack_map == {}
+
+
+def test_prefill_window_is_split_by_the_tokens_it_forwarded():
+    """The schedule->drain window belongs to the batch, not to one prompt: every prompt of a
+    shared batch claiming it whole would multiply the prompt phase the frontend reports. A
+    chunked prompt accumulates its chunks, since only the last one samples a token."""
+
+    def req(uid: int, tokens: int) -> Req:
+        # What schedule_next_batch leaves for the drain: the Req plus this batch's snapshot of
+        # the tokens it forwards, because extend_len reads 0 once the forward is done.
+        admitted = Req(
+            input_ids=torch.zeros(tokens, dtype=torch.int32), table_idx=0, cached_len=0,
+            output_len=8, uid=uid, sampling_params=SamplingParams(), cache_handle=None,
+        )
+        admitted.prefill_chunk_tokens = tokens
+        return admitted
+
+    scheduler = Scheduler.__new__(Scheduler)
+    long_req, short_req = req(1, 300), req(2, 100)
+    batch = SimpleNamespace(
+        is_prefill=True, spec_mode=None, reqs=[long_req, short_req],
+        scheduled_at=time.perf_counter() - 0.25,
+    )
+    Scheduler._charge_prefill_time(scheduler, batch)
+    assert long_req.prefill_ms == pytest.approx(short_req.prefill_ms * 3, rel=0.02)
+    assert long_req.prefill_ms + short_req.prefill_ms == pytest.approx(250.0, rel=0.05)
+
+    first_chunk = long_req.prefill_ms
+    chunk = SimpleNamespace(
+        is_prefill=True, spec_mode=None, reqs=[long_req], scheduled_at=time.perf_counter() - 0.05
+    )
+    Scheduler._charge_prefill_time(scheduler, chunk)
+    # the next chunk adds to the prompt's total, it does not replace it
+    assert long_req.prefill_ms - first_chunk == pytest.approx(50.0, rel=0.15)
+
+
+def test_prefill_window_skips_batches_that_forwarded_no_prompt():
+    """A spec verify rides phase="prefill" but is a decode step, a decode batch has no prompt,
+    and an unstamped batch never reached the engine; charging any of them invents a prompt phase
+    for a request that did not run one."""
+
+    scheduler = Scheduler.__new__(Scheduler)
+    req = Req(
+        input_ids=torch.zeros(64, dtype=torch.int32), table_idx=0, cached_len=0,
+        output_len=8, uid=1, sampling_params=SamplingParams(), cache_handle=None,
+    )
+    req.prefill_chunk_tokens = 64  # it did forward a prompt: only the guards can stop the charge
+    stamp = time.perf_counter() - 0.25
+    for batch in (
+        SimpleNamespace(is_prefill=False, spec_mode=None, reqs=[req], scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, spec_mode="verify", reqs=[req], scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, spec_mode=None, reqs=[req], scheduled_at=0.0),
+    ):
+        Scheduler._charge_prefill_time(scheduler, batch)
+    assert req.prefill_ms == 0.0
