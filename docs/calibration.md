@@ -1,4 +1,4 @@
-# Calibrating prompt lookup and parallel requests on this PC
+# Calibrating prompt lookup, parallel requests, and concurrent prefill on this PC
 
 `--speculative lookup` pays when a verify of `1 + K` rows costs less than the `K` decode steps it
 replaces. That ratio is a property of the machine and the model: a fast box with experts in VRAM
@@ -221,6 +221,45 @@ If a profile already has a full argv, pass it instead of rebuilding one:
 `--port` overrides the config's port. Any `--speculative` already in `argv`, and any
 `FREETOKEN_LOOKUP_*` already in its `env`, is removed: the baseline arm must be plain decoding, and
 every candidate sets its own three values.
+
+## Calibrating concurrent prefill (`ft calibrate multi`)
+
+`FREETOKEN_PIPED_PREFILL` / `FREETOKEN_MIXED_PREFILL_TOKENS` (see
+[cli.md](cli.md#prefill--decode-scheduling)) decide whether a new prompt's prefill runs beside
+the running decodes or ahead of them, and that, too, is a property of the machine: how long an
+eager chunk costs here, how much of the PCIe the decode-side expert streaming still has left,
+and whether the GPU honours stream priorities. `ft calibrate multi` measures the four arms on
+this box with one staggered workload (three short greedy victims, then a 16k-token aggressor
+admitted while they decode):
+
+| arm | knobs | what it should win |
+|---|---|---|
+| `none` | all off | the inline interleave baseline (debt guard bounds the stall at ~one chunk) |
+| `mixed` | MIXED=1024, SHORT_FIRST=1024 | decodes advance per CHUNK; bounded stall, split-chunk cost |
+| `piped` | PIPED=1 | decodes advance per REPLAY; zero stall, chunk runs beside them |
+| `piped-sf` | PIPED=1, SHORT_FIRST=1024 | also: short prompts admitted ahead of the long queue |
+
+An arm wins only when it cuts the worst inter-token stall by 0.5 s (or lands under the 0.5 s
+human threshold while the baseline is above it) and gives up at most 25% of aggregate tok/s.
+Arms whose mechanism never activated - piping is refused while `--speculative` is armed, and the
+tool reads its own server log for the `piped prefill enabled` / `[chunktime] mix=` markers -
+are excluded with the reason in the report, not scored as if they ran. The winner's FULL knob
+set (explicit zeros included) is written to `freetoken-multi-<tag>.json` +
+`run-freetoken-multi-<tag>.sh`; "none wins" therefore also clears stale experimental ON values.
+
+```bash
+.venv/bin/ft calibrate multi --config launch.json --out-dir ~/calibration/qwen38-multi
+```
+
+Unlike the lookup tool, a multi arm keeps the config's `--speculative` flag: it measures the
+server the profile actually starts, and rejects piping on it with the reason if the spec path
+makes the side stream unsafe. The same preflight applies to tensor parallelism: piping is
+TP1-only (concurrent NCCL comms across two host threads can deadlock ranks -- measured), so
+under `--tp-size > 1` the piped arms are reported as skipped with that reason and only the
+`none`/`mixed` arms run. Expect ~15 min (4 arms x one engine start) on TP1, ~7 min on TP2.
+The launcher's
+Calibration tab exposes this as the multi choice next to the single-stream (auto) one, and
+writes the winner into the profile's / the launch JSON's `env` the same way lookup does.
 
 ## Notes
 

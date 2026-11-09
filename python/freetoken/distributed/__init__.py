@@ -1,8 +1,6 @@
 from .impl import (
     DistributedCommunicator,
     ar_instance,
-    mark_pipe_thread,
-    pipe_comm_available,
     destroy_distributed,
     dual_ar_available,
     enable_pynccl_distributed,
@@ -19,6 +17,4 @@ __all__ = [
     "destroy_distributed",
     "ar_instance",
     "dual_ar_available",
-    "mark_pipe_thread",
-    "pipe_comm_available",
 ]

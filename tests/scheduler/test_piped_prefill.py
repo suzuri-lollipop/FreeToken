@@ -64,41 +64,6 @@ def test_ctx_nesting_assert_stays_per_thread():
 # ------------------------------------------------------------------ collectives
 
 
-def test_pipe_thread_routes_collectives_to_the_second_comm(monkeypatch):
-    from freetoken.distributed import impl
-
-    class _Rec:
-        def __init__(self, tag):
-            self.tag = tag
-            self.seen = []
-
-        def all_reduce(self, x):
-            self.seen.append(self.tag)
-            return x
-
-        def all_gather(self, x):
-            return x
-
-    primary, pipe = _Rec("primary"), _Rec("pipe")
-    comm = impl.DistributedCommunicator()
-    monkeypatch.setattr(impl.DistributedCommunicator, "plugins", [primary])
-    monkeypatch.setattr(impl, "_PIPE_IMPL", pipe)
-
-    comm.all_reduce("t")
-    assert primary.seen == ["primary"] and pipe.seen == []
-
-    def worker():
-        impl.mark_pipe_thread()
-        comm.all_reduce("t")
-        comm.all_gather("t")
-
-    th = threading.Thread(target=worker)
-    th.start()
-    th.join()
-    assert pipe.seen == ["pipe"]  # only the marked thread's calls moved
-    assert primary.seen == ["primary"]
-
-
 # ------------------------------------------------------------------ scheduler policy
 
 

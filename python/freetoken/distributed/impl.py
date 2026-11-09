@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
@@ -99,19 +98,11 @@ class DistributedCommunicator:
         # SECOND shm one-shot instance (its own counter/flags/data slots): two
         # independent call sequences must never share one seq-locked reducer, and
         # the per-stream choice is baked at graph-capture time by ``ar_instance``.
-        if getattr(_PIPE_TL, "on", False) and _PIPE_IMPL is not None:
-            # piped prefill (FREETOKEN_PIPED_PREFILL): the pipe thread's collectives
-            # interleave with the decode loop's in WALL CLOCK, so they run on their
-            # own NCCL comm -- per-comm call order stays rank-identical (both ranks
-            # replay the same broadcast schedule), concurrent comms are NCCL-legal.
-            return _PIPE_IMPL.all_reduce(x)
         if _AR_INSTANCE == 1 and _DUAL_IMPL is not None:
             return _DUAL_IMPL.all_reduce(x)
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        if getattr(_PIPE_TL, "on", False) and _PIPE_IMPL is not None:
-            return _PIPE_IMPL.all_gather(x)
         return self.plugins[-1].all_gather(x)
 
 
@@ -133,20 +124,6 @@ def enable_pynccl_distributed(
     )
 
     DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
-
-    if tp_info.size > 1 and os.environ.get("FREETOKEN_PIPED_PREFILL", "0") == "1":
-        # Piped prefill (Strata PIPED_CONCURRENT port): a second NCCL comm for the
-        # pipe thread. Both ranks take this branch identically (same env, same
-        # tp_cpu_group rendezvous), so the extra uid exchange is symmetric.
-        global _PIPE_IMPL
-        pipe_comm = init_pynccl(
-            tp_rank=tp_info.rank,
-            tp_size=tp_info.size,
-            tp_cpu_group=tp_cpu_group,
-            max_size_bytes=max_bytes,
-        )
-        _PIPE_IMPL = PyNCCLDistributedImpl(pipe_comm)
-        logger.info_rank0("piped prefill: second NCCL communicator ready")
 
     # Small-message fast path for decode-sized reductions (~26-37us NCCL LL ->
     # single-digit us): GPU-P2P one-shot where the PCIe/NVLink data plane works,
@@ -202,20 +179,6 @@ def enable_pynccl_distributed(
 
 _DUAL_IMPL: "DistributedImpl | None" = None
 _AR_INSTANCE = 0
-# Piped prefill (FREETOKEN_PIPED_PREFILL): the pipe thread marks itself here and its
-# collectives route to a dedicated NCCL comm; the main loop never touches either.
-_PIPE_TL = threading.local()
-_PIPE_IMPL: "DistributedImpl | None" = None
-
-
-def pipe_comm_available() -> bool:
-    """Whether piped prefill has a collectives path (second comm, or nothing to say)."""
-    return _PIPE_IMPL is not None
-
-
-def mark_pipe_thread() -> None:
-    """Declare the calling thread the piped-prefill worker (collectives route to _PIPE_IMPL)."""
-    _PIPE_TL.on = True
 
 
 @contextlib.contextmanager
@@ -241,8 +204,7 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    global _DUAL_IMPL, _AR_INSTANCE, _PIPE_IMPL
+    global _DUAL_IMPL, _AR_INSTANCE
     _DUAL_IMPL = None
-    _PIPE_IMPL = None
     _AR_INSTANCE = 0
     DistributedCommunicator.plugins = []
