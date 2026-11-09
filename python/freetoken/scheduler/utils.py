@@ -20,6 +20,8 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
+    # perf_counter() stamp of arrival in pending_list, the start of this prompt's queue wait.
+    enqueued_at: float = 0.0
 
     @property
     def input_len(self) -> int:

@@ -24,6 +24,12 @@ class RequestRecord:
     completion_tokens: int | None
     stream: bool | None
     error: str | None
+    # Wall-epoch arrival (time.time()) and the engine's split of the prompt phase. Only the
+    # generation layer sets these; `ts` above has second resolution and cannot pair with a
+    # client-side send timestamp.
+    arrival_s: float = 0.0
+    queue_ms: float | None = None
+    prefill_ms: float | None = None
 
 
 class RequestRing:
@@ -53,6 +59,12 @@ class RequestRing:
 
         return out, next_cursor
 
+    def phase_rows(self, limit: int) -> list[dict]:
+        """Recent rows that carry the sub-second phase split, oldest first. Rows logged by the
+        HTTP middleware have no arrival stamp, so they cannot be paired with a client request."""
+        rows = [asdict(rec) for _idx, rec in self._buf if rec.arrival_s and rec.prefill_ms]
+        return rows[-limit:] if limit > 0 else rows
+
     def p95_ms(self) -> int:
         durs = sorted(rec.duration_ms for _idx, rec in self._buf)
         if not durs:
@@ -81,6 +93,10 @@ def record_request(rec: RequestRecord) -> None:
 
 def requests_since(cursor: int, limit: int) -> tuple[list[dict], int]:
     return _RING.since(cursor, limit)
+
+
+def requests_phase_rows(limit: int) -> list[dict]:
+    return _RING.phase_rows(limit)
 
 
 def requests_p95_ms() -> int:

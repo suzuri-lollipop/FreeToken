@@ -89,6 +89,46 @@ def _adaptive_chunk_target_s() -> float:
         raise ValueError(f"FREETOKEN_ADAPTIVE_CHUNK_TARGET_S must be a number, got {raw!r}")
 
 
+# FREETOKEN_MIXED_PREFILL_TOKENS=N (0 = off): while decodes run, the next prompt chunk
+# is scheduled WITH every running request in one phase="prefill" batch (their
+# extend_len==1 rows ride the chunk's forward) instead of as a dedicated prefill step.
+# Decodes then advance on EVERY forward -- the scheduling effect of Strata's
+# STRATA_PIPED_CONCURRENT -- and N caps the chunk so a mixed step stays near Strata's
+# 1024-token concurrent prompt window. While a prompt queue exists and a decode runs,
+# the prefill/decode interleave guard (prefill_decode_interval, FREETOKEN_PREFILL_DEBT_S)
+# is inert: nobody waits on a dedicated chunk anymore. A mixed batch never upgrades to
+# spec (MTP/lookup drafting resumes when the prompt queue drains), and the running
+# requests' GDN rows take the chunked-scan kernel instead of the recurrent decode
+# kernel for the duration -- same math, different rounding.
+def _mixed_prefill_tokens() -> int:
+    raw = os.environ.get("FREETOKEN_MIXED_PREFILL_TOKENS", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        raise ValueError(
+            f"FREETOKEN_MIXED_PREFILL_TOKENS must be an integer, got {raw!r}"
+        )
+
+
+# FREETOKEN_ADMIT_SHORT_FIRST=N (port of STRATA_ADMIT_SHORT_FIRST): a pending prompt of
+# at most N tokens takes this step's token budget before longer ones queued ahead of it;
+# a long one that waited FREETOKEN_ADMIT_MAX_WAIT_S counts as short (no starvation).
+def _admit_short_first() -> int:
+    raw = os.environ.get("FREETOKEN_ADMIT_SHORT_FIRST", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        raise ValueError(f"FREETOKEN_ADMIT_SHORT_FIRST must be an integer, got {raw!r}")
+
+
+def _admit_max_wait_s() -> float:
+    raw = os.environ.get("FREETOKEN_ADMIT_MAX_WAIT_S", "30")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise ValueError(f"FREETOKEN_ADMIT_MAX_WAIT_S must be a number, got {raw!r}")
+
+
 # Adaptive chunk shaping: multiples of 64 keep the hybrid GDN x64 snapshot
 # boundaries (prefill_chunk_align's reuse points); the floor stops a slow outlier
 # chunk from collapsing the prompt into per-chunk-overhead-dominated slivers.
@@ -207,6 +247,8 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            short_first=_admit_short_first(),
+            admit_max_wait_s=_admit_max_wait_s(),
         )
 
         # some alias for easy access
@@ -263,6 +305,18 @@ class Scheduler(SchedulerIOMixin):
         # re-open the debt it bought (one chunk == at most one concede, see _inflight_prefill).
         self._debt_discharge = None
         self._prefill_debt_s = _prefill_debt_budget()
+        self._mixed_prefill_tokens = _mixed_prefill_tokens()
+        # Piped prefill (FREETOKEN_PIPED_PREFILL, Strata PIPED_CONCURRENT port): prefill
+        # chunks run on the pipe thread's own default-priority stream while this loop
+        # keeps issuing decode steps on the high-priority engine stream. It supersedes
+        # mixed batching (decodes ride every REPLAY now, not every chunk), so enabling
+        # it clears the mixed cap.
+        self._pipe = None
+        self._pipe_take = None
+        if getattr(self.engine, "piped_prefill", False):
+            self._pipe = self._make_pipe()
+            if self._pipe is not None:
+                self._mixed_prefill_tokens = 0
         self._chunk_target_s = _adaptive_chunk_target_s()
         self._chunk_ema_spt: float | None = None  # EMA of prefill seconds per token
         # Opt-in per-chunk wall-clock breakdown ([chunktime] log lines). Independent of
@@ -403,6 +457,10 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
             or self._pending_flush is not None  # a deferred flush to run at idle or time out
+            # a piped chunk holds pages/slots and owes a drain: the loop is NOT idle,
+            # and blocking here would let run_when_idle's integrity check see the
+            # chunk's own allocations as a leak (and stall the drain behind messages)
+            or (self._pipe is not None and (self._pipe.inflight or self._pipe_take is not None))
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -421,6 +479,7 @@ class Scheduler(SchedulerIOMixin):
         # NOT a gate — those requests are already freed (no live GPU/page resources).
         if self._pending_rebuild is not None and last_data is None and not (
             self.prefill_manager.runnable or self.decode_manager.runnable
+            or (self._pipe is not None and self._pipe.inflight)
         ):
             self._execute_pending_rebuild()
         self._check_pending_flush()
@@ -432,6 +491,30 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        # Piped prefill: harvest a finished chunk BEFORE deciding this iteration's
+        # batches (can_take() must see the slot as free) and order the staging stream
+        # behind the chunk's pool write. A dead worker discards its chunk and the
+        # loop reverts to inline prefill steps.
+        piped_drain = None
+        if self._pipe is not None:
+            got = self._pipe.poll()
+            if got is not None:
+                fin, fout, err = got
+                if err is not None:
+                    self._discard_piped_chunk(fin, err)
+                    self._pipe = None
+                else:
+                    self.stream.wait_event(self._pipe.chunk_done)
+                    piped_drain = (fin, fout)
+            elif self._pipe.inflight and last_data is None and not self.decode_manager.runnable:
+                # the pipe is the only work: wait it out instead of spinning the loop
+                # (message latency stays at one chunk, today's inline cadence). An
+                # unrecorded event would answer instantly, so wait the cv for the
+                # publish and only then the GPU point.
+                if self._pipe.slot is None:
+                    self._pipe.wait_slot()
+                else:
+                    self._pipe.chunk_done.synchronize()
         # The accept of an in-flight spec batch is host state the next batch is built from, so
         # this iteration cannot issue first: drain it (in the order normal_loop uses -- the
         # deferred PLE fill runs inside _process_last_data, before that batch's copy_done wait,
@@ -467,11 +550,18 @@ class Scheduler(SchedulerIOMixin):
                         ("p." if forward_input.batch.is_prefill else "d.") + "fw.restore",
                         _n1 - _n0)
                 ongoing_data = (forward_input, self._forward(forward_input))
+                if self._pipe is not None:
+                    # Strata's launch_gate: the chunk's kernel storm waits behind THIS
+                    # launch, so prefill queueing can never delay the replay's launch.
+                    self._pipe.record_gate()
                 if _dbg is not None:
                     _n2 = _time.perf_counter()
                     _dbg.host_phase(
                         ("p." if forward_input.batch.is_prefill else "d.") + "fw.total",
                         _n2 - _n1)
+        if self._pipe is not None and self._pipe_take is not None:
+            take, self._pipe_take = self._pipe_take, None
+            self._pipe.handoff(take)
         if _ct:
             _ct3 = time.perf_counter()
         if _dbg is not None or _lat is not None:
@@ -491,6 +581,17 @@ class Scheduler(SchedulerIOMixin):
         try:
             self._process_last_data(last_data)
             self._flush_abort_acks()
+            if piped_drain is not None:
+                # the chunk's sampled row joins running only now (its forward was not
+                # gated by this loop); the drain delivered its first token first
+                main_finished = self.finished_reqs
+                self._process_last_data(piped_drain)
+                # keep the main drain's finish set alive: _process_last_data replaces
+                # it, and the next iteration's overlap-extra-step skip covers both
+                self.finished_reqs = self.finished_reqs | main_finished
+                self.decode_manager.filter_reqs(piped_drain[0].batch.reqs)
+                if self._chunk_timing:
+                    self._log_chunk_timing(piped_drain, (0.0, 0.0, 0.0, 0.0))
         finally:
             # Run the just-issued batch's deferred PLE fill AFTER the drain: its readback
             # event sits a hair past the drain's copy_done point in stream order (so the
@@ -525,6 +626,8 @@ class Scheduler(SchedulerIOMixin):
         self._ct_chunks += 1
         window_ms = (time.perf_counter() - batch.scheduled_at) * 1e3 if batch.scheduled_at else -1.0
         recv, sched, issue, drain = (x * 1e3 for x in phases)
+        mix = getattr(batch, "decoding_reqs", None)
+        mix_s = f" mix={len(mix)}" if mix else (" pipe" if getattr(batch, "piped", False) else "")
         promote = ""
         moc = getattr(self.engine, "moe_offload_cache", None)
         if moc is not None:
@@ -546,7 +649,7 @@ class Scheduler(SchedulerIOMixin):
         logger.info_rank0(
             f"[chunktime] #{self._ct_chunks} T={batch.log_new_tokens} "
             f"window={window_ms:.0f}ms recv={recv:.1f} sched={sched:.1f} "
-            f"issue={issue:.1f} drain={drain:.1f}{promote}{ple}"
+            f"issue={issue:.1f} drain={drain:.1f}{mix_s}{promote}{ple}"
         )
 
     def normal_loop(self) -> None:
@@ -645,6 +748,9 @@ class Scheduler(SchedulerIOMixin):
             _t0 = _time.perf_counter()
 
         batch, fout = last_data[0].batch, last_data[1]
+        # rows of running requests riding a mixed prefill batch (see _mix_decodes): they
+        # drain as decode tokens, and only the prompt side is radix-committed below
+        decoding = getattr(batch, "decoding_reqs", None) or ()
         next_tokens_cpu, copy_done = fout.next_tokens_cpu, fout.copy_done_event
         copy_done.synchronize()
         if _dbg is not None:
@@ -668,6 +774,7 @@ class Scheduler(SchedulerIOMixin):
         # (normal_loop drains the batch it just issued and runs the fill BEFORE this
         # point, so this is a no-op there -- draining first would deadlock.)
         self.engine.run_pending_host_fill()
+        self._charge_prefill_time(batch)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         spec_two_row = getattr(batch, "spec_mode", None) == "verify"
@@ -679,6 +786,9 @@ class Scheduler(SchedulerIOMixin):
                 self._spec_steps = getattr(self, "_spec_steps", 0) + 1
             elif batch.is_decode:
                 self._spec_decode_steps = getattr(self, "_spec_decode_steps", 0) + 1
+            if decoding:
+                # a mixed batch decoded its ride-along rows for real -- coverage counts them
+                self._spec_decode_steps = getattr(self, "_spec_decode_steps", 0) + len(decoding)
         with self.cache_manager.lazy_free_region():
             if spec_two_row:
                 # The spec drain owns this batch's bookkeeping (accept: complete_one +
@@ -686,7 +796,7 @@ class Scheduler(SchedulerIOMixin):
                 # below must not also run (its prefill branch would radix-commit).
                 self._drain_spec(batch, spec_payload, reply, new_finished_reqs)
             for i, req in enumerate(() if spec_two_row else batch.reqs):
-                if batch.is_prefill and req.spec_off and req.spec_off_reason:
+                if batch.is_prefill and req not in decoding and req.spec_off and req.spec_off_reason:
                     # The engine's residual-stash gate declined this request during this
                     # forward. Prefill only: the scheduler's own declines set the same
                     # field, and re-adopting one at every decode drain would bury the
@@ -753,6 +863,8 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        queue_ms=req.queue_ms,
+                        prefill_ms=req.prefill_ms,
                     )
                 )
 
@@ -761,8 +873,9 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
+                elif batch.is_prefill and req not in decoding and req.table_idx != -1:
+                    # for prefill, non-chunk req, cache the prefix. A mixed batch's ride-along
+                    # decodes are NOT prompt completions: their prefix commit happens at finish.
                     # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
                     # the generic manager inserts the prefix into its radix/naive cache.
                     # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
@@ -841,6 +954,36 @@ class Scheduler(SchedulerIOMixin):
         if _dbg is not None:
             _dbg.host_phase("drain.work", _time.perf_counter() - _t0)
 
+    def _charge_prefill_time(self, batch: Batch) -> None:
+        """Charge this prefill batch's schedule->drain window to the prompts it forwarded.
+
+        The window is the forward's, not one prompt's, so a shared batch splits it by the
+        tokens each prompt snapshotted when the batch was scheduled, and the per-request parts
+        still add up to the wall time. Chunked prompts accumulate: one prompt's prefill spans
+        several batches, and only its last chunk samples a token, which is the reply that
+        carries the total.
+        """
+        if (
+            not batch.is_prefill
+            or getattr(batch, "spec_mode", None) is not None
+            or not getattr(batch, "scheduled_at", 0.0)
+        ):
+            return
+        weights = [req.prefill_chunk_tokens for req in batch.reqs]
+        # A mixed batch's ride-along decodes still carry their own admission's snapshot;
+        # they forwarded no prompt, so this window belongs to the prompt side alone.
+        decoding = getattr(batch, "decoding_reqs", None)
+        if decoding:
+            weights = [
+                0 if req in decoding else w for req, w in zip(batch.reqs, weights)
+            ]
+        total = sum(weights)
+        if total <= 0:
+            return
+        window_ms = (time.perf_counter() - batch.scheduled_at) * 1e3
+        for req, weight in zip(batch.reqs, weights):
+            req.prefill_ms += window_ms * weight / total
+
     def _account_prefill_debt(self, batch) -> None:
         """Accrue the wall time a prefill batch held the engine while decodes waited.
 
@@ -861,6 +1004,10 @@ class Scheduler(SchedulerIOMixin):
             self._debt_discharge = None
             if batch is discharged:
                 return  # this chunk bought the concede the guard just granted
+        # a mixed batch ran the waiting decodes inside its own forward: it stalls nobody
+        if getattr(batch, "decoding_reqs", None) or getattr(batch, "piped", False):
+            # piped: the chunk ran on its own stream while decodes kept replaying
+            return
         self._prefill_debt += time.perf_counter() - batch.scheduled_at
 
     def _inflight_prefill(self) -> tuple[Batch | None, float]:
@@ -883,6 +1030,8 @@ class Scheduler(SchedulerIOMixin):
         batch = data[0].batch
         if not batch.is_prefill or getattr(batch, "spec_mode", None) is not None:
             return None, 0.0  # spec rides phase="prefill" but is a decode step
+        if getattr(batch, "decoding_reqs", None):
+            return None, 0.0  # mixed: the waiting decodes rode this one, they stalled for nobody
         if not getattr(batch, "scheduled_at", 0.0):
             return None, 0.0  # unstamped: now - 0 would concede unconditionally
         return batch, time.perf_counter() - batch.scheduled_at
@@ -894,6 +1043,9 @@ class Scheduler(SchedulerIOMixin):
             self._chunk_target_s <= 0
             or not batch.is_prefill
             or getattr(batch, "spec_mode", None) is not None
+            # a mixed window carries decode rows too: the chunk-size calibration stays
+            # on pure chunks, which is what this budget will size again
+            or getattr(batch, "decoding_reqs", None)
             or not getattr(batch, "scheduled_at", 0.0)
         ):
             return
@@ -1113,6 +1265,11 @@ class Scheduler(SchedulerIOMixin):
                     self._last_data is not None
                     and req_to_free in self._last_data[0].batch.reqs
                 )
+                if not inflight and getattr(self, "_pipe", None) is not None:
+                    # a piped chunk is the same hazard on the prefill stream: mark it,
+                    # the pipe drain frees it after chunk_done
+                    pb = self._pipe.inflight_batch()
+                    inflight = pb is not None and req_to_free in pb.reqs
                 if inflight:
                     req_to_free.aborted = True
                 else:
@@ -1595,6 +1752,9 @@ class Scheduler(SchedulerIOMixin):
         msg, deadline = self._pending_flush
         if self._last_data is None and not (
             self.prefill_manager.runnable or self.decode_manager.runnable
+            # a piped chunk holds pages too: flushing under it would leak its
+            # allocations out from under the in-flight forward
+            or (self._pipe is not None and (self._pipe.inflight or self._pipe_take is not None))
         ):
             self._pending_flush = None
             freed = self.cache_manager.flush()
@@ -1668,6 +1828,29 @@ class Scheduler(SchedulerIOMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
+    def _free_window_slots(self, batch: Batch) -> None:
+        """Run the two SWA eviction drivers over the requests each one owns, BEFORE the
+        batch's pages are allocated. The decode driver bounds a running request's swa
+        footprint at an interval with the window+page margin and the first-step guard;
+        the extend driver runs every prefill pass with the pre-chunk cached_len
+        frontier, so a chunked prompt longer than the swa pool never accumulates its
+        whole swa footprint (which would exhaust alloc_swa). Both no-op unless the
+        model is SWA / paged swa pool. A mixed batch runs each driver on its own side:
+        the ride-along decodes must not take the extend frontier (it ignores the anchor
+        retention) and the prompt chunks must not skip the eviction cadence."""
+        decoding = getattr(batch, "decoding_reqs", None)
+        if batch.is_decode or decoding:
+            dec = decoding or batch.reqs
+            self.cache_manager.maybe_free_swa_out_of_window(
+                dec, forward_iter=self._forward_iter)
+            for req in dec:
+                req.decode_batch_idx += 1
+        if batch.is_prefill:
+            prompt_reqs = (
+                [r for r in batch.reqs if r not in decoding] if decoding else batch.reqs
+            )
+            self.cache_manager.free_swa_out_of_window_extend(prompt_reqs)
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
@@ -1680,19 +1863,7 @@ class Scheduler(SchedulerIOMixin):
             and getattr(batch, "spec_source", "mtp") == "mtp"
             and self.engine.spec_graph_will_replay(getattr(batch, "spec_sample", False))
         )
-        if batch.is_decode:
-            # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
-            # so they can back the new token -- this is what bounds the per-request swa
-            # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
-            self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
-            for req in batch.reqs:
-                req.decode_batch_idx += 1
-        else:
-            # Prefill sibling of the decode driver: free out-of-window swa BEFORE allocating
-            # this chunk, so a chunked prompt longer than the swa pool never accumulates its
-            # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
-            self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        self._free_window_slots(batch)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table. Spec batches
         # record their charges so rejection can free pages beyond the committed prefix.
@@ -1772,6 +1943,9 @@ class Scheduler(SchedulerIOMixin):
         from freetoken.moe import _debug_stats
 
         _dbg = _debug_stats.probe()
+        if getattr(self, "_pipe", None) is not None:
+            # getattr: Scheduler.__new__ stubs predate the pipe (same rule as mixed)
+            return self._schedule_next_batch_piped()
         interval = self.config.prefill_decode_interval
         batch = None
         # schedule_next_batch consumes the admission, so the interleave guard must run
@@ -1787,8 +1961,15 @@ class Scheduler(SchedulerIOMixin):
         owed = (interval > 0 and self._prefill_streak >= interval) or (
             threshold > 0 and self._prefill_debt + inflight_s >= threshold
         )
-        if not (owed and self.decode_manager.runnable):
-            batch = self.prefill_manager.schedule_next_batch(self._adaptive_prefill_budget())
+        # Mixed mode: while a decode runs, the prefill step carries it -- the concede the
+        # guard below would buy is already paid for, so prefill is scheduled even when
+        # the streak/debt says owed. (getattr first: Scheduler.__new__ stubs predate it.)
+        mixed = getattr(self, "_mixed_prefill_tokens", 0) > 0 and self.decode_manager.runnable
+        budget = self._adaptive_prefill_budget()
+        if mixed:
+            budget = min(budget, self._mixed_prefill_tokens)
+        if mixed or not (owed and self.decode_manager.runnable):
+            batch = self.prefill_manager.schedule_next_batch(budget)
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
@@ -1804,17 +1985,19 @@ class Scheduler(SchedulerIOMixin):
                     # every row placed here is a row it will never see.
                     for req in getattr(batch, "reqs", ()):
                         self._on_regular_decode(req)
+        elif mixed:
+            batch = self._mix_decodes(batch)
         if batch is None:
             return None
         # Spec batches ride phase="prefill" for the extend machinery but ARE decode steps:
         # they must not feed the prefill-interleave streak.
         is_spec = getattr(batch, "spec_mode", None) is not None
-        if batch.is_prefill and not is_spec:
+        if batch.is_prefill and not is_spec and not getattr(batch, "decoding_reqs", None):
             self._prefill_streak += 1
         else:
+            # A mixed step ran the decodes too: like a concede it ends the streak and the
+            # debt, and the chunk that bought it (if one was in flight) is discharged.
             self._prefill_streak = 0
-            # the chunk in flight bought this concede with the time it is about to report;
-            # discharging it is what keeps one slow chunk from buying two decode steps
             self._debt_discharge = inflight_batch if inflight_s > 0 else None
             self._prefill_debt = 0.0
         if _dbg is not None:
@@ -1824,6 +2007,140 @@ class Scheduler(SchedulerIOMixin):
             _dbg.host_phase("sched.prepare", time.perf_counter() - _tp)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _mix_decodes(self, batch: Batch) -> Batch:
+        """Let every running request ride this prefill chunk's forward (the ported effect
+        of Strata's STRATA_PIPED_CONCURRENT: the decode loop never waits for the prompt).
+
+        The batch keeps phase="prefill" so the extend machinery runs: attention and GDN see
+        the decode rows as length-1 varlen sequences -- the chunk kernels' smallest partial
+        chunk, the same case a chunked continuation is, just shorter. They sample, write and
+        commit like the rows of a decode step (the drain branches on ``decoding_reqs``),
+        while only the prompt side is radix-committed. What they give up for the ride: no
+        CUDA graph, no spec upgrade (their drafts are dropped here, as they are for any
+        batch the drafter could not upgrade), and the GDN chunked-scan kernel instead of
+        the recurrent decode kernel -- same math, different rounding.
+        """
+        reqs = sorted(self.decode_manager.running_reqs, key=lambda req: req.uid)
+        if _spec_backend_of(self.config) != "none":
+            # A mixed batch never feeds the drafter: reconcile every decode row the same
+            # way a regular decode batch does, at the same moment the batch is placed.
+            for req in reqs:
+                self._on_regular_decode(req)
+        batch.reqs.extend(reqs)
+        batch.decoding_reqs = reqs
+        return batch
+
+    def _make_pipe(self):
+        from freetoken.distributed import get_tp_info, pipe_comm_available
+
+        if ENV.DISABLE_OVERLAP_SCHEDULING:
+            logger.warning_rank0(
+                "FREETOKEN_PIPED_PREFILL needs overlap scheduling (FREETOKEN_DISABLE_"
+                "OVERLAP_SCHEDULING is set); piping disabled"
+            )
+            return None
+        if _spec_backend_of(self.config) != "none":
+            # v1 scope: a spec verify is an EAGER forward on the main thread, and the
+            # eager PLE staging slots / plan 0 are then shared with the pipe's chunk.
+            # Strata pre-captures drafter graphs for its reader thread; until this port
+            # does the same, piping stays off while MTP/lookup is armed.
+            logger.info_rank0(
+                "FREETOKEN_PIPED_PREFILL: speculative decoding armed; piping disabled "
+                "(eager spec verify shares the PLE/plan staging with the pipe)"
+            )
+            return None
+        if get_tp_info().size > 1 and not pipe_comm_available():
+            # the pipe thread's collectives cannot share the main loop's comm: without
+            # the second NCCL comm (pynccl), concurrent calls have no rank-consistent
+            # order. Stay on the inline path rather than risk a TP deadlock.
+            logger.warning_rank0(
+                "FREETOKEN_PIPED_PREFILL needs the second NCCL communicator (requires "
+                "pynccl); piping disabled"
+            )
+            return None
+        from .prefill_pipe import PrefillPiper
+
+        logger.info_rank0(
+            "piped prefill enabled: chunks run on the prefill stream, decode replays "
+            "keep the high-priority engine stream"
+        )
+        return PrefillPiper(self)
+
+    def _schedule_next_batch_piped(self) -> ForwardInput | None:
+        """Piped mode: the pipe thread owns prefill issue, this loop owns decode.
+
+        The streak/debt/mixed guards are inert by construction -- a decode is never
+        behind a chunk any more, so the main issue is simply the decode batch, and a
+        chunk is prepared the moment the pipe's single slot is free. The chunk's
+        FORWARD launches on the pipe thread (see _issue_piped_forward); everything
+        that mutates scheduler state (allocation, radix, admissions) ran here.
+        """
+        self._pipe_take = None
+        if self._pipe.can_take() and self.prefill_manager.runnable:
+            pbatch = self.prefill_manager.schedule_next_batch(
+                self._adaptive_prefill_budget()
+            )
+            if pbatch is not None:
+                pbatch.piped = True
+                self._prefill_streak = 0
+                self._prefill_debt = 0.0
+                self._pipe_take = self._prepare_batch(pbatch)
+                self._report_prompt_admissions(pbatch)
+        if not self.decode_manager.runnable:
+            return None
+        batch = self.decode_manager.schedule_next_batch()
+        if batch is None:
+            return None
+        upgraded = self._as_spec_batch(batch)
+        if upgraded is not None:
+            batch = upgraded
+        elif _spec_backend_of(self.config) != "none":
+            for req in getattr(batch, "reqs", ()):
+                self._on_regular_decode(req)
+        return self._prepare_batch(batch)
+
+    def _issue_piped_forward(self, forward_input: ForwardInput):
+        """The pipe thread's half of a chunk: gather inputs, run the forward, write the
+        sampled row. Only this chunk's Req device counters advance here (complete_one
+        inside forward_batch) -- the running decodes the main loop reads are disjoint.
+        No filter_reqs (the drain runs it on the main thread), no toolcall anchor (a
+        prompt chunk carries none)."""
+        batch, sample_args, input_mapping, output_mapping = forward_input
+        if input_mapping is not None:
+            batch.input_ids = self.token_pool[input_mapping]
+        self._restore_linear_states(batch)
+        forward_output = self.engine.forward_batch(batch, sample_args)
+        if output_mapping is not None:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        return forward_output
+
+    def _discard_piped_chunk(self, forward_input: ForwardInput, err: BaseException) -> None:
+        """Release a chunk whose worker died: wait its stream point (its kernels may
+        have launched before the raise), free its resources, drop the pending
+        continuation it owned, and end each request with an error reply."""
+        from freetoken.message import ErrorReplyMsg
+
+        from .prefill import ChunkedReq
+
+        batch = forward_input.batch
+        logger.warning_rank0(f"piped prefill chunk failed: {err!r}")
+        self._pipe.chunk_done.synchronize()
+        dead = set(batch.reqs)
+        self.prefill_manager.pending_list = [
+            p for p in self.prefill_manager.pending_list if p.chunked_req not in dead
+        ]
+        # the drain's lazy_free_region is the normal flusher; a discard outside any
+        # region would strand the deferred page frees (integrity sees them as leaks)
+        with self.cache_manager.lazy_free_region():
+            for req in dead:
+                self.decode_manager.remove_req(req)
+                self._free_req_resources(req)
+        for req in dead:
+            if not isinstance(req, ChunkedReq):
+                self.send_result([ErrorReplyMsg(
+                    uid=req.uid, error=f"prefill forward failed: {err}"
+                )])
 
     def _on_regular_decode(self, req: Req) -> None:
         """Reconcile one request's spec state after a regular (non-spec) decode step.
@@ -2365,6 +2682,8 @@ class Scheduler(SchedulerIOMixin):
                     finish_reason=finish_reason,
                     matched_stop=matched_stop,
                     stop_strs=req.sampling_params.stop_strs or None,
+                    queue_ms=req.queue_ms,
+                    prefill_ms=req.prefill_ms,
                 )
             )
             if finished:
@@ -2480,8 +2799,15 @@ class Scheduler(SchedulerIOMixin):
         if _dbg is not None:
             _q1 = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.inputids", _q1 - _q0)
-        if self.toolcall_anchor_id is not None and not batch.is_prefill:
-            self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if self.toolcall_anchor_id is not None:
+            # prompt chunks cannot carry a generated anchor; a mixed batch snapshots on its
+            # ride-along decodes only
+            anchor_reqs = (
+                batch.reqs if not batch.is_prefill
+                else getattr(batch, "decoding_reqs", None)
+            )
+            if anchor_reqs:
+                self.cache_manager.snapshot_toolcall_anchor(anchor_reqs)
         if _dbg is not None:
             _qa = _time.perf_counter()
             _dbg.host_phase(_pk + "fw.anchor", _qa - _q1)

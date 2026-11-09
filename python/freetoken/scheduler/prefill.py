@@ -256,6 +256,10 @@ class PrefillAdder:
             if req is not None:
                 req.spec_residual = chunked_req.spec_residual
                 req.spec_off = chunked_req.spec_off
+                # Same for the phase split: the queue wait was paid once, at the first chunk, and
+                # the prefill time of the chunks behind this one has to reach its final drain.
+                req.queue_ms = chunked_req.queue_ms
+                req.prefill_ms = chunked_req.prefill_ms
             return req
 
         if resource := self._try_allocate_one(pending_req):
@@ -291,6 +295,36 @@ class PrefillManager:
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
+    # FREETOKEN_ADMIT_SHORT_FIRST (port of STRATA_ADMIT_SHORT_FIRST): a new prompt of at
+    # most this many tokens is admitted before longer ones; 0 keeps pure arrival order.
+    short_first: int = 0
+    # FREETOKEN_ADMIT_MAX_WAIT_S: a long prompt that has waited this long counts as short,
+    # so short-first can never starve one.
+    admit_max_wait_s: float = 30.0
+
+    def _admission_order(self) -> List[PendingReq]:
+        """The pass order for this step's budget (STRATA_ADMIT_SHORT_FIRST's rule).
+
+        Chunk continuations stay first -- they already hold a table row, KV pages and GDN
+        slots, and parking them would re-acquire what this pass is about to spend. New
+        admissions then run in two classes: short-or-aged first, long behind, arrival
+        order inside a class. The class/arrival key uses the pending_list INDEX, not the
+        local stamp, so every TP rank (which receives the identical message sequence)
+        builds the identical batch; only the aged bit reads a clock, the same accepted
+        risk as the wall-clock prefill debt.
+        """
+        if self.short_first <= 0:
+            return self.pending_list
+        now = time.perf_counter()
+        cont = [p for p in self.pending_list if p.chunked_req is not None]
+        new = [(i, p) for i, p in enumerate(self.pending_list) if p.chunked_req is None]
+
+        def key(item):
+            i, p = item
+            aged = p.enqueued_at and now - p.enqueued_at >= self.admit_max_wait_s
+            return (0 if p.input_len <= self.short_first or aged else 1, i)
+
+        return cont + [p for _k, p in sorted(new, key=key)]
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -301,6 +335,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                enqueued_at=time.perf_counter(),
             )
         )
 
@@ -326,7 +361,7 @@ class PrefillManager:
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
         log_new_tokens = 0
         log_cached_tokens = 0
-        for pending_req in self.pending_list:
+        for pending_req in self._admission_order():
             is_continuation = pending_req.chunked_req is not None
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
@@ -335,6 +370,10 @@ class PrefillManager:
                     chunked_list.append(pending_req)
                 reqs.append(req)
                 if not is_continuation:
+                    # The queue wait ends at admission, not at the batch stamp: backfill lets a
+                    # req leave pending_list out of order, so position cannot say it.
+                    if pending_req.enqueued_at:
+                        req.queue_ms = (time.perf_counter() - pending_req.enqueued_at) * 1e3
                     # Record the COMPLETE prompt length and the prefix-cache hit on the
                     # first chunk. The scheduler publishes them only after _prepare_batch
                     # succeeds; continuation chunks must never publish them again.
@@ -347,6 +386,9 @@ class PrefillManager:
                             self.encoder_cache.register(
                                 item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
                             )
+                # The drain splits this batch's wall time by this snapshot; extend_len reads 0
+                # by then, and a continuation overwrites it with its own chunk.
+                req.prefill_chunk_tokens = req.extend_len
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len

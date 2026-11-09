@@ -256,6 +256,8 @@ def tokenize_worker(
                         spec_steps=msg.spec_steps,
                         spec_decode_steps=msg.spec_decode_steps,
                         spec_cold_seeds=msg.spec_cold_seeds,
+                        queue_ms=msg.queue_ms,
+                        prefill_ms=msg.prefill_ms,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
