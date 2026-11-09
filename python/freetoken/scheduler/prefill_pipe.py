@@ -115,11 +115,10 @@ class PrefillPiper:
 
     @torch.inference_mode()
     def _run(self) -> None:
-        import freetoken.distributed as ddist
-
         torch.cuda.set_device(self.device)
+        # the engine Context routes this thread's forward to its own batch slot; TP>1
+        # never reaches this thread (piping is TP1-only, see Scheduler._make_pipe)
         get_global_ctx().register_pipe_thread()
-        ddist.mark_pipe_thread()
         while True:
             with self._cv:
                 while self._item is None and not self.dead:

@@ -2032,7 +2032,7 @@ class Scheduler(SchedulerIOMixin):
         return batch
 
     def _make_pipe(self):
-        from freetoken.distributed import get_tp_info, pipe_comm_available
+        from freetoken.distributed import get_tp_info
 
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             logger.warning_rank0(
@@ -2050,13 +2050,16 @@ class Scheduler(SchedulerIOMixin):
                 "(eager spec verify shares the PLE/plan staging with the pipe)"
             )
             return None
-        if get_tp_info().size > 1 and not pipe_comm_available():
-            # the pipe thread's collectives cannot share the main loop's comm: without
-            # the second NCCL comm (pynccl), concurrent calls have no rank-consistent
-            # order. Stay on the inline path rather than risk a TP deadlock.
+        if get_tp_info().size > 1:
+            # TP>1 stays on the inline path (Strata's own parity: its engine has no TP).
+            # Two NCCL comms issued concurrently from two host threads DO rendezvous per
+            # comm, but the GIL plus launch-queue backpressure lets one rank's pipe thread
+            # hold the lock while its peer waits on a collective this rank's main thread
+            # has not reached -- measured as a 95 s freeze of both schedulers (2026-11-09,
+            # multi calibration). FREETOKEN_MIXED_PREFILL_TOKENS is the TP2 answer.
             logger.warning_rank0(
-                "FREETOKEN_PIPED_PREFILL needs the second NCCL communicator (requires "
-                "pynccl); piping disabled"
+                "FREETOKEN_PIPED_PREFILL is TP1-only in this port (concurrent NCCL comms "
+                "can deadlock across ranks); use FREETOKEN_MIXED_PREFILL_TOKENS under TP"
             )
             return None
         from .prefill_pipe import PrefillPiper
