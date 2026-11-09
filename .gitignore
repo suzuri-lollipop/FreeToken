@@ -231,3 +231,7 @@ _scratch
 .triton-tools
 freetoken-launch.json
 run.sh
+
+# llm-launcher generated serve specs (paired .json/.sh written at the repo root)
+Qwen3.8-Flash-Next-NVFP4-*.json
+Qwen3.8-Flash-Next-NVFP4-*.sh
