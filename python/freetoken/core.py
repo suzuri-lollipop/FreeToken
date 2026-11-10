@@ -28,6 +28,9 @@ class SamplingParams:
     stop_strs: list[str] = field(default_factory=list)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # min-p (typicality) filtering: tokens below min_p * p_max are dropped before top-k/p.
+    # At high temperature it trims the tail that produces particle-drop / fragment decay.
+    min_p: float = 0.0
 
     @property
     def is_greedy(self) -> bool:

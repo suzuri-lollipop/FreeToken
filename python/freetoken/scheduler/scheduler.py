@@ -497,11 +497,31 @@ class Scheduler(SchedulerIOMixin):
         # loop reverts to inline prefill steps.
         piped_drain = None
         if self._pipe is not None:
-            got = self._pipe.poll()
+            if self._pipe.stalled():
+                # a chunk older than the hard ceiling means the worker is wedged
+                # (a rendezvous bug would pin the GPU forever, invisible to the
+                # stall watchdog); crash so the supervisor restarts cleanly.
+                logger.warning_rank0(
+                    f"piped prefill chunk in flight over {self._pipe.timeout_s:.0f}s: "
+                    "the worker is wedged, restarting the engine"
+                )
+                raise RuntimeError("piped prefill stalled past the hard timeout")
+            # the drain gate is the broadcast flag: rank0 fills it with its own
+            # readiness, every other rank obeys it - one iteration, all ranks drain
+            # (poll(force) waits our worker's publish and the drain's copy_done
+            # synchronize absorbs GPU-side skew)
+            got = self._pipe.poll(force=bool(getattr(self, "_pipe_ready_bcast", False)))
             if got is not None:
                 fin, fout, err = got
                 if err is not None:
                     self._discard_piped_chunk(fin, err)
+                    from freetoken.distributed import get_tp_info
+
+                    if get_tp_info().size > 1:
+                        # a rank-local fallback would run the next chunks' collectives
+                        # on the wrong comm while the peer pipes on: crash and let the
+                        # supervisor restart both ranks together.
+                        raise err
                     self._pipe = None
                 else:
                     self.stream.wait_event(self._pipe.chunk_done)
@@ -2051,17 +2071,27 @@ class Scheduler(SchedulerIOMixin):
             )
             return None
         if get_tp_info().size > 1:
-            # TP>1 stays on the inline path (Strata's own parity: its engine has no TP).
-            # Two NCCL comms issued concurrently from two host threads DO rendezvous per
-            # comm, but the GIL plus launch-queue backpressure lets one rank's pipe thread
-            # hold the lock while its peer waits on a collective this rank's main thread
-            # has not reached -- measured as a 95 s freeze of both schedulers (2026-11-09,
-            # multi calibration). FREETOKEN_MIXED_PREFILL_TOKENS is the TP2 answer.
+            # TP1-only until the piped SCHEDULING stays rank-consistent: a live capture
+            # (2026-11-10) showed rank0 taking a chunk rank1 never scheduled - both
+            # pipes idle, one main waiting its own broadcast, the other waiting a
+            # publish that never comes - so the drain lockstep above is necessary but
+            # not sufficient. Until that divergence is root-caused, TP runs the inline
+            # interleave (FREETOKEN_MIXED_PREFILL_TOKENS bounds its stall).
             logger.warning_rank0(
-                "FREETOKEN_PIPED_PREFILL is TP1-only in this port (concurrent NCCL comms "
-                "can deadlock across ranks); use FREETOKEN_MIXED_PREFILL_TOKENS under TP"
+                "FREETOKEN_PIPED_PREFILL is TP1-only for now (rank scheduling under TP "
+                "can diverge and wedge a collective); use FREETOKEN_MIXED_PREFILL_TOKENS "
+                "under TP"
             )
             return None
+        if os.environ.get("FREETOKEN_PIPED_DEBUG", "0") == "1":
+            # crash/freeze diagnostic: SIGABRT/SIGSEGV (glibc heap aborts included) dump
+            # every Python thread's stack, and a 30 s repeating dump catches a deadlock
+            # as two stacks parked in cuda* calls that never return.
+            import faulthandler
+
+            faulthandler.enable()
+            faulthandler.dump_traceback_later(30, repeat=True, exit=False)
+            logger.info_rank0("piped prefill: faulthandler enabled (abort + 30s stack dumps)")
         from .prefill_pipe import PrefillPiper
 
         logger.info_rank0(
@@ -2089,6 +2119,14 @@ class Scheduler(SchedulerIOMixin):
                 self._prefill_streak = 0
                 self._prefill_debt = 0.0
                 self._pipe_take = self._prepare_batch(pbatch)
+                # GDN snapshot restore runs HERE, on the main thread's staging stream,
+                # not on the pipe thread: the snapshot host tier's buffer bookkeeping is
+                # single-thread code, and a prefix-hit restore under it raced the main
+                # loop's eviction saves (glibc "double free" at the first piped prefix
+                # hit). self.stream already waited chunk_done, so the source snapshot
+                # and the prior chunk's writes are ordered; prefill_stream waits
+                # prepare_done before the forward reads the live slot.
+                self._restore_linear_states(pbatch)
                 self._report_prompt_admissions(pbatch)
         if not self.decode_manager.runnable:
             return None
@@ -2112,7 +2150,7 @@ class Scheduler(SchedulerIOMixin):
         batch, sample_args, input_mapping, output_mapping = forward_input
         if input_mapping is not None:
             batch.input_ids = self.token_pool[input_mapping]
-        self._restore_linear_states(batch)
+        # (_restore_linear_states already ran on the main thread at handoff)
         forward_output = self.engine.forward_batch(batch, sample_args)
         if output_mapping is not None:
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu

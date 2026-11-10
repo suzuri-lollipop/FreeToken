@@ -148,14 +148,12 @@ def test_score_window_opens_at_the_aggressor_send_time():
     assert score_window(victims, open_at=6.9)["stall_worst"] == pytest.approx(6.0)
 
 
-def test_arms_for_skips_piping_under_tensor_parallel():
+def test_arms_for_measures_every_arm_on_any_tp():
     tp2 = {"argv": ["-m", "freetoken", "--tp-size", "2"]}
     arms = arms_for(tp2)
-    assert [a[2] != "" for a in arms] == [False, False, True, True]
-    assert "TP1-only" in arms[2][2]
-    tp1 = arms_for({"argv": ["-m", "freetoken", "--tp-size", "1"]})
-    assert all(skip == "" for _l, _e, skip in tp1)
-    smoke = arms_for({"argv": []}, smoke=True)  # no --tp-size = 1
+    assert [label for label, _e, skip in arms] == ["none", "mixed", "piped", "piped-sf"]
+    assert all(skip == "" for _l, _e, skip in arms)
+    smoke = arms_for({"argv": []}, smoke=True)
     assert [label for label, _e, _s in smoke] == ["none", "piped"]
 
 
@@ -167,3 +165,15 @@ def test_parse_live_servers_spots_the_server_not_the_calibrator():
     ])
     live = parse_live_servers(lines)
     assert len(live) == 1 and live[0].startswith("100 ")
+
+
+def test_request_body_probes_the_production_sampling_by_default():
+    from freetoken.calibrate_multi import request_body
+
+    prod = request_body("m", "p", 64, None)
+    # omitted temperature = the server's sampling_defaults=model + guard regime
+    assert "temperature" not in prod and "top_k" not in prod and "top_p" not in prod
+    assert prod["ignore_eos"] is True and prod["stream"] is True
+
+    greedy = request_body("m", "p", 64, 0.0)
+    assert greedy["temperature"] == 0.0 and greedy["top_k"] == 1 and greedy["top_p"] == 1.0

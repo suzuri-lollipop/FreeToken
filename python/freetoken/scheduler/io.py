@@ -76,6 +76,22 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
+    def _pipe_drain_ready(self) -> int:
+        """Piped prefill under TP: the drain decision must be rank-consistent.
+
+        The poll that consumes the pipe slot changes scheduler state (filter_reqs joins
+        the chunk's request to the running set, the continuation becomes schedulable),
+        and a drain that lands one iteration earlier on one rank desynchronizes the
+        next batch's composition - the NCCL sequences then mismatch and the rank that
+        launched first spins its collective forever (measured: GPU pinned at 100% by a
+        rank-local poll racing the last chunk's drain). Rank 0 decides here, at the
+        same point of its loop where it already broadcasts the message count, and the
+        flag rides that broadcast; every rank drains on the same iteration."""
+        pipe = getattr(self, "_pipe", None)
+        if pipe is None or pipe.slot is None or pipe.slot[2] is not None:
+            return 0
+        return 1 if pipe.chunk_done.query() else 0
+
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
@@ -83,6 +99,7 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
+        self._pipe_ready_bcast = bool(self._pipe_drain_ready())
         return pending_msgs
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
@@ -97,8 +114,10 @@ class SchedulerIOMixin:
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
-        # broadcast the number of raw messages to all ranks
-        src_tensor = torch.tensor(len(pending_raw_msgs))
+        # broadcast the number of raw messages (+ the piped-drain ready flag, see
+        # _pipe_drain_ready) to all ranks
+        self._pipe_ready_bcast = bool(self._pipe_drain_ready())
+        src_tensor = torch.tensor([len(pending_raw_msgs), int(self._pipe_ready_bcast)])
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
 
         for raw in pending_raw_msgs:
@@ -112,10 +131,12 @@ class SchedulerIOMixin:
             self.run_when_idle()
             pending_msgs.append(self._recv_from_rank0.get())
 
-        # ensure all ranks have the same number of raw messages
-        dst_tensor = torch.tensor(-1)
+        # ensure all ranks have the same number of raw messages (slot 1: rank0's
+        # piped-drain decision; obey it even where our own GPU finished earlier)
+        dst_tensor = torch.tensor([-1, -1])
         self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
-        dst_length = int(dst_tensor.item())
+        dst_length = int(dst_tensor[0].item())
+        self._pipe_ready_bcast = bool(int(dst_tensor[1].item()))
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
