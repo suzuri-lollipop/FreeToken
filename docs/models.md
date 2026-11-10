@@ -192,3 +192,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- With the default KV cache (bf16, sized from free VRAM) a 2x24 GB rig holds only ~8k
+  tokens of context, and an over-long prompt is a clean 400 `context_length_exceeded`.
+  Long-context serving needs `--kv-cache-dtype fp8` and/or `--num-tokens` (the shipped
+  launch profiles set both); the ceiling is reported in the 400 message.

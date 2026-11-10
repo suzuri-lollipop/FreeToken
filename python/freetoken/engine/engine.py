@@ -593,6 +593,20 @@ class Engine:
         self.device = bind_assigned_gpu(config.tp_info.rank)
         # before the first CUDA allocation below: probes the VMM-backed allocator on this device
         _ensure_expandable_segments(self.device)
+        # set BEFORE _adjust_config: the config pass gates the MoE staging-buffer
+        # invariants (hit-D2D / decode fetch overlap) on it, and a piped chunk must
+        # never share those buffers with the decode graph's fetch overlap -- concurrent
+        # writers into one pinned staging region is a heap corruption, not a race.
+        self.piped_prefill = os.environ.get("FREETOKEN_PIPED_PREFILL", "0") == "1"
+        if self.piped_prefill:
+            # Piped prefill runs a second NCCL comm (the pipe's torch group) concurrent
+            # with the decode graph's collectives. NCCL kernels spin for their peer and
+            # an uncapped comm can occupy every SM: rank A's pipe kernel then starves
+            # rank A's decode kernel that rank B's decode is waiting on -- a measured
+            # cross-rank deadlock (watchdog at collective #394, both streams spinning).
+            # Cap each collective at 4 CTAs so a spinner always leaves the SMs open.
+            # Measured cost: none (decode tps unchanged at tp2 on this model).
+            os.environ.setdefault("NCCL_MAX_CTAS", "4")
         _adjust_config(config)
         torch.manual_seed(42)
         # Piped prefill (FREETOKEN_PIPED_PREFILL, Strata PIPED_CONCURRENT port): prefill
@@ -601,7 +615,6 @@ class Engine:
         # the high-priority range: the GPU schedules decode kernels ahead of queued
         # prefill work, which is the whole ITL story. Without piping the priority is a
         # no-op (single stream, same order as before).
-        self.piped_prefill = os.environ.get("FREETOKEN_PIPED_PREFILL", "0") == "1"
         try:
             self.stream = torch.cuda.Stream(
                 device=self.device, priority=-1 if self.piped_prefill else 0

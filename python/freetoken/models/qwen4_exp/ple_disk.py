@@ -6,6 +6,7 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -145,6 +146,13 @@ class DiskRowTable:
         from freetoken.kernel import _row_store
         from freetoken.kernel.row_store import PleStore
         from freetoken.layers.quantization.ggml_types import float_dtype
+
+        # Piped prefill (FREETOKEN_PIPED_PREFILL) calls fill() from the pipe thread (eager
+        # prefill rows) AND the main loop (deferred decode fills). The native PleStore's
+        # pending-batch queue and row LRU are single-thread designs -- concurrent
+        # stage/flush pairs corrupt its arena bookkeeping (measured: glibc "double free
+        # or corruption"). One lock, spanning stage..flush atomically per fill.
+        self._fill_lock = threading.Lock()
 
         self.num_rows = source.total_rows
         self.head_dim = source.row_values or source.row_bytes
@@ -311,21 +319,22 @@ class DiskRowTable:
         log_fills = os.getenv("PLE_FILL_LOG") == "1"
         if log_fills:
             self._fill_log_n = getattr(self, "_fill_log_n", 0) + 1
-        if graph:
-            self._graph_consumed.synchronize()
-            pinned = self._graph_pinned
-        else:
-            self._eager_slot ^= 1
-            self._eager_read[self._eager_slot].synchronize()
-            pinned = self._eager_pinned[self._eager_slot]
-        offset = 0
-        for run in runs:
-            self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
-            offset += run.numel() - 2
-        # a gated graph has no WAIT node to satisfy: signaling the shared flag would
-        # leave it raised and prematurely satisfy a LATER bs1 wait-sync replay
-        signal = graph and self._wait_sync and not self._rows_gated(offset)
-        self._store.flush(self._flag.data_ptr() if signal else 0)
+        with self._fill_lock:
+            if graph:
+                self._graph_consumed.synchronize()
+                pinned = self._graph_pinned
+            else:
+                self._eager_slot ^= 1
+                self._eager_read[self._eager_slot].synchronize()
+                pinned = self._eager_pinned[self._eager_slot]
+            offset = 0
+            for run in runs:
+                self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
+                offset += run.numel() - 2
+            # a gated graph has no WAIT node to satisfy: signaling the shared flag would
+            # leave it raised and prematurely satisfy a LATER bs1 wait-sync replay
+            signal = graph and self._wait_sync and not self._rows_gated(offset)
+            self._store.flush(self._flag.data_ptr() if signal else 0)
         if log_fills and self._fill_log_n <= 3000:
             import hashlib
 
@@ -400,10 +409,14 @@ class DiskRowTable:
 
                     def _complete_cpp(_keepalive=buffers) -> None:
                         try:
-                            store.fill_decode_graph(
-                                event.cuda_event, ids_addrs, positions, readback, pinned,
-                                image_id, MM_PAD_SHIFT_VALUE, flag,
-                            )
+                            # same native store as the eager fill() path: under piped
+                            # prefill the pipe thread may be mid stage/flush when the
+                            # main loop runs this deferred fill -- one lock, both doors
+                            with self._fill_lock:
+                                store.fill_decode_graph(
+                                    event.cuda_event, ids_addrs, positions, readback, pinned,
+                                    image_id, MM_PAD_SHIFT_VALUE, flag,
+                                )
                         except BaseException:
                             from freetoken.kernel import _row_store
 

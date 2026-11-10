@@ -30,15 +30,28 @@ and runs every later chunk on the old inline path.
 """
 from __future__ import annotations
 
+import os
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import torch
 
 from freetoken.core import get_global_ctx
 
+# FREETOKEN_PIPED_TIMEOUT_S: hard ceiling on one piped chunk's in-flight time. A
+# rendezvous bug would otherwise leave a spinning collective pinning a GPU at 100%
+# forever, invisible to the stall watchdog (the spinning rank is burning CPU).
+# Crossing it crashes the scheduler on purpose: the supervisor restarts the engine.
+_TIMEOUT_S = float(os.environ.get("FREETOKEN_PIPED_TIMEOUT_S", "600"))
+# cap for a forced drain waiting our own worker to publish (divergence detection)
+_FORCED_WAIT_S = float(os.environ.get("FREETOKEN_PIPED_FORCED_WAIT_S", "30"))
+
 if TYPE_CHECKING:
     from .scheduler import Scheduler, ForwardInput
+
+
+_SERIAL_DEBUG = __import__("os").environ.get("FREETOKEN_PIPED_SERIAL", "0") == "1"
 
 
 class PrefillPiper:
@@ -54,6 +67,8 @@ class PrefillPiper:
         # in-flight batch during the whole launch->completion window, not only the
         # queued (pre-start) and done (post-slot) states around it
         self.running: "ForwardInput | None" = None
+        self.handoff_ts: float = 0.0
+        self.timeout_s = _TIMEOUT_S
         self._cv = threading.Condition()
         self._prepare_done = torch.cuda.Event()
         self._gate: torch.cuda.Event | None = None
@@ -82,7 +97,15 @@ class PrefillPiper:
         with self._cv:
             self._item = forward_input
             self.inflight = True
+            self.handoff_ts = time.perf_counter()
             self._cv.notify()
+        if _SERIAL_DEBUG:
+            # bisect knob: keep the thread + stream plumbing, serialize the GPU.
+            # If corruption vanishes under this, the bug is a concurrent-state race;
+            # if it stays, the bug is in the piped ordering itself.
+            while self.slot is None:
+                self.wait_slot()
+            self.chunk_done.synchronize()
 
     def record_gate(self) -> None:
         """Called on the main thread inside the engine-stream context after a batch was
@@ -91,17 +114,46 @@ class PrefillPiper:
             self._gate = torch.cuda.Event()
         self._gate.record(self.engine.stream)
 
-    def poll(self):
-        """Non-blocking: consume the slot once the chunk's stream point passed,
-        returning (forward_input, forward_output, error). None while still running."""
+    def poll(self, force: bool = False):
+        """Consume the slot once the chunk's stream point passed, returning
+        (forward_input, forward_output, error). None while still running.
+
+        force=True is rank0's broadcast drain decision under TP: the worker must have
+        published (launches rendezvous chunk-by-chunk with the peer pipe, so publish
+        is bounded), and the drain's own copy_done.synchronize absorbs any remaining
+        GPU skew - but the ITERATION on which scheduler state moves is rank-identical."""
         if self.slot is None:
-            return None
-        if self.slot[2] is None and not self.chunk_done.query():
-            return None
+            if not force:
+                return None
+            # force=True came from rank0's broadcast, but THIS rank has nothing
+            # published: a scheduling divergence. Give our worker a bounded time to
+            # catch up (publish is bounded while the peer pipe is healthy); beyond
+            # that the ranks are desynchronized and only a restart re-aligns them -
+            # never wait forever, that is how a wedged collective pins a GPU at 100%.
+            deadline = time.perf_counter() + _FORCED_WAIT_S
+            while self.slot is None and not self.dead:
+                if time.perf_counter() > deadline:
+                    raise RuntimeError(
+                        "piped drain divergence: rank0 signaled a ready chunk this "
+                        "rank never received (scheduling desynchronized); restarting"
+                    )
+                self.wait_slot()
+            if self.slot is None:
+                return None
         out = self.slot
+        if out[2] is None and not force and not self.chunk_done.query():
+            return None
         self.slot = None
         self.inflight = False
+        self.handoff_ts = 0.0
         return out
+
+    def stalled(self) -> bool:
+        return (
+            self.inflight
+            and self.handoff_ts > 0.0
+            and time.perf_counter() - self.handoff_ts > self.timeout_s
+        )
 
     def inflight_batch(self):
         """The batch whose forward is (or was until drain) on the prefill stream - the
@@ -116,8 +168,9 @@ class PrefillPiper:
     @torch.inference_mode()
     def _run(self) -> None:
         torch.cuda.set_device(self.device)
-        # the engine Context routes this thread's forward to its own batch slot; TP>1
-        # never reaches this thread (piping is TP1-only, see Scheduler._make_pipe)
+        # the engine Context routes this thread's forward to its own batch slot; the
+        # pipe only runs under TP1 (see Scheduler._make_pipe), where there are no
+        # collectives to route at all
         get_global_ctx().register_pipe_thread()
         while True:
             with self._cv:

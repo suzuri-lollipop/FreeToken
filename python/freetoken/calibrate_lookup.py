@@ -17,6 +17,10 @@ they are a starting point, not a law.  This tool measures the real server here:
     and writes a script without it.  The parallel sweep then chooses `--max-running-requests`,
     and lookup stays enabled only if it also beats plain batch decoding at that ceiling.
 
+Sampling stays GREEDY here on purpose (unlike calibrate_multi, which probes at the
+server's production temperature): draft/verify acceptance is defined on argmax parity,
+and a sampled verify would measure the sampler's variance, not the drafter's width.
+
 The output is the Strata-style pair: a JSON launch config with the measured `env` and the
 `--speculative lookup` argument, and an executable ``run-freetoken-lookup-<tag>.sh`` that exports
 those variables and execs the same server.  Both are written atomically.  Requests use a fixed

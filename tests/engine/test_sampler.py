@@ -142,3 +142,20 @@ def test_sample_mixed_batch_forces_argmax_on_greedy_rows(monkeypatch):
     args = prepare(make_req(1, greedy), make_req(2, sampled))
     tokens = sampler.sample(logits, args)
     assert tokens.tolist() == [expected_greedy[0].item(), 3]
+
+def test_min_p_tensor_built_only_when_needed():
+    args = prepare(
+        make_req(1, SamplingParams(temperature=1.0, min_p=0.05)),
+        make_req(2, SamplingParams(temperature=0.7, min_p=0.1)),
+    )
+    assert args.min_p is not None
+    assert args.min_p.tolist() == pytest.approx([0.05, 0.1])
+    # a batch with no min_p anywhere does not pay for the filter
+    plain = prepare(make_req(1, SamplingParams(temperature=1.0)))
+    assert plain.min_p is None
+    # greedy rows are neutralized in the tensor even when a sampling row sets min_p
+    mixed = prepare(
+        make_req(1, SamplingParams(temperature=1.0, min_p=0.08)),
+        make_req(2, SamplingParams(temperature=0.0)),
+    )
+    assert mixed.min_p.tolist() == pytest.approx([0.08, 0.0])

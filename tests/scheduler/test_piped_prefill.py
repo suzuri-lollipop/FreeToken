@@ -68,13 +68,15 @@ def test_ctx_nesting_assert_stays_per_thread():
 
 
 class _FakePipe:
+    """Mirrors PrefillPiper's slot/poll semantics without CUDA or threads."""
+
     def __init__(self, can_take=True):
         self._can = can_take
         self.inflight = False
         self.dead = False
         self.handed = []
         self.gates = 0
-        self.poll_result = None
+        self.slot = None
         self.chunk_done = SimpleNamespace(
             query=lambda: True, synchronize=lambda: None, record=lambda s: None
         )
@@ -89,13 +91,29 @@ class _FakePipe:
     def record_gate(self):
         self.gates += 1
 
-    def poll(self):
-        out, self.poll_result = self.poll_result, None
-        if out is not None and out[2] is None:
-            self.inflight = False
+    def publish(self, fin, fout, err=None, done_ready=True):
+        self.slot = (fin, fout, err)
+        self.chunk_done.query = lambda: done_ready
+
+    def poll(self, force=False):
+        if self.slot is None:
+            if not force:
+                return None
+            while self.slot is None and not self.dead:
+                self.wait_slot()
+            if self.slot is None:
+                return None
+        out = self.slot
+        if out[2] is None and not force and not self.chunk_done.query():
+            return None
+        self.slot = None
+        self.inflight = False
         return out
 
     def inflight_batch(self):
+        for holder in (self.slot, None):
+            if holder is not None:
+                return holder[0].batch if isinstance(holder[0], SimpleNamespace) and hasattr(holder[0], "batch") else holder.batch
         return self.handed[-1].batch if self.handed else None
 
     def wait_slot(self, timeout=0.05):
@@ -139,6 +157,7 @@ def _pipe_stub(prefill_runnable=True, decode_runnable=True, can_take=True, budge
     )
     s._prepare_batch = lambda b: ("fi", b)
     s._report_prompt_admissions = lambda b: None
+    s.engine = SimpleNamespace(linear_state_pool=None)  # restore: no pool = no-op
     s._as_spec_batch = lambda b: None
     s.batches = {"prefill": prefill_batch, "decode": decode_batch}
     return s, calls
@@ -262,3 +281,59 @@ def test_dead_pipe_discards_its_chunk_and_ends_the_requests(monkeypatch):
     assert stub.prefill_manager.pending_list == []  # the continuation was dropped
     assert freed == [chunked] and removed == [chunked]
     assert sent == [] or all(isinstance(m, ErrorReplyMsg) for m in sent)
+
+
+def test_poll_force_consumes_even_before_local_query_ready():
+    # rank0's broadcast says drain: a rank whose GPU finished LATER must still drain
+    # this iteration (the drain's copy_done synchronize absorbs the skew)
+    pipe = _FakePipe()
+    fin, fout = SimpleNamespace(batch=SimpleNamespace(reqs=[])), SimpleNamespace(
+        copy_done_event=SimpleNamespace(query=lambda: False))
+    pipe.publish(fin, fout, done_ready=False)
+    pipe.inflight = True
+    assert pipe.poll(force=False) is None  # local query False: no drain
+    got = pipe.poll(force=False)  # still not ready
+    assert got is None
+    got = pipe.poll(force=True)
+    assert got == (fin, fout, None) and not pipe.inflight
+
+
+def test_poll_force_with_dead_worker_and_no_slot_returns_none():
+    pipe = _FakePipe()
+    pipe.slot = None
+    pipe.dead = True
+    assert pipe.poll(force=True) is None
+
+
+def test_stalled_watchdog_fires_past_the_ceiling():
+    from freetoken.scheduler.prefill_pipe import PrefillPiper
+
+    # pure time arithmetic on a bare instance (no thread, no CUDA)
+    piper = PrefillPiper.__new__(PrefillPiper)
+    piper.inflight = True
+    piper.handoff_ts = time.perf_counter() - 10.0
+    piper.timeout_s = 5.0
+    assert piper.stalled()
+    piper.timeout_s = 600.0
+    assert not piper.stalled()
+    piper.inflight = False
+    assert not piper.stalled()
+
+
+def test_forced_poll_raises_on_permanent_divergence(monkeypatch):
+    import threading
+    import time as _time
+
+    from freetoken.scheduler import prefill_pipe as pp
+    from freetoken.scheduler.prefill_pipe import PrefillPiper
+
+    monkeypatch.setattr(pp, "_FORCED_WAIT_S", 0.1)
+    piper = PrefillPiper.__new__(PrefillPiper)
+    piper.slot = None
+    piper.dead = False
+    piper.inflight = True
+    piper._cv = threading.Condition()
+    t0 = _time.perf_counter()
+    with pytest.raises(RuntimeError, match="divergence"):
+        piper.poll(force=True)
+    assert _time.perf_counter() - t0 < 2.0  # bounded, not a wedge
