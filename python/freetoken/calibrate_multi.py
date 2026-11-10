@@ -7,6 +7,11 @@ width is -- chunk cost, PCIe share between prefill and decode expert streaming, 
 stream priorities all decide whether piping pays here -- so the tool measures the real
 server on this PC instead of trusting the defaults measured on one box.
 
+Arms are probed at the server's PRODUCTION sampling by default (the request omits
+temperature, so sampling_defaults=model and the high-temperature guard apply exactly as
+they do for real traffic); --temperature 0.0 switches to deterministic greedy, whose
+lower variance suits a re-run that must diff against an older report.
+
 Every arm answers the SAME staggered workload:
 
   - `victims` short greedy requests (a 128-token prompt, a fixed 256-token answer)
@@ -94,22 +99,14 @@ STALL_EVENT_S = 0.5  # the launcher bench's stall threshold; keep the two in ste
 
 
 def arms_for(spec: dict, smoke: bool = False) -> list[tuple[str, dict[str, str], str]]:
-    """The arms to MEASURE on this config. Piping is TP1-only (Scheduler._make_pipe
-    refuses TP>1: concurrent NCCL comms can deadlock across ranks), so under TP>1 the
-    piped arms are reported as skipped-with-reason instead of burning an engine restart
-    on a config that would only prove the guard works."""
-    try:
-        tp = int(_arg_value(list(spec.get("argv") or []), "--tp-size") or 1)
-    except ValueError:
-        tp = 1
+    """The arms to MEASURE on this config: all four on any TP. (Piping under TP runs
+    the pipe's collectives on a dedicated torch NCCL group; the earlier TP1-only
+    refusal was chasing a PLE native-store race, not a comm deadlock.)"""
     out = []
     for label, env in ARMS:
         if smoke and label not in ("none", "piped"):
             continue
-        skip = ""
-        if tp > 1 and label in ("piped", "piped-sf"):
-            skip = f"piping is TP1-only (config runs tp={tp}); mixed is the TP arm"
-        out.append((label, env, skip))
+        out.append((label, env, ""))
     return out
 
 
@@ -175,16 +172,31 @@ def workload(cfg: dict) -> list[dict]:
     return items
 
 
-def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
-                 t_start: float, delay: float, timeout: float = REQUEST_TIMEOUT) -> dict:
-    """One streamed greedy request; returns per-token arrival times (perf_counter)."""
+def request_body(model: str, prompt: str, max_tokens: int,
+                 temperature: float | None) -> dict:
+    """The probe request. temperature=None OMITS the field so the server applies its
+    production defaults (sampling_defaults=model: the checkpoint's generation_config,
+    plus the high-temperature guard) - calibrating the regime traffic actually runs.
+    Pass 0.0 for the deterministic greedy variant."""
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens, "temperature": 0.0, "top_k": 1, "top_p": 1.0,
+        "max_tokens": max_tokens,
         "ignore_eos": True, "stream": True,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+        body["top_k"] = 1
+        body["top_p"] = 1.0
+    return body
+
+
+def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
+                 t_start: float, delay: float, timeout: float = REQUEST_TIMEOUT,
+                 temperature: float | None = None) -> dict:
+    """One streamed request; returns per-token arrival times (perf_counter)."""
+    body = request_body(model, prompt, max_tokens, temperature)
     data = json.dumps(body).encode()
     req = urllib.request.Request(
         server.base + "/v1/chat/completions", data=data,
@@ -220,7 +232,8 @@ def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
             "usage_tokens": usage_tokens, "end": time.perf_counter()}
 
 
-def run_workload(server: Server, model: str, items: list[dict]) -> dict:
+def run_workload(server: Server, model: str, items: list[dict],
+                 temperature: float | None = None) -> dict:
     """Launch the staggered workload and score it. The stall window opens when the
     aggressor is admitted: gaps BEFORE that are the victims' own (short) prefill."""
     t_start = time.perf_counter()
@@ -229,7 +242,7 @@ def run_workload(server: Server, model: str, items: list[dict]) -> dict:
 
     def one(name: str, item: dict) -> None:
         r = _stream_chat(server, model, item["prompt"], item["max_tokens"],
-                         t_start, item["at"])
+                         t_start, item["at"], temperature=temperature)
         with lock:
             results[name] = r
 
@@ -313,7 +326,8 @@ def arm_active(label: str, log_text: str) -> tuple[bool, str]:
 
 
 def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
-                   reps: int, log_dir: Path, port: int) -> MultiScore:
+                   reps: int, log_dir: Path, port: int,
+                   temperature: float | None = None) -> MultiScore:
     run_spec = {**spec, "port": port,
                 "argv": argv_with_port(list(spec["argv"]), port)}
     full_env = {**env, "FREETOKEN_CHUNK_TIMING": "1"}
@@ -330,9 +344,10 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                 model = spec.get("model_name") or "default"
                 # warm-up doubles as the liveness probe (see calibrate_lookup)
                 _stream_chat(server, model, "Repeat after me exactly: warm up.", 16,
-                             time.perf_counter(), 0.0, timeout=WARMUP_TIMEOUT)
+                             time.perf_counter(), 0.0, timeout=WARMUP_TIMEOUT,
+                             temperature=temperature)
                 for _ in range(max(1, reps)):
-                    per.append(run_workload(server, model, items))
+                    per.append(run_workload(server, model, items, temperature))
             log_text = (log_dir / log_name).read_text(errors="replace")
             break
         except (ServerError, urllib.error.URLError, TimeoutError, OSError) as e:
@@ -432,7 +447,8 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                                      valid=False, note=skip))
             continue
         print(f"  measuring {label} ...", flush=True)
-        score = evaluate_multi(spec, label, env, cfg, reps, log_dir, take_port())
+        score = evaluate_multi(spec, label, env, cfg, reps, log_dir, take_port(),
+                               a.temperature)
         print("    " + score.line(), flush=True)
         scores.append(score)
 
@@ -493,6 +509,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reps", type=int, default=2, help="measured repeats per arm")
     ap.add_argument("--long", type=int, default=16384, help="aggressor prompt tokens")
     ap.add_argument("--out-tokens", type=int, default=256, help="victim answer length")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="probe sampling temperature; default OMITs it so the server's "
+                         "production defaults (generation_config + the high-temp guard) "
+                         "apply. 0.0 = deterministic greedy arms")
     a = ap.parse_args(argv)
     import signal as _signal
     if hasattr(_signal, "SIGTERM"):

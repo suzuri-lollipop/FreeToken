@@ -239,6 +239,13 @@ admitted while they decode):
 | `piped` | PIPED=1 | decodes advance per REPLAY; zero stall, chunk runs beside them |
 | `piped-sf` | PIPED=1, SHORT_FIRST=1024 | also: short prompts admitted ahead of the long queue |
 
+Arms are probed at the server's PRODUCTION sampling by default: the request omits
+`temperature`, so `sampling_defaults=model` (the checkpoint's generation_config) and the
+high-temperature guard apply exactly as they do for real traffic -- a calibration must
+measure the regime the profile serves, not a greener one. `--temperature 0.0` switches to
+deterministic greedy arms for a re-run that must diff against an older report (the lookup
+tool stays greedy always: draft/verify acceptance is defined on argmax parity).
+
 An arm wins only when it cuts the worst inter-token stall by 0.5 s (or lands under the 0.5 s
 human threshold while the baseline is above it) and gives up at most 25% of aggregate tok/s.
 Arms whose mechanism never activated - piping is refused while `--speculative` is armed, and the
@@ -253,11 +260,8 @@ set (explicit zeros included) is written to `freetoken-multi-<tag>.json` +
 
 Unlike the lookup tool, a multi arm keeps the config's `--speculative` flag: it measures the
 server the profile actually starts, and rejects piping on it with the reason if the spec path
-makes the side stream unsafe. The same preflight applies to tensor parallelism: piping is
-TP1-only (concurrent NCCL comms across two host threads can deadlock ranks -- measured), so
-under `--tp-size > 1` the piped arms are reported as skipped with that reason and only the
-`none`/`mixed` arms run. Expect ~15 min (4 arms x one engine start) on TP1, ~7 min on TP2.
-The launcher's
+makes the side stream unsafe. All four arms run on any TP size (piping under TP uses a
+dedicated second NCCL group). Expect ~15 min (4 arms x one engine start). The launcher's
 Calibration tab exposes this as the multi choice next to the single-stream (auto) one, and
 writes the winner into the profile's / the launch JSON's `env` the same way lookup does.
 

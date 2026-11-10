@@ -289,3 +289,34 @@ def test_phase_rows_are_only_the_ones_the_engine_stamped():
     rows = request_ring.requests_phase_rows(256)
     assert [(r["queue_ms"], r["prefill_ms"]) for r in rows] == [(2.5, 40.0)]
     assert rows[0]["arrival_s"] > 0
+
+
+def test_high_temperature_guard_applies_min_p_only():
+    from freetoken.server.generation import resolve_sampling
+
+    ms = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}
+    p = resolve_sampling(temperature=None, top_k=None, top_p=None, max_tokens=64,
+                         ignore_eos=False, model_sampling=ms)
+    # min_p trims the tail; NO count-linear penalty: it would strip punctuation from
+    # long outputs (。、repeat hundreds of times legitimately)
+    assert p.min_p == 0.05 and p.frequency_penalty == 0.0 and p.presence_penalty == 0.0
+
+    # explicit values (including an explicit 0.0) are respected untouched
+    p = resolve_sampling(temperature=None, top_k=None, top_p=None, max_tokens=64,
+                         ignore_eos=False, model_sampling=ms, min_p=0.0)
+    assert p.min_p == 0.0
+
+    # a client penalty passes through unchanged (the guard adds none of its own)
+    p = resolve_sampling(temperature=None, top_k=None, top_p=None, max_tokens=64,
+                         ignore_eos=False, model_sampling=ms, frequency_penalty=0.5)
+    assert p.min_p == 0.05 and p.frequency_penalty == 0.5
+
+    # below the guard threshold nothing is added
+    p = resolve_sampling(temperature=0.7, top_k=None, top_p=None, max_tokens=64,
+                         ignore_eos=False, model_sampling=ms)
+    assert p.min_p == 0.0 and p.frequency_penalty == 0.0
+
+    # greedy (top_k == 1) is never guarded
+    p = resolve_sampling(temperature=1.0, top_k=1, top_p=None, max_tokens=64,
+                         ignore_eos=False, model_sampling={})
+    assert p.min_p == 0.0

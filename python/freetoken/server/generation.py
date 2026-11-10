@@ -13,6 +13,8 @@ it depends on none of them.
 
 from __future__ import annotations
 
+import os
+
 import asyncio
 import hashlib
 import json
@@ -165,6 +167,8 @@ class GenSpec:
 # --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
 # context by the scheduler regardless.
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
+# FREETOKEN_SAMPLING_GUARD=0 disables the automatic min_p/frequency tail guard at temp >= 1.0
+SAMPLING_GUARD = os.environ.get("FREETOKEN_SAMPLING_GUARD", "1") == "1"
 
 
 def resolve_sampling(
@@ -179,9 +183,26 @@ def resolve_sampling(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    min_p: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
-    filling unspecified fields from the checkpoint's recommended defaults."""
+    filling unspecified fields from the checkpoint's recommended defaults.
+
+    High-temperature guard (FREETOKEN_SAMPLING_GUARD=1, the default): a request that
+    samples at temperature >= 1.0 without saying anything about tail control gets
+    min_p 0.05 and a mild frequency penalty. Quantized checkpoints on long Japanese
+    prose drift into particle-drop fragmentation and punctuation storms exactly in
+    that regime (measured on this rig: the same decay with the engine's pre-piping
+    build too - it is sampling, not scheduling); min_p trims the tail that starts
+    the decay. An explicit min_p (including 0.0) is respected untouched.
+
+    The guard deliberately does NOT add a frequency penalty: count-linear penalties
+    accumulate over a long generation's legitimate repeats (。、and newlines appear
+    hundreds of times, and a reasoning channel burns through them before the visible
+    text starts), which silently strips all punctuation from the output - a worse
+    regression than the decay it aimed at (measured 2026-11-10: 0.3 punct/100 chars
+    with freq 0.3 vs ~3 without). Clients that want repetition control set
+    frequency_penalty themselves."""
 
     def pick(value, key, framework):
         return value if value is not None else model_sampling.get(key, framework)
@@ -193,15 +214,27 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+    temp = pick(temperature, "temperature", 0.0)
+    top_k_v = pick(top_k, "top_k", -1)
+    min_p_v = min_p if min_p is not None else float(model_sampling.get("min_p", 0.0))
+    if (
+        SAMPLING_GUARD
+        and min_p is None
+        and "min_p" not in model_sampling
+        and temp >= 1.0
+        and top_k_v != 1
+    ):
+        min_p_v = 0.05
     return SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=default_max_tokens if max_tokens is None else max_tokens,
-        temperature=pick(temperature, "temperature", 0.0),
-        top_k=pick(top_k, "top_k", -1),
+        temperature=temp,
+        top_k=top_k_v,
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        min_p=min_p_v,
     )
 
 

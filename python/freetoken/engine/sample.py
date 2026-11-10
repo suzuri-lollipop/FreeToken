@@ -17,6 +17,7 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    min_p: torch.Tensor | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -28,6 +29,7 @@ def sample_impl(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -37,6 +39,11 @@ def sample_impl(
         import freetoken.kernel.triton.sampling as sampling
 
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+    if min_p is not None:
+        # min-p filter then renormalize; cheap at these batch sizes (bs <= max_running)
+        floor = min_p.unsqueeze(-1) * probs.max(dim=-1, keepdim=True).values
+        probs = probs * (probs >= floor)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     if top_k is None and top_p is None:
         return sampling.sampling_from_probs(probs)
 
@@ -75,6 +82,8 @@ class Sampler:
         if all(is_greedy):
             return BatchSamplingArgs(temperatures=None, penalties=penalties)
 
+        min_ps = [p.min_p if not g else 0.0 for p, g in zip(params, is_greedy)]
+
         MIN_P = MIN_T = 1e-6
         # Greedy outputs are selected explicitly in sample(); use neutral sampling
         # parameters for those rows instead of approximating argmax at low temperature.
@@ -97,7 +106,9 @@ class Sampler:
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties,
+            min_p=(make_device_tensor(min_ps, torch.float32, self.device)
+                   if any(m > 0 for m in min_ps) else None),
         )
 
     @nvtx_annotate("Sampler")
@@ -110,7 +121,8 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p,
+                                     args.min_p)
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.

@@ -76,6 +76,8 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    # min-p typicality filter; None = unset (the high-temperature guard may still apply one)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
@@ -114,6 +116,8 @@ class CompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    # min-p typicality filter; None = unset (the high-temperature guard may still apply one)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     ignore_eos: bool = False
     logprobs: int | None = None
     echo: bool = False
