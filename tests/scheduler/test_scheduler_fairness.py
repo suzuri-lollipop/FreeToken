@@ -23,7 +23,8 @@ import torch
 def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float = 0.0,
                     debt: float = 0.0, chunk_target: float = 0.0,
                     chunk_ema: float | None = None, budget: int = 99,
-                    mixed_tokens: int = 0, running_uids: tuple = (1, 2)):
+                    mixed_tokens: int = 0, running_uids: tuple = (1, 2),
+                    tp_size: int = 1):
     from freetoken.scheduler.scheduler import Scheduler
 
     calls: list[str] = []
@@ -42,7 +43,8 @@ def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float =
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = budget
-    scheduler.config = SimpleNamespace(prefill_decode_interval=interval)
+    scheduler.config = SimpleNamespace(prefill_decode_interval=interval,
+                                       tp_info=SimpleNamespace(size=tp_size))
     scheduler._prefill_streak = 0
     scheduler._prefill_debt = debt
     scheduler._prefill_debt_s = debt_s
@@ -372,6 +374,18 @@ def test_adaptive_budget_off_without_target_or_ema():
     assert Scheduler._adaptive_prefill_budget(scheduler) == 99
 
 
+def test_adaptive_budget_stays_configured_under_tp():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    # the EMA is this rank's own measurement: shrinking on it would size the same
+    # chunk differently per rank, and mismatched shapes desync the collectives
+    scheduler, _ = _stub_scheduler(
+        interval=0, debt_s=0.0, chunk_target=0.5, chunk_ema=7.3 / 8192, budget=8192,
+        tp_size=2,
+    )
+    assert Scheduler._adaptive_prefill_budget(scheduler) == 8192
+
+
 def test_schedule_next_batch_uses_the_adaptive_budget():
     from freetoken.scheduler.scheduler import Scheduler
 
@@ -561,3 +575,47 @@ def test_admission_order_keeps_chunk_continuations_first():
     manager.pending_list = [long_p, cont, short_p]
 
     assert manager._admission_order() == [cont, short_p, long_p]
+
+
+def test_admission_aging_reads_the_broadcast_clock_not_the_local_one(monkeypatch):
+    # Under TP the aged bit must flip on the SAME iteration on every rank: both compare
+    # rank0's broadcast clock (sched_clock), never their own skewed perf_counter. Here the
+    # long prompt is 29s old on the broadcast clock (NOT aged) but the local clock reads
+    # far ahead, which would age it. Reverting _admission_order to time.perf_counter()
+    # turns this red (the order would flip to [1, 2]).
+    import time as _time
+    from types import SimpleNamespace as NS
+
+    from freetoken.scheduler.prefill import PrefillManager
+
+    manager = PrefillManager.__new__(PrefillManager)
+    manager.short_first = 16
+    manager.admit_max_wait_s = 30.0
+    manager.sched_clock = 1000.0  # rank0's broadcast recv-time clock
+    long_p = NS(uid=1, chunked_req=None, input_len=40, enqueued_at=971.0)
+    short_p = NS(uid=2, chunked_req=None, input_len=8, enqueued_at=1000.0)
+    manager.pending_list = [long_p, short_p]
+
+    monkeypatch.setattr(_time, "perf_counter", lambda: 5000.0)  # local clock far ahead
+    assert [p.uid for p in manager._admission_order()] == [2, 1]
+
+
+def test_enqueue_stamp_follows_the_broadcast_clock_under_tp(monkeypatch):
+    # add_one_req stamps the queue-wait start from rank0's broadcast clock under TP so
+    # every rank agrees when the wait began (the aging threshold later compares it). A
+    # local stamp would skew the wait per rank. Reverting enqueued_at to
+    # time.perf_counter() turns this red.
+    import time as _time
+
+    from freetoken.core import SamplingParams
+    from freetoken.message.backend import UserMsg
+
+    _cache, _tables, manager = _build_managers(num_pages=512)
+    manager.sched_clock = 1000.0
+    monkeypatch.setattr(_time, "perf_counter", lambda: 5000.0)  # local clock far off
+    msg = UserMsg(
+        uid=7, input_ids=torch.arange(8, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    manager.add_one_req(msg)
+    assert manager.pending_list[0].enqueued_at == 1000.0

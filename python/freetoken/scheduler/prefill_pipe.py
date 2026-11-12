@@ -114,14 +114,21 @@ class PrefillPiper:
             self._gate = torch.cuda.Event()
         self._gate.record(self.engine.stream)
 
-    def poll(self, force: bool = False):
+    def poll(self, force: bool = False, strict: bool = False):
         """Consume the slot once the chunk's stream point passed, returning
         (forward_input, forward_output, error). None while still running.
 
         force=True is rank0's broadcast drain decision under TP: the worker must have
         published (launches rendezvous chunk-by-chunk with the peer pipe, so publish
         is bounded), and the drain's own copy_done.synchronize absorbs any remaining
-        GPU skew - but the ITERATION on which scheduler state moves is rank-identical."""
+        GPU skew - but the ITERATION on which scheduler state moves is rank-identical.
+
+        strict=True (tp>1) makes that flag the only gate for a successful chunk: a rank
+        whose own GPU finished EARLIER must not drain an iteration ahead of the
+        broadcast, or it joins the chunk's request to its running set one step before
+        the peer does and the next decode batch is composed differently on each rank -
+        mismatched NCCL sequences, and the rank that launched first spins forever. An
+        errored slot still drains at once: it ends the rank either way."""
         if self.slot is None:
             if not force:
                 return None
@@ -141,7 +148,7 @@ class PrefillPiper:
             if self.slot is None:
                 return None
         out = self.slot
-        if out[2] is None and not force and not self.chunk_done.query():
+        if out[2] is None and not force and (strict or not self.chunk_done.query()):
             return None
         self.slot = None
         self.inflight = False
@@ -168,10 +175,13 @@ class PrefillPiper:
     @torch.inference_mode()
     def _run(self) -> None:
         torch.cuda.set_device(self.device)
-        # the engine Context routes this thread's forward to its own batch slot; the
-        # pipe only runs under TP1 (see Scheduler._make_pipe), where there are no
-        # collectives to route at all
+        # the engine Context routes this thread's forward to its own batch slot, and the
+        # distributed layer routes its collectives to the pipe's own comm (tp>1); at tp1
+        # there are no collectives to route, so the register call is a no-op marker
         get_global_ctx().register_pipe_thread()
+        from freetoken.distributed import register_pipe_comm_thread
+
+        register_pipe_comm_thread()
         while True:
             with self._cv:
                 while self._item is None and not self.dead:

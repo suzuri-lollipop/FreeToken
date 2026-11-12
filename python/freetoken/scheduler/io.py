@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Final, List
 
 import torch
@@ -27,6 +28,11 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        # rank0's recv-time clock, broadcast with the message count (None at tp1:
+        # local reads stay exact). Scheduling thresholds (admission aging, prefill
+        # debt) must compare the SAME clock on every rank or they flip on different
+        # iterations and desynchronize the collectives.
+        self._tp_sched_clock: float | None = None
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -115,9 +121,14 @@ class SchedulerIOMixin:
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
         # broadcast the number of raw messages (+ the piped-drain ready flag, see
-        # _pipe_drain_ready) to all ranks
+        # _pipe_drain_ready, + rank0's clock for the rank-consistent scheduling
+        # thresholds) to all ranks
         self._pipe_ready_bcast = bool(self._pipe_drain_ready())
-        src_tensor = torch.tensor([len(pending_raw_msgs), int(self._pipe_ready_bcast)])
+        self._tp_sched_clock = time.perf_counter()
+        src_tensor = torch.tensor(
+            [len(pending_raw_msgs), int(self._pipe_ready_bcast), self._tp_sched_clock],
+            dtype=torch.float64,
+        )
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
 
         for raw in pending_raw_msgs:
@@ -132,11 +143,13 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_rank0.get())
 
         # ensure all ranks have the same number of raw messages (slot 1: rank0's
-        # piped-drain decision; obey it even where our own GPU finished earlier)
-        dst_tensor = torch.tensor([-1, -1])
+        # piped-drain decision; obey it even where our own GPU finished earlier;
+        # slot 2: rank0's clock - the scheduling thresholds compare it, not ours)
+        dst_tensor = torch.tensor([-1.0, -1.0, 0.0], dtype=torch.float64)
         self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
         dst_length = int(dst_tensor[0].item())
         self._pipe_ready_bcast = bool(int(dst_tensor[1].item()))
+        self._tp_sched_clock = float(dst_tensor[2].item())
 
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
