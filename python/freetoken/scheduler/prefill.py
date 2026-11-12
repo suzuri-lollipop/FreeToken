@@ -301,6 +301,13 @@ class PrefillManager:
     # FREETOKEN_ADMIT_MAX_WAIT_S: a long prompt that has waited this long counts as short,
     # so short-first can never starve one.
     admit_max_wait_s: float = 30.0
+    # rank0's broadcast recv-time clock under TP (None at tp1: local reads). The aging
+    # threshold and the queue stamps must compare the SAME clock on every rank, or the
+    # admission order flips on different iterations and desynchronizes the collectives.
+    sched_clock: float | None = None
+
+    def _now(self) -> float:
+        return self.sched_clock if self.sched_clock is not None else time.perf_counter()
 
     def _admission_order(self) -> List[PendingReq]:
         """The pass order for this step's budget (STRATA_ADMIT_SHORT_FIRST's rule).
@@ -310,12 +317,11 @@ class PrefillManager:
         admissions then run in two classes: short-or-aged first, long behind, arrival
         order inside a class. The class/arrival key uses the pending_list INDEX, not the
         local stamp, so every TP rank (which receives the identical message sequence)
-        builds the identical batch; only the aged bit reads a clock, the same accepted
-        risk as the wall-clock prefill debt.
-        """
+        builds the identical batch; the aged bit reads the broadcast rank0 clock under TP
+        (sched_clock), so the 30s threshold flips on the SAME iteration on every rank."""
         if self.short_first <= 0:
             return self.pending_list
-        now = time.perf_counter()
+        now = self._now()
         cont = [p for p in self.pending_list if p.chunked_req is not None]
         new = [(i, p) for i, p in enumerate(self.pending_list) if p.chunked_req is None]
 
@@ -335,7 +341,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
-                enqueued_at=time.perf_counter(),
+                enqueued_at=self._now(),
             )
         )
 
@@ -402,7 +408,7 @@ class PrefillManager:
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
-        batch.scheduled_at = time.perf_counter()
+        batch.scheduled_at = self._now()
         batch.prompt_admissions = prompt_admissions
         return batch
 

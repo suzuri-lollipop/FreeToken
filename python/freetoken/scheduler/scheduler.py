@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# FREETOKEN_PIPED_DEBUG also traces the scheduling state on EVERY rank: under TP the
+# message-count broadcast stays aligned only while `blocking` and the pipe handoff are
+# rank-identical, and a divergence is invisible unless both sides are logged.
+_PIPED_TRACE = os.environ.get("FREETOKEN_PIPED_DEBUG", "0") == "1"
+
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -319,6 +324,8 @@ class Scheduler(SchedulerIOMixin):
                 self._mixed_prefill_tokens = 0
         self._chunk_target_s = _adaptive_chunk_target_s()
         self._chunk_ema_spt: float | None = None  # EMA of prefill seconds per token
+        self._warned_adaptive_tp = False
+        self._pipe_trace_n = 0  # one-time note: the EMA shrink is TP-unsafe
         # Opt-in per-chunk wall-clock breakdown ([chunktime] log lines). Independent of
         # the moe _debug_stats probe (which must not be enabled on PLE-graph rigs).
         self._chunk_timing = os.environ.get("FREETOKEN_CHUNK_TIMING", "0") == "1"
@@ -462,8 +469,25 @@ class Scheduler(SchedulerIOMixin):
             # chunk's own allocations as a leak (and stall the drain behind messages)
             or (self._pipe is not None and (self._pipe.inflight or self._pipe_take is not None))
         )
-        for msg in self.receive_msg(blocking=blocking):
+        if _PIPED_TRACE and self._pipe is not None:
+            _pt_pre = (int(self._pipe.inflight), int(self._pipe.slot is not None),
+                       int(self._pipe_take is not None))
+        _msgs = self.receive_msg(blocking=blocking)
+        # the admission aging / queue stamps below must read rank0's broadcast clock
+        self.prefill_manager.sched_clock = getattr(self, "_tp_sched_clock", None)
+        for msg in _msgs:
             self._process_one_msg(msg)
+        if _PIPED_TRACE and self._pipe is not None:
+            self._pipe_trace_n += 1
+            logger.info(
+                f"[pipetrace] it={self._pipe_trace_n} block={int(blocking)} "
+                f"pre={_pt_pre} msgs={len(_msgs)} "
+                f"bcast={int(getattr(self, '_pipe_ready_bcast', False))} "
+                f"post=({int(self._pipe.inflight)},{int(self._pipe.slot is not None)},"
+                f"{int(self._pipe_take is not None)}) "
+                f"prun={int(self.prefill_manager.runnable)} "
+                f"drun={int(self.decode_manager.runnable)} last={int(last_data is not None)}"
+            )
         if _ct:
             _ct1 = time.perf_counter()
         if _dbg is not None or _lat is not None:
@@ -509,8 +533,12 @@ class Scheduler(SchedulerIOMixin):
             # the drain gate is the broadcast flag: rank0 fills it with its own
             # readiness, every other rank obeys it - one iteration, all ranks drain
             # (poll(force) waits our worker's publish and the drain's copy_done
-            # synchronize absorbs GPU-side skew)
-            got = self._pipe.poll(force=bool(getattr(self, "_pipe_ready_bcast", False)))
+            # synchronize absorbs GPU-side skew; strict also SUPPRESSES the rank-local
+            # drain our own chunk_done would allow an iteration early)
+            got = self._pipe.poll(
+                force=bool(getattr(self, "_pipe_ready_bcast", False)),
+                strict=self.config.tp_info.size > 1,
+            )
             if got is not None:
                 fin, fout, err = got
                 if err is not None:
@@ -682,7 +710,9 @@ class Scheduler(SchedulerIOMixin):
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
             or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
-        for msg in self.receive_msg(blocking=blocking):
+        _msgs = self.receive_msg(blocking=blocking)
+        self.prefill_manager.sched_clock = getattr(self, "_tp_sched_clock", None)
+        for msg in _msgs:
             self._process_one_msg(msg)
         if _ct:
             _ct1 = time.perf_counter()
@@ -1004,6 +1034,17 @@ class Scheduler(SchedulerIOMixin):
         for req, weight in zip(batch.reqs, weights):
             req.prefill_ms += window_ms * weight / total
 
+    def _sched_now(self) -> float:
+        """The clock scheduling thresholds compare. Under TP it is rank0's recv-time
+        clock broadcast with the message count (io.py): a local read would let the
+        admission-aging / prefill-debt thresholds flip on one rank an iteration before
+        the other, composing different batches and wedging a collective. At tp1 the
+        local clock stays exact."""
+        clock = getattr(self, "_tp_sched_clock", None)
+        if clock is not None and self.config.tp_info.size > 1:
+            return clock
+        return time.perf_counter()
+
     def _account_prefill_debt(self, batch) -> None:
         """Accrue the wall time a prefill batch held the engine while decodes waited.
 
@@ -1028,7 +1069,7 @@ class Scheduler(SchedulerIOMixin):
         if getattr(batch, "decoding_reqs", None) or getattr(batch, "piped", False):
             # piped: the chunk ran on its own stream while decodes kept replaying
             return
-        self._prefill_debt += time.perf_counter() - batch.scheduled_at
+        self._prefill_debt += self._sched_now() - batch.scheduled_at
 
     def _inflight_prefill(self) -> tuple[Batch | None, float]:
         """The launched-but-undrained prefill chunk and how long it has been running.
@@ -1054,7 +1095,7 @@ class Scheduler(SchedulerIOMixin):
             return None, 0.0  # mixed: the waiting decodes rode this one, they stalled for nobody
         if not getattr(batch, "scheduled_at", 0.0):
             return None, 0.0  # unstamped: now - 0 would concede unconditionally
-        return batch, time.perf_counter() - batch.scheduled_at
+        return batch, self._sched_now() - batch.scheduled_at
 
     def _observe_chunk_time(self, batch) -> None:
         """EMA of prefill seconds-per-token, from the same schedule->drain window the
@@ -1072,7 +1113,7 @@ class Scheduler(SchedulerIOMixin):
         tokens = getattr(batch, "log_new_tokens", 0)
         if tokens <= 0:
             return
-        spt = (time.perf_counter() - batch.scheduled_at) / tokens
+        spt = (self._sched_now() - batch.scheduled_at) / tokens
         ema = self._chunk_ema_spt
         self._chunk_ema_spt = spt if ema is None else 0.7 * ema + 0.3 * spt
 
@@ -1093,6 +1134,17 @@ class Scheduler(SchedulerIOMixin):
             or self._chunk_ema_spt <= 0
             or not self.decode_manager.runnable
         ):
+            return self.prefill_budget
+        if self.config.tp_info.size > 1:
+            # The EMA is THIS rank's own seconds-per-token, so the shrink would size the
+            # same chunk differently on each rank: mismatched collective shapes, not a
+            # slow step. Under TP every rank keeps the configured budget.
+            if not getattr(self, "_warned_adaptive_tp", False):
+                self._warned_adaptive_tp = True
+                logger.warning_rank0(
+                    "FREETOKEN_ADAPTIVE_CHUNK_TARGET_S is ignored under TP: a per-rank "
+                    "chunk-size EMA would desynchronize the ranks' collectives"
+                )
             return self.prefill_budget
         tok = int(self._chunk_target_s / self._chunk_ema_spt)
         tok = (tok // _CHUNK_ALIGN) * _CHUNK_ALIGN
@@ -2052,7 +2104,7 @@ class Scheduler(SchedulerIOMixin):
         return batch
 
     def _make_pipe(self):
-        from freetoken.distributed import get_tp_info
+        from freetoken.distributed import get_tp_info, pipe_distributed_ready
 
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             logger.warning_rank0(
@@ -2070,17 +2122,14 @@ class Scheduler(SchedulerIOMixin):
                 "(eager spec verify shares the PLE/plan staging with the pipe)"
             )
             return None
-        if get_tp_info().size > 1:
-            # TP1-only until the piped SCHEDULING stays rank-consistent: a live capture
-            # (2026-11-10) showed rank0 taking a chunk rank1 never scheduled - both
-            # pipes idle, one main waiting its own broadcast, the other waiting a
-            # publish that never comes - so the drain lockstep above is necessary but
-            # not sufficient. Until that divergence is root-caused, TP runs the inline
+        if get_tp_info().size > 1 and not pipe_distributed_ready():
+            # The engine builds the pipe's own NCCL group at init when piping is on; if
+            # it is missing the chunk's collectives would share the decode comm and
+            # interleave two call sequences across ranks, so TP stays on the inline
             # interleave (FREETOKEN_MIXED_PREFILL_TOKENS bounds its stall).
             logger.warning_rank0(
-                "FREETOKEN_PIPED_PREFILL is TP1-only for now (rank scheduling under TP "
-                "can diverge and wedge a collective); use FREETOKEN_MIXED_PREFILL_TOKENS "
-                "under TP"
+                "FREETOKEN_PIPED_PREFILL: this rank built no dedicated pipe comm; "
+                "piping disabled (use FREETOKEN_MIXED_PREFILL_TOKENS under TP)"
             )
             return None
         if os.environ.get("FREETOKEN_PIPED_DEBUG", "0") == "1":
@@ -2110,10 +2159,10 @@ class Scheduler(SchedulerIOMixin):
         that mutates scheduler state (allocation, radix, admissions) ran here.
         """
         self._pipe_take = None
-        if self._pipe.can_take() and self.prefill_manager.runnable:
-            pbatch = self.prefill_manager.schedule_next_batch(
-                self._adaptive_prefill_budget()
-            )
+        budget = self._adaptive_prefill_budget()
+        _can, _prun = self._pipe.can_take(), self.prefill_manager.runnable
+        if _can and _prun:
+            pbatch = self.prefill_manager.schedule_next_batch(budget)
             if pbatch is not None:
                 pbatch.piped = True
                 self._prefill_streak = 0
@@ -2128,6 +2177,12 @@ class Scheduler(SchedulerIOMixin):
                 # prepare_done before the forward reads the live slot.
                 self._restore_linear_states(pbatch)
                 self._report_prompt_admissions(pbatch)
+        if _PIPED_TRACE:
+            logger.info(
+                f"[pipetrace] take can={int(_can)} prun={int(_prun)} budget={budget} "
+                f"chunk={0 if self._pipe_take is None else int(getattr(self._pipe_take.batch, 'log_new_tokens', 0))} "
+                f"drun={int(self.decode_manager.runnable)}"
+            )
         if not self.decode_manager.runnable:
             return None
         batch = self.decode_manager.schedule_next_batch()

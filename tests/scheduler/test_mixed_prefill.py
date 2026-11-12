@@ -171,6 +171,8 @@ def test_mixed_batch_owes_no_stall_debt():
             _prefill_debt_s=2.0, _prefill_debt=0.0, _debt_discharge=None,
             decode_manager=SimpleNamespace(runnable=True),
         )
+        # tp1 stub: no broadcast clock, so the real _sched_now reads the local clock
+        stub._sched_now = lambda: Scheduler._sched_now(stub)
         Scheduler._account_prefill_debt(stub, batch)
         return stub._prefill_debt
 

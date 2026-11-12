@@ -607,6 +607,22 @@ class Engine:
             # Cap each collective at 4 CTAs so a spinner always leaves the SMs open.
             # Measured cost: none (decode tps unchanged at tp2 on this model).
             os.environ.setdefault("NCCL_MAX_CTAS", "4")
+            if config.tp_info.size > 1:
+                # The shm one-shot AR bakes a RESIDENT spin kernel into the bs>=2 decode
+                # graphs: it holds the SMs until the peer's decode arrives, so the pipe's
+                # concurrent NCCL collective never gets a CTA, its host thread blocks in
+                # the MoE plan's stream sync, and both ranks wedge (measured tp2, cold
+                # 16k prompt). NCCL_MAX_CTAS cannot cap a kernel that is not NCCL's.
+                # Plain NCCL also keeps PLE's decode fill on wait-sync instead of the
+                # launch-gating path, whose blocking D2H stalls the issue loop the same way.
+                from freetoken.distributed.shm_ar import shm_ar_enabled
+
+                if shm_ar_enabled():
+                    logger.info_rank0(
+                        "piped prefill under TP: disabling the shm one-shot AR "
+                        "(its resident decode spin kernel starves the pipe's collectives)"
+                    )
+                os.environ["FREETOKEN_SHM_AR"] = "0"
         _adjust_config(config)
         torch.manual_seed(42)
         # Piped prefill (FREETOKEN_PIPED_PREFILL, Strata PIPED_CONCURRENT port): prefill
@@ -641,6 +657,14 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
+        if self.piped_prefill and config.tp_info.size > 1:
+            # The pipe thread's chunk forwards reduce concurrently with the decode
+            # replays, so they need their own comm (see enable_pipe_distributed).
+            from freetoken.distributed import enable_pipe_distributed
+
+            if enable_pipe_distributed(config.tp_info, self.tp_cpu_group,
+                                       config.distributed_timeout):
+                logger.info_rank0("piped prefill: dedicated torch NCCL group ready")
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._init_free_memory = init_free_memory  # reused by the GDN-pool budget settle
@@ -2951,6 +2975,16 @@ class Engine:
         # system-prompt conversations. Sampling warmup runs only at the last
         # length since those kernels are shape-independent.
         candidates = [64, 128, 256]
+        if self.piped_prefill:
+            # A piped chunk runs EAGER on the pipe thread at runtime, so a first-time
+            # Triton specialization there loads a cubin (a device allocation) while the
+            # decode graph's untimed shm rendezvous spins on the peer rank - measured
+            # tp2 deadlock on a cold 16k prompt. Warm the chunk buckets here instead,
+            # single-threaded. Include lengths that are NOT multiples of 16: Triton
+            # specializes integer args on %16 and real prompts have arbitrary lengths
+            # (the 151-token victim chunk was the one that wedged).
+            budget = max(2, min(self.config.max_extend_tokens, self.max_seq_len))
+            candidates += [budget, budget - 1, max(2, budget // 2), 255]
         warmup_lens = sorted({min(l, self.max_seq_len) for l in candidates if l <= self.max_seq_len and l >= 2})
         if not warmup_lens:
             warmup_lens = [min(64, self.max_seq_len)]

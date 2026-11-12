@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -96,6 +98,13 @@ class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        # A piped-prefill chunk's forward runs CONCURRENTLY with the decode replays, so
+        # its reductions go out on their own comm (see enable_pipe_distributed): one
+        # communicator carries one call sequence, and the one-shot reducers are
+        # seq-locked per instance.
+        pipe = _pipe_impl()
+        if pipe is not None:
+            return pipe.all_reduce(x)
         # Dual-microbatch decode routes the trailing half's reductions through a
         # SECOND shm one-shot instance (its own counter/flags/data slots): two
         # independent call sequences must never share one seq-locked reducer, and
@@ -105,6 +114,9 @@ class DistributedCommunicator:
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        pipe = _pipe_impl()
+        if pipe is not None:
+            return pipe.all_gather(x)
         return self.plugins[-1].all_gather(x)
 
 
@@ -202,11 +214,76 @@ def dual_ar_available() -> bool:
     return _DUAL_IMPL is not None
 
 
+_PIPE_IMPL: "DistributedImpl | None" = None
+_PIPE_THREADS: set = set()
+
+
+def enable_pipe_distributed(
+    tp_info: DistributedInfo,
+    tp_cpu_group: "torch.distributed.ProcessGroup",
+    timeout_s: float = 0.0,
+) -> bool:
+    """Build the piped-prefill thread's own torch NCCL group, or return False (logged).
+
+    A pipe chunk's forward runs concurrently with the main loop's decode replays, so
+    under TP it may not share their communicator: two host threads issuing into one
+    comm interleave two call sequences, and the decode graph's one-shot reducer is
+    seq-locked per instance. NCCL (never the one-shot path) because the pipe must not
+    touch a rendezvous the decode graph baked in; NCCL_MAX_CTAS caps its spinners.
+
+    The collective sequence is FIXED (group, probe, verdict reduce) and runs identically
+    on every rank whatever fails locally, so a one-sided failure cannot strand a peer in
+    a collective - and the VERDICT is what gates piping: one rank piping while its peer
+    stays on the inline path is a guaranteed desync.
+    """
+    global _PIPE_IMPL
+    if tp_info.size <= 1 or _PIPE_IMPL is not None:
+        return False
+    verdict = torch.ones(1, dtype=torch.int32)
+    group = None
+    try:
+        group = dist.new_group(
+            backend="nccl",
+            timeout=timedelta(seconds=timeout_s) if timeout_s > 0 else None,
+        )
+        # Warm the comm HERE, not inside the pipe's first chunk: ncclCommInitRank is a
+        # blocking rendezvous, and starting it at engine init keeps its VRAM inside the
+        # non-pool overhead the cache sizing measures right after this call.
+        probe = torch.zeros(1, device=f"cuda:{torch.cuda.current_device()}")
+        dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=group)
+    except Exception as exc:  # noqa: BLE001 -- degrade to the inline path, never kill boot
+        logger.warning(f"piped prefill comm unavailable ({exc}); keeping NCCL inline")
+        verdict[0] = 0
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=tp_cpu_group)
+    if int(verdict[0]) != 1 or group is None:
+        return False
+    _PIPE_IMPL = TorchDistributedImpl(group=group)
+    return True
+
+
+def pipe_distributed_ready() -> bool:
+    """True once the pipe's own comm exists (always False at tp1: no collectives)."""
+    return _PIPE_IMPL is not None
+
+
+def register_pipe_comm_thread() -> None:
+    """Mark the CALLING thread as a pipe thread: its collectives take the pipe comm."""
+    _PIPE_THREADS.add(threading.get_ident())
+
+
+def _pipe_impl() -> "DistributedImpl | None":
+    if _PIPE_IMPL is None or not _PIPE_THREADS:
+        return None
+    return _PIPE_IMPL if threading.get_ident() in _PIPE_THREADS else None
+
+
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    global _DUAL_IMPL, _AR_INSTANCE
+    global _DUAL_IMPL, _AR_INSTANCE, _PIPE_IMPL
     _DUAL_IMPL = None
     _AR_INSTANCE = 0
+    _PIPE_IMPL = None
+    _PIPE_THREADS.clear()
     DistributedCommunicator.plugins = []

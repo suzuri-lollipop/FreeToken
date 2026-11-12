@@ -54,6 +54,7 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -78,6 +79,9 @@ DEFAULT_PORT = 1920
 DEFAULT_MAX_TOKENS = 192
 DEFAULT_REPS = 2
 STARTUP_TIMEOUT = 900
+# An engine start is minutes of silence (weights, then the expert banks into host RAM) and
+# the tools print one line per cell, so a start looks like a hang. Say what it is doing.
+STARTUP_PROGRESS_S = 30.0
 REQUEST_TIMEOUT = 120
 WARMUP_TIMEOUT = 30.0
 STOP_TIMEOUT = 60.0
@@ -452,6 +456,20 @@ def _port_free(port: int) -> bool:
             return False
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _last_engine_line(tail: str) -> str:
+    """The engine's newest own line, colour codes off: the tqdm bars (weights, then the
+    63 GB of experts) are the useful part, so headers, uvicorn and the ServerArgs dump go."""
+    for line in reversed(tail.splitlines()):
+        text = _ANSI.sub("", line).strip()
+        if not text or text.startswith(("INFO:", "$ ", "# ")) or len(text) > 300:
+            continue
+        return text[:110]
+    return "loading the model"
+
+
 class Server:
     def __init__(self, spec: dict, env: dict[str, str], log_path: Path):
         self.spec = spec
@@ -469,7 +487,9 @@ class Server:
         return "\n".join(lines[-n:])
 
     def _wait_health(self) -> None:
-        deadline = time.time() + STARTUP_TIMEOUT
+        started = time.time()
+        deadline = started + STARTUP_TIMEOUT
+        next_note = started + STARTUP_PROGRESS_S
         while time.time() < deadline:
             if self.proc is not None and self.proc.poll() is not None:
                 raise ServerError(
@@ -485,9 +505,14 @@ class Server:
                 with urllib.request.urlopen(self.base + "/health", timeout=2) as r:
                     doc = json.load(r)
                 if doc.get("status") == "ok":
+                    print(f"    server ready in {time.time() - started:.0f}s", flush=True)
                     return
             except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
                 pass
+            if time.time() >= next_note:
+                next_note += STARTUP_PROGRESS_S
+                print(f"    starting the server ({time.time() - started:.0f}s): "
+                      f"{_last_engine_line(tail)}", flush=True)
             time.sleep(2)
         raise ServerError(
             f"server did not become healthy in {STARTUP_TIMEOUT:.0f}s\n{self._tail()}"

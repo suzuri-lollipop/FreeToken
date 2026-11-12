@@ -346,6 +346,8 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                 _stream_chat(server, model, "Repeat after me exactly: warm up.", 16,
                              time.perf_counter(), 0.0, timeout=WARMUP_TIMEOUT,
                              temperature=temperature)
+                print(f"    {label}: running the staggered workload "
+                      f"({len(items)} requests x {max(1, reps)} reps)", flush=True)
                 for _ in range(max(1, reps)):
                     per.append(run_workload(server, model, items, temperature))
             log_text = (log_dir / log_name).read_text(errors="replace")

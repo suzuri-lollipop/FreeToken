@@ -64,6 +64,68 @@ def test_ctx_nesting_assert_stays_per_thread():
 # ------------------------------------------------------------------ collectives
 
 
+class _RecordingImpl:
+    def __init__(self, name: str, calls: list[str]):
+        self.name, self.calls = name, calls
+
+    def all_reduce(self, x):
+        self.calls.append(self.name)
+        return x
+
+    def all_gather(self, x):
+        self.calls.append(self.name)
+        return x
+
+
+def test_pipe_thread_collectives_take_the_dedicated_comm(monkeypatch):
+    """A chunk's forward reduces while the main loop replays decodes, so the marked
+    thread must reach its OWN impl: one communicator carries one call sequence, and
+    the decode graph's one-shot reducer is seq-locked per instance."""
+    from freetoken.distributed import impl as di
+
+    calls: list[str] = []
+    comm = di.DistributedCommunicator()
+    monkeypatch.setattr(di.DistributedCommunicator, "plugins",
+                        [_RecordingImpl("primary", calls)])
+    monkeypatch.setattr(di, "_PIPE_IMPL", _RecordingImpl("pipe", calls))
+    monkeypatch.setattr(di, "_PIPE_THREADS", set())
+
+    seen: dict[str, list[str]] = {}
+
+    def worker():
+        di.register_pipe_comm_thread()
+        comm.all_reduce("x")
+        comm.all_gather("y")
+        seen["pipe_thread"] = list(calls)
+
+    comm.all_reduce("x")                       # the main thread keeps the primary path
+    seen["main"] = list(calls)
+    th = threading.Thread(target=worker)
+    th.start()
+    th.join()
+    comm.all_reduce("x")                       # and stays on it afterwards
+    seen["main_after"] = list(calls)
+
+    assert seen["main"] == ["primary"]
+    assert seen["pipe_thread"] == ["primary", "pipe", "pipe"]
+    assert seen["main_after"] == ["primary", "pipe", "pipe", "primary"]
+
+
+def test_no_pipe_comm_leaves_every_thread_on_the_primary(monkeypatch):
+    from freetoken.distributed import impl as di
+
+    calls: list[str] = []
+    comm = di.DistributedCommunicator()
+    monkeypatch.setattr(di.DistributedCommunicator, "plugins",
+                        [_RecordingImpl("primary", calls)])
+    monkeypatch.setattr(di, "_PIPE_IMPL", None)
+    monkeypatch.setattr(di, "_PIPE_THREADS", set())
+
+    di.register_pipe_comm_thread()             # tp1: marked, but no second comm exists
+    comm.all_reduce("x")
+    assert calls == ["primary"]
+
+
 # ------------------------------------------------------------------ scheduler policy
 
 
@@ -95,7 +157,7 @@ class _FakePipe:
         self.slot = (fin, fout, err)
         self.chunk_done.query = lambda: done_ready
 
-    def poll(self, force=False):
+    def poll(self, force=False, strict=False):
         if self.slot is None:
             if not force:
                 return None
@@ -104,7 +166,7 @@ class _FakePipe:
             if self.slot is None:
                 return None
         out = self.slot
-        if out[2] is None and not force and not self.chunk_done.query():
+        if out[2] is None and not force and (strict or not self.chunk_done.query()):
             return None
         self.slot = None
         self.inflight = False
@@ -296,6 +358,33 @@ def test_poll_force_consumes_even_before_local_query_ready():
     assert got is None
     got = pipe.poll(force=True)
     assert got == (fin, fout, None) and not pipe.inflight
+
+
+def test_strict_poll_never_drains_ahead_of_the_broadcast():
+    # the other half of the lockstep: a rank whose chunk_done ALREADY fired keeps its
+    # slot until rank0's flag says drain, or it joins the chunk's request to its running
+    # set one iteration early and the peer's next collective never matches
+    pipe = _FakePipe()
+    fin, fout = SimpleNamespace(batch=SimpleNamespace(reqs=[])), SimpleNamespace(
+        copy_done_event=SimpleNamespace(query=lambda: True))
+    pipe.publish(fin, fout, done_ready=True)
+    pipe.inflight = True
+    assert pipe.poll(force=False) == (fin, fout, None)   # tp1: local readiness gates
+    pipe.publish(fin, fout, done_ready=True)
+    pipe.inflight = True
+    assert pipe.poll(force=False, strict=True) is None
+    assert pipe.inflight and pipe.slot is not None
+    assert pipe.poll(force=True, strict=True) == (fin, fout, None)
+    assert not pipe.inflight
+
+
+def test_strict_poll_still_drains_an_errored_slot():
+    # a dead worker ends the rank either way, so its slot must not wait for the flag
+    pipe = _FakePipe()
+    fin = SimpleNamespace(batch=SimpleNamespace(reqs=[]))
+    pipe.publish(fin, None, err=RuntimeError("boom"))
+    got = pipe.poll(force=False, strict=True)
+    assert got is not None and isinstance(got[2], RuntimeError)
 
 
 def test_poll_force_with_dead_worker_and_no_slot_returns_none():
