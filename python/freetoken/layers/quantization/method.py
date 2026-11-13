@@ -38,7 +38,8 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
             continue
         if kernel.worth_it(cfg):
             if skipped:
-                logger.info("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                # every layer selects its own kernel
+                logger.info_once("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
             return kernel
         if fallback is None:
             fallback = kernel
@@ -51,11 +52,18 @@ class QuantMethod(ABC):
     kind: ClassVar[QuantKind]
     layer_kind: ClassVar[LayerKind]
     candidates: ClassVar[tuple[type, ...]] = ()
+    # declares the bf16 weight the checkpoint stores and converts it in finalize; the engine loads such weights to host first
+    online: ClassVar[bool] = False
 
     def __init__(self, cfg: Any, requested: str = "auto"):
         self.cfg = cfg
         self.requested = requested
         self.kernel = select_kernel(self.candidates, requested, cfg)
+
+    @classmethod
+    def refuses(cls, layer: Any) -> str | None:
+        """Why this online method leaves ``layer`` as the checkpoint stores it, or None when it converts it."""
+        return None
 
     @property
     def scheme(self):

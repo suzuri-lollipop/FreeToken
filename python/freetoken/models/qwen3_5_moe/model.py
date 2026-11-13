@@ -11,13 +11,13 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from freetoken.layers.linear_attn import GatedDeltaNet
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen3_5Attention
-from .gdn import Qwen3_5GatedDeltaNet
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ class Qwen3_5DecoderLayer(BaseOP):
         if self._is_linear:
             g = config.linear_attention_group()
             assert g is not None
-            self.linear_attn = Qwen3_5GatedDeltaNet(
+            self.linear_attn = GatedDeltaNet(
                 hidden_size=config.hidden_size,
                 num_k_heads=g.num_key_heads,
                 num_v_heads=g.num_value_heads,
@@ -44,6 +44,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=g.conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
+                output_gate=g.output_gate,
                 quant_config=config.quant,
                 prefix=f"{prefix}.linear_attn",
                 # llama.cpp stores every qwen35 ssm_out with tiled value-head columns
@@ -88,10 +89,16 @@ class Qwen3_5Model(BaseOP):
         self.norm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
+        batch = get_global_ctx().batch
+        x = embed_input_ids(self.embed_tokens, input_ids, batch)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        features = batch.features
+        wanted = features.wanted_layers if features is not None else ()
+        for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if i in wanted:
+                # the layer's output is the sum the next fused add forms
+                features.layer_output(i, x, residual)
         x, _ = self.norm.forward(x, residual)
         return x
 

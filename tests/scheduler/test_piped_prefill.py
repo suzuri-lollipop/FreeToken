@@ -220,7 +220,6 @@ def _pipe_stub(prefill_runnable=True, decode_runnable=True, can_take=True, budge
     s._prepare_batch = lambda b: ("fi", b)
     s._report_prompt_admissions = lambda b: None
     s.engine = SimpleNamespace(linear_state_pool=None)  # restore: no pool = no-op
-    s._as_spec_batch = lambda b: None
     s.batches = {"prefill": prefill_batch, "decode": decode_batch}
     return s, calls
 
@@ -262,7 +261,7 @@ def test_piped_chunk_owes_no_stall_debt():
         decode_manager=SimpleNamespace(runnable=True),
     )
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None, decoding_reqs=None, piped=True,
+        is_prefill=True, decoding_reqs=None, piped=True,
         scheduled_at=_time.perf_counter() - 7.3,
     )
     Scheduler._account_prefill_debt(stub, batch)

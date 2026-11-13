@@ -53,30 +53,6 @@ def test_prefill_line_reports_tokens_and_throughput():
     assert "input throughput (token/s): 60.00" in line
 
 
-def test_prefill_throughput_uses_the_batch_schedule_window():
-    # A lone request arriving after startup + idle must not pay for the idle gap: the
-    # window is the batch's own schedule->completion span, not the time since the last
-    # prefill report.
-    rep, logs, clock = _reporter()
-    batch = _prefill_batch(new_tokens=1547, cached_tokens=0, n_seqs=1)
-    batch.scheduled_at = 99.4  # scheduled 0.6s before the report, long after startup
-    clock["t"] = 100.0  # startup + idle dominate the wall clock
-    rep.report_batch(
-        batch, running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1,
-    )
-    assert "input throughput (token/s): 2578.33" in logs[-1]  # 1547 / 0.6, not 1547 / 100
-
-
-def test_prefill_throughput_falls_back_without_a_schedule_stamp():
-    rep, logs, clock = _reporter()
-    clock["t"] = 0.25  # unstamped batch: keep the since-last-report window
-    rep.report_batch(
-        _prefill_batch(new_tokens=10, cached_tokens=0, n_seqs=1),
-        running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1,
-    )
-    assert "input throughput (token/s): 40.00" in logs[-1]
-
-
 def test_mamba_slots_reported_only_when_provided():
     rep, logs, clock = _reporter()
     clock["t"] = 1.0
@@ -184,65 +160,6 @@ def test_usage_ratio_guard():
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
 
-
-def _spec_batch():
-    # An MTP verify forward: phase="prefill" for the extend machinery, no PrefillManager
-    # log snapshot, and one request.
-    return SimpleNamespace(
-        is_prefill=True, is_decode=False, reqs=[_req(2, 0)],
-        log_new_tokens=0, log_cached_tokens=0, spec_mode="verify",
-    )
-
-
-def _report_spec(rep, clock, t, generated_tokens):
-    clock["t"] = t
-    rep.report_batch(
-        _spec_batch(), running_reqs=1, queue_reqs=0, kv_used_pages=1,
-        kv_total_pages=10, page_size=1, generated_tokens=generated_tokens,
-    )
-
-
-def test_spec_verify_reports_on_the_decode_line():
-    rep, logs, clock = _reporter(interval=1)
-    _report_spec(rep, clock, 1.0, 2)
-    assert logs[0].startswith("Decode batch, ")
-    assert "Prefill batch" not in logs[0]
-
-
-def test_accepted_spec_tokens_count_toward_gen_throughput():
-    # An accept emits two tokens, a reject one: a 2 + 1 pair over the window must read as
-    # three tokens, where one-token-per-forward would read two.
-    rep, logs, clock = _reporter(interval=2)
-    _report_spec(rep, clock, 1.0, 2)
-    _report_spec(rep, clock, 2.0, 1)
-    assert "gen throughput (token/s): 1.50" in logs[-1]  # 3 tokens over the 2.0s window
-    _report_spec(rep, clock, 2.5, 2)
-    _report_spec(rep, clock, 3.0, 1)
-    assert "gen throughput (token/s): 3.00" in logs[-1]  # 3 tokens over the 1.0s window
-
-
-def test_regular_decode_still_counts_one_token_per_request():
-    rep, logs, clock = _reporter(interval=1)
-    clock["t"] = 2.0
-    rep.report_batch(_decode_batch(3), running_reqs=3, queue_reqs=0,
-                     kv_used_pages=1, kv_total_pages=10, page_size=1)
-    assert "gen throughput (token/s): 1.50" in logs[-1]  # 3 tokens over 2.0s
-
-
-def test_mtp_tally_prints_on_both_decode_routes():
-    """The Decode line is the cadence that survives a run with no verifies, so the tally rides
-    on it: on a regular decode batch, and on the spec batch that also reports there."""
-    rep, logs, clock = _reporter(interval=1)
-    tally = "acceptance 37/64 = 0.578, declined: prefix_hit=2 chunked=1"
-    clock["t"] = 1.0
-    rep.report_batch(_decode_batch(2), running_reqs=2, queue_reqs=0, kv_used_pages=1,
-                     kv_total_pages=10, page_size=1, spec=tally)
-    assert f"mtp: {tally}, " in logs[-1]
-    _report_spec(rep, clock, 2.0, 2)  # a spec batch with no tally: no field, no stray comma
-    assert "mtp" not in logs[-1]
-    rep.report_batch(_spec_batch(), running_reqs=1, queue_reqs=0, kv_used_pages=1,
-                     kv_total_pages=10, page_size=1, generated_tokens=1, spec=tally)
-    assert f"mtp: {tally}, " in logs[-1]
 
 def test_moe_stats_line_follows_each_decode_line():
     logs: list[str] = []

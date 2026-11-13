@@ -5,8 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, get_global_ctx
-from freetoken.distributed import get_tp_info
-from freetoken.utils import div_even, is_arch_supported, is_sm100_supported
+from freetoken.utils import is_arch_supported, is_sm100_supported
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -47,38 +46,11 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.capture: FACaptureData | None = None
+        self.capture_rows_per_req = 1
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
         self.version = 4 if is_sm100_supported() else 3
-        # FA3's fp8 kernel takes the query in e4m3 as well and descales through per-batch
-        # tensors (see kvcache/kv_quant.py for the scale semantics).
-        self.quant = getattr(self.kvcache, "quant", None)
-        self.kv_head_local = div_even(
-            config.num_kv_heads, get_tp_info().size, allow_replicate=True
-        )
-        self._descales: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-
-    def _fp8_query(self, q: torch.Tensor, bs: int):
-        """The e4m3 query FA3 wants, plus its (q, k, v) descale tensors.
-
-        K/V already sit in the pool divided by the pool's scales; the query is divided by
-        the K scale so q_descale * k_descale restores the true score, and v_descale
-        restores the output. FA3 wants one fp32 value per (batch row, kv head), cached and
-        grown on demand.
-        """
-        from freetoken.kvcache.kv_quant import E4M3_MAX
-
-        quant = self.quant
-        q_fp8 = (q.float() / quant.k_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-        if self._descales is None or self._descales[0].shape[0] < bs:
-            rows = max(bs, 64)
-            self._descales = tuple(
-                torch.full((rows, self.kv_head_local), value, dtype=torch.float32, device=q.device)
-                for value in (quant.k_scale, quant.k_scale, quant.v_scale)
-            )
-        q_d, k_d, v_d = self._descales
-        return q_fp8, q_d[:bs], k_d[:bs], v_d[:bs]
 
     def forward(
         self,
@@ -96,10 +68,6 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        descales: dict = {}
-        if self.quant is not None:
-            q, q_descale, k_descale, v_descale = self._fp8_query(q, metadata.page_table.shape[0])
-            descales = dict(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
         return _fa_sgl_impl(
             q=q,
             k_cache=self.kvcache.k_cache(layer_id),
@@ -111,7 +79,6 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=metadata.max_seqlen_q,
             softmax_scale=self.scale,
             version=self.version,
-            **descales,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -154,23 +121,26 @@ class FlashAttentionBackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
+        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device, rows_per_req=rows_per_req)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        self.capture_rows_per_req = rows_per_req
 
     def prepare_for_capture(self, batch: Batch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
+        rows_per_req = self.capture_rows_per_req
+        capture.seq_lens[:bs].fill_(rows_per_req)
         metadata = FAMetadata(
             cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
             cache_seqlens=capture.seq_lens[:bs],
             max_seqlen_k=capture.page_table.size(1) * self.page_size,
-            max_seqlen_q=1,  # decode only
+            max_seqlen_q=rows_per_req,
             page_table=capture.page_table[:bs, :],
         )
         batch.attn_metadata = metadata
@@ -179,7 +149,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FAMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+        # cu_seqlens_q is the constant arange * rows_per_req under a graph (i.e. no-op)
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
@@ -197,9 +167,6 @@ def _fa_sgl_impl(
     max_seqlen_q: int,
     softmax_scale: float,
     version: int,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
     sm_margin: int = 0,
     window_size: Tuple[int, int] = (-1, -1),  # -1 means infinite context window
     softcap: float = 0.0,  # 0.0 means deactivated
@@ -225,9 +192,6 @@ def _fa_sgl_impl(
         cu_seqlens_k_new=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
         sm_margin=sm_margin,
         window_size=window_size,
         softcap=softcap,

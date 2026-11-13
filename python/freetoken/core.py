@@ -10,10 +10,9 @@ import torch
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
-    from freetoken.engine.lookup import LookupState
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
-    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.models.blocks import FeatureSink
 
 
 @dataclass
@@ -31,10 +30,55 @@ class SamplingParams:
     # min-p (typicality) filtering: tokens below min_p * p_max are dropped before top-k/p.
     # At high temperature it trims the tail that produces particle-drop / fragment decay.
     min_p: float = 0.0
+    # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
+    # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
+    timings_per_token: bool = False
 
     @property
     def is_greedy(self) -> bool:
         return self.temperature <= 0.0 or self.top_k == 1
+
+
+@dataclass
+class ReqStats:
+    """Per-request timing and draft counters, stamped by the scheduler with
+    time.perf_counter(). Spans follow llama.cpp's server_slot_stats plus a queue
+    span: queue = waiting queue -> first prefill chunk launch, prompt = first
+    chunk launch -> first sampled token on the host (chunk gaps included),
+    predicted = first token -> last committed token. One instance is shared by
+    every chunk Req of a request, so the stamps survive chunked prefill."""
+
+    enqueued_at: float | None = None     # entered the scheduler's waiting queue
+    first_chunk_at: float | None = None  # first prefill chunk launched
+    first_token_at: float | None = None  # first sampled token back on the host
+    last_token_at: float | None = None   # last committed token
+    cache_n: int = 0                     # prompt tokens served from the prefix cache at admission
+    prompt_n: int = 0                    # prompt tokens actually computed
+    draft_n: int = 0                     # drafted tokens summed over verify steps
+    draft_n_accepted: int = 0            # accepted drafts that were committed, after stop truncation
+
+    def stamp_token(self, now: float) -> None:
+        if self.first_token_at is None:
+            self.first_token_at = now
+        self.last_token_at = now
+
+    def finish(self, completion_tokens: int) -> dict | None:
+        """Raw spans and counts for the terminal reply; None when no prefill ever
+        launched or no token was committed (errors and aborts emit nothing)."""
+        if self.first_chunk_at is None or self.first_token_at is None:
+            return None
+        return {
+            "queue_ms": (self.first_chunk_at - self.enqueued_at) * 1000.0
+            if self.enqueued_at is not None else 0.0,
+            "cache_n": self.cache_n,
+            "prompt_n": self.prompt_n,
+            "prompt_ms": (self.first_token_at - self.first_chunk_at) * 1000.0,
+            "predicted_n": completion_tokens,
+            # 1 us floor as in llama.cpp: the first token can land in the same instant
+            "predicted_ms": max((self.last_token_at - self.first_token_at) * 1000.0, 0.001),
+            "draft_n": self.draft_n,
+            "draft_n_accepted": self.draft_n_accepted,
+        }
 
 
 @dataclass(eq=False)
@@ -74,56 +118,11 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Timing/draft counters shared with every other chunk Req of this request (set by
+    # the PrefillManager from the PendingReq's instance; a default blank otherwise).
+    stats: ReqStats = field(default_factory=ReqStats, init=False, repr=False)
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
-    # The scratch slot holds GDN/conv/PLE state after the first verify row.
-    # A reject restores it; an accept keeps the live state after both rows.
-    spec_slot_idx: int | None = None
-    # Prompt residual stash [T, hc*hidden] (device), accumulated over the prefill chunk(s):
-    # the head's whole-prompt catch-up pass (Batch.spec_prologue) consumes it at the first
-    # decode step and drops it. Spec is gated on prompts whose stash fits the budget.
-    spec_residual: torch.Tensor | None = None
-    # The density that produced spec_draft, carried between spec steps so the sampled verify can
-    # reject-test against the p the draft was actually drawn from. One row per request (~1 MiB):
-    # requests alternate single-request batches, so an engine-wide row would mix their densities.
-    spec_draft_probs: torch.Tensor | None = None
-    # Pending draft token id (host int) predicted for the position after the current input
-    # token; None until the head has produced one.
-    spec_draft: int | None = None
-    # The head's own top-1 probability for spec_draft (greedy drafts only; None when unknown).
-    # FREETOKEN_MTP_MIN_P declines verifies of drafts the head did not believe in.
-    spec_draft_prob: float | None = None
-    # --speculative lookup: the per-request suffix index and acceptance gate. Built on the first
-    # eligible decode step from the committed prefix; None until then, and again once the gate
-    # switches the request off.
-    lookup: "LookupState | None" = None
-    # Permanently disables spec for this request: non-greedy sampling under the kill switch, an
-    # image row, a stash that cannot cover the prompt (only with cold start off), or the
-    # acceptance floor with FREETOKEN_MTP_RESUME_AFTER=0. Regular decoding continues untouched.
-    spec_off: bool = False
-    # Rows the MTP head has consumed (its KV covers positions [0, spec_head_len), plus any hole
-    # where a mixed batch decoded rows it never saw). Nonzero once the head has run at all.
-    spec_head_len: int = 0
-    # Why spec stopped ('' while the request is still eligible). The scheduler counts these:
-    # a run where MTP never fired otherwise looks identical to one where it fired and lost.
-    spec_off_reason: str = ""
-    # Decode steps left before a request stands down by the acceptance floor re-probes. Kept
-    # separate from spec_off because the floor is a statistical judgement on a small window:
-    # ending the request on one trip is what switched good heads off mid-answer.
-    spec_suspend: int = 0
-    # Regular rows decoded while suspended, i.e. rows the head missed on purpose. Compared
-    # with the resync lag when the countdown ends: a bigger hole re-seeds the draft instead
-    # of verifying one aimed that many committed tokens back.
-    spec_suspend_missed: int = 0
-    # What the engine's residual gate saw when it declined (rows, cache hit, the stash cap), for
-    # the scheduler's decline line: the drain runs after complete_one() has advanced cached_len,
-    # so the live numbers no longer describe the decision that was made.
-    spec_off_detail: str = ""
-    # Verify/accept tally of the current low-acceptance auto-off window.
-    spec_verifies: int = 0
-    spec_accepted: int = 0
-    # Consecutive rejected verifies: the per-step signal behind the short stand-down.
-    spec_rejects: int = 0
     # Phase timings in ms, measured in the scheduler and reported to the frontend on the first
     # sampled token: time held in the prefill queue, and the schedule->drain prefill window.
     queue_ms: float = 0.0
@@ -157,6 +156,15 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def widen_pending(self, k: int) -> None:
+        """Extend the pending token at cached_len by k provisional draft tokens."""
+        self.device_len += k
+
+    def commit_pending(self, n: int) -> None:
+        """Make n tokens final and leave the last committed one pending at cached_len."""
+        self.cached_len += n
+        self.device_len = self.cached_len + 1
+
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
         m = n + next_token.numel()
@@ -185,17 +193,15 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "verify"]
+    # query rows per request: 1 on decode, more on verify, None on prefill (ragged)
+    rows_per_req: int | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
     # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
     mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
-    # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
-    # decode to gather/scatter recurrent+conv state without host-side loops (so the
-    # decode step is CUDA-graph capturable). Set by the scheduler / graph buffer.
-    linear_table_idx: torch.Tensor | None = field(default=None, init=False)
     # Per-forward GatedDeltaNet metadata (cu_seqlens / cache_indices / continuation
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
@@ -235,30 +241,14 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # per-row hidden states a draft model reads from this forward; None when nothing reads them
+    features: "FeatureSink | None" = field(default=None, init=False)
 
-    # None for regular batches; prologue_decode catches up head KV from the prompt
-    # residuals, then verify processes [last placed token, draft] in one main forward.
-    spec_mode: str | None = field(default=None, init=False)
-    # "mtp" for the checkpoint's draft head, "lookup" for the prompt-lookup drafter. The
-    # two-row verify and the drain are shared; only the draft source differs.
-    spec_source: str = field(default="mtp", init=False)
-    # "verify" only: the host draft id under test (the engine's accept decision input).
-    spec_draft_id: int = field(default=-1, init=False)
-    # Lookup only: every staged draft, in order (spec_draft_id is the first, for logs), and the
-    # cached length before staging (the rollback target on a partial accept).
-    spec_draft_ids: tuple[int, ...] = field(default=(), init=False)
-    spec_prefix_len: int = field(default=0, init=False)
-    # Multi-request lookup: one entry per upgraded request, each {"req", "drafts", "prefix"}.
-    # Single-request and MTP batches leave this None.
-    spec_items: list | None = field(default=None, init=False)
-    # Non-greedy MTP: verify runs rejection sampling against the head's carried-over density
-    # instead of comparing ids. Set by the scheduler alongside spec_mode.
-    spec_sample: bool = field(default=False, init=False)
-    # Page charges for this verify; reject releases only pages beyond row 0.
-    spec_pages: list | None = field(default=None, init=False)
-    # "prologue_decode" only: the scheduler-prepared head-only batch over the prompt rows
-    # (positions 0..T-1, embeds = tokens 1..T-1 plus the first sampled token).
-    spec_prologue: "Batch | None" = field(default=None, init=False)
+    def __post_init__(self) -> None:
+        if self.rows_per_req is None and self.phase == "decode":
+            self.rows_per_req = 1
+        # without it, input_mapping[0][::None] would read every row as its own request
+        assert self.phase != "verify" or self.rows_per_req is not None, "a verify batch needs rows_per_req"
 
     # Dual-microbatch decode (FREETOKEN_DUAL_STREAM_DECODE): a bs4 decode step runs as
     # two bs2 half-batches on skewed streams. Each half is a Batch VIEW carrying its
@@ -297,7 +287,6 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
-    moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
@@ -336,11 +325,37 @@ class Context:
         return cur
 
     @contextmanager
-    def forward_batch(self, batch: Batch):
+    def override(
+        self,
+        *,
+        kv_cache: BaseKVCachePool | None = None,
+        attn_backend: BaseAttnBackend | None = None,
+        hide_target_state: bool = False,
+    ):
+        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool."""
+        swaps = {}
+        if kv_cache is not None:
+            swaps["kv_cache"] = kv_cache
+        if attn_backend is not None:
+            swaps["attn_backend"] = attn_backend
+        if hide_target_state:
+            swaps["linear_state_pool"] = None
+        saved = {name: getattr(self, name) for name in swaps}
+        try:
+            for name, value in swaps.items():
+                setattr(self, name, value)
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+
+    @contextmanager
+    def forward_batch(self, batch: Batch, **override):
         assert self._active is None, "Nested forward_batch is not allowed"
         self._active = batch
         try:
-            yield
+            with self.override(**override):
+                yield
         finally:
             self._active = None
 

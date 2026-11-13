@@ -6,7 +6,7 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the n-gram table (47.7 GiB fp8 or 95.4 GiB bf16), 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named under the checkpoint's dialect, for the offload cache's expert reader.
 
-Dropped: ``mtp.*`` unless ``include_mtp`` (the speculative head's dense weights; its routed experts stay dropped until Phase 2 of _scratch/mtp_design.md); ``model.visual.*`` is kept only when the model built the tower.
+Dropped: ``mtp.*`` (speculative head, read by :func:`iter_mtp_weights`); ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -47,42 +47,6 @@ _EXPERT_KEY_RE = (
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
-# Per-expert MTP head pieces (the released shape). iter_weights accumulates them and
-# yields the fused resident buffers; a stacked export (mtp.layers.N.mlp.experts.gate_up_proj)
-# already carries the buffer names and passes through _rename untouched.
-_MTP_EXPERT_PIECE_RE = re.compile(
-    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale_inv)$"
-)
-# The stacked MTP expert export: buffer-named tensors that pass through _rename and are
-# sharded here under TP (same block-aligned ranges as _fuse_mtp_experts).
-_MTP_STACKED_EXPERT_RE = re.compile(
-    r"^mtp\.layers\.\d+\.mlp\.experts\."
-    r"(gate_up_proj|gate_up_scale_inv|down_proj|down_scale_inv)$"
-)
-
-
-def _shard_stacked_mtp(name: str, tensor: torch.Tensor) -> torch.Tensor:
-    m = _MTP_STACKED_EXPERT_RE.match(name)
-    tp = get_tp_info()
-    if m is None or tp.size <= 1:
-        return tensor
-    from freetoken.layers.quantization.moe.base import block_aligned_range
-
-    kind = m.group(1)
-    if kind == "gate_up_proj":
-        i_full = tensor.shape[1] // 2
-        lo, hi = block_aligned_range(i_full, 128, tp.rank, tp.size)
-        return torch.cat((tensor[:, lo:hi], tensor[:, i_full + lo:i_full + hi]), dim=1)
-    if kind == "down_proj":
-        lo, hi = block_aligned_range(tensor.shape[2], 128, tp.rank, tp.size)
-        return tensor[:, :, lo:hi].contiguous()
-    blocks = tensor.shape[1] if kind == "gate_up_scale_inv" else tensor.shape[2]
-    b_full = blocks // 2 if kind == "gate_up_scale_inv" else blocks
-    lb, hb = b_full * tp.rank // tp.size, b_full * (tp.rank + 1) // tp.size
-    if kind == "gate_up_scale_inv":
-        return torch.cat((tensor[:, lb:hb], tensor[:, b_full + lb:b_full + hb]), dim=1)
-    return tensor[:, :, lb:hb].contiguous()
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -101,7 +65,7 @@ _LINEAR_LEAVES = frozenset({
     "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
     "gate_proj", "up_proj", "down_proj",
     "input_mix_weight_down", "block_inject_weight", "input_mix_weight_up",
-    "key_proj", "value_proj", "lm_head",
+    "key_proj", "value_proj", "lm_head", "fc_embedding", "fc_hidden",
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
@@ -138,16 +102,10 @@ _PAD_TO = {"input_mix_weight_down_block_inject": 16}
 _HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
 
 
-def _rename(raw_name: str, include_mtp: bool = False) -> str | None:
+def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
-        if not include_mtp:
-            return None
-        # The head attaches as the model's `mtp` attribute, so its dense keys (and the
-        # stacked-expert export's buffer-named keys) pass through verbatim; the fuser and
-        # TP shard rules key off the same leaf names as the main layers. Per-expert MTP
-        # pieces never reach here -- iter_weights intercepts them and yields fused.
-        return raw_name
+        return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -194,7 +152,7 @@ class _DenseReader:
         if not candidates:
             return module, 0, 1
         if len(candidates) > 1:
-            # GDN: quantized checkpoints split qkv|z from b|a; same test as gdn.py
+            # GDN: quantized checkpoints split qkv|z from b|a; same test as layers/linear_attn/gdn.py
             split = self.scheme(f"{parent}.in_proj_qkvz") is not None
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]
@@ -305,73 +263,6 @@ class _DenseReader:
         return out
 
 
-def _fuse_mtp_experts(
-    pieces: dict[tuple[int, int, str, str], torch.Tensor],
-    tp_rank: int = 0,
-    tp_size: int = 1,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Stack the per-expert MTP pieces into the resident buffers create_weights declares.
-
-    gate|up fuse along the intermediate dim exactly like the bank layout does. Under TP
-    the shard keeps whole 128-row scale blocks (MoEConfig.local_intermediate_range and
-    this packer must agree -- 640 rows over TP2 gives 256 on rank 0 and 384 on rank 1,
-    so the fused boundary stays block-aligned even though a uniform split would not).
-    Pieces arrive on CPU (the fused peak stays off the GPU); the emitted names match the
-    state dict of the resident fp8-block method: ``experts.{gate_up_proj,
-    gate_up_scale_inv, down_proj, down_scale_inv}`` (scales only when the checkpoint
-    carries them -- unquantized exports have plain bf16 weights and no scale_inv).
-    """
-    from freetoken.layers.quantization.moe.base import block_aligned_range
-
-    for layer in sorted({k[0] for k in pieces}):
-        experts = sorted({k[1] for k in pieces if k[0] == layer})
-        if experts != list(range(len(experts))):
-            raise ValueError(
-                f"mtp.layers.{layer}.mlp.experts: expert ids are not 0..N-1 ({len(experts)} found)"
-            )
-
-        def has(proj: str, kind: str) -> bool:
-            return all((layer, e, proj, kind) in pieces for e in experts)
-
-        if not (has("gate_proj", "weight") and has("up_proj", "weight") and has("down_proj", "weight")):
-            raise ValueError(f"mtp.layers.{layer}.mlp.experts: incomplete per-expert weights")
-        scaled = [has(p, "weight_scale_inv") for p in ("gate_proj", "up_proj", "down_proj")]
-        if any(scaled) and not all(scaled):
-            raise ValueError(f"mtp.layers.{layer}.mlp.experts: weight_scale_inv present for only some projections")
-
-        i_full = pieces[(layer, experts[0], "gate_proj", "weight")].shape[0]
-        if tp_size > 1:
-            lo, hi = block_aligned_range(i_full, 128, tp_rank, tp_size)
-        else:
-            lo, hi = 0, i_full  # no shard: any intermediate size packs whole
-        lb, hb = lo // 128, hi // 128 if hi % 128 == 0 else None
-
-        def stack_rows(proj: str, kind: str) -> torch.Tensor:
-            return torch.stack([pieces[(layer, e, proj, kind)][lo:hi] for e in experts])
-
-        def stack_cols(proj: str, kind: str) -> torch.Tensor:
-            return torch.stack([pieces[(layer, e, proj, kind)][:, lo:hi] for e in experts])
-
-        def stack_scale_rows(proj: str) -> torch.Tensor:
-            return torch.stack([
-                pieces[(layer, e, proj, "weight_scale_inv")][lb:hb] for e in experts
-            ])
-
-        def stack_scale_cols(proj: str) -> torch.Tensor:
-            return torch.stack([
-                pieces[(layer, e, proj, "weight_scale_inv")][:, lb:hb] for e in experts
-            ])
-
-        prefix = f"mtp.layers.{layer}.mlp.experts."
-        yield prefix + "gate_up_proj", torch.cat(
-            (stack_rows("gate_proj", "weight"), stack_rows("up_proj", "weight")), dim=1)
-        yield prefix + "down_proj", stack_cols("down_proj", "weight")
-        if scaled[0]:
-            yield prefix + "gate_up_scale_inv", torch.cat(
-                (stack_scale_rows("gate_proj"), stack_scale_rows("up_proj")), dim=1)
-            yield prefix + "down_scale_inv", stack_scale_cols("down_proj")
-
-
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -379,7 +270,6 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_vision: bool = True,
-    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
@@ -397,9 +287,6 @@ def iter_weights(
     # the tower declares its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves
     vc = model_config.vision_config
     vision = vision_tp_shard(vc) if include_vision and vc is not None else None
-    # MTP per-expert pieces stage on CPU: the fused stack of all 512 experts would
-    # otherwise hold pieces AND buffer on the GPU at the same time.
-    mtp_pieces: dict[tuple[int, int, str, str], torch.Tensor] = {}
     reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
     parts_of = {fused: parts for fused, parts in spec.packed_modules_mapping}
 
@@ -442,20 +329,12 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                if include_mtp:
-                    piece = _MTP_EXPERT_PIECE_RE.match(raw_name)
-                    if piece is not None:
-                        mtp_pieces[(int(piece["layer"]), int(piece["expert"]),
-                                    piece["proj"], piece["kind"])] = f.get_tensor(raw_name).cpu()
-                        continue
-                name = _rename(raw_name, include_mtp)
+                name = _rename(raw_name)
                 if name is None:
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = f.get_tensor(raw_name)
-                if include_mtp:
-                    tensor = _shard_stacked_mtp(name, tensor)
                 emitted = None if name.startswith(VISION_KEY_PREFIXES) else reader.add(name, tensor)
                 if emitted is None:
                     yield name, slice_dense(name, tensor)
@@ -468,8 +347,51 @@ def iter_weights(
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
-    tp = get_tp_info()
-    yield from _fuse_mtp_experts(mtp_pieces, tp.rank, tp.size)
+
+
+# routed experts: expert_pieces.iter_extra_layer_expert_pieces
+_MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+_MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen4ExpMTPDraft names it and fused like the target's dense weights."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]).packed_modules_mapping)
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if raw_name.startswith(_MTP_EXPERTS_PREFIX):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                emitted = reader.add(raw_name, tensor)
+                if emitted is None:
+                    yield raw_name[len("mtp."):], tensor
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str):
+    """The MTP head's routed experts: the stacked bf16 pair, or per-expert projections with their block-fp8 scales."""
+    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+
+    def locate(name: str):
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None:
+            return None
+        if m["stacked"]:
+            return None, m["stacked"]
+        return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
+
+    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
@@ -644,6 +566,8 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
+    "iter_mtp_expert_pieces",
+    "iter_mtp_weights",
     "iter_weights",
     "load_ple_table",
 ]

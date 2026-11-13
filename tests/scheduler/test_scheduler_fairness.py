@@ -35,7 +35,7 @@ def _stub_scheduler(interval: int, decode_runnable: bool = True, debt_s: float =
         calls.append("prefill")
         budgets.append(_budget)
         # fresh batch per pass: the mixed path appends ride-along rows to batch.reqs
-        return SimpleNamespace(is_prefill=True, spec_mode=None, prompt_admissions=[], reqs=[])
+        return SimpleNamespace(is_prefill=True, prompt_admissions=[], reqs=[])
 
     def decode():
         calls.append("decode")
@@ -115,7 +115,7 @@ def test_debt_not_owed_when_no_decode_is_running():
 # ------------------------------------------------ P1b: the chunk still in flight counts too
 
 
-def _inflight(scheduler, seconds: float, phase: str = "prefill", spec_mode=None,
+def _inflight(scheduler, seconds: float, phase: str = "prefill",
               scheduled_at: float | None = None):
     """Makes ``_last_data`` the batch overlap_loop launched but has not drained yet."""
     import time as _time
@@ -126,7 +126,7 @@ def _inflight(scheduler, seconds: float, phase: str = "prefill", spec_mode=None,
     scheduler._last_data = (
         SimpleNamespace(  # ForwardData = (ForwardInput, ForwardOutput); only .batch matters
             batch=SimpleNamespace(
-                is_prefill=phase == "prefill", spec_mode=spec_mode, prompt_admissions=[],
+                is_prefill=phase == "prefill", prompt_admissions=[],
                 scheduled_at=scheduled_at, log_new_tokens=0,
             ),
         ),
@@ -172,7 +172,6 @@ def test_count_guard_unchanged_when_debt_is_off():
 
 def test_inflight_guard_matches_the_accrual_guard():
     cases = [
-        dict(phase="prefill", spec_mode="verify"),  # a spec step rides phase="prefill"
         dict(phase="decode"),                       # decode batches are unstamped
         dict(phase="prefill", scheduled_at=0.0),    # unstamped prefill: never elapsed
     ]
@@ -229,22 +228,21 @@ def test_account_prefill_debt_accrues_schedule_to_drain_window():
 
     scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=True)
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None, scheduled_at=_time.perf_counter() - 7.3
+        is_prefill=True, scheduled_at=_time.perf_counter() - 7.3
     )
     Scheduler._account_prefill_debt(scheduler, batch)
     assert 7.2 < scheduler._prefill_debt < 8.0
 
 
-def test_account_prefill_debt_skips_non_prefill_spec_and_idle():
+def test_account_prefill_debt_skips_non_prefill_and_idle():
     import time as _time
 
     from freetoken.scheduler.scheduler import Scheduler
 
     stamp = _time.perf_counter() - 5.0
     cases = [
-        SimpleNamespace(is_prefill=False, spec_mode=None, scheduled_at=stamp),
-        SimpleNamespace(is_prefill=True, spec_mode="verify", scheduled_at=stamp),
-        SimpleNamespace(is_prefill=True, spec_mode=None, scheduled_at=0.0),
+        SimpleNamespace(is_prefill=False, scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, scheduled_at=0.0),
     ]
     for batch in cases:
         scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=True)
@@ -253,7 +251,7 @@ def test_account_prefill_debt_skips_non_prefill_spec_and_idle():
     # debt is only "owed" while somebody waits: no runnable decode -> no accrual
     scheduler = _stub_drain_scheduler(debt_s=2.0, decode_runnable=False)
     Scheduler._account_prefill_debt(
-        scheduler, SimpleNamespace(is_prefill=True, spec_mode=None, scheduled_at=stamp)
+        scheduler, SimpleNamespace(is_prefill=True, scheduled_at=stamp)
     )
     assert scheduler._prefill_debt == 0.0
 
@@ -404,7 +402,7 @@ def test_observe_chunk_time_updates_ema():
 
     scheduler = _stub_drain_scheduler(debt_s=0.0, decode_runnable=True, chunk_target=0.5)
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=_time.perf_counter() - 7.3, log_new_tokens=8192,
     )
     Scheduler._observe_chunk_time(scheduler, batch)
@@ -413,19 +411,16 @@ def test_observe_chunk_time_updates_ema():
     assert abs(first - 7.3 / 8192) < 0.0005
     # second sample moves the EMA 30% toward itself
     batch2 = SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=_time.perf_counter() - 2.0, log_new_tokens=512,
     )
     Scheduler._observe_chunk_time(scheduler, batch2)
     expected = 0.7 * first + 0.3 * (batch2_spt := 2.0 / 512)
     assert abs(scheduler._chunk_ema_spt - expected) < 0.0005
-    # spec batches and zero-token batches never feed the EMA
+    # zero-token batches never feed the EMA
     before = scheduler._chunk_ema_spt
     Scheduler._observe_chunk_time(scheduler, SimpleNamespace(
-        is_prefill=True, spec_mode="verify",
-        scheduled_at=_time.perf_counter() - 9.0, log_new_tokens=2))
-    Scheduler._observe_chunk_time(scheduler, SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=_time.perf_counter() - 9.0, log_new_tokens=0))
     assert scheduler._chunk_ema_spt == before
 
@@ -458,7 +453,6 @@ def _mixed_phases(scheduler, n: int) -> list[list[int]]:
     for _ in range(n):
         launched = Scheduler._schedule_next_batch(scheduler)
         assert launched.is_prefill
-        assert launched.spec_mode is None
         rides.append([r.uid for r in launched.decoding_reqs])
     return rides
 

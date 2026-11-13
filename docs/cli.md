@@ -23,7 +23,7 @@ ft <command> [args]
 ft serve --model <path-or-hf-id> [options]
 ```
 
-`--model` is the only required flag — dtype, attention backend, MoE backend,
+`--model` is the only required flag - dtype, attention backend, MoE backend,
 MoE cache size, KV capacity, CUDA-graph sizes and the tool-call/reasoning
 parsers all resolve automatically from the checkpoint and the GPU.
 
@@ -31,9 +31,9 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
+| `--model-path`, `--model` | required | Local dir, HF repo id, a `.gguf` file, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
-| `--hf-overrides` | — | JSON object applied to the checkpoint's config as vLLM's `--hf-overrides`: a nested config section updates key by key, any other value is replaced whole. A YaRN `rope_parameters` override serves `original_max_position_embeddings * factor` positions |
+| `--hf-overrides` | - | JSON object applied to the checkpoint's config as vLLM's `--hf-overrides`: a nested config section updates key by key, any other value is replaced whole. A YaRN `rope_parameters` override serves `original_max_position_embeddings * factor` positions |
 
 ### Server & runtime
 
@@ -65,7 +65,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `FREETOKEN_PREFILL_DEBT_S` | 2.0 | Wall-clock ITL guard: once prefill has held the engine this many seconds while a decode was runnable, the next step goes to decode (the chunk in flight already counts; the count-based `--prefill-decode-interval` cannot bound ITL when chunk times swing by 10x). `0` keeps the pure count-based guard |
 | `FREETOKEN_ADAPTIVE_CHUNK_TARGET_S` | off | While a decode waits, shrink the prefill chunk so one chunk's forward time tracks this target (the waiting user's stall is one chunk, so the target is the stall budget); nobody waiting keeps the full `--max-prefill-length`. Chunks stay 64-aligned, floored at 128 tokens |
 | `FREETOKEN_MIXED_PREFILL_TOKENS` | off | With N > 0 a new prompt's chunk runs WITH every running request in one batch (their single-token rows ride the chunk's forward), so decodes advance on every forward instead of waiting for a dedicated decode step; N caps the chunk. While a decode runs this replaces the interleave guard above. The mixed forward stays eager (no CUDA graph, no spec verify until the prompt queue drains), and riding GDN rows take the chunked-scan kernel: same math, different rounding |
-| `FREETOKEN_PIPED_PREFILL` | off | Strata's `STRATA_PIPED_CONCURRENT` port: prefill chunks run on a dedicated thread and a default-priority side stream while the scheduler loop keeps issuing decode steps on the high-priority engine stream, so running decodes never wait for a prompt (measured: worst inter-token stall 3.8s -> 0 behind a 16k-token queue; the joiners pay ~+40% TTFT, Strata's trade curve). **Under TP** the pipe's collectives run on their own torch NCCL group (built at engine init and probed there, so a rank that cannot build it turns piping off on every rank; `NCCL_MAX_CTAS` caps a spinning pipe kernel so it cannot starve the decode kernels, and `FREETOKEN_SHM_AR` is forced to 0 because the shm one-shot AR bakes a resident spin kernel into the decode graphs that `NCCL_MAX_CTAS` cannot cap - it holds the SMs until the peer's decode arrives and starves the pipe's collective the other way, which wedged both ranks on a cold 16k prompt), and the drain is rank-locked: rank0 broadcasts its readiness with the message count and every rank drains on that same iteration - never on its own earlier `chunk_done`, because a one-iteration skew composes the next decode batch differently per rank and wedges a collective. A forced wait past `FREETOKEN_PIPED_FORCED_WAIT_S` (30) crashes+restarts instead of wedging, and `FREETOKEN_PIPED_TIMEOUT_S` (600) bounds an in-flight chunk. `FREETOKEN_ADAPTIVE_CHUNK_TARGET_S` is ignored under TP for the same rank-consistency reason. Needs overlap scheduling and `speculative none` |
+| `FREETOKEN_PIPED_PREFILL` | off | Strata's `STRATA_PIPED_CONCURRENT` port: prefill chunks run on a dedicated thread and a default-priority side stream while the scheduler loop keeps issuing decode steps on the high-priority engine stream, so running decodes never wait for a prompt (measured: worst inter-token stall 3.8s -> 0 behind a 16k-token queue; the joiners pay ~+40% TTFT, Strata's trade curve). **Under TP** the pipe's collectives run on their own torch NCCL group (built at engine init and probed there, so a rank that cannot build it turns piping off on every rank; `NCCL_MAX_CTAS` caps a spinning pipe kernel so it cannot starve the decode kernels, and `FREETOKEN_SHM_AR` is forced to 0 because the shm one-shot AR bakes a resident spin kernel into the decode graphs that `NCCL_MAX_CTAS` cannot cap - it holds the SMs until the peer's decode arrives and starves the pipe's collective the other way, which wedged both ranks on a cold 16k prompt), and the drain is rank-locked: rank0 broadcasts its readiness with the message count and every rank drains on that same iteration - never on its own earlier `chunk_done`, because a one-iteration skew composes the next decode batch differently per rank and wedges a collective. A forced wait past `FREETOKEN_PIPED_FORCED_WAIT_S` (30) crashes+restarts instead of wedging, and `FREETOKEN_PIPED_TIMEOUT_S` (600) bounds an in-flight chunk. `FREETOKEN_ADAPTIVE_CHUNK_TARGET_S` is ignored under TP for the same rank-consistency reason. Needs overlap scheduling and no speculative decoding (`--speculative-algorithm` off) |
 | `FREETOKEN_ADMIT_SHORT_FIRST` | off | With N > 0 a pending prompt of at most N tokens takes this step's admission before longer ones queued ahead of it (arrival order within each class; chunk continuations always stay first). The chat turn stops queueing behind the 30k-token agent prompt |
 | `FREETOKEN_ADMIT_MAX_WAIT_S` | 30 | A long prompt waiting this long in the admit queue counts as short (aging guard against starvation) |
 
@@ -182,28 +182,30 @@ not on identical text, unless you have verified repeatability at TP=1 first.
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of the GPU's total VRAM the engine's whole per-rank footprint may use (weights + MoE cache + KV + CUDA context); the remainder is runtime headroom for CUDA graphs and activations |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
-| `--embed-weights` | gpu | Where the input token embedding table lives. `host` keeps it in pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. Refused when the table is tied to the LM head |
+| `--embed-weights` | gpu | Where the input token embedding tables live. `host` keeps them in pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. A table tied to the LM head stays on the GPU, and `host` is refused when there is no other table; Gemma-4 E2B / E4B's per-layer table is the one that moves, the way those models fit an 8 GB GPU |
+| `--online-quant` | - | Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. `df11` compresses them losslessly to about 11 bits per weight and decodes them bit-for-bit on use: about 30% less VRAM for those weights, at the cost of a decode per use. Layers the checkpoint quantizes, the LM head, a table tied to it, vision encoders and layers whose weight the model reads directly are left as they are, and so are tables under TP > 1; refused when no layer qualifies |
+| `--online-quant-modules` | all | Limit `--online-quant` to these modules: comma-separated checkpoint module names or glob patterns, e.g. `model.layers.*.self_attn,model.embed_tokens` (`model.language_model.layers.*` where the checkpoint nests the text model); a name also covers the modules under it, and one that selects no convertible layer is refused. A fused layer (`qkv_proj`) must be covered in all of its checkpoint parts |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--kv-cache-dtype` | auto | `fp8_e4m3` (`fp8`) stores K/V as fp8 e4m3: half the bytes per cached token, so roughly twice the prefix reuse for the same VRAM. Needs sm_89+ and an MHA, SWA-hybrid or Qwen3.8-Flash-Next (QSA) pool; on QSA only the paged K/V quantizes, its compressed index keys keep the model dtype. The latent-MLA, DSA, DSV4 and MiniMax-M3 block-sparse pools reject it at startup, so drop the flag for those models. `auto` keeps the model dtype |
-| `--kv-cache-quant-scale` | 1.0 | For a quantized cache: the static scale K and V divide by on store and multiply back on read. Raise it if attention states exceed the e4m3 range (+/- 448 * scale), which would otherwise clamp |
-| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU. A `--kv-cache-dtype` cache needs a backend that applies its descales (`triton`, `fi` and the in-tree `qsa_sparse` today; `fa`/`trtllm` are refused with it) |
+| `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+| `--kv-cache-dtype` | auto | How K and V are stored. `auto` keeps the compute dtype. `fp8_per_token_head` (e4m3) and `int8_per_token_head` store 8 bits per element plus one fp32 scale per token and head (two per MLA latent row, for ckv and kpe), about half the KV memory. The `triton`, `qsa_sparse`, `m3_sparse` and `dsa` backends read them; `auto` picks one of these. They need `--dtype bfloat16` and no tensor parallelism. An `mtp` draft stores its KV in the same format |
 
 ### MoE offload
 
-See [models.md](models.md#moe-strategies) for what each strategy does, and [performance/prefill.md](performance/prefill.md) for prefill speed.
+See [models.md](models.md#moe-strategies) for what each strategy does, [performance/prefill.md](performance/prefill.md) for prefill speed, and [performance/decode.md](performance/decode.md) for decode speed.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto -> offload; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
-| `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
+| `--nvfp4-backend` | - | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--moe-cache-scope` | unified | `unified`: one LRU pool of slots per expert quant (quant type and bank layout), so all MoE layers share one pool when they share a quant format; `per-layer`: each layer has its own pool. `per-layer` does not combine with `--moe-strategy cpu` or `--moe-cpu-layers` |
 | `--moe-cache-split` | equal | How the pools share the slots: `equal` (in proportion to their layer counts), or `profile:<path>`: every pool keeps `top_k` slots and the rest go to the most used experts in the profile's per-layer expert counts. With `offload`, a pool smaller than the expert count lowers `--max-running-requests` to its slots / top_k |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`/`hybrid`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for hosts that cap CUDA pinned memory (Windows/WSL): it pins layers from the middle out until CUDA refuses one and OS-locks the rest (`FREETOKEN_PIN_BUDGET_GB` and FTW checkpoints lock from a size estimate instead), see [models.md](models.md#hosts-that-cap-pinned-memory-wsl); every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs) |
+| `--moe-cpu-layers` | all on GPU | With `offload`/`hybrid`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for hosts that cap CUDA pinned memory (Windows/WSL): it pins layers from the middle out until CUDA refuses one and OS-locks the rest (`FREETOKEN_PIN_BUDGET_GB` and FTW checkpoints lock from a size estimate instead), see [models.md](models.md#hosts-that-cap-pinned-memory-wsl); every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs, except gpt-oss GGUF files whose per-expert biases decode on the GPU only) |
+| `--moe-ram-budget` | 0 (auto) | Machine-wide host RAM ceiling in GiB the expert banks may pin; `0` sizes it from MemAvailable minus headroom. Raise it only with room for the dense staging, KV host caches and page cache that ride on top; a tensor-parallel boot divides the figure across its ranks |
 | `--moe-disk-tier` | auto | `auto`: when the expert banks exceed host RAM, map the head+tail MoE layers' banks from a repacked FTW sidecar on NVMe (built one-time on first serve, next to the model; `FREETOKEN_BANKS_DIR` overrides), pin what still fits; disk layers decode on CPU and prefill with readahead. `all` = every layer on disk; `off` = never (OOMs when banks exceed RAM) |
 | `--moe-bank-profile` | none | FTXP expert profile (build with `ft profile write-round-robin`, inspect with `ft profile inspect`); with the disk tier, spend `--moe-hot-frac` of the host RAM budget on the profile's hottest experts of the disk layers (compact pinned banks the CPU executor prefers over the mmap) instead of more whole layers. A profile measured on your workload's routing is what pays; round-robin is a placeholder |
 | `--moe-hot-frac` | 0.25 | Fraction (0..1) of the host RAM budget given to the profile's hot experts |
@@ -216,183 +218,18 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
-### Speculative decoding (MTP and prompt lookup)
+### Speculative decoding
 
-Two drafters share one two-row verify. `--speculative mtp` builds the checkpoint's MTP head and
-drafts the next token with it; `--speculative lookup` has no weights and drafts the token that
-followed the last earlier occurrence of the current suffix (Strata's prompt lookup). Both verify the
-draft inside the same forward, so one step costs two target rows and emits one or two tokens, and
-greedy output stays token-identical to non-speculative decoding.
-
-#### MTP
-
-`--speculative mtp` builds the checkpoint's MTP head, drafts the next token with it and verifies the
-draft inside the same forward, so one step costs two target rows and emits one or two tokens. Only a
-checkpoint that ships an MTP head can serve it.
-
-Drafting is opportunistic: a request that does not qualify decodes normally, at its own cost. The
-rules are what a log with no MTP activity means, so they are printed at start-up too. A request must
-reach a decode batch of one (a spec step is a two-row forward for a single request), and the head
-drafts over the prompt's residual rows: those exist only for rows the target forward actually ran,
-so a prefix-cache hit never produced them and a prompt longer than the stash budget cannot be
-covered in full. Both of those declines disappear with `FREETOKEN_MTP_COLD_START`: the head then
-seeds its first draft from the row it is decoding and pays for the missing catch-up with a few
-rejected verifies. Any number of prefill chunks is fine -- each chunk adds its rows to the stash --
-and sharing a decode batch with another request is no longer terminal either: the staged draft is
-dropped because it aims at a position that already committed, and drafting resumes the moment the
-request runs alone. Greedy requests verify by comparing token ids; sampled ones by exact
-rejection sampling (output distribution unchanged). Both verify kinds capture their own CUDA
-graph after three warm steps -- the sampled capture stages its uniforms, sampling knobs and
-carried density per replay, so one graph serves every sampled request, and its replay is
-verified token-identical against the eager step before it serves anything
-(`FREETOKEN_MTP_SAMPLED_GRAPH=0` keeps sampled verifies eager). Only the drafting steps leave
-the overlap pipeline (the next batch's positions
-and pages are built from the accept count), so a request that never drafts pays nothing for
-somebody else's draft; `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1` restores the old serialized loop.
-Enabling the head is not free even for traffic that never drafts: it adds one full-attention layer
-to the pool sizing (KV plus its index slab, so the KV/expert pools are a layer smaller), and one
-GDN scratch slot per running request is held back for verify rollbacks.
-
-Acceptance is a property of the text as much as of the engine: how often a draft lands is how
-predictable the next token is. The head's own ceiling is a separate, measurable quantity -- the
-wiring probe (`_scratch/mtp_probe.py`, teacher-forced prose and code) put the shipping wiring at
-0.560, and a live greedy session measured 0.578 -- while random word-salad prompts in the same
-build measured 0.42-0.50. So compare acceptance only between runs of the same text and the same
-sampling mode, and read a lone number with that in mind. Sampling mode matters on its own: a
-sampled request lands below its greedy equivalent by construction, because rejection sampling
-accepts a draft with probability `min(1, q(y)/p(y))` -- its ceiling is `sum(min(q, p))`, not an
-argmax match -- and the flatter the request's temperature/top_p, the lower that sum. `[mtp-s]`
-prints the ceiling next to the ratio for exactly this comparison (eager sampled steps only --
-a graphed verify logs its staging/replay timings as `[mtp-gs]` instead), and
-`FREETOKEN_MTP_MIN_ACCEPTANCE` is the floor that stops paying a second target row for a draft that
-keeps missing; a sampled-only workload sits permanently closer to it than a greedy one.
-
-What a draft costs, measured on one RTX-class card with this checkpoint and three identical cold
-642-token sampled prompts (256 tokens out, every gate open so the head drafted 99.6% of steps):
-21.9 tok/s with drafting off, 16.0 with it on, at acceptance 0.453 -- so a spec step costs about two
-decode steps and break-even would need acceptance at 1.0, which no head reaches. Shrinking the GPU
-expert cache from 4204 to 1200 slots slowed both arms by about a third (21.9 -> 14.8 without
-drafting, 16.0 -> 10.6 with) and left the ratio unchanged: the second row is compute, not an expert
-fetch, so no batching of drafts amortizes it away. The same step on a 10k-token prompt costs nearer
-1.5 decode steps, which is why a long answer can break even at the acceptance it actually reaches
-while a short one cannot -- the whole reason `streak` and `low_acceptance` stand down instead of
-paying that price for a draft that lands ~0.15 of the time.
-
-| Env var | Default | Meaning |
+| Flag | Default | Meaning |
 |---|---|---|
-| `FREETOKEN_MTP_ACCEPT_WINDOW` | 64 | Verifies per acceptance report and per auto-off window (floor 8) |
-| `FREETOKEN_MTP_MIN_ACCEPTANCE` | 0.35 | Below this acceptance within one window the request stops drafting; `0` disables the check |
-| `FREETOKEN_MTP_REJECT_STREAK` | 3 | Consecutive rejected verifies that trigger a short stand-down (the per-step half of the floor); `0` disables |
-| `FREETOKEN_MTP_SKIP_STEPS` | 8 | Decode steps that stand-down lasts before drafting resumes |
-| `FREETOKEN_MTP_MIN_P` | 0 | Declines a verify when the head's own top-1 probability for the draft is below this floor (per-draft, greedy drafts only, counted as `low_prob`; Strata's `--spec-min-p` parity). `0` disables |
-| `FREETOKEN_MTP_RESUME_AFTER` | one window | Decode steps a suspended request waits before re-probing the floor; `0` makes the trip terminal |
-| `FREETOKEN_MTP_COLD_START` | off | Draft even when the prompt rows are gone (prefix hit) or over the stash budget: the head seeds its first draft from its own row instead of declining. Costs a few rejected verifies, buys back the multi-turn traffic that always hits the cache |
-| `FREETOKEN_MTP_RESYNC_LAG` | 8 | Rows a request may decode unseen by the head before its stash is written off, and before a stand-down's resume re-seeds the draft instead of verifying it (`suspend_hole`) |
-| `FREETOKEN_MTP_MAX_STASH_TOKENS` | 16384 | Prompt rows whose residual is held for the head's catch-up pass (~20 KiB/row at this model's width, so ~320 MiB per draftable request; also how long the catch-up pass is) |
-| `FREETOKEN_MTP_SAMPLING` | on | `0` declines every sampled request (the pre-rejection-sampling behaviour) -- the A/B switch |
-| `FREETOKEN_MTP_SAMPLED_GRAPH` | on | `0` keeps sampled verifies eager instead of replaying the captured graph -- the A/B switch for the capture itself |
-| `FREETOKEN_MTP_LOOKUP_CHAIN` | off | Continues the MTP draft with suffix-lookup continuations and verifies them as one wider eager window (greedy single-request steps only; a suffix miss keeps the plain two-row verify and its graph replay). Strata's `--lookup-chain` port; the head rides the same step, so the MTP cadence and reject rules are unchanged |
-| `FREETOKEN_MTP_CHAIN_K` | 2 | Continuation rows per chain verify at most: the payout past row 0 is all-or-nothing, so a wide window on a weak match costs rows it will not cash |
-| `FREETOKEN_MTP_REPORT_INTERVAL_S` | 60 | Shortest gap between acceptance lines when verifies are too sparse to drive one |
-| `FREETOKEN_MTP_DECLINE_LOG` | 5 | Decline lines printed per reason; the counters keep counting past it |
-| `FREETOKEN_MTP_DEBUG` | off | Per-step trace: `[mtp]` decisions, `[mtp-s]` rejection ratios with the host uniforms that decided them (eager sampled steps), `[mtp-g]`/`[mtp-gs]` graph staging and replay timings, `[mtp-t]` step timings. Reads the value for truth, so `0` is off; the timing line synchronizes the device every spec step, so never leave it on for a throughput run |
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, the draft's `block_size` - 1 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to the draft's `block_size` - 1 for `dflash` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; for `mtp`, a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`), whose `target_layer_ids`, `num_target_layers`, hidden size and vocabulary must match the target |
+| `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
 
-What to read when MTP appears to do nothing:
+Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
-- `MTP spec: enabled ...` at start-up names the caps and which sampling modes may draft. No such line
-  means `--speculative mtp` was not passed.
-- `MTP spec: declined <reason> for req <uid>: ...` prints with the numbers the gate used (a capped
-  number of lines per reason); the `declined: <reason>=<count>` breakdown rides on every tally
-  line, and counts per request for the terminal reasons, per episode for `resync`, `streak` and
-  `suspend_hole`.
-
-| Decline reason | Means |
-|---|---|
-| `prefix_hit` | The prompt's first rows came from the prefix cache, so no residual exists for them and there is nothing to catch the head up on. Only a decline with `FREETOKEN_MTP_COLD_START=0`: with it on, the head drafts from where it is |
-| `over_budget` | The prompt is longer than `FREETOKEN_MTP_MAX_STASH_TOKENS` rows (the line prints `stashed=` how far it got); cold start drafts these without the catch-up pass instead |
-| `nongreedy` | Only with `FREETOKEN_MTP_SAMPLING=0`: the request samples and sampled drafting was switched off |
-| `mm` | The prompt carries image rows; those keep the regular decode path |
-| `no_gdn_pool` | No GDN state pool to clone for a rejection rollback (non-hybrid model, or the pool is off) |
-| `exhausted` | The GDN pool had no scratch slot to spare for this request |
-| `resync` | The decode batch grew past one request, so the head missed rows. Not terminal: the staged draft is dropped (it aims at a position that already committed) and drafting continues, one rejected verify later |
-| `no_stash` | The prefill forward produced no residual rows for this request, so the head cannot be caught up. The forward gate declines whole batches and names no request, which is why this reason exists at all: it is the visible form of "the prefill never offered me rows". Cold start removes it by drafting anyway |
-| `lag_overflow` | The request decoded more than `FREETOKEN_MTP_RESYNC_LAG` rows unseen by the head before ever drafting, so the stash (prompt-sized, otherwise pinned for the request's whole life) is written off. Terminal only with cold start off |
-| `low_acceptance` | This request's acceptance fell under `FREETOKEN_MTP_MIN_ACCEPTANCE` within one window of verifies; drafting stands down for `FREETOKEN_MTP_RESUME_AFTER` decode steps and probes again (`0` ends it for the request) |
-| `suspend_hole` | A stand-down lasted longer than `FREETOKEN_MTP_RESYNC_LAG` rows, so the staged draft (and the sampled path's carried density) was computed too many committed tokens ago to verify: both are dropped and the next single-request step cold-seeds a fresh draft. Not terminal |
-| `streak` | `FREETOKEN_MTP_REJECT_STREAK` verifies in a row missed, so the next `FREETOKEN_MTP_SKIP_STEPS` are spent decoding: after three misses the next draft lands ~0.15 while a verify costs ~2.1 decode steps. Not terminal, and the one number to read before blaming the head |
-| `no_room` | One row of output budget left: an accept could not pay out, so drafting is over for this request |
-
-- `MTP spec: acceptance <a>/<n> = <rate>` prints when the verify window fills, when the report
-  interval elapses, and as the queue drains; the periodic `Decode batch` line carries `mtp: ...` too,
-  so the state is readable even with zero verifies.
-- `GET /v1/stats` reports the same counters under `spec` (`verifies`, `accepted`, `acceptance_rate`,
-  `declined`, plus the coverage split `steps` / `decode_steps` / `drafted_ratio` and the
-  `cold_seeds` that had no catch-up pass behind them), and `spec` is `null` when speculative
-  decoding is off -- which is how "not enabled" and "enabled, and nothing ever qualified" tell each
-  other apart without reading a log.
-
-#### Prompt lookup
-
-`--speculative lookup` needs no draft head, so it serves any text checkpoint and any quantization.
-The drafter is the user's own history: every trigram in the prompt plus the accepted output is
-indexed with its four most recent end positions; the longest earlier occurrence of the current
-suffix (at least 3 tokens, extended backwards up to 32) proposes the tokens that followed it (up
-to `FREETOKEN_LOOKUP_MAX_DRAFT`). That is
-the mechanism Strata ships as `--suffix-draft`, and it is most useful exactly where MTP is weakest:
-code edits, refactors, quoted patches and repeated boilerplate.
-
-Two constraints come from the verify path, not from the drafter:
-
-- **Greedy only.** A lookup draft is a token id, with no density to rejection-sample against, so a
-  sampled request is declined (`nongreedy`) rather than verified incorrectly. Greedy verification
-  compares ids and every emitted token is the target's argmax for its position.
-- **All-or-nothing at width K.** Each verified request is an extend of `1 + K` rows (`K =
-  FREETOKEN_LOOKUP_MAX_DRAFT`, default 4) and its GDN/PLE state saved for rollback is the one
-  after row 0. A full hit emits all K drafts plus the target's next token; a partial hit keeps
-  only the first verified token and discards the rest, then decodes on from there. Saving a state per row (which
-  would let a partial hit keep `r` tokens) is the next step if the discarded work ever matters.
-
-Lookup reserves **no** fixed GDN scratch slot: it takes one (or, for a two-request verify, two)
-slots from the pool's spare snapshots at verify time and keeps the regular step if none is free.
-The batch path therefore stays at the no-spec slot count. Reserving `--max-running-requests` slots
-added unused state-pool bytes and cost 10-12% batch throughput at four requests even with zero
-verifies. `FREETOKEN_LOOKUP_MAX_BATCH` (default 2) caps how many requests one verify upgrades.
-
-Width matters more than it looks. At depth 1 a verify is two target rows and measured 2.13 decode
-steps, so even acceptance 1.0 cannot pay for it. A wider extend amortizes the fixed per-step cost:
-on 2x RTX PRO 4000 Blackwell with Qwen3.8-Flash-Next NVFP4, a 2.4K-token copy-heavy code edit
-(979 greedy output tokens, warm prefix cache, two runs) measured 59.6 tok/s plain and 84.0 with
-four drafts (+41%, acceptance 0.86 per draft, 3.3 tokens per step); prose copy went 53.8 -> 70.3
-(+31%). A creative haiku prompt with almost no repeats is the reason for the 256-token context
-floor: drafting its 32-token prompt cost ~7%, while disallowing it leaves that request at baseline
-speed. Three drafts measured +20% on the code edit and five was within noise of four on code
-(slightly better on prose); four is the default because it keeps the discarded work and the gate's
-sample size smaller. The gain grows with context (the decode step it replaces is longer) and
-disappears on text that does not repeat, where the drafter rarely proposes and the gate turns the
-request off. A 2,000-token greedy code edit produced byte-identical output in both arms.
-
-| Env var | Default | Meaning |
-|---|---|---|
-| `FREETOKEN_LOOKUP_MIN_MATCH` | 3 | Shortest suffix match that may propose; lower matches too often to be evidence |
-| `FREETOKEN_LOOKUP_MAX_MATCH` | 32 | How far back a match may be extended to beat a newer shorter one |
-| `FREETOKEN_LOOKUP_MIN_CONTEXT` | 256 | Placed tokens required before drafting starts; below this the decode step is cheap enough that the wide verify loses. Not a decline: a request that grows past it starts drafting |
-| `FREETOKEN_LOOKUP_CAPACITY` | 131072 | Unique trigrams indexed per request; once full, new suffixes stop being indexed but known trigrams still draft (the table is memory-bounded, ~one dict entry per token) |
-| `FREETOKEN_LOOKUP_MAX_DRAFT` | 4 | Drafts staged per verify (`K`); the verify extends `1 + K` rows |
-| `FREETOKEN_LOOKUP_MAX_BATCH` | 2 | Largest decode batch one verify upgrades. 1 keeps the old single-request gate; 2 (default) verifies two requests together; larger batches fall back to plain decoding |
-| `FREETOKEN_LOOKUP_ACCEPT_WINDOW` | 128 | Drafts per gate window (floor 8), i.e. 32 verifies at the default width |
-| `FREETOKEN_LOOKUP_MIN_ACCEPTANCE` | 0.8 | Below this per-draft acceptance in one window the request stops drafting for good; `0` disables the check. With four drafts and a ~2.4-step verify the payout is `1 + 4p^4`, so break-even is `p ~= 0.77`; long contexts can lower it |
-| `FREETOKEN_LOOKUP_DEBUG` | off | Per-step `[lookup]` accept/reject and `[lookup-t]` verify timing; reads the value for truth, so `0` is off |
-
-The width is the one value that most needs measuring on the machine that will serve: run
-`ft calibrate` (see [calibration.md](calibration.md)) to sweep it with the minimum match, the
-context floor, the acceptance floor and the number of parallel requests, and to write a launch JSON
-and start script with the values that won there.
-
-Declines are the MTP terminal ones minus the head-specific reasons: `nongreedy`, `mm`, `no_room`,
-`exhausted` (no GDN scratch slot) and `low_acceptance`; a request with no repeated suffix is not
-counted. `Lookup spec: enabled ...` at start-up names the rules, the tally line reads
-`Lookup spec: acceptance <a>/<n> = <rate>`, and `GET /v1/stats` reports the same counters with
-`"backend": "lookup"` under `spec`.
+`dflash` keeps the draft's context in a per-request ring of the draft's sliding window (2048 positions for the released drafts) and, on a hybrid GDN target, in a window on the GDN state slots, so a prefix-cache hit restores it with the GDN snapshot; the window adds `(window + 64) x hidden` activation-dtype bytes to every GDN slot (`/v1/cache/status` counts them). A target without GDN layers needs `--cache-type naive`. Quantized drafts and DFlash v1 drafts are refused. With sampling, the drafts are drawn from the draft's own distribution over its top-16 candidates and verified by rejection sampling against the target's distribution, so the output distribution is the target's.
 
 ### API behaviour
 
@@ -402,7 +239,26 @@ counted. `Lookup spec: enabled ...` at start-up names the rules, the tally line 
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+
+With `--enable-timings-report` every chat completion, completion and Responses response
+also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
+`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
+extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
+like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
+measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
+`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
+`predicted_ms` the first to the last committed token; `prompt_n` counts only the
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
+streams the object rides the final chunk; a multi-prompt `/v1/completions` request
+reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+(llama.cpp emits no timings there either). A streaming chat completion, completion or
+Responses request may set the llama.cpp top-level body field `"timings_per_token": true`
+to carry the block with growing values on every chunk that follows an ack: text and
+reasoning deltas, tool-argument fragments, and the finish chunk (or the usage chunk
+with `include_usage`). Without the server flag the field is ignored.
 
 ### Image input
 
@@ -449,7 +305,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--api-key KEY] [--timeout 10] [--json
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
 | `health` | `GET /health` | Server status, model, load progress, and whether an engine is behind the API (`loaded`, [Engine recovery](#engine-recovery)) |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, MTP draft tallies, accepted input modalities |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, speculative draft tallies, accepted input modalities |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
@@ -463,7 +319,7 @@ ft launch {claude,codex,dsh,hermes,openclaw,opencode} [options] [-- <agent args>
 
 Discovers the served model via `/v1/models`, writes the agent's provider
 config, installs the agent CLI if missing, then launches it. Cloud API keys
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) are cleared from the child
 environment so the agent cannot silently fall back to a paid endpoint.
 When `/v1/stats` reports `image` among `model.input_modalities`, the written
 config declares the model image-capable, which Codex, OpenCode, OpenClaw and

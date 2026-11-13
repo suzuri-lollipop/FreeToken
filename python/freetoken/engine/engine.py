@@ -14,12 +14,14 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
+from freetoken.attention.linear import LinearAttnBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
 from freetoken.gpu_select import gpu_identity, nvml_free_bytes
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
+from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.layers.quantization.names import name_set
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -32,14 +34,13 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
-from .config import (EngineConfig, SPEC_PROB_FP, mtp_cold_start, mtp_stash_budget,
-                     tp_preflight_error)
+from .config import EngineConfig, tp_preflight_error
 from .cache_budget import has_explicit_cache_sizing, headroom_growth_eligible
-from .graph import GraphRunner, get_free_memory
-from .lookup import lookup_debug
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
-from .spec_sample import debug_traced, sampled_graph_enabled, spec_supported
-from freetoken.kvcache import check_kv_quant, create_kv_pool, resolve_pool_class
+from .spec_protocol import SpecRuntime
+from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache.format import NONE, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -47,6 +48,17 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+def _disable_unsafe_cpu_moe_graphs(config: EngineConfig, executor, dtype, tp_cpu_group) -> None:
+    safe = torch.tensor([executor.graph_capture_safe(dtype)], dtype=torch.int32)
+    if config.tp_info.size > 1:
+        torch.distributed.all_reduce(safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
+    if not safe.item():
+        logger.warning_rank0("CPU MoE IO/handshake is not graph-safe on every TP rank for this dtype; disabling decode graphs")
+        # Clear explicit sizes too; GraphRunner gives them priority over max_bs, including on rebuild.
+        object.__setattr__(config, "cuda_graph_bs", [])
+        object.__setattr__(config, "cuda_graph_max_bs", 0)
+
 
 def _clamp_decode_batch_to_pools(
     config: EngineConfig,
@@ -68,8 +80,9 @@ def _clamp_decode_batch_to_pools(
     num_experts = config.model_config.num_experts
     small = [s for s in pool_sizes if s < num_experts]
     _NO_CAP = 1 << 30
+    # a decode step routes every row of every request, decode_rows_per_req rows each
     limit = (
-        min(small) // config.model_config.num_experts_per_tok
+        min(small) // (config.model_config.num_experts_per_tok * getattr(config, "decode_rows_per_req", 1))
         if small and decode_target == "gpu"
         else _NO_CAP
     )
@@ -257,6 +270,12 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
+    """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
+    limit = min(config.max_seq_len, num_tokens)
+    return limit - (config.decode_rows_per_req - 1), _page_table_width(limit, config.page_size)
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -273,9 +292,9 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     return types or frozenset({AttnType.FULL})
 
 
-def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
+def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE) -> bool:
     return all(
-        required <= attention_backend_info(part).supported_types
+        required <= attention_backend_info(part).supported_types and kv_format.name in attention_backend_info(part).kv_formats
         for part in name.split(",")
     )
 
@@ -285,7 +304,7 @@ _ATTENTION_BACKEND_NAMES = (
 )
 
 
-def _backend_requirements_met(name: str, fp8_kv: bool = False, tp_size: int = 1) -> bool:
+def _backend_requirements_met(name: str, tp_size: int = 1) -> bool:
     infos = [attention_backend_info(part) for part in name.split(",")]
     if tp_size > 1 and any(not i.supports_tp for i in infos):
         return False
@@ -297,21 +316,18 @@ def _backend_requirements_met(name: str, fp8_kv: bool = False, tp_size: int = 1)
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
-    # A quantized cache is only readable by backends that apply the pool's descales; one
-    # that ignores them would return wrong logits, not slow ones.
-    if fp8_kv and not all(i.supports_fp8_kv for i in infos):
-        return False
     return True
 
 
 def _resolve_auto_attention_backend(
-    required: frozenset[AttnType], fp8_kv: bool = False, tp_size: int = 1
+    required: frozenset[AttnType], tp_size: int = 1, kv_format: KVFormat = NONE
 ) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton.
     Tensor parallelism narrows that to the backends that read TP-local heads."""
+    fp8_kv = kv_format.quantized
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
@@ -332,21 +348,16 @@ def _resolve_auto_attention_backend(
             ("fi", True),
             ("triton", True),
         ]
-    quant_skipped: list[str] = []
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
-        if not _backend_parts_serve(name, required):
+        if not _backend_parts_serve(name, required, kv_format):
             continue
-        if not _backend_requirements_met(name, fp8_kv, tp_size):
-            # Would it run without the quantized cache? Then the flag, not the hardware or
-            # the packages, is what took this candidate out of the list.
-            if fp8_kv and _backend_requirements_met(name, tp_size=tp_size):
-                quant_skipped.append(name)
+        if not _backend_requirements_met(name, tp_size):
             continue
         return name
     msg = "No attention backend can serve attention types "
-    msg += f"{sorted(t.value for t in required)} on this machine"
+    msg += f"{sorted(t.value for t in required)} with KV format {kv_format.name} on this machine"
     if tp_size > 1:
         msg += (
             f"; with tensor parallelism over {tp_size} ranks only backends that shard their "
@@ -354,14 +365,53 @@ def _resolve_auto_attention_backend(
         )
     if fp8_kv:
         msg += " with a quantized KV cache (--kv-cache-dtype)"
-        if quant_skipped:
-            msg += (
-                ": "
-                + ", ".join(sorted(set(quant_skipped)))
-                + " cannot descale a quantized cache -- drop --kv-cache-dtype, or name a"
-                " backend that can"
-            )
     raise RuntimeError(msg + ".")
+
+
+def _spec_runner():
+    from freetoken.engine.spec_protocol import SPEC_RUNNER
+    from freetoken.models.register import _load_attr
+
+    return _load_attr(*SPEC_RUNNER.split(":"))
+
+
+def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
+    """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    override("spec_slot_states", runner.slot_states(config))
+    if windowed_kv:
+        raise ValueError(
+            "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
+            "their window frees would release slots a verify step still reads"
+        )
+    # at config time: the state pool that holds the handlers is built only after the weights load
+    if unverified := [s.name for s in config.model_config.slot_states if s.verify is None]:
+        raise ValueError(f"speculative decoding does not support per-request state {unverified} yet: it declares no verify handler")
+    parts = [p.strip() for p in config.attention_backend.split(",")]
+    graph = attention_backend_info(parts[-1]).uniform_extend_graph
+    if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":
+        # verify steps run on the decode part; a prefill part that captures on device serves them better
+        logger.info_rank0(f"speculative decoding: attention backend {config.attention_backend} -> {parts[0]}")
+        override("attention_backend", parts[0])
+    elif graph == "none":
+        raise ValueError(
+            f"speculative decoding needs a decode attention backend that captures multi-row graphs "
+            f"(fa, triton or fi), got {config.attention_backend!r}"
+        )
+
+
+def _validate_kv_format(config, model_config) -> None:
+    kv_format = getattr(config, "kv_format", NONE)
+    if not kv_format.quantized:
+        return
+    pool_cls = resolve_pool_class(model_config)
+    if kv_format.name not in pool_cls.kv_formats:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
+    if config.dtype != torch.bfloat16:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
+    if config.tp_info.size != 1:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -396,20 +446,18 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"attention, which backend {part!r} does not support; valid backends: "
                 f"{', '.join(valid)} (or auto), got {config.attention_backend!r}."
             )
+        kv_format = getattr(config, "kv_format", NONE)
+        if kv_format.name not in info.kv_formats:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_format.name}: backend {part!r} cannot read that format, "
+                f"got {config.attention_backend!r}."
+            )
         if AttnType.SWA in required and not info.consumes_attn_spec:
             # SWA models drive window/sinks/sm_scale through the per-call AttentionSpec;
             # a backend that drops it would attend with the wrong window silently.
             raise ValueError(
                 f"backend {part!r} does not consume the per-call AttentionSpec that "
                 f"SWA models require, got {config.attention_backend!r}."
-            )
-        if getattr(config, "kv_quant", None) is not None and not info.supports_fp8_kv:
-            # Reading a quantized pool without its descales is silently wrong, so the
-            # combination is refused instead of degrading the numerics.
-            raise RuntimeError(
-                f"--kv-cache-dtype {config.kv_cache_dtype} needs a backend that descales a "
-                f"quantized KV cache; {part!r} does not. Use "
-                f"--attention-backend triton (or fi), or drop --kv-cache-dtype."
             )
         if tp_size > 1 and not info.supports_tp:
             # A non-sharding backend would read global head counts against the TP-local KV
@@ -485,19 +533,46 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
     if config.embed_weights != "host":
         return frozenset()
-    if config.model_config.tie_word_embeddings:
+    # a tied LM head reads its whole table every step, so that table stays on the GPU
+    tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
+    tables = {
+        id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
+    }
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys and tied:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
             "every step; serve it with --embed-weights gpu"
         )
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
-    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys:
         raise ValueError(
-            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
-            "on the GPU); serve it with --embed-weights gpu"
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (an --online-quant "
+            "table stays on the GPU); serve it with --embed-weights gpu"
         )
     return keys
+
+
+def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the bf16 weights an online quant method converts in finalize; they load to host RAM so the GPU holds one of them at a time."""
+    if not config.online_quant:
+        return frozenset()
+    to_checkpoint = config.model_config.quant.name_map.to_checkpoint
+    ops = [op for op in iter_ops(model) if getattr(op, "quant_method", None) is not None and op.quant_method.online]
+    names = [name for op in ops for name in to_checkpoint(op.prefix)]
+    missed = [p for p in config.online_quant_modules if not any(map(name_set((p,)), names))]
+    if missed:
+        example = to_checkpoint(next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", "")))[0]
+        raise ValueError(
+            f"--online-quant-modules: no layer --online-quant {config.online_quant} converts matches {', '.join(missed)}; "
+            f"give the checkpoint's module names, e.g. {example!r}"
+        )
+    if not ops:
+        raise ValueError(
+            f"--online-quant {config.online_quant}: {config.model_path} has no layer it converts; the checkpoint quantizes "
+            "its Linear layers and tables, or they must stay as stored"
+        )
+    weights = {id(op.weight) for op in ops}
+    return frozenset(key for key, t in model.state_dict().items() if id(t) in weights)
 
 
 def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
@@ -519,6 +594,7 @@ def _make_dummy_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -543,6 +619,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
         if key in host_keys:
             state_dict[key] = _pinned_copy(key, state_dict[key])
+        elif key in staged_keys:
+            state_dict[key] = state_dict[key].cpu()
     return state_dict
 
 
@@ -577,6 +655,7 @@ def _materialize_loaded_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -588,6 +667,8 @@ def _materialize_loaded_weight_state_dict(
             state_dict[key] = weight.to(device=device)
         elif key in host_keys:
             state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
+        elif key in staged_keys:
+            state_dict[key] = weight.to(device="cpu", dtype=expected.dtype)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -597,13 +678,6 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
-    # MTP spec payload (None for regular batches): mode-dependent host ints the drain
-    # consumes -- prologue_decode: {y1, draft}; verify: {y1, y2, accept, draft};
-    spec: dict | None = None
-    # Graphed spec steps cannot build the dict before the device->host copy lands: the
-    # pinned [y1, y2, draft, accept] row arrives here and the drain decodes it after
-    # copy_done_event.
-    spec_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -757,6 +831,8 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        # draft weights load before any pool is sized, so every free-memory read below counts them
+        self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -781,10 +857,14 @@ class Engine:
         # planning sees the pin quota the table already spent.
         # weight is None on a table the W8A16 embed finalize already rewrote to fp8 and dropped
         # the bf16 master of; that path runs only for CUDA tables, so None is never a host table.
+        # An online-quant rewrite likewise replaces the host master, so skip those too.
         host_embeds = [
             op
             for op in iter_ops(self.model)
-            if type(op) is VocabParallelEmbedding and op.weight is not None and not op.weight.is_cuda
+            if type(op) is VocabParallelEmbedding
+            and op.weight is not None
+            and not op.quant_method.online
+            and not op.weight.is_cuda
         ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
@@ -831,6 +911,11 @@ class Engine:
             weights_bytes=self._weights_bytes,
         )
         available_memory -= state_pool_bytes(config)
+        if self.spec is not None:
+            # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
+            spec_fixed, draft_page = self._spec_budget(config)
+            page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+            available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -853,7 +938,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
-                slot_states=config.model_config.slot_states,
+                slot_states=config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
@@ -861,8 +946,7 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -877,6 +961,7 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -887,9 +972,9 @@ class Engine:
         if headroom_growth_eligible(config.moe_cache_auto, self._moe_sizing_explicit):
             post_free_memory = self._grow_moe_cache_into_headroom(config, post_free_memory)
 
-        # ======================= Graph capture initialization ========================
+        # padded rows replay this request, so it carries one token per decode row
         self.dummy_req = Req(
-            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            input_ids=torch.zeros(config.decode_rows_per_req, dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
@@ -898,24 +983,19 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
-        if self.linear_state_pool is not None:
+        # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
+        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
-            device=self.device,
-            model=self.model,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
-            mrope=config.model_config.model_is_mrope,
-            max_running_req=config.max_running_req,
-        )
+
+        # ======================= Verify state initialization ========================
+        if config.decode_rows_per_req > 1 and self.linear_state_pool is not None:
+            self.linear_state_pool.attach_verify_scratch(config.max_running_req, config.decode_rows_per_req)
+        if self.spec is not None:
+            self.spec.attach(self)
+
+        # ======================= Graph capture initialization ========================
+        self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
         # Warm the prefill path for all attention backends: Triton kernels
         # (FLA/GDN, MoE, sampling) need JIT compilation regardless of which
         # attention backend is selected. The old guard only warmed for the
@@ -974,16 +1054,23 @@ class Engine:
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
         host_keys = _host_embedding_keys(self.model, config)
+        staged_keys = _online_quant_keys(self.model, config)
+        if config.online_quant:
+            logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
+        if config.speculative_algorithm is not None:
+            _spec_runner().prepare_target(config, self.model)
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
 
-    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(
+        self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
+    ) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -994,10 +1081,10 @@ class Engine:
                 self.device,
                 include_moe_experts=not getattr(config.model_config, "is_moe", False),
                 include_vision=bool(config.active_encoders),
-                include_mtp=config.speculative == "mtp",
             ),
             device=self.device,
             host_keys=host_keys,
+            staged_keys=staged_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -1299,6 +1386,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         num_moe_layers = config.model_config.num_moe_layers
         total_experts = num_moe_layers * num_experts
@@ -1611,8 +1701,8 @@ class Engine:
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
         self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
-        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
-        pools = self._moe_pools(1)
+        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
+        pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
@@ -1879,7 +1969,6 @@ class Engine:
                 cache.hybrid_min_bs = max(1, int(os.getenv("FREETOKEN_HYBRID_MIN_BS", "2")))
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
-        self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
 
@@ -2069,6 +2158,12 @@ class Engine:
             # buffers and C++ scratch must cover the largest chunk the on-demand path
             # accepts. Only paid when the split is actually on.
             max_tokens = max(max_tokens, cache.ondemand_max_tokens)
+        max_tokens *= config.decode_rows_per_req
+        # Match GraphRunner's explicit-size precedence, including an empty list.
+        if config.cuda_graph_bs is not None:
+            graph_enabled = bool(config.cuda_graph_bs)
+        else:
+            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -2079,12 +2174,16 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
+            activation_dtype=self.dtype,
+            graph_enabled=graph_enabled,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        if graph_enabled:
+            _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks, clamped to the whole-device (NVML) free.
@@ -2147,8 +2246,7 @@ class Engine:
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
             # columns must track it or new requests would index out of bounds. The scheduler
@@ -2192,7 +2290,7 @@ class Engine:
                 )
             try:
                 # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
-                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                batch = config.max_running_req * config.decode_rows_per_req if self.moe_offload_cache.decode_target == "gpu" else 1
                 moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
@@ -2241,6 +2339,7 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        spec_fixed, draft_page = self._spec_budget(config)
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
@@ -2251,7 +2350,8 @@ class Engine:
             nonpool_overhead_bytes=self._nonpool_overhead_floor,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            ) + spec_fixed,
+            extra_page_bytes=draft_page,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
@@ -2270,7 +2370,12 @@ class Engine:
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
+        if self.linear_backend is not None:
+            self.linear_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.spec is not None:
+            # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
+            self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -2296,26 +2401,53 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
-        self.graph_runner = GraphRunner(
+        if self.spec is not None:
+            self.spec.attach(self)
+        # reuse the startup-resolved bs set (see above)
+        self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+
+    def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
+        """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
+        config = self.config
+        rows = config.decode_rows_per_req
+        verify = {}
+        if rows > 1:
+            # every decode step is a verify; the verify scratch has max_running_req rows
+            cuda_graph_bs = [
+                bs for bs in _determine_cuda_graph_bs(
+                    cuda_graph_bs, config.cuda_graph_max_bs, free_memory,
+                    max_running_req=config.max_running_req,
+                )
+                if bs <= config.max_running_req
+            ]
+            verify = dict(rows_per_req=rows, phase="verify", batch_hook=self._prepare_verify_batch)
+        runner = GraphRunner(
             stream=self.stream,
             device=self.device,
-            model=self.model,
+            forward=self.model.forward,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=free_min,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            free_memory=free_memory,
+            max_seq_len=max_seq_len,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             max_running_req=config.max_running_req,
+            out_dtype=torch.float32,
+            linear_backend=self.linear_backend,
+            # the decode family arms dual-microbatch capture; the verify family ignores it
+            model=self.model,
+            **verify,
         )
+        if self.spec is not None:
+            self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
+        return runner
 
     def run_pending_host_fill(self) -> None:
         """Run the deferred host fill stashed by the last forward_batch (if any).
@@ -2340,6 +2472,45 @@ class Engine:
             if _dbg is not None:
                 _dbg.host_phase("ple.fill", _time.perf_counter() - _f0)
 
+    def _prepare_verify_batch(self, batch: Batch) -> None:
+        batch.features = self.spec.feature_sink(batch)
+
+    def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
+        """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
+        if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
+            self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
+        for req, n, tokens in zip(reqs, counts, out):
+            if req.output_token_counts is not None:
+                req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
+
+    def _spec_budget(self, config) -> tuple[int, int]:
+        """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""
+        if getattr(self, "spec", None) is None:
+            return 0, 0
+        fixed, per_token = self.spec.budget(config)
+        return fixed, per_token * config.page_size
+
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """The batch's logits from its captured graph, or eagerly when none fits.
+
+        The spec runtime's verify entry (SpecRuntime.verify_step calls this); the
+        scheduler's prefill/decode path goes through forward_batch instead."""
+        if torch.cuda.current_stream() is self.stream:
+            self.run_pending_host_fill()
+        use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph) as _deferred_fill:
+            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        # PLE deferred fill: same contract as forward_batch -- a verify batch on a PLE
+        # model parks at the lookup's memop WAIT until the fill signals it post-drain.
+        if _deferred_fill is not None:
+            if torch.cuda.current_stream() is not self.stream or os.getenv("PLE_FILL_AT_EXIT") == "1":
+                _deferred_fill()
+            else:
+                self._pending_host_fill = _deferred_fill
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        return logits
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         from freetoken.moe import _debug_stats
 
@@ -2347,10 +2518,6 @@ class Engine:
             # the deferred-fill slot is the main loop's; a piped chunk's eager path
             # stages PLE rows inline on its own stream and must not touch it
             self.run_pending_host_fill()
-        if batch.spec_mode is not None:
-            # MTP spec step: dedicated eager path (no graph, no sampler -- the drain
-            # consumes the dual-argmax payload instead).
-            return self._forward_spec(batch)
         _dbg = _debug_stats.probe()
         _ek = "p." if batch.is_prefill else "d."
         if _dbg is not None:
@@ -2362,6 +2529,9 @@ class Engine:
             _te1 = _time.perf_counter()
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        spec_prefill = self.spec is not None and batch.is_prefill
+        if spec_prefill:
+            batch.features = self.spec.feature_sink(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         # Prefill chunk graph (phase 1: single-req T=128 continuations, slot-direct
         # promote, qsa_sparse): a captured continuation chunk samples nothing, so its
@@ -2413,11 +2583,8 @@ class Engine:
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph) as _deferred_fill:
             if _dbg is not None:
                 _tc1 = _time.perf_counter()
-            spec_stash = self._spec_stash_eligible(batch, use_graph)
             if use_graph:
                 logits = self.graph_runner.replay(batch)
-            elif spec_stash:
-                logits, spec_residual = self.model.forward_with_residual_ctx()
             else:
                 logits = self.model.forward()
             if _dbg is not None:
@@ -2438,8 +2605,6 @@ class Engine:
                 _deferred_fill()
             else:
                 self._pending_host_fill = _deferred_fill
-        if spec_stash:
-            self._stash_spec_residual(batch, spec_residual)
         if _profiling:
             # safe only because AT_EXIT mode ran the fill above (see the NOTE)
             torch.cuda.synchronize(self.device)
@@ -2471,6 +2636,9 @@ class Engine:
         # record on the stream that RAN the forward: the drain waits this event whether
         # the batch executed on the engine stream or the piped prefill stream
         copy_done_event.record(torch.cuda.current_stream())
+        if spec_prefill:
+            # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
+            self.spec.on_prefill(batch, next_tokens_gpu)
         if pg is not None:
             # Capture on THIS chunk's context after its eager result is sealed (the
             # drain consumes the eager output above; capture restores the GDN live
@@ -2488,494 +2656,6 @@ class Engine:
             _dbg.host_phase("fb.sample", _te - _ts)
             _dbg.host_phase(_ek + "fe.ret", _time.perf_counter() - _te)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
-
-    def spec_graph_will_replay(self, sampling: bool) -> bool:
-        """Whether the next verify of this kind replays a captured graph.
-
-        The scheduler asks this to skip the per-step batch preparation a replay never
-        reads (positions, mapping tuples, out_loc, attn/FLA metadata, the sampler knobs):
-        the graph derives every input from its staged scalars and in-graph gathers.
-        Mirrors _forward_spec's dispatch exactly, so a step prepared by the fast path
-        always lands on the replay -- and a warm/eager step (or one after an invalidate)
-        gets the full preparation it needs.
-        """
-        runner = getattr(self, "_spec_graph", None)
-        if runner is None:
-            return False
-        if sampling:
-            from .spec_sample import sampled_graph_enabled
-
-            return runner.graph_sampled is not None and sampled_graph_enabled()
-        return runner.graph is not None
-
-    @torch.inference_mode()
-    def _forward_lookup(self, batch: Batch) -> ForwardOutput:
-        """Prompt-lookup verify (--speculative lookup): 1 + K rows per request, no draft head.
-
-        Row 0 is the last placed token, rows 1..K the suffix drafter's proposal. The target's
-        argmax at each row decides the accept; a full hit also emits row K's next token as the
-        bonus. Unlike MTP there is no head pass and no residual: the next draft is looked up
-        from the text the drain just committed, so this path works on any checkpoint.
-
-        A multi-request verify is one extend batch whose sequences each carry their own draft
-        width; ``spec_items`` names them in row order. The GDN/PLE snapshot takes the first row
-        of each sequence, so every request can roll back independently.
-        """
-        model = self.model
-        assert batch.spec_mode == "verify", "lookup step shape"
-        items = getattr(batch, "spec_items", None)
-        if not items:
-            drafts = batch.spec_draft_ids or (batch.spec_draft_id,)
-            items = [{"req": batch.reqs[0], "drafts": tuple(drafts)}]
-        debug = lookup_debug()
-        if debug:
-            import time as _time
-
-            _t0 = _time.perf_counter()
-        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
-            mixed, _residual = model.model.forward_with_residual(batch.input_ids, batch)
-            logits = model.greedy_ids(mixed)
-            vals = logits.tolist()
-        if _deferred_fill is not None:
-            self._pending_host_fill = _deferred_fill
-
-        payloads = []
-        next_ids = []
-        offset = 0
-        for item in items:
-            drafts = tuple(item["drafts"])
-            rows = vals[offset:offset + len(drafts) + 1]
-            offset += len(drafts) + 1
-            accept = 0
-            while accept < len(drafts) and rows[accept] == drafts[accept]:
-                accept += 1
-            full = accept == len(drafts)
-            # On a full hit row K is the target's bonus token; on a miss row 0 is the
-            # committed token. The drain uses these ids; next_tokens is only staging.
-            next_ids.append(rows[len(drafts)] if full else rows[0])
-            payloads.append({"ids": rows, "accept": accept, "full": full,
-                             "y1": rows[0], "y2": rows[1] if len(rows) > 1 else None})
-            if debug:
-                logger.info_rank0(
-                    f"[lookup-t] verify req={item['req'].uid} "
-                    f"pre={(_time.perf_counter() - _t0) * 1e3:.1f}ms "
-                    f"drafts={drafts} accept={accept}/{len(drafts)} vals={rows[:4]}"
-                )
-        next_tokens_gpu = torch.tensor(next_ids, dtype=torch.int32, device=self.device)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        payload = payloads[0] if len(payloads) == 1 else {"items": payloads}
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
-
-    @torch.inference_mode()
-    def _forward_chain(self, batch: Batch) -> ForwardOutput:
-        """Chained verify (FREETOKEN_MTP_LOOKUP_CHAIN): an MTP draft plus suffix-lookup
-        continuations, compared row by row like a lookup verify, then the head pass drafts the
-        NEXT MTP token off the last fully-correct row -- so a chain step keeps the MTP cadence
-        (no seed step in between) and one host read carries the whole payload.
-
-        The head contract mirrors the two-row verify: every row updates the head KV and
-        select_row picks the prefix the next draft continues (row K on a full hit, row 0 on a
-        miss -- the rollback case drafts exactly where the plain reject does)."""
-        model = self.model
-        assert batch.spec_mode == "verify", "chain step shape"
-        assert model.mtp is not None, "chain step without the MTP head (--speculative mtp)"
-        drafts = tuple(batch.spec_draft_ids or (batch.spec_draft_id,))
-        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
-            mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-            ids = model.greedy_ids(mixed)
-            rows = ids.tolist()
-            accept = 0
-            while accept < len(drafts) and rows[accept] == drafts[accept]:
-                accept += 1
-            full = accept == len(drafts)
-            sel = torch.tensor([len(drafts) if full else 0], dtype=torch.int64,
-                               device=ids.device)
-            head_logits = model.draft(residual, ids.to(torch.int32), batch,
-                                      select_row=sel.view(1), return_logits=True)
-            top_logp = head_logits.max(-1).values - torch.logsumexp(head_logits, -1)
-            probs = (top_logp.exp() * SPEC_PROB_FP).to(torch.int64)
-            vals = torch.stack([head_logits.argmax(-1)[0], probs[0]]).tolist()
-        if _deferred_fill is not None:
-            self._pending_host_fill = _deferred_fill
-        next_id = rows[len(drafts)] if full else rows[0]
-        payload = {"ids": rows, "accept": accept, "full": full,
-                   "y1": rows[0], "y2": rows[1] if len(rows) > 1 else None,
-                   "draft": int(vals[0]), "prob": int(vals[1]) / SPEC_PROB_FP}
-        next_tokens_gpu = torch.tensor([next_id], dtype=torch.int32, device=self.device)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
-
-    @torch.inference_mode()
-    def _forward_spec(self, batch: Batch) -> ForwardOutput:
-        """MTP spec step (single request, greedy or rejection-sampled; --speculative mtp).
-
-        All modes run the head unconditionally so the accept decision, both target tokens and
-        the next draft come back in ONE device->host read (the eager normal_loop
-        serializes here anyway). Row 0 supplies a fresh draft after a rejection;
-        row 1 supplies it after acceptance.
-
-        Both verify kinds replay a captured graph once the runner has one; the sampled
-        capture stages its uniforms/knobs/density per replay (FREETOKEN_MTP_SAMPLED_GRAPH=0
-        keeps it eager). Eager fallbacks: :meth:`_spec_sampled_step`, and the prologue/seed
-        steps which are variable-length and never captured.
-        """
-        source = getattr(batch, "spec_source", "mtp")
-        if source == "lookup":
-            return self._forward_lookup(batch)
-        if source == "chain":
-            return self._forward_chain(batch)
-        model = self.model
-        req = batch.reqs[0]
-        assert len(batch.reqs) == 1, "spec steps run a single request"
-        assert model.mtp is not None, "spec step without the MTP head (--speculative mtp)"
-        mode = batch.spec_mode
-        # non-greedy requests verify by rejection sampling instead of comparing ids
-        sampling = bool(batch.spec_sample)
-        runner = getattr(self, "_spec_graph", None)
-        if mode == "verify":
-            if runner is None:
-                from .spec_graph import SpecGraphRunner
-
-                runner = self._spec_graph = SpecGraphRunner(self)
-            if sampling:
-                # the knobs ride a staged row (graph_knob_values), so one capture serves
-                # every sampled request instead of freezing whoever was resident at capture
-                if runner.graph_sampled is not None and sampled_graph_enabled():
-                    return runner.run_sampled(self, model, batch, req, self.spec_uniforms())
-            elif runner.graph is not None:
-                return runner.run(self, model, batch, req)
-        _dbg_spec = debug_traced()
-        if _dbg_spec:
-            import time as _time
-
-            _t0 = _time.perf_counter()
-
-        capture_state = None
-        carried_pre = None
-        if mode == "verify" and not runner.disabled:
-            if not sampling:
-                if runner.graph is None and runner.warm + 1 >= runner.WARM_STEPS:
-                    capture_state = runner.save_state(req.linear_slot_idx)
-            elif (sampled_graph_enabled() and runner.graph_sampled is None
-                  and runner.warm_sampled + 1 >= runner.WARM_STEPS):
-                capture_state = runner.save_state(req.linear_slot_idx)
-                # the eager step is about to overwrite the request's density with its
-                # p_next; the capture choreography rejects against the PRE-step row
-                carried_pre = (req.spec_draft_probs.clone()
-                               if req.spec_draft_probs is not None else None)
-        # one draw set per sampled step, drawn on the host so a step is reproducible from its
-        # payload and every TP rank works from the same numbers
-        u_spec = self.spec_uniforms() if sampling else None
-
-        with self.ctx.forward_batch(batch), model.forward_host_ctx(batch, False) as _deferred_fill:
-            if mode == "prologue_decode" and batch.spec_prologue is not None:
-                # a cold seed step (no stash) skips this: the head pass below seeds the draft
-                self._run_head_prologue(model, req, batch.spec_prologue)
-            if _dbg_spec:
-                _t1 = _time.perf_counter()
-            mixed, residual = model.model.forward_with_residual(batch.input_ids, batch)
-            if sampling:
-                # the density that produced the draft rode in from the previous head pass, so
-                # the rejection test costs no host round-trip
-                payload, next_tokens_gpu = self._spec_sampled_step(
-                    model, batch, req, mixed, residual, u_spec
-                )
-                if _dbg_spec:
-                    torch.cuda.synchronize(self.device)
-                    _t2 = _time.perf_counter()
-            else:
-                ids = model.greedy_ids(mixed)
-                if _dbg_spec:
-                    torch.cuda.synchronize(self.device)
-                    _t2 = _time.perf_counter()
-                if mode == "prologue_decode":
-                    y = ids[0]
-                    head_logits = model.draft(residual, y.view(1).to(torch.int32), batch,
-                                              return_logits=True)
-                    top_logp = head_logits.max(-1).values - torch.logsumexp(head_logits, -1)
-                    probs = (top_logp.exp() * SPEC_PROB_FP).to(torch.int64)
-                    vals = torch.stack([y, head_logits.argmax(-1)[0], probs[0]]).tolist()
-                    next_tokens_gpu = y.view(1).to(torch.int32)
-                    payload = {"y1": int(vals[0]), "draft": int(vals[1]),
-                               "prob": int(vals[2]) / SPEC_PROB_FP}
-                else:
-                    y1, y2 = ids[0], ids[1]
-                    accepted = y1 == batch.spec_draft_id
-                    head_logits = model.draft(
-                        residual, torch.stack([y1, y2]).to(torch.int32), batch,
-                        select_row=accepted.to(torch.int64).view(1), return_logits=True)
-                    top_logp = head_logits.max(-1).values - torch.logsumexp(head_logits, -1)
-                    probs = (top_logp.exp() * SPEC_PROB_FP).to(torch.int64)
-                    vals = torch.stack([y1, y2, head_logits.argmax(-1)[0], probs[0]]).tolist()
-                    accept = int(vals[0]) == batch.spec_draft_id
-                    next_tokens_gpu = y2.view(1).to(torch.int32)
-                    payload = {
-                        "y1": int(vals[0]), "y2": int(vals[1]),
-                        "accept": accept, "draft": int(vals[2]),
-                        "prob": int(vals[3]) / SPEC_PROB_FP,
-                    }
-            if _dbg_spec:
-                _t3 = _time.perf_counter()
-                logger.info_rank0(
-                    f"[mtp-t] {mode} pre={(_t1 - _t0) * 1e3:.1f}ms "
-                    f"fwd={(_t2 - _t1) * 1e3:.1f}ms head+read={(_t3 - _t2) * 1e3:.1f}ms"
-                )
-        if _deferred_fill is not None:
-            self._pending_host_fill = _deferred_fill
-
-        if runner is not None and mode == "verify" and not runner.disabled:
-            if sampling:
-                if runner.graph_sampled is None and sampled_graph_enabled():
-                    runner.warm_sampled += 1
-                    if runner.warm_sampled >= runner.WARM_STEPS:
-                        # capture on this step's context; the state is restored around the
-                        # warm/capture/replay runs, so the step's own eager payload stays the
-                        # one the drain consumes
-                        runner.capture_after_step_sampled(
-                            self, model, batch, req, payload, capture_state,
-                            u_spec, carried_pre)
-            elif runner.graph is None:
-                runner.warm += 1
-                if runner.warm >= runner.WARM_STEPS:
-                    runner.capture_after_step(self, model, batch, req, payload, capture_state)
-
-        if mode == "prologue_decode":
-            req.complete_one()  # a regular decode row; the drain only picks up the draft
-        # The drain commits both input rows on acceptance, or just row 0 on rejection.
-
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, payload)
-
-    def _run_head_prologue(self, model, req: Req, prologue: Batch) -> None:
-        """The head's catch-up pass over the rows it has not seen, run before that step drafts.
-
-        Rows 0..t-1 with teacher-forced embeds (tokens 1..t), building the head layer's KV
-        that the main forward never ran. The shadow batch sees a fresh prefill of length t
-        (cached_len=0), so the sparse backend initializes its slab/ring for the head layer
-        exactly like a prompt chunk. t is the scheduler's, capped by the stash: rows the
-        request decoded while the batch held more than one request have no residual, and
-        the head starts with a hole there (draft quality only).
-        """
-        residual = req.spec_residual
-        assert residual is not None and prologue is not None, "prologue without the residual stash"
-        next_embed = model.model.embed_tokens.forward(prologue.input_ids)
-        self.attn_backend.prepare_metadata(prologue)
-        model.mtp.forward(residual, next_embed, prologue)
-        req.spec_head_len = int(prologue.reqs[0].device_len)
-        req.spec_residual = None  # consumed; the stash storage is released here
-
-    # ----------------------------------------------------------- sampled spec step
-
-    def spec_uniforms(self) -> torch.Tensor:
-        """Four fresh uniforms (accept, residual, bonus, draft) for one spec step, on host.
-
-        A fixed CPU generator, not the device RNG: every TP rank samples the same token from
-        the same gathered logits, so ranks cannot diverge on the accept decision, and with the
-        verify trace on (which prints them) a step is reproducible from its log.
-        """
-        gen = getattr(self, "_spec_gen", None)
-        if gen is None:
-            gen = self._spec_gen = torch.Generator().manual_seed(0x5EC7)  # rank-independent
-        return torch.rand(4, generator=gen)
-
-    def _spec_stage(self, uniforms: torch.Tensor, draft_id: int):
-        """The sampled step's host values as ONE async H2D, and its device views.
-
-        The four fp32 uniforms ride bit-exact in the first two int64 slots (an fp32 view of
-        the pinned row) and the draft id under test in the third. Pageable copies of this
-        size serialize against the stream they feed; one pinned row does not, and the eager
-        sampled step used to pay three of them.
-        """
-        h = getattr(self, "_spec_stage_h", None)
-        if h is None:
-            h = self._spec_stage_h = torch.empty(3, dtype=torch.int64, pin_memory=True)
-            self._spec_stage_d = torch.empty(3, dtype=torch.int64, device=self.device)
-        h.view(torch.float32)[:4].copy_(uniforms)
-        h[2] = draft_id
-        self._spec_stage_d.copy_(h, non_blocking=True)
-        return self._spec_stage_d.view(torch.float32)[:4], self._spec_stage_d[2:3]
-
-    def _spec_draft_probs(self, req: Req, vocab: int) -> torch.Tensor:
-        """The head density carried from one spec step to the next, one row per request.
-
-        The rejection test needs the distribution that PRODUCED the draft id, and the head pass
-        that produced it ran in the previous step -- its argmax went out in the payload, its
-        density stays here. One row of fp32 costs ~1 MiB and no host round-trip.
-
-        It lives on the request, not the engine: spec steps only run for a single-request batch,
-        but two requests alternate those batches, and a shared row would have every request's
-        second verify reject-test against the OTHER request's density -- which both loses
-        acceptance and drops the guarantee that the emitted token follows the target's
-        distribution, since rejection sampling is unbiased only against the p it drew from.
-        """
-        buf = req.spec_draft_probs
-        if buf is None or buf.shape[-1] != vocab:
-            buf = req.spec_draft_probs = torch.zeros(
-                1, vocab, dtype=torch.float32, device=self.device
-            )
-        return buf
-
-    def _spec_sampled_step(self, model, batch: Batch, req: Req, mixed, residual,
-                           uniforms) -> tuple[dict, torch.Tensor]:
-        """The non-greedy MTP step: returns ``(payload, next_token)``.
-
-        Counterpart of the greedy branch in :meth:`_forward_spec`, running the same three ops
-        the captured greedy body runs on its static buffers, but with the real per-request
-        tensors and the request's own sampling parameters:
-
-          1. the target's distribution at the drafted position, truncated and renormalized
-             exactly as the draft head's was when it drew the id under test;
-          2. the rejection test on that pair -- keep the draft, else take the residual draw,
-             which is what pins the output to the target's distribution for any draft head;
-          3. the head pass on the VERIFIED prefix, whose density is both the next draft's draw
-             and the next step's ``p``.
-
-        Row 1 of the target pass only means anything once the draft is accepted, so the bonus
-        token it yields (the K+1-th token, drawn from the target's own distribution rather than
-        argmaxed) is dropped on a rejection -- the same one-or-two tokens per step the greedy
-        path pays out.
-        """
-        from .spec_sample import draw_probs, rejection_sample, trunc_renorm_probs
-
-        params = req.sampling_params
-        verify = batch.spec_mode == "verify"
-        logits = model.full_vocab_logits(mixed)
-        # Both target rows truncate in ONE pass: the kernels are per row (and so is the CPU
-        # reference), so row 0's q is bit-identical to the separate call this replaces, minus
-        # a few launches on a step that is already paying for two rows of the target.
-        qs = trunc_renorm_probs(logits, params.temperature, params.top_k, params.top_p)
-        q = qs[:1]
-        u, draft = self._spec_stage(uniforms, batch.spec_draft_id if verify else 0)
-        if verify:
-            carried = self._spec_draft_probs(req, logits.shape[-1])
-            emit, accept, ratio = rejection_sample(q, carried, draft, u[0:1], u[1:2])
-            # row 1 re-draws from the target's own row-1 density: on an acceptance the head
-            # consumes this token, and the next verify's draft comes out of the same pass
-            # (both draws are [rows] tensors and the head indexes a FLAT id list, so stacking
-            # them into a [2, 1] column dies inside the embedding gather)
-            head_in = torch.cat((emit, draw_probs(qs[1:2], u[2:3])))
-            select_row = accept.to(torch.int64)
-        else:
-            emit, accept = draw_probs(q, u[0:1]), torch.zeros(
-                1, dtype=torch.bool, device=self.device)
-            head_in, select_row = emit, None
-        p_next = trunc_renorm_probs(
-            model.draft(residual, head_in.to(torch.int32), batch, select_row=select_row,
-                        return_logits=True),
-            params.temperature, params.top_k, params.top_p)
-        draft_id = draw_probs(p_next, u[3:4])
-        if verify and debug_traced():
-            from .spec_sample import expected_acceptance
-
-            logger.info_rank0(
-                f"[mtp-s] u={[round(v, 4) for v in uniforms.tolist()]} "
-                f"ratio={ratio.item():.3f} "
-                f"ceiling={expected_acceptance(q, carried).item():.3f} accept={int(accept)}"
-            )
-        # zero on a request's first verify (the prologue builds head KV without producing
-        # densities): a zero p always rejects, and the residual is then exactly q, so the
-        # emitted token is still a clean target draw
-        self._spec_draft_probs(req, p_next.shape[-1]).copy_(p_next)
-        bonus = head_in[1:2] if verify else emit  # row 1 means nothing on a rejection
-        vals = torch.cat((emit, bonus, draft_id, accept.to(torch.int64))).tolist()
-        payload = {"y1": int(vals[0]), "draft": int(vals[2])}
-        if verify:
-            payload.update({"y2": int(vals[1]), "accept": bool(vals[3])})
-            return payload, bonus.view(1).to(torch.int32)
-        return payload, emit.view(1).to(torch.int32)
-
-
-    def _spec_stash_eligible(self, batch: Batch, use_graph: bool) -> bool:
-        """Whether this prefill forward must produce the residual the MTP head catches up on.
-
-        The residual is a full [T, hc*hidden] copy of the chunk, so it is only paid for a
-        batch with someone who can draft with it: requests already declined stay off,
-        multimodal rows keep the regular decode path, and sampling is judged with the same
-        predicate as the per-request gate and the verify itself (:func:`spec_supported`).
-        Testing it against ``is_greedy`` here instead starves every sampled request in
-        silence: with no stash there is never a first draft, so the request decodes regularly
-        and no decline reason is recorded either.
-        """
-        if self.config.speculative != "mtp" or not batch.is_prefill or use_graph:
-            return False
-        return any(
-            not getattr(r, "spec_off", False)
-            and spec_supported(r.sampling_params)
-            and not getattr(r, "mm_items", None)
-            for r in batch.padded_reqs
-        )
-
-    def _stash_spec_residual(self, batch: Batch, residual: torch.Tensor) -> None:
-        """Per-req residual rows of this prefill chunk, for the head's catch-up pass.
-
-        The catch-up pass is a head-only prefill over the rows THIS request's prefills computed,
-        so what it needs is a hole-free span starting at position 0 -- not one chunk. Every chunk
-        adds its rows to the stash, which makes a prompt that splits over --max-prefill-length as
-        draftable as a short one. A prefix-cache hit stays declined: those rows were never run
-        and nothing downstream can produce them. Multimodal spans and over-budget prompts opt
-        out, and so does non-greedy sampling while the FREETOKEN_MTP_SAMPLING kill switch turns
-        the sampled verify off (see spec_supported); all of these turn spec off for the request
-        and record the reason on it, which the scheduler counts at the drain.
-
-        The stash is prompt-sized, so it lives and dies by mtp_stash_budget (per-row cost there).
-        """
-        budget = mtp_stash_budget()
-        multi = len(batch.padded_reqs) > 1
-        from freetoken.scheduler.prefill import ChunkedReq
-
-        off = 0
-        for req in batch.padded_reqs:
-            n = req.extend_len
-            rows, off = residual[off:off + n], off + n
-            if getattr(req, "spec_off", False):
-                continue
-            prior = req.spec_residual
-            held = 0 if prior is None else int(prior.shape[0])
-            if held != req.cached_len or held + n > budget:
-                # No hole-free span that fits the cap. Either the rows are gone (a radix hit) or
-                # the prompt is longer than the stash budget -- with cold-start drafting the
-                # head simply starts without a catch-up pass, so nothing is declined here; the
-                # partial stash goes because a span with a hole at the END is worthless.
-                if mtp_cold_start():
-                    req.spec_residual = None
-                    continue
-                reason = "prefix_hit" if held != req.cached_len else "over_budget"
-            elif getattr(req, "linear_slot_idx", None) is None:
-                reason = "no_gdn_pool"  # nothing to clone for a rejection rollback
-            elif not spec_supported(req.sampling_params):
-                reason = "nongreedy"  # sampled drafting is available but switched off
-            elif getattr(req, "mm_items", None):
-                reason = "mm"
-            else:
-                reason = ""
-            if reason:
-                req.spec_off = True
-                req.spec_off_reason = reason
-                # the numbers the decision was made on, for the scheduler's decline line
-                sp = req.sampling_params
-                # a chunk's input_ids is a prefix slice: on an intermediate chunk this counts the
-                # rows placed so far, not the prompt, and calling that "prompt" made a 35k prompt
-                # declining at its fourth chunk read like a 16k one
-                span = "rows" if isinstance(req, ChunkedReq) else "prompt"
-                req.spec_off_detail = (
-                    f"{span}={req.input_ids.numel()} new={n} cached={req.cached_len} "
-                    f"stashed={held} out={req.output_len} stash_budget={budget} "
-                    f"sampling=(T={sp.temperature}, top_k={sp.top_k}, top_p={sp.top_p})"
-                )
-                req.spec_residual = None
-                continue
-            if prior is None:
-                # a view of this forward's rows when nobody else shares the buffer: the stash
-                # outlives the forward, but the buffer it was cut from is not reused either
-                req.spec_residual = rows.clone() if multi else rows
-            else:
-                req.spec_residual = torch.cat((prior, rows))
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -3999,24 +3679,23 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
-    # The pool family is the earlier constraint than the backend list: a pool that cannot
-    # descale its own reads would mis-serve silently, and its message names the fix (drop
-    # the flag) where the backend search can only report the symptom (nothing left to pick).
-    check_kv_quant(getattr(config, "kv_quant", None), model_config)
     if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
         raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+    _validate_kv_format(config, model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
             _resolve_auto_attention_backend(
                 required_attn_types,
-                getattr(config, "kv_quant", None) is not None,
                 tp_size,
+                kv_format=getattr(config, "kv_format", NONE),
             ),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if getattr(config, "speculative_algorithm", None) is not None:
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

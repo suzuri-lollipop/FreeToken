@@ -68,7 +68,7 @@ class PrefillGraphRunner:
     def eligible(self, engine: "Engine", batch: Batch) -> bool:
         if self.disabled:
             return False
-        if not batch.is_prefill or getattr(batch, "spec_mode", None) is not None:
+        if not batch.is_prefill:
             return False
         if batch.mm_gather_plan:
             return False
@@ -81,12 +81,6 @@ class PrefillGraphRunner:
         if req.can_decode or req.extend_len != self.T or req.cached_len <= 0:
             return False
         if getattr(req, "mm_items", None):
-            return False
-        if getattr(req, "spec_residual", None) is not None and not getattr(req, "spec_off", False):
-            # The replay returns before the engine's residual-stash gate, so a graphed chunk
-            # would commit rows the MTP head never gets a residual for -- hole in the span,
-            # and the request declines for the rest of its life. Keep it eager while its
-            # stash is live; a request already off-spec has nothing left to protect.
             return False
         if req.linear_slot_idx is None or engine.linear_state_pool is None:
             return False
@@ -154,7 +148,7 @@ class PrefillGraphRunner:
         shadow = SimpleNamespace(
             extend_len=T, cached_len=0, device_len=T, table_idx=0, linear_slot_idx=0,
             mamba_ping_pong=(0, 0), mamba_next_track_idx=0, mamba_last_track_seqlen=None,
-            mamba_restore_src=None, spec_slot_idx=None,
+            mamba_restore_src=None,
         )
         batch = Batch(reqs=[shadow], phase="prefill")
         batch.padded_reqs = [shadow]
@@ -223,7 +217,7 @@ class PrefillGraphRunner:
         self._gather_inputs(engine)
         batch = self.batch
         # backbone only: a continuation chunk samples nothing (no lm_head, no sampler)
-        model.model.forward_with_residual(batch.input_ids, batch)
+        model.model.forward(batch.input_ids, batch)
 
     # ------------------------------------------------------------------ state save/restore
     @staticmethod

@@ -206,10 +206,10 @@ def test_extend_config_for_mtp_rejects_missing_head():
         extend_config_for_mtp(parse_config(_hf_config()))  # no mtp block
 
 
-def test_speculative_field_defaults_to_none():
+def test_speculative_algorithm_defaults_to_none():
     from freetoken.engine.config import EngineConfig
 
-    assert EngineConfig.speculative == "none"
+    assert EngineConfig.speculative_algorithm is None
 
 
 def test_ple_on_full_attention_layer_rejected():
@@ -259,7 +259,7 @@ def test_vision_turns_on_mrope_and_the_tower():
 def test_text_only_keeps_the_1d_rope():
     config = parse_config(_hf_config())
     assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
-# the merged-projection prefixes the model asks the QuantConfig about (attention.py / gdn.py)
+# the merged-projection prefixes the model asks the QuantConfig about (attention.py / layers/linear_attn/gdn.py)
 DENSE_PREFIXES = (
     "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",
     "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",

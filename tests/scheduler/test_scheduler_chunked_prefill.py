@@ -90,39 +90,6 @@ def test_multichunk_overlap_no_double_free():
     assert len(cm.free_slots) == cm.num_pages - 4 * CHUNK
 
 
-def test_a_continuation_chunk_carries_the_mtp_stash():
-    """Stage D: the head catches up over the rows EVERY chunk computed, so the residual stash has
-    to survive the fresh Req a continuation is built into. Dropped at the chunk boundary it is
-    indistinguishable from the hole a prefix-cache hit leaves, and long prompts never draft."""
-    from freetoken.core import SamplingParams
-    from freetoken.scheduler.prefill import ChunkedReq
-    from freetoken.scheduler.utils import PendingReq
-
-    cm, _tm, _dm, pm = _build_managers(num_pages=64)
-    pm.pending_list = [PendingReq(uid=UID, input_ids=torch.arange(3 * CHUNK, dtype=torch.int32),
-                                  sampling_params=SamplingParams(max_tokens=4))]
-
-    first = pm.schedule_next_batch(CHUNK)
-    cm.allocate_paged(first.reqs)
-    req0 = first.reqs[0]
-    assert isinstance(req0, ChunkedReq)
-    stash = torch.arange(CHUNK * 2, dtype=torch.float32).view(CHUNK, 2)
-    req0.spec_residual = stash  # what the engine's gate leaves on a chunk's rows
-    req0.complete_one()
-
-    second = pm.schedule_next_batch(CHUNK)
-    cm.allocate_paged(second.reqs)
-    req1 = second.reqs[0]
-    assert req1.spec_residual is stash
-    assert not req1.spec_off
-    req1.spec_off = True  # declined mid-prompt: the veto belongs to the whole request
-    req1.complete_one()
-
-    third = pm.schedule_next_batch(CHUNK)
-    assert not isinstance(third.reqs[0], ChunkedReq)  # the last chunk
-    assert third.reqs[0].spec_residual is stash and third.reqs[0].spec_off
-
-
 def test_radix_hit_admission_reports_nonzero_cached_tokens():
     """A second request sharing a cached prefix admits with the prefix-cache hit recorded."""
     from freetoken.core import SamplingParams
@@ -183,6 +150,46 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     batch = pm.schedule_next_batch(16)
     assert batch is not None
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
+
+
+def test_chunked_reqs_share_one_stats_stamped_at_the_first_chunk():
+    """The queue span ends and the prompt span starts when the FIRST chunk launches, and
+    every chunk Req shares one ReqStats, so the token stamps the final chunk's drain
+    takes land on the instance the admission stamps populated. A per-chunk restamp would
+    hide the queue wait and the earlier chunks' prefill time."""
+    from types import SimpleNamespace
+
+    from freetoken.core import SamplingParams
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompt_len = 3 * CHUNK
+    pm.add_one_req(SimpleNamespace(
+        uid=UID, input_ids=torch.arange(prompt_len, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4), mm_items=None,
+        mrope_positions=None, mrope_delta=0,
+    ))
+    pending = pm.pending_list[0]
+    assert pending.stats.enqueued_at is not None
+
+    seen_first_chunks = []
+    while pm.runnable:
+        batch = pm.schedule_next_batch(CHUNK)
+        assert batch is not None
+        cm.allocate_paged(batch.reqs)
+        for req in batch.reqs:
+            req.complete_one()
+            seen_first_chunks.append(req.stats.first_chunk_at)
+            assert req.stats is pending.stats
+        if pm.pending_list:  # the final chunk leaves no continuation behind
+            assert pm.pending_list[0].stats is pending.stats
+
+    assert pending.stats.first_chunk_at is not None
+    assert pending.stats.first_chunk_at >= pending.stats.enqueued_at
+    assert pending.stats.cache_n == 0
+    assert pending.stats.prompt_n == prompt_len
+    # stamped once, on the first chunk: every later chunk reads the same value
+    assert len(seen_first_chunks) == 3
+    assert all(f == pending.stats.first_chunk_at for f in seen_first_chunks)
 
 
 def test_chunk_ends_before_an_image_it_would_cut_on_bidirectional_models():

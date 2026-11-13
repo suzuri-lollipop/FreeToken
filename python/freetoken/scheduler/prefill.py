@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, ReqStats
 from freetoken.utils import align_down, div_ceil, init_logger
 
 from .mm import mm_chunk_end, mm_rows_after
@@ -56,6 +56,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # slots a decode step may hold past a request's own length; reserved with it
+    token_headroom: int = 0
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -80,7 +82,7 @@ class PrefillAdder:
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_size = self._kv_reservation_size(
-            req.input_len + req.output_len, cached_len
+            req.input_len + req.output_len + self.token_headroom, cached_len
         )
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
@@ -203,7 +205,7 @@ class PrefillAdder:
         # page span here; charging raw tokens can admit several short requests against one page
         # even though allocate_paged() needs a separate page for each request.
         self.reserved_size += self._kv_reservation_size(
-            pending_req.input_len + pending_req.output_len, cached_len
+            pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
         )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
@@ -222,6 +224,9 @@ class PrefillAdder:
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
         req.mrope_delta = pending_req.mrope_delta
+        # one ReqStats across all chunk Reqs of the request: the stamps the scheduler
+        # takes on the final chunk's Req must survive the intermediate ones
+        req.stats = pending_req.stats
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
@@ -248,16 +253,10 @@ class PrefillAdder:
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
-            # A continuation is a FRESH Req, so the MTP residual stash has to be handed over here:
-            # the head catches up over every row the chunks computed, and a stash dropped at the
-            # chunk boundary is indistinguishable from the hole a prefix-cache hit leaves. The
-            # decline reason is deliberately not carried -- the chunk that decided it reports it
-            # at its own drain, and carrying it would count the same request twice.
+            # A continuation is a FRESH Req: the phase split has to be handed over here.
+            # The queue wait was paid once, at the first chunk, and the prefill time of the
+            # chunks behind this one has to reach its final drain.
             if req is not None:
-                req.spec_residual = chunked_req.spec_residual
-                req.spec_off = chunked_req.spec_off
-                # Same for the phase split: the queue wait was paid once, at the first chunk, and
-                # the prefill time of the chunks behind this one has to reach its final drain.
                 req.queue_ms = chunked_req.queue_ms
                 req.prefill_ms = chunked_req.prefill_ms
             return req
@@ -294,6 +293,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    token_headroom: int = 0
     pending_list: List[PendingReq] = field(default_factory=list)
     # FREETOKEN_ADMIT_SHORT_FIRST (port of STRATA_ADMIT_SHORT_FIRST): a new prompt of at
     # most this many tokens is admitted before longer ones; 0 keeps pure arrival order.
@@ -333,6 +333,7 @@ class PrefillManager:
         return cont + [p for _k, p in sorted(new, key=key)]
 
     def add_one_req(self, req: UserMsg) -> None:
+        stats = ReqStats(enqueued_at=time.perf_counter())
         self.pending_list.append(
             PendingReq(
                 req.uid,
@@ -342,6 +343,7 @@ class PrefillManager:
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
                 enqueued_at=self._now(),
+                stats=stats,
             )
         )
 
@@ -357,6 +359,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            token_headroom=self.token_headroom,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -386,6 +389,11 @@ class PrefillManager:
                     prompt_admissions.append(
                         (req.uid, pending_req.input_len, req.cache_handle.cached_len)
                     )
+                    # The first prefill chunk is launching: queue time ends here and the
+                    # prompt span starts (ReqStats carries both to the final chunk's Req).
+                    pending_req.stats.first_chunk_at = time.perf_counter()
+                    pending_req.stats.cache_n = req.cache_handle.cached_len
+                    pending_req.stats.prompt_n = pending_req.input_len - req.cache_handle.cached_len
                     if pending_req.mm_items and self.encoder_cache is not None:
                         # claim the rows every chunk of this request will gather; the entry outlives the chunks
                         for item in pending_req.mm_items:

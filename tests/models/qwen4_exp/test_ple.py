@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 
+from freetoken.attention.linear import FLAMetadata
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.ple import (
@@ -29,7 +30,7 @@ from freetoken.models.qwen4_exp.ple import (
     short_conv_reference,
 )
 
-from .common import EOS, VOCAB, hash_constants, requires_cuda, toy_hf_config
+from .common import EOS, VOCAB, fresh_ctx, hash_constants, requires_cuda, toy_hf_config
 
 _HF_REF_PYTHON = os.environ.get("FREETOKEN_QWEN4_HF_PYTHON", "")
 _HF_REF_SCRIPT = Path(__file__).with_name("ple_hf_ref.py")
@@ -108,41 +109,6 @@ def _run_hf_reference(tmp_path, data: dict, layer_idx=2, ple_layer_index=0) -> d
         capture_output=True,
     )
     return dict(np.load(tmp_path / "out.npz"))
-
-
-def test_spec_snapshot_matches_one_token_ple_and_ngram_state():
-    config = _config()
-    layer = _make_layer(config)
-    width = config.qwen4_args.ple_state_width
-    torch.manual_seed(52)
-    residual = torch.randn(2, width)
-    states = torch.randn(4, width, layer.state_len)
-    original = states.clone()
-    reference = states.clone()
-    context = torch.tensor([[7, 8], [11, 12], [13, 14], [15, 16]])
-    context_before = context.clone()
-    meta = _meta([[21, 22]], [[7, 8]], slots=[0])
-    fla = SimpleNamespace(
-        spec_state_indices=torch.tensor([2]),
-        track_boundary_row=None,
-        # the spec verify pass hands over its query indptr; one query here
-        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
-    )
-    batch = SimpleNamespace(fla_metadata=fla)
-    got = layer.forward(residual, batch, meta, states)
-    commit_ngram_context(meta, fla, context)
-    first_meta = _meta([[21]], [[7, 8]], slots=[0], decode=True)
-    first = layer.forward(residual[:1], SimpleNamespace(fla_metadata=None), first_meta, reference)
-    middle = reference[0].clone()
-    second_meta = _meta([[22]], [[8, 21]], slots=[0], decode=True)
-    second = layer.forward(residual[1:], SimpleNamespace(fla_metadata=None), second_meta, reference)
-    torch.testing.assert_close(got, torch.cat([first, second]))
-    torch.testing.assert_close(states[0], reference[0])
-    torch.testing.assert_close(states[2], middle)
-    torch.testing.assert_close(states[[1, 3]], original[[1, 3]])
-    assert context[0].tolist() == [21, 22]
-    assert context[2].tolist() == [8, 21]
-    torch.testing.assert_close(context[[1, 3]], context_before[[1, 3]])
 
 
 # --------------------------------------------------------------------------------------
@@ -404,14 +370,10 @@ def _state_pool(config, num_slots=8):
 
 def _track_batch(req, tokens, pool):
     """Prefill batch whose FLAMetadata carries the hybrid-radix track indices for ``req``."""
-    import freetoken.core as core
     from freetoken.attention.linear import build_fla_metadata
-    from freetoken.core import Context, set_global_ctx
 
-    core._GLOBAL_CTX = None  # test-only: build_fla_metadata reads the state pool off the ctx
-    set_global_ctx(Context(page_size=64, linear_state_pool=pool))
     batch = _fake_batch([req], decode=False, input_ids=tokens)
-    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"))
+    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"), pool)
     return batch
 
 
@@ -442,7 +404,7 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
     batch = _track_batch(req, tokens, pool)
 
     fla = batch.fla_metadata
-    assert fla.track_dst.tolist() == [dst]
+    assert fla.track_dst.tolist() == [dst] and fla.track_src.tolist() == [live]
     assert req.mamba_last_track_seqlen == CHUNK_SIZE
     assert fla.track_boundary_row.tolist() == [CHUNK_SIZE]
 
@@ -598,8 +560,9 @@ def _fake_batch(reqs, *, decode, input_ids, positions=None, table_idx=None, devi
         is_prefill=not decode,
         input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
         positions=None if positions is None else torch.tensor(positions, dtype=torch.int32, device=device),
-        linear_table_idx=(
-            None if table_idx is None else torch.tensor(table_idx, dtype=torch.int32, device=device)
+        fla_metadata=None if table_idx is None else FLAMetadata(
+            cu_seqlens=torch.arange(len(table_idx) + 1, dtype=torch.int32, device=device),
+            cache_indices=torch.tensor(table_idx, dtype=torch.int32, device=device),
         ),
     )
 
@@ -662,6 +625,66 @@ def test_context_matches_the_token_history_across_chunks_and_decode():
         cached += 1
 
 
+@requires_cuda
+@pytest.mark.parametrize("accepted", [(1, 4), (2, 1), (4, 3)])
+def test_verify_commit_matches_stepwise_decode(accepted):
+    """A verify forward over k+1 rows per request leaves the PLE state as it was; committing n rows leaves the conv history and n-gram context of n decode steps, and every row's conv output is its decode step's, bitwise."""
+    from freetoken.attention.linear import FLAMetadata
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.qwen4_exp.config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+    torch.manual_seed(19)
+    config = _config()
+    args = config.qwen4_args
+    device = torch.device("cuda")
+    layer = _make_layer(config, device="cuda")
+    pool = LinearStatePool(config.linear_attention_group(), 6, torch.float32, device, tp_size=1, slot_states=config.slot_states)
+    fresh_ctx(linear_state_pool=pool)
+    rows, slots = 4, [3, 1]
+    bs = len(slots)
+    conv = pool.slot_state(PLE_CONV_STATE, layer.layer_id)
+    context = pool.slot_state(PLE_NGRAM_STATE)
+    conv.copy_(torch.randn_like(conv))
+    context.copy_(torch.randint(8, VOCAB, context.shape, device=device, dtype=context.dtype))
+    conv0, context0 = conv.clone(), context.clone()
+    tokens = torch.tensor([[11, EOS, 12, 13], [14, 15, 16, EOS]], dtype=torch.int32, device=device)
+    x = torch.randn(bs, rows, args.ple_state_width, device=device)
+    slot_ids = torch.tensor(slots, dtype=torch.int32, device=device)
+
+    def batch(phase, input_ids, extend):
+        reqs = [Req(input_ids=torch.zeros(8 + extend, dtype=torch.int32), table_idx=slot, cached_len=8, output_len=8,
+                    uid=i, sampling_params=SamplingParams(), cache_handle=None) for i, slot in enumerate(slots)]
+        b = Batch(reqs=reqs, phase=phase, rows_per_req=extend)
+        b.padded_reqs, b.input_ids = reqs, input_ids
+        b.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * extend, cache_indices=slot_ids)
+        return b
+
+    want, after = [], []
+    for t in range(rows):
+        meta = build_ple_metadata(batch("decode", tokens[:, t].contiguous(), 1), args, device)
+        want.append(layer._short_conv(x[:, t].contiguous(), meta, conv))
+        commit_ngram_context(meta, None)
+        after.append((conv.clone(), context.clone()))
+    conv.copy_(conv0)
+    context.copy_(context0)
+
+    pool.attach_verify_scratch(bs, rows)
+    meta = build_ple_metadata(batch("verify", tokens.view(-1), rows), args, device)
+    got = layer._short_conv(x.view(bs * rows, -1), meta, conv)
+    pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+    assert torch.equal(conv, conv0) and torch.equal(context, context0)
+    assert torch.equal(got.view(bs, rows, -1), torch.stack(want, dim=1))
+
+    pool.commit_verify(slots, list(accepted))
+    for slot, n in zip(slots, accepted):
+        assert torch.equal(conv[slot], after[n - 1][0][slot]), f"conv history of slot {slot} after {n} rows"
+        assert torch.equal(context[slot], after[n - 1][1][slot]), f"n-gram context of slot {slot} after {n} rows"
+    others = [s for s in range(conv.shape[0]) if s not in slots]
+    assert torch.equal(conv[others], conv0[others]) and torch.equal(context[others], context0[others])
+
+
 # --------------------------------------------------------------------------------------
 # CUDA graph + prefetch overlap
 # --------------------------------------------------------------------------------------
@@ -685,7 +708,8 @@ def test_decode_graph_replay_matches_eager():
     batch = SimpleNamespace(
         padded_reqs=[None] * bs, is_decode=True, is_prefill=False,
         input_ids=torch.randint(0, VOCAB, (bs,), device="cuda", dtype=torch.int32),
-        positions=positions, linear_table_idx=slots,
+        positions=positions,
+        fla_metadata=FLAMetadata(cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device="cuda"), cache_indices=slots),
     )
     R = torch.randn(bs, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
     states0 = torch.randn(bs + 1, args.ple_state_width, args.ple_conv_state_len,

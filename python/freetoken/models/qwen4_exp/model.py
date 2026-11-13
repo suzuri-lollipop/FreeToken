@@ -25,9 +25,9 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
+from .config import PLE_NGRAM_STATE
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
-from .mtp import Qwen4ExpMTPHead
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -39,10 +39,10 @@ if TYPE_CHECKING:
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
-    from .gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet
 
     g = config.linear_attention_group()
-    return Qwen4ExpGatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
         num_v_heads=g.num_value_heads,
@@ -118,12 +118,7 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward_with_residual(self, input_ids: torch.Tensor, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
-        """``forward`` plus the raw hyper-connection residual: ``(mixed [T,H], R [T,HC*H])``.
-
-        The MTP spec path consumes R (the head's fc_hidden input) alongside the logits,
-        so the top mixer's INPUT has to escape the model too.
-        """
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
         hidden = hidden.repeat(1, self.hc_count)
         meta = None
@@ -133,16 +128,23 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
+        features = batch.features
+        wanted = features.wanted_layers if features is not None else ()
+        for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
-        if meta is not None:
+            if i in wanted:
+                features.layer_output(i, hidden, num_streams=self.hc_count)
+        if meta is not None and meta.is_verify:
+            # the commit rolls the context by the accepted rows only
+            get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+        elif meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0], hidden
-
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        return self.forward_with_residual(input_ids, batch)[0]
+        if features is not None:
+            # a draft reads the residual streams before the final mix
+            features.final_hidden(hidden)
+        return self.hyper_connection_mixer.mix(hidden)[0]
 
     def forward_dual(self, batchA: Batch, batchB: Batch, side: torch.cuda.Stream) -> torch.Tensor:
         """Dual-microbatch decode: run the two half-batches on skewed streams.
@@ -270,19 +272,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
-        # Speculative MTP head (--speculative mtp): attached under `mtp` so the strict
-        # weight load lines up with the checkpoint's mtp.* names. Nothing in the serving
-        # path calls it until the spec step lands (Phase 1 of _scratch/mtp_design.md);
-        # the wiring variant is the probe knob FREETOKEN_MTP_WIRING.
-        self.mtp = (
-            Qwen4ExpMTPHead(
-                config,
-                layer_id=config.num_layers,
-                wiring=os.getenv("FREETOKEN_MTP_WIRING", "norm_mixfrom_fc"),
-            )
-            if config.qwen4_args.mtp_enabled
-            else None
-        )
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -326,11 +315,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "eos_token_id": args.ngram_boundary_token_id,
                 "image_token_id": args.image_token_id,
             }
+            rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
                 resolve_row_source(engine_config.model_path),
                 constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
+                # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
+                max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
+                # an eager decode or verify step stages max_running_req * rows tokens, which can exceed a prefill chunk
+                max_eager_tokens=max(engine_config.max_extend_tokens, engine_config.max_running_req * rows),
             )
             self._ple_table = disk_table
             for ple in ple_layers:
@@ -359,74 +351,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return self.lm_head.forward(
                 self.model.forward_dual(dual[0], dual[1], self._dual_stream)
             )
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
-
-    def forward_with_residual_ctx(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """``forward()`` over the ctx batch, plus the raw residual (the engine's MTP stash)."""
-        batch = get_global_ctx().batch
-        mixed, residual = self.model.forward_with_residual(batch.input_ids, batch)
-        return self.lm_head.forward(mixed), residual
-
-    def full_vocab_logits(self, mixed: torch.Tensor) -> torch.Tensor:
-        """Full ``[T, vocab]`` logits from mixed hidden rows.
-
-        The spec path needs EVERY row (ParallelLMHead.forward's row selection is
-        ctx-driven: per-request last row), so this is the head's own shard projection
-        (its weight may be an fp8 replacement by now) plus the head's vocab gather
-        (rank-major order, padding trimmed) -- the same contract
-        ParallelLMHead.forward implements for its selected rows.
-        """
-        head = self.lm_head
-        logits = head.shard_logits(mixed)
-        if head.tp_size == 1:
-            return logits
-        shape = logits.shape
-        gathered = head._comm.all_gather(logits)
-        gathered = gathered.view((head.tp_size,) + shape).permute(1, 0, 2).contiguous()
-        return gathered.reshape(shape[0], head.tp_size * shape[1])[:, : head.num_embeddings]
-
-    def greedy_ids(self, mixed: torch.Tensor) -> torch.Tensor:
-        """Select every row's global argmax with one candidate per vocab shard."""
-        head = self.lm_head
-        logits = head.shard_logits(mixed)
-        if head.tp_size == 1:
-            return logits.argmax(-1)
-        start, count = head.vocab_range
-        logits[:, count:] = -torch.inf
-        values, indices = logits.max(-1)
-        # Float64 preserves both FP32 scores and token ids in a single collective.
-        candidates = torch.stack(
-            (values.to(torch.float64), (indices + start).to(torch.float64)), -1
-        )
-        # PyNCCL accepts only 16-bit floats; transport the bits without conversion.
-        gathered = head._comm.all_gather(candidates.view(torch.bfloat16))
-        gathered = gathered.view(torch.float64).view(head.tp_size, mixed.shape[0], 2)
-        # Rank-major order preserves full-vocab argmax's lowest-id tie break.
-        winners = gathered[:, :, 0].argmax(0)
-        return gathered[:, :, 1].gather(0, winners.unsqueeze(0)).squeeze(0).to(torch.int64)
-
-    def draft(self, residual: torch.Tensor, next_ids: torch.Tensor, batch: Batch,
-              *, select_row: torch.Tensor | None = None,
-              return_logits: bool = False) -> torch.Tensor:
-        """MTP head output for the rows of ``residual`` (the spec step's head pass).
-
-        All rows update head KV. select_row chooses which verified prefix needs
-        a new draft before the shared mixer and vocabulary projection.
-
-        ``return_logits`` trades the argmax ids for the head's full-vocab logits: a sampled
-        request needs the head's DENSITY (it is both the distribution the draft is drawn from
-        and the ``p`` of the next step's rejection test), which argmax throws away.
-        """
-        if self.mtp is None:
-            raise AssertionError("draft() needs the MTP head (--speculative mtp)")
-        # the embedding gather indexes with a flat id list; a column would fail in the kernel
-        assert next_ids.dim() == 1, f"draft() needs flat next_ids, got {tuple(next_ids.shape)}"
-        next_embed = self.model.embed_tokens.forward(next_ids)
-        head_out = self.mtp.forward(residual, next_embed, batch)
-        if select_row is not None:
-            head_out = head_out.index_select(0, select_row)
-        mixed = self.model.hyper_connection_mixer.mix(head_out)[0]
-        return self.full_vocab_logits(mixed) if return_logits else self.greedy_ids(mixed)
+        # the model hands its pre-mix streams to batch.features itself
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

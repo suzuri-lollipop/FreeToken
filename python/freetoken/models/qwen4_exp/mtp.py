@@ -1,201 +1,204 @@
-"""MTP speculative head for Qwen3.8-Flash-Next (qwen4_exp).
+"""Qwen3.8-Flash-Next MTP draft: the checkpoint's own ``mtp.*`` layer, one QSA decoder layer over the hyper-connection streams.
 
-One extra full-attention decoder layer over the hyper-connection streams plus the
-fc/norm front end that fuses the next-token embedding with the main model's final
-residual ``R [T, hc_count*hidden]``. Shares ``embed_tokens``/``lm_head``/the top-level
-mixer with the main model (the caller passes them in; nothing is double-registered).
+Draft row c reads the target's residual streams before the final mix, ``R_c [hc_count*hidden]``, and the token after it::
 
-Attach the head as the owning model's ``mtp`` attribute: its state-dict names then
-match the checkpoint's ``mtp.*`` dense keys exactly (loader fusions aside: q|k|v ->
-qkv_proj and down+inject -> input_mix_weight_down_block_inject, both already handled
-for the main layers).
+    e     = fc_embedding(norm_e(embed(x_{c+1})))
+    R_in  = fc_hidden(norm_h(R_c)) per stream + e      # norm_h: one RMS statistic over all hc_count*hidden
+    R_out = layer(R_in)                                # QSA attention + routed MoE, no PLE
+    logits = lm_head(mixer(R_out))
 
-Wiring (design doc _scratch/mtp_design.md section 4; the checkpoint ships no HF
-reference, so the front-end order is an empirical question settled by acceptance-rate
-probing -- ``wiring`` selects the hypothesis under test):
-
-    e  = fc_embedding(pre_fc_norm_embedding(embed(next_ids)))        # [T, H]
-    h  = fc_hidden(mixer.<mix>(pre_fc_norm_hidden(R)))               # [T, H]
-    R0 = (e + h).repeat(1, hc_count)                                 # [T, HC*H]
-    -- one Qwen4ExpDecoderLayer-shaped pass (attn HC -> QSA -> mlp HC -> MoE) --
-    R_out                                                            # [T, HC*H]
-
-and the spec step collapses ``R_out`` through the main model's top-level mixer and
-lm_head. The front-end order was settled empirically (the checkpoint ships no HF
-reference): the acceptance-rate probe on real weights (_scratch/mtp_probe.py,
-2026-09-23, 550 teacher-forced positions) measured "norm_mixfrom_fc" -- pre_fc_norm_hidden
-norms R and the mixer consumes it via mix_from_normed, its own hc_norm idle -- at
-0.560 greedy acceptance vs 0.184 for the double-normed "norm_mix_fc" variant.
-rope_theta is shared: the released config has mtp.rope_theta equal to the main
-rope_theta (1e7), asserted at build.
+``R_out`` relays to the next draft step. The weights come from the checkpoint's ``mtp.*`` tensors, or from a Strata MTP pack (a GGUF with the same names, stacked ggml experts).
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import TYPE_CHECKING
+import dataclasses
+import os
+import re
+from typing import TYPE_CHECKING, Iterator
 
 import torch
-from freetoken.layers import BaseOP, LinearReplicated, OPList
-from freetoken.layers.quantization import QuantKind
 
-from .attention import Qwen4ExpAttention
-from .hc import GatedResidual, GroupedPlusOneRMSNorm
-from .moe import Qwen4ExpMoE
+from freetoken.core import get_global_ctx
+from freetoken.layers import GemmaPlusOneRMSNorm, LinearReplicated, OPList
+from freetoken.layers.base import BaseOP
+from freetoken.layers.quantization import finalize_quant
+from freetoken.models.config import FullAttentionGroupConfig
+from freetoken.utils import torch_dtype
+
+from .hc import GatedResidual
+from .model import Qwen4ExpDecoderLayer
+from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
-    from freetoken.core import Batch
+    from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
 
-MTP_WIRINGS = ("norm_mix_fc", "norm_mixfrom_fc")
+
+_PACK_EXPERT_RE = re.compile(r"^(mtp\.layers\.0\.mlp\.experts)\.0\.(gate|up|down)_proj$")
 
 
-class _DenseMTPExperts:
-    """The MTP head's experts stay dense state-dict tensors.
+def _pack_tensors(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Module name -> the pack's tensors: the HF name itself, but stacked experts with gate and up in one tensor."""
+    m = _PACK_EXPERT_RE.match(name)
+    if m is None:
+        return (name,)
+    return (f"{m[1]}.{'down_proj' if m[2] == 'down' else 'gate_up_proj'}",)
 
-    Resident experts normally carry no state-dict tensors at all: the engine fills
-    expert banks sized by ``num_moe_layers`` (``attach_resident_banks``). The head is
-    one layer outside that geometry and its weights ship in the checkpoint's ``mtp.*``
-    block, so this wrapper allocates the buffers ``_fuse_mtp_experts`` emits and hands
-    the kernel the matching view. Format, kernel and epilogue stay with ``inner``.
-    """
 
-    def __init__(self, inner):
-        if inner.kind not in (QuantKind.NONE, QuantKind.FP8_BLOCK):
-            raise NotImplementedError(
-                f"--speculative mtp: the head loads its {inner.kind} experts as dense "
-                "mtp.* tensors, which only bf16 and fp8-block exports provide; serve the "
-                "checkpoint without --speculative mtp"
-            )
-        self.__dict__["_inner"] = inner
+def _iter_pack_weights(model_path: str, config: ModelConfig) -> Iterator[tuple[str, torch.Tensor]]:
+    """The dense tensors of a Strata MTP pack, named and fused as Qwen4ExpMTPDraft names them; its norms are stored zero-centered, as the layers read them."""
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.gguf.tensors import float_tensor, fused, matrix
 
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+    index = gguf_tensor_index(model_path)
+    hidden, width = config.hidden_size, config.qwen4_args.hc_count * config.hidden_size
 
-    def create_weights(self, layer) -> None:
-        cfg = self._inner.cfg
-        e, i, h = cfg.num_experts, cfg.local_intermediate, cfg.hidden
-        if self._inner.kind is QuantKind.FP8_BLOCK:
-            b = 128  # whole 128x128 blocks, unpadded: the packer emits no bank padding
-            layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=torch.float8_e4m3fn)
-            layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
-            layer.down_proj = torch.empty(e, h, i, dtype=torch.float8_e4m3fn)
-            layer.down_scale_inv = torch.empty(e, h // b, i // b, dtype=torch.bfloat16)
+    def t(name: str):
+        return index[f"mtp.{name}.weight"]
+
+    def linear(name: str, parts: tuple[str, ...], k: int, pad_to: int = 0):
+        infos = [t(p) for p in parts]
+        return fused(name, infos, [matrix(i) for i in infos], k, pad_to)
+
+    sa, mlp = "layers.0.self_attn", "layers.0.mlp"
+    for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", f"{sa}.q_norm", f"{sa}.k_norm", f"{sa}.indexer.q_layernorm",
+                 f"{sa}.indexer.k_layernorm", f"{mlp}.gate", f"{mlp}.shared_expert_gate", "hyper_connection_mixer.hc_norm"):
+        yield f"{name}.weight", float_tensor(t(name))
+    yield from linear("fc_embedding", ("fc_embedding",), hidden)
+    yield from linear("fc_hidden", ("fc_hidden",), hidden)
+    yield from linear(f"{sa}.qkv_proj", tuple(f"{sa}.{p}_proj" for p in "qkv"), hidden)
+    yield from linear(f"{sa}.o_proj", (f"{sa}.o_proj",), int(t(f"{sa}.o_proj").ne[0]))
+    yield from linear(f"{sa}.indexer.index_qk_proj", (f"{sa}.indexer.index_qk_proj",), hidden)
+    yield from linear(f"{mlp}.shared_expert.gate_up_proj", (f"{mlp}.shared_expert.gate_proj", f"{mlp}.shared_expert.up_proj"), hidden)
+    yield from linear(f"{mlp}.shared_expert.down_proj", (f"{mlp}.shared_expert.down_proj",), config.shared_expert_intermediate_size)
+    for hc in ("layers.0.attn_hyper_connection", "layers.0.mlp_hyper_connection"):
+        down = (f"{hc}.input_mix_weight_down", f"{hc}.block_inject_weight")
+        yield from linear(f"{hc}.input_mix_weight_down_block_inject", down, width, pad_to=16)
+        yield from linear(f"{hc}.input_mix_weight_up", (f"{hc}.input_mix_weight_up",), config.qwen4_args.hc_lowrank)
+        yield f"{hc}.hc_norm.weight", float_tensor(t(f"{hc}.hc_norm"))
+    yield from linear("hyper_connection_mixer.input_mix_weight_down", ("hyper_connection_mixer.input_mix_weight_down",), width)
+    yield from linear("hyper_connection_mixer.input_mix_weight_up", ("hyper_connection_mixer.input_mix_weight_up",), config.qwen4_args.hc_lowrank)
+
+
+def _pack_expert_banks(model_path: str, device: torch.device):
+    """The pack's stacked experts as the resident banks of bank layer 0, in their packed ggml rows."""
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.gguf.experts import resident_expert_bank
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.moe.expert_banks import ExpertBanks
+
+    index = gguf_tensor_index(model_path)
+    sources = {role: [resident_expert_bank(index[f"mtp.layers.0.mlp.experts.{role}_proj"], device)] for role in ("gate_up", "down")}
+    return ExpertBanks("gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None)
+
+
+def _pack_quant(model_path: str):
+    from freetoken.layers.quantization import GGUFConfig, NameMap
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.register import get_model_spec
+
+    packed = get_model_spec("Qwen4ExpForConditionalGeneration").packed_modules_mapping
+    types = {name: info.ggml_type for name, info in gguf_tensor_index(model_path).items()}
+    return GGUFConfig(types, _pack_tensors, name_map=NameMap(packed=packed))
+
+
+def draft_config(config: ModelConfig) -> ModelConfig:
+    """The target config cut to one QSA layer (layer id 0) without PLE."""
+    group = next(g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig) and g.index_ratio > 1)
+    return dataclasses.replace(
+        config,
+        num_layers=1,
+        attention_groups=(dataclasses.replace(group, layer_ids=(0,), num_index_layers=1),),
+        qwen4_args=dataclasses.replace(config.qwen4_args, ple_layer_ids=()),
+        slot_states=(),
+        vision_config=None,
+    )
+
+
+class Qwen4ExpMTPDraft(BaseOP):
+    attention_backend = "qsa_sparse"
+    draft_config = staticmethod(draft_config)
+
+    @staticmethod
+    def relay_width(config: ModelConfig) -> int:
+        return config.qwen4_args.hc_count * config.hidden_size
+
+    @staticmethod
+    def check_source(path: str, target_path: str) -> None:
+        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
+        from freetoken.models.loader import safetensors_weight_map
+
+        if is_gguf_path(path):
+            if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
+                raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
+        elif is_gguf_path(target_path):
+            # a draft read from a folder takes the target's quant config, which for a GGUF target describes GGUF tensors
+            raise ValueError(f"a GGUF target needs a GGUF draft that carries mtp.* tensors (a Strata MTP pack), not {path}")
+        elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
+            raise ValueError(f"{path} has no mtp.* tensors")
+
+    def __init__(self, config: ModelConfig, target_model, quant=None) -> None:
+        draft = draft_config(config)
+        # a Strata pack carries its own ggml types
+        self.config = draft = draft if quant is None else dataclasses.replace(draft, quant=quant)
+        hidden = draft.hidden_size
+        self.hc_count = draft.qwen4_args.hc_count
+        self.fc_embedding = LinearReplicated(hidden, hidden, has_bias=False, quant_config=draft.quant, prefix="mtp.fc_embedding")
+        self.fc_hidden = LinearReplicated(hidden, hidden, has_bias=False, quant_config=draft.quant, prefix="mtp.fc_hidden")
+        self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(hidden, eps=draft.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(self.hc_count * hidden, eps=draft.rms_norm_eps)
+        self.layers = OPList([Qwen4ExpDecoderLayer(draft, 0, prefix="mtp.layers.0")])
+        self.hyper_connection_mixer = GatedResidual(draft, use_combine=False, prefix="mtp.hyper_connection_mixer")
+        # the target's own module; an underscore name keeps it out of this module's state dict
+        self._embed_tokens = target_model.model.embed_tokens
+
+    @classmethod
+    def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen4ExpMTPDraft:
+        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
+
+        pack = is_gguf_path(model_path)
+        with torch.device("meta"), torch_dtype(dtype):
+            draft = cls(config, target_model, _pack_quant(model_path) if pack else None)
+        expected = draft.state_dict()
+        loaded = {}
+        weights = _iter_pack_weights(model_path, draft.config) if pack else iter_mtp_weights(model_path, device)
+        for name, tensor in weights:
+            if name not in expected:
+                raise ValueError(f"{model_path}: unexpected MTP tensor {name!r}")
+            loaded[name] = tensor.to(device=device, dtype=expected[name].dtype)
+        if missing := sorted(set(expected) - set(loaded)):
+            raise ValueError(f"{model_path}: MTP tensors missing: {missing}")
+        draft.load_state_dict(loaded)
+        # packed by the layer's own expert method, as the target's resident layers are
+        moe = draft.layers.op_list[0].mlp.experts
+        if pack:
+            banks = _pack_expert_banks(model_path, device)
         else:
-            layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=cfg.dtype)
-            layer.down_proj = torch.empty(e, h, i, dtype=cfg.dtype)
+            pieces = iter_mtp_expert_pieces(model_path)
+            banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
+        attach_resident_banks([moe], banks)
+        # not the root: it reaches the target's embedding, which the target finalized already
+        for module in (draft.fc_embedding, draft.fc_hidden, draft.layers, draft.hyper_connection_mixer):
+            finalize_quant(module)
+        return draft
 
-    def resident_view(self, layer):
-        from freetoken.layers.quantization.moe.base import ExpertView
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        return self._embed_tokens
 
-        # load_state_dict swaps the tensors out, so read them off the layer every call
-        tensors = {"gate_up": layer.gate_up_proj, "down": layer.down_proj}
-        if self._inner.kind is QuantKind.FP8_BLOCK:
-            tensors["gate_up_scale"] = layer.gate_up_scale_inv
-            tensors["down_scale"] = layer.down_scale_inv
-        return ExpertView(tensors)
+    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+        """``R_out`` of each row from the embedding of its token and the residual streams of the position before it."""
+        rows, hidden = embeds.shape
+        e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embeds))
+        h = self.pre_fc_norm_hidden.forward(prev_hidden)
+        r = self.fc_hidden.forward(h.view(rows * self.hc_count, hidden)).view(rows, self.hc_count, hidden)
+        r += e.unsqueeze(1)
+        return self.layers.op_list[0].forward(r.view(rows, -1), get_global_ctx().batch)
 
-
-class Qwen4ExpMTPLayer(BaseOP):
-    """One MTP decoder layer: the frozen main-layer contract (model.py docstring)
-    minus PLE -- the head has no n-gram layer of its own."""
-
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
-        self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
-        self.self_attn = Qwen4ExpAttention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
-        # The head's experts are RESIDENT whatever the engine's moe_strategy is: the
-        # offload cache is keyed by main-decoder layer ids (0..num_layers-1), so an
-        # OffloadMoELayer at the synthetic index would fall outside every cache.
-        self.mlp = Qwen4ExpMoE(
-            replace(config, moe_strategy="fused"), layer_id, prefix=f"{prefix}.mlp"
-        )
-        experts = self.mlp.experts
-        experts.quant_method = _DenseMTPExperts(experts.quant_method)
-        experts.quant_method.create_weights(experts)
-        experts.owns_experts = True
-
-    def forward(self, hidden: torch.Tensor, batch: "Batch") -> torch.Tensor:
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
-        block_output = self.self_attn.forward(block_input, batch)
-        hidden, mlp_rn = self.attn_hyper_connection.combine_norm(
-            hidden, block_output, inject,
-            self.mlp_hyper_connection.hc_norm.weight,
-            self.mlp_hyper_connection.hc_norm.eps,
-        )
-        block_input, inject = self.mlp_hyper_connection.mix_from_normed(mlp_rn)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+    def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.hyper_connection_mixer.mix(hidden)[0]
 
 
-class Qwen4ExpMTPHead(BaseOP):
-    """The single-layer MTP head. ``layer_id`` is the synthetic decoder index the
-    attention backend and MoE cache see (num_layers of the main model)."""
-
-    def __init__(
-        self,
-        config: ModelConfig,
-        *,
-        layer_id: int,
-        wiring: str = "norm_mixfrom_fc",
-        prefix: str = "mtp",
-    ) -> None:
-        if wiring not in MTP_WIRINGS:
-            raise ValueError(f"unknown MTP wiring {wiring!r}; expected one of {MTP_WIRINGS}")
-        args = config.qwen4_args
-        if args.mtp_num_layers < 1:
-            raise ValueError("config carries no MTP block (mtp_num_layers == 0)")
-        if args.mtp_rope_theta is not None:
-            main_theta = config.rotary_config.base
-            if float(args.mtp_rope_theta) != float(main_theta):
-                raise NotImplementedError(
-                    f"MTP rope_theta {args.mtp_rope_theta} != main {main_theta}: the head "
-                    "shares config.rotary_config and needs its own RotaryConfig first"
-                )
-        self.wiring = wiring
-        self.hc_count = args.hc_count
-        self.hidden_size = args.hidden_size
-        width = args.ple_state_width  # hc_count * hidden
-
-        self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(self.hidden_size, config.rms_norm_eps, 1)
-        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
-        self.fc_embedding = LinearReplicated(
-            self.hidden_size, self.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.fc_embedding",
-        )
-        self.fc_hidden = LinearReplicated(
-            self.hidden_size, self.hidden_size, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.fc_hidden",
-        )
-        self.hyper_connection_mixer = GatedResidual(
-            config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
-        )
-        self.layers = OPList(
-            [Qwen4ExpMTPLayer(config, layer_id, prefix=f"{prefix}.layers.{i}")
-             for i in range(args.mtp_num_layers)]
-        )
-
-    def fuse_input(self, residual: torch.Tensor, next_embed: torch.Tensor) -> torch.Tensor:
-        """Front end: (R, embed(next_ids)) -> the head-layer input stream R0 [T, HC*H].
-
-        Split out from forward so the wiring probe can drive it without attention.
-        """
-        e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(next_embed))
-        if self.wiring == "norm_mix_fc":
-            mixed = self.hyper_connection_mixer.mix(self.pre_fc_norm_hidden.forward(residual))[0]
-        else:  # norm_mixfrom_fc
-            mixed = self.hyper_connection_mixer.mix_from_normed(
-                self.pre_fc_norm_hidden.forward(residual)
-            )[0]
-        h = self.fc_hidden.forward(mixed)
-        return (e + h).repeat(1, self.hc_count)
-
-    def forward(self, residual: torch.Tensor, next_embed: torch.Tensor, batch: "Batch") -> torch.Tensor:
-        """Run the head over one step's final residual; returns R_out [T, HC*H] for the
-        caller to collapse through the shared top-level mixer + lm_head."""
-        hidden = self.fuse_input(residual, next_embed)
-        for layer in self.layers.op_list:
-            hidden = layer.forward(hidden, batch)
-        return hidden
-
-
-__all__ = ["MTP_WIRINGS", "Qwen4ExpMTPHead", "Qwen4ExpMTPLayer"]
+__all__ = ["Qwen4ExpMTPDraft", "draft_config"]

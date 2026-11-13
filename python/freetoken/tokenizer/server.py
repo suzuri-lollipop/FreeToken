@@ -236,7 +236,7 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
-                        completion_tokens_delta=1,
+                        completion_tokens_delta=len(msg.next_tokens),
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
                         mamba_used_slots=msg.mamba_used_slots,
@@ -250,14 +250,7 @@ def tokenize_worker(
                         moe_active_slots=msg.moe_active_slots,
                         moe_total_slots=msg.moe_total_slots,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
-                        spec_verifies=msg.spec_verifies,
-                        spec_accepted=msg.spec_accepted,
-                        spec_declines=dict(msg.spec_declines or {}),
-                        spec_steps=msg.spec_steps,
-                        spec_decode_steps=msg.spec_decode_steps,
-                        spec_cold_seeds=msg.spec_cold_seeds,
-                        queue_ms=msg.queue_ms,
-                        prefill_ms=msg.prefill_ms,
+                        timings=msg.timings,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

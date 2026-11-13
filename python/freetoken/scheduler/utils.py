@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
+
+from freetoken.core import ReqStats
 
 if TYPE_CHECKING:
     from freetoken.core import SamplingParams
@@ -20,8 +22,12 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
-    # perf_counter() stamp of arrival in pending_list, the start of this prompt's queue wait.
+    # perf_counter() stamp of arrival in pending_list, the start of this prompt's queue wait
+    # (the short-first admission order reads it; under TP it is the broadcast rank0 clock).
     enqueued_at: float = 0.0
+    # timing/draft counters; add_one_req stamps enqueued_at on it, and every chunk
+    # Req built from this pending request shares the same instance
+    stats: ReqStats = field(default_factory=ReqStats)
 
     @property
     def input_len(self) -> int:
