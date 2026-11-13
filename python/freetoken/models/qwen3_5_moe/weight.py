@@ -259,11 +259,6 @@ def iter_weights(
     """
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
-    if get_tp_info().size > 1 and config.is_moe:
-        raise NotImplementedError(
-            "qwen3_5_moe keeps its routed experts at the full intermediate width, so only "
-            "the dense checkpoints of this family shard for tensor parallelism today"
-        )
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     shard = tp_shard(config)
     # the tower builds its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves,
@@ -415,9 +410,6 @@ def iter_weights_parallel(
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
-
     def _is_expert(raw_name: str) -> bool:
         name = _rename(raw_name)
         return name is not None and _STACKED_EXPERT_RE.match(name) is not None
@@ -453,8 +445,6 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 

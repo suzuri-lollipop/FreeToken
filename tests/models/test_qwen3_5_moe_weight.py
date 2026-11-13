@@ -788,14 +788,79 @@ def test_gdn_refuses_heads_that_cannot_split(dense_folder):
         )
 
 
-def test_routed_experts_of_this_family_are_still_refused(tmp_path):
-    """The MoE variant of the family keeps its experts at full width, so the reader says no."""
+def test_routed_experts_of_this_family_shard_for_tp(tmp_path):
+    """The MoE variant now shards its routed experts: the reader no longer refuses TP>1, and
+    each rank's bank pack takes its own slice of the intermediate (the routed forward's
+    all-reduce sums the halves back together). Reverting the pack cut turns this red."""
     torch.manual_seed(3)
     moe, quant, raw = _layout("bf16")
     with _tp_rank(0, 1):
         folder = _write(tmp_path, moe, quant, raw)
-    with _tp_rank(0, 2), pytest.raises(NotImplementedError, match="routed experts"):
-        _load(folder)
+    # the dense load that used to raise NotImplementedError now succeeds under TP
+    with _tp_rank(0, 2):
+        loaded = _load(folder)
+    assert loaded  # dense weights sliced to the rank, no refusal
+
+
+def _tp_pack_banks(kernel, pieces, intermediate: int, world: int, rank: int):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+
+    cfg = MoEConfig(
+        num_experts=E, hidden=H, intermediate=intermediate, top_k=2,
+        tp_rank=rank, tp_size=world, strategy="resident",
+    )
+    out = {role: torch.zeros((E, *spec.shape), dtype=spec.dtype) for role, spec in kernel.layout(cfg).items()}
+    kernel.pack({k: v.clone() for k, v in pieces.items()}, cfg, out)
+    return out
+
+
+def test_bf16_expert_banks_shard_the_intermediate_per_rank():
+    from freetoken.layers.quantization.moe.unquantized import FusedMoEKernel
+
+    inter = I  # 128, halves to 64 per rank
+    pieces = {
+        "gate": torch.randn(E, inter, H, dtype=torch.bfloat16),
+        "up": torch.randn(E, inter, H, dtype=torch.bfloat16),
+        "down": torch.randn(E, H, inter, dtype=torch.bfloat16),
+    }
+    kernel = FusedMoEKernel()
+    local = inter // 2
+    first, second = (_tp_pack_banks(kernel, pieces, inter, 2, r) for r in (0, 1))
+    assert first["gate_up"].shape == (E, 2 * local, H)
+    assert torch.equal(first["gate_up"][:, :local], pieces["gate"][:, :local])
+    assert torch.equal(first["gate_up"][:, local:], pieces["up"][:, :local])
+    assert torch.equal(second["gate_up"][:, :local], pieces["gate"][:, local:])
+    assert torch.equal(second["gate_up"][:, local:], pieces["up"][:, local:])
+    assert torch.equal(first["down"], pieces["down"][:, :, :local])
+    assert torch.equal(second["down"], pieces["down"][:, :, local:])
+
+
+def test_fp8_block_expert_banks_shard_whole_scale_blocks_per_rank():
+    from freetoken.layers.quantization.moe.fp8_block import TritonFp8BlockMoEKernel
+
+    inter = 2 * BLOCK  # two 128-row scale blocks: one whole block per rank at TP=2
+    pieces = {
+        "gate": torch.randn(E, inter, H).to(torch.float8_e4m3fn),
+        "up": torch.randn(E, inter, H).to(torch.float8_e4m3fn),
+        "down": torch.randn(E, H, inter).to(torch.float8_e4m3fn),
+        "gate_scale": torch.rand(E, inter // BLOCK, H // BLOCK, dtype=torch.bfloat16) + 0.5,
+        "up_scale": torch.rand(E, inter // BLOCK, H // BLOCK, dtype=torch.bfloat16) + 0.5,
+        "down_scale": torch.rand(E, H // BLOCK, inter // BLOCK, dtype=torch.bfloat16) + 0.5,
+    }
+    kernel = TritonFp8BlockMoEKernel()
+    local = inter // 2  # 128 == one scale block
+    first, second = (_tp_pack_banks(kernel, pieces, inter, 2, r) for r in (0, 1))
+    assert first["gate_up"].shape == (E, 2 * local, H)
+    assert torch.equal(first["gate_up"][:, :local].float(), pieces["gate"][:, :local].float())
+    assert torch.equal(second["gate_up"][:, local:].float(), pieces["up"][:, local:].float())
+    assert torch.equal(first["down"].float(), pieces["down"][:, :, :local].float())
+    assert torch.equal(second["down"].float(), pieces["down"][:, :, local:].float())
+    # the scale banks keep whole blocks: rank 0 the first block row, rank 1 the second.
+    # each bank is rank-local, so the rank's slice starts at index 0 of its own bank.
+    assert torch.equal(first["gate_up_scale"][:, :1, :1], pieces["gate_scale"][:, :1, :1])
+    assert torch.equal(second["gate_up_scale"][:, 1:2, :1], pieces["up_scale"][:, 1:2, :1])
+    assert torch.equal(first["down_scale"][:, :1, :1], pieces["down_scale"][:, :1, :1])
+    assert torch.equal(second["down_scale"][:, :1, :1], pieces["down_scale"][:, :1, 1:2])
 
 
 # --------------------------------------------------------------------------- FTW replay
