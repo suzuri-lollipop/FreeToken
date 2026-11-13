@@ -280,6 +280,10 @@ class Scheduler(SchedulerIOMixin):
         self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        from freetoken.engine.think_wrap import ThinkWrap
+
+        self._think_wrap = ThinkWrap(self.tokenizer, config)
+        self.engine._think_wrap = self._think_wrap
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
             self.cache_manager.is_hybrid or self.cache_manager.is_swa
@@ -881,6 +885,11 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                # thinking wrap-up: track the think block as tokens land (the force
+                # decision itself runs at sample time in the engine)
+                _tw = getattr(self, "_think_wrap", None)
+                if _tw is not None:
+                    _tw.observe(req, next_token)
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 # Overlap can advance device_len one token ahead of this host reply.

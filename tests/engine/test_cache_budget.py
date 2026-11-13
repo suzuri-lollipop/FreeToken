@@ -1051,3 +1051,53 @@ def test_moe_pool_flags_and_decode_batch_clamp():
     )
     _clamp_decode_batch_to_pools(config, [12, 16, 9])
     assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (2, 2, [1, 2])
+
+
+def test_decode_batch_clamp_uses_the_cross_rank_min():
+    # The slot count is rank-local under an uneven shard / budget skew, so the admission
+    # cap must be the cross-rank MIN, not this rank's own limit -- a per-rank cap composes
+    # different batches on each rank and wedges a collective. Reverting the all_reduce MIN
+    # to the local limit turns this red (the clamp would use 2 instead of the peer's 1).
+    from unittest.mock import patch
+
+    import torch
+
+    from freetoken.engine.engine import _clamp_decode_batch_to_pools
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4],
+    )
+    # this rank's smallest pool (9) implies 9//4 = 2; a peer's tighter pool implies 1
+    def fake_all_reduce(t, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MIN
+        t.fill_(1)
+
+    with patch("freetoken.engine.engine.torch.distributed.get_world_size", return_value=2), \
+         patch("freetoken.engine.engine.torch.distributed.all_reduce", side_effect=fake_all_reduce):
+        _clamp_decode_batch_to_pools(config, [12, 16, 9], object(), "gpu")
+    assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (1, 1, [1])
+
+
+def test_decode_batch_clamp_no_gpu_pool_on_this_rank_adopts_peer_cap():
+    # A rank with no undersized GPU pool (or decoding on CPU) contributes no cap of its own
+    # but must still adopt the peer's cap, so max_running_req stays rank-identical. Reverting
+    # to the early `if not small: return` (rank-local) turns this red.
+    from unittest.mock import patch
+
+    import torch
+
+    from freetoken.engine.engine import _clamp_decode_batch_to_pools
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4],
+    )
+    def fake_all_reduce(t, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MIN
+        t.fill_(2)  # the peer's GPU pool cap wins the MIN over this rank's no-cap sentinel
+
+    with patch("freetoken.engine.engine.torch.distributed.get_world_size", return_value=2), \
+         patch("freetoken.engine.engine.torch.distributed.all_reduce", side_effect=fake_all_reduce):
+        _clamp_decode_batch_to_pools(config, [16, 32], object(), "gpu")  # no pool < num_experts
+    assert config.max_running_req == 2
