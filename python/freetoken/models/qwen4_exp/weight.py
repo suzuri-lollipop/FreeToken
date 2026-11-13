@@ -263,6 +263,42 @@ class _DenseReader:
         return out
 
 
+def _dense_slicer(shard, parts_of):
+    """A ``slice_dense(name, tensor)`` that cuts a fused, global-shape dense tensor to this
+    rank's model buffers. Shared by the target reader and the MTP draft reader so the draft's
+    TP-aware attention / shared-expert buffers get the same rank-local cuts as the target's.
+
+    A fused buffer is its parts concatenated along their own split axes, so the buffer is
+    first split back into those parts, each part is cut by its own leaf, and the cuts are
+    re-concatenated: the rank's module holds the same parts in the same order. Leaves
+    outside the slicer's table (routers, norms, the HC/PLE mixers, the replicated fc front
+    end) are replicated, so cutting them is a no-op by design.
+    """
+    def slice_dense(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if shard is None:
+            return tensor
+        module, _, last = name.rpartition(".")
+        leaf = module.rpartition(".")[2]
+        parts = parts_of.get(leaf) if last in ROLE_SUFFIXES else None
+        if not parts:
+            return shard.tensor(module_leaf(name), tensor)
+        units = shard.units
+        if any(part not in units for part in parts):
+            return tensor  # a part the table leaves replicated: nothing to cut
+        edge, cuts = 0, []
+        for part in parts:
+            width = units[part]
+            piece = tensor[edge : edge + width]
+            cuts.append(shard.tensor(part, piece))
+            edge += width
+        if edge != tensor.shape[0]:
+            raise ValueError(
+                f"{name}: the fused buffer has {tensor.shape[0]} rows, its parts {parts} need {edge}"
+            )
+        return torch.cat(cuts, dim=0) if len(cuts) > 1 else cuts[0]
+    return slice_dense
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -289,39 +325,13 @@ def iter_weights(
     vision = vision_tp_shard(vc) if include_vision and vc is not None else None
     reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
     parts_of = {fused: parts for fused, parts in spec.packed_modules_mapping}
+    slice_text = _dense_slicer(shard, parts_of)
 
     def slice_dense(name: str, tensor: torch.Tensor) -> torch.Tensor:
-        """Cut an emitted (fused, global-shape) tensor to this rank's model buffers.
-
-        A fused buffer is its parts concatenated along their own split axes, so the buffer is
-        first split back into those parts, each part is cut by its own leaf, and the cuts are
-        re-concatenated: the rank's module holds the same parts in the same order. Leaves
-        outside the slicer's table (routers, norms, the HC/PLE mixers) are replicated, so
-        cutting them is a no-op by design.
-        """
+        # the tower declares its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves
         if vision is not None and name.startswith(VISION_KEY_PREFIXES):
             return vision.tensor(vision_module_leaf(name), tensor)
-        if shard is None:
-            return tensor
-        module, _, last = name.rpartition(".")
-        leaf = module.rpartition(".")[2]
-        parts = parts_of.get(leaf) if last in ROLE_SUFFIXES else None
-        if not parts:
-            return shard.tensor(module_leaf(name), tensor)
-        units = shard.units
-        if any(part not in units for part in parts):
-            return tensor  # a part the table leaves replicated: nothing to cut
-        edge, cuts = 0, []
-        for part in parts:
-            width = units[part]
-            piece = tensor[edge : edge + width]
-            cuts.append(shard.tensor(part, piece))
-            edge += width
-        if edge != tensor.shape[0]:
-            raise ValueError(
-                f"{name}: the fused buffer has {tensor.shape[0]} rows, its parts {parts} need {edge}"
-            )
-        return torch.cat(cuts, dim=0) if len(cuts) > 1 else cuts[0]
+        return slice_text(name, tensor)
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -355,9 +365,18 @@ _MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+
 
 
 def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
-    """The ``mtp.*`` head but its routed experts, named as Qwen4ExpMTPDraft names it and fused like the target's dense weights."""
+    """The ``mtp.*`` head but its routed experts, named as Qwen4ExpMTPDraft names it and fused like the target's dense weights.
+
+    The draft's attention and shared expert are TP-aware (rank-local qkv/o_proj and gate_up/down),
+    so the emitted dense tensors are cut to this rank exactly like the target's; the routed
+    experts come separately through iter_mtp_expert_pieces, whose bank pack takes the rank slice.
+    """
     hf_config = cached_load_hf_config(model_path)
-    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]).packed_modules_mapping)
+    spec = get_model_spec(hf_config.architectures[0])
+    shard = tp_shard(parse_config(hf_config))
+    parts_of = {fused: parts for fused, parts in spec.packed_modules_mapping}
+    slice_dense = _dense_slicer(shard, parts_of)
+    reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
     seen = False
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -370,9 +389,9 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
                 tensor = f.get_tensor(raw_name)
                 emitted = reader.add(raw_name, tensor)
                 if emitted is None:
-                    yield raw_name[len("mtp."):], tensor
+                    yield raw_name[len("mtp."):], slice_dense(raw_name[len("mtp."):], tensor)
                 else:
-                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+                    yield from ((n.removeprefix("mtp."), slice_dense(n.removeprefix("mtp."), t)) for n, t in emitted)
     if not seen:
         raise ValueError(f"{model_path} has no mtp.* weights")
     if reader.pending:

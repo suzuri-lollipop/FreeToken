@@ -342,9 +342,15 @@ _MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+
 
 
 def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
-    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's.
+
+    The draft's attention buffers are TP-aware, so the dense tensors are cut to this rank exactly
+    like the target's dense reader; the routed experts come separately through iter_mtp_expert_pieces.
+    """
     hf_config = cached_load_hf_config(model_path)
-    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    spec = get_model_spec(hf_config.architectures[0])
+    shard = tp_shard(parse_config(hf_config))
+    reader = _DenseReader(get_quant_config(), spec, shard)
     seen = False
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -357,7 +363,8 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
                 tensor = f.get_tensor(raw_name)
                 emitted = reader.add(raw_name, tensor)
                 if emitted is None:
-                    yield raw_name[len("mtp."):], tensor
+                    name = raw_name[len("mtp."):]
+                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
                 else:
                     yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
     if not seen:
