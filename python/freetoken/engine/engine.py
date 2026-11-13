@@ -48,17 +48,41 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
-def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
-    """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
+def _clamp_decode_batch_to_pools(
+    config: EngineConfig,
+    pool_sizes: list[int],
+    tp_cpu_group=None,
+    decode_target: str = "gpu",
+) -> None:
+    """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool.
+
+    The slot count is rank-local under an uneven expert shard / the per-rank budget skew,
+    so the cap it implies must be agreed across ranks: max_running_req is an admission
+    limit every rank's scheduler honors, and a per-rank value would compose different
+    batches and wedge a collective. Each rank contributes its own GPU-pool limit (or no
+    cap), and the cross-rank MIN clamps every rank to the tightest one. The reduction is
+    gated by the caller on len(pools) > 1, which is rank-consistent (pool COUNT comes from
+    the checkpoint layouts / layer count, not the per-rank slot bytes), so it cannot hang
+    even where decode_target itself resolves differently per rank.
+    """
     num_experts = config.model_config.num_experts
     small = [s for s in pool_sizes if s < num_experts]
-    if not small:
+    _NO_CAP = 1 << 30
+    limit = (
+        min(small) // config.model_config.num_experts_per_tok
+        if small and decode_target == "gpu"
+        else _NO_CAP
+    )
+    if tp_cpu_group is not None and torch.distributed.get_world_size(group=tp_cpu_group) > 1:
+        t = torch.tensor([limit], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
+        limit = int(t[0])
+    if limit >= _NO_CAP:
         return
-    limit = min(small) // config.model_config.num_experts_per_tok
     if config.max_running_req > limit:
         logger.warning_rank0(
-            f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
-            f"{config.max_running_req} -> {limit} so a decode step fits in it"
+            f"lowering max_running_req {config.max_running_req} -> {limit} so a decode step "
+            f"fits in the smallest GPU MoE slot pool across ranks"
         )
         object.__setattr__(config, "max_running_req", limit)
     if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > limit:
@@ -1627,8 +1651,10 @@ class Engine:
                 f"MoE slot pools: {config.moe_cache_scope}, {len(pools)} pools of {min(pool_sizes)}-{max(pool_sizes)} "
                 f"slots ({config.moe_cache_split})"
             )
-            if decode_target == "gpu":
-                _clamp_decode_batch_to_pools(config, pool_sizes)
+            # called on every rank whenever there is more than one pool (a rank-consistent
+            # count): the cross-rank MIN inside must be reached by all ranks, so it is NOT
+            # gated on the possibly rank-local decode_target (handled inside the clamp)
+            _clamp_decode_batch_to_pools(config, pool_sizes, self.tp_cpu_group, decode_target)
         layout = layer_layouts = max_slots = None
         if layer_methods is not None:
             _check_layer_formats(banks, layer_methods)
@@ -2434,6 +2460,12 @@ class Engine:
             _ts = _time.perf_counter()
             _dbg.host_phase(_ek + "fb.mid", _ts - _tm0)
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        # thinking wrap-up: force the end-of-thinking tag when the remaining budget
+        # runs low mid-think. Eager (post-graph) so the override reaches both the
+        # token_pool feedback and the CPU reply consistently.
+        _tw = getattr(self, "_think_wrap", None)
+        if _tw is not None:
+            _tw.apply(batch, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         # record on the stream that RAN the forward: the drain waits this event whether
