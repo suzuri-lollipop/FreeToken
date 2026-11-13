@@ -19,7 +19,7 @@ class _FakeTok:
 
 
 def _msg(uid, tok, finished=False):
-    return DetokenizeMsg(uid=uid, next_token=tok, finished=finished,
+    return DetokenizeMsg(uid=uid, next_tokens=[tok], finished=finished,
                          finish_reason="stop" if finished else None,
                          matched_stop=None, stop_strs=None)
 

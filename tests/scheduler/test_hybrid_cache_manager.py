@@ -294,25 +294,6 @@ def test_copy_from_roundtrips_a_spec_snapshot_including_slot_states():
                        torch.tensor([7, 9], dtype=torch.int32))
 
 
-def test_req_spec_fields_default_to_disabled():
-    req = Req(input_ids=torch.tensor([1, 2, 3], dtype=torch.int32), table_idx=0,
-              cached_len=0, output_len=1, uid=0, sampling_params=SamplingParams(),
-              cache_handle=None)
-    assert req.spec_slot_idx is None
-    assert req.spec_residual is None
-    assert req.spec_draft is None
-
-
-def test_batch_spec_fields_default_to_regular():
-    from freetoken.core import Batch
-
-    b = Batch(reqs=[], phase="decode")
-    assert b.spec_mode is None
-    assert b.spec_draft_id == -1
-    assert b.spec_pages is None
-    assert b.spec_prologue is None
-
-
 def test_allocate_paged_record_and_release_roundtrip():
     """Spec-batch page accounting: a recorded charge is exactly reversible (the reject
     path releases, the replay step re-charges the same position span)."""

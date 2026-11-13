@@ -134,26 +134,16 @@ class FlashInferBackend(BaseAttnBackend):
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
-        # A quantized pool stores below the compute dtype, so plan() needs the two
-        # separately plus the pool's static descales (kvcache/kv_quant.py).
-        self.quant = getattr(self.kvcache, "quant", None)
-        self.kv_dtype = self.kvcache.dtype
-        self.q_dtype = self.kv_dtype if self.quant is None else self.quant.compute_dtype
-        # flashinfer takes the descales on run(), not plan(). Empty for a plain pool,
-        # so the bf16 path keeps its exact call and stays compatible with builds that
-        # have no such argument. Constants, hence safe to bake into a captured graph.
-        self.scale_kwargs: dict = (
-            {}
-            if self.quant is None
-            else {"k_scale": self.quant.k_scale, "v_scale": self.quant.v_scale}
-        )
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self.graph_wrappers: Dict[
+            int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper
+        ] = {}
         self.capture: FICaptureData | None = None
+        self.capture_rows_per_req = 1
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -180,7 +170,7 @@ class FlashInferBackend(BaseAttnBackend):
                 seq_lens=metadata.seq_lens_cpu,
                 data_type=metadata.dtype,
                 q_data_type=metadata.dtype,
-                kv_data_type=self.kv_dtype,
+                kv_data_type=metadata.dtype,
                 non_blocking=True,
             )
         else:
@@ -196,7 +186,7 @@ class FlashInferBackend(BaseAttnBackend):
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
                 q_data_type=metadata.dtype,
-                kv_data_type=self.kv_dtype,
+                kv_data_type=metadata.dtype,
                 non_blocking=True,
                 causal=True,
             )
@@ -233,7 +223,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache, **self.scale_kwargs)
+        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -268,7 +258,7 @@ class FlashInferBackend(BaseAttnBackend):
             page_size=1,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
-            dtype=self.q_dtype,
+            dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 
@@ -279,14 +269,15 @@ class FlashInferBackend(BaseAttnBackend):
         super().reset_capture()
         self.graph_wrappers = {}
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device, rows_per_req=rows_per_req)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        self.capture_rows_per_req = rows_per_req
 
     @cached_property
     def use_tensor_cores(self) -> bool:
@@ -296,22 +287,41 @@ class FlashInferBackend(BaseAttnBackend):
         GQA = self.config.num_qo_heads // self.config.num_kv_heads
         return GQA >= 4
 
-    def prepare_for_capture(self, batch: Batch) -> None:
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+    def _make_graph_wrapper(
+        self, bs: int
+    ) -> CUDAGraphBatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper:
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper, CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
+        capture = self.capture
+        assert capture is not None
+        if self.capture_rows_per_req > 1:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                backend="fa2",
+                use_cuda_graph=True,
+                qo_indptr_buf=capture.cu_seqlens_q[: bs + 1],
+                paged_kv_indptr_buf=capture.cu_seqlens_k[: bs + 1],
+                paged_kv_indices_buf=capture.indices,
+                paged_kv_last_page_len_buf=capture.one_tensor[:bs],
+            )
+        else:
+            wrapper = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=capture.cu_seqlens_k[: bs + 1],
+                indices_buffer=capture.indices,
+                last_page_len_buffer=capture.one_tensor[:bs],
+            )
+            wrapper._backend = "fa2"
+        wrapper._int_workspace_buffer = self.int_workspace_buffer
+        return wrapper
+
+    def prepare_for_capture(self, batch: Batch) -> None:
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
-        capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
-        )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
+        self.graph_wrappers[bs] = self._make_graph_wrapper(bs)
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)

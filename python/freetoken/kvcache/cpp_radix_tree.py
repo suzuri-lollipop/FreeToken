@@ -191,6 +191,36 @@ class CppSWARadixCache(_CppTreeMixin):
         kv, cached_len, node = self._tree.match_swa(input_ids)
         return SWAMatch(kv, int(cached_len), node)
 
+    def has_locked_tombstone(self, input_ids: torch.Tensor, after_len: int) -> bool:
+        """True if insert(input_ids, update_kv_after_len=after_len) would keep a tombstone that
+        another request still full-locks, freeing the caller's copy of it. Mirrors the Python
+        SWARadixCache walk over the C++ NodeRef tree (children are keyed like key_fn)."""
+        from freetoken.utils import align_down
+
+        node, total = self.root, 0
+        while total < len(input_ids):
+            child = node.children.get(self.key_fn(input_ids[total:]))
+            if child is None:
+                return False
+            match_len = align_down(child.get_match_len(input_ids[total:]), self.page_size)
+            if match_len == 0:
+                return False
+            if child.swa_tombstone and child.ref_count > 0 and after_len < total + match_len:
+                return True
+            if match_len < child.length:
+                return False
+            node, total = child, total + match_len
+        return False
+
+    def _all_nodes(self):
+        out, stack = [], [self.root]
+        while stack:
+            n = stack.pop()
+            if not n.is_root():
+                out.append(n)
+            stack.extend(n.children.values())
+        return out
+
     def insert(
         self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
         swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0,

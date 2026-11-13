@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
+from typing import Any, ClassVar, Dict, List, Literal, Protocol, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
@@ -246,13 +246,34 @@ def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
     return AttnType.MLA
 
 
+class SlotVerify(Protocol):
+    """How a speculative verify step stages and commits one slot state; the state's owner supplies it and the pool only calls it.
+
+    The pool builds one per engine as ``cls(spec, max_bs, rows_per_req, device, dtype)``, ``dtype`` being the state's own, and keeps it across ``rebuild``.
+    A verify forward reads the live state only and writes what the commit needs into this handler's scratch; the owner gets it back with ``pool.verify_handler(spec.name)``.
+    Scratch row = verify-batch row, never a pool slot.
+    The scratch is single-buffered, which is safe because speculative decoding forces the normal loop.
+    A handler reads only its own scratch and writes only its own state, so the handlers commit in any order.
+    """
+
+    @staticmethod
+    def nbytes(spec: SlotStateSpec, max_bs: int, rows_per_req: int, dtype) -> int:
+        """Scratch bytes, from the spec alone, before any pool exists."""
+        ...
+
+    def commit(self, pool, slots, counts) -> None:
+        """Roll live slot ``slots[i]`` to where it stands after the first ``counts[i]`` rows of verify request i; int64 device tensors, one entry per request.
+
+        Reads the scratch without consuming it and may run more than once per step; reads the state through ``pool.slot_state`` on every call, since ``rebuild`` replaces it.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class SlotStateSpec:
     """One extra per-request tensor riding the LinearStatePool slots.
 
-    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]`` and advanced, snapshot,
-    COW'd and rebuilt with the GDN state; the owner reads it back through
-    ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
+    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]``; ``copy_from``, ``reset`` and ``rebuild`` cover it with the GDN state. The owner advances it in the forward and writes its own prefill track snapshot into ``fla_metadata.track_dst``, after the chunk's rows; it reads the state back through ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
     """
 
     name: str
@@ -260,6 +281,8 @@ class SlotStateSpec:
     layer_ids: Tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
+    # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
+    verify: type[SlotVerify] | None = None
 
 
 @dataclass(frozen=True)
@@ -357,6 +380,9 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
+    # layers. Opaque to model-agnostic engine code; None for every other model.
+    gemma4_e_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

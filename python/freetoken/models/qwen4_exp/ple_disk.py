@@ -140,7 +140,7 @@ class DiskRowTable:
         hash_constants: dict,
         *,
         max_graph_rows: int = 256,
-        max_extend_tokens: int = 8192,
+        max_eager_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel import _row_store
@@ -201,7 +201,7 @@ class DiskRowTable:
         # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
         # dispatch context after the step's fill: a record inside the capture would not be observable)
         self._graph_consumed = torch.cuda.Event()
-        eager_bytes = max_extend_tokens * self._token_bytes
+        eager_bytes = max_eager_tokens * self._token_bytes
         # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
         # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
         # that last read it has run (``_eager_read[i]``, recorded right after that copy)
@@ -248,12 +248,12 @@ class DiskRowTable:
                 + (", cpp fill" if self._cpp_fill else "")
             )
 
-    def _fill_decode(self, histories: Sequence[Sequence[int]], bs: int) -> None:
+    def _fill_decode(self, histories: Sequence[Sequence[int]], bs: int, rows: int) -> None:
         try:
             self._readback_event.synchronize()
-            tokens = self._token_readback[:bs].to(torch.int64).tolist()
-            runs = [torch.tensor([*history, t], dtype=torch.int64)
-                    for history, t in zip(histories, tokens)]
+            tokens = self._token_readback[: bs * rows].to(torch.int64).tolist()
+            runs = [torch.tensor([*history, *tokens[i * rows : (i + 1) * rows]], dtype=torch.int64)
+                    for i, history in enumerate(histories)]
             self.fill(runs, graph=True)
         except BaseException:
             from freetoken.kernel.row_store import signal
@@ -262,10 +262,10 @@ class DiskRowTable:
             signal(self._flag)
             raise
 
-    def _start_fill(self, histories: Sequence[Sequence[int]], bs: int) -> None:
+    def _start_fill(self, histories: Sequence[Sequence[int]], bs: int, rows: int) -> None:
         @torch.inference_mode()
         def _complete() -> None:
-            self._fill_decode(histories, bs)
+            self._fill_decode(histories, bs, rows)
 
         # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
         self._pending = self._worker.submit(_complete)
@@ -383,15 +383,19 @@ class DiskRowTable:
             if self._failed:
                 raise RuntimeError("PLE disk table failed; recreate the engine before dispatch")
         eos = self.eos_token_id
-        if batch.is_decode:
+        # decode and verify: rows_per_req tokens per request on the device, the first at device_len - rows_per_req
+        rows = getattr(batch, "rows_per_req", None) or 1
+        if batch.is_decode or rows > 1:
             reqs = list(batch.reqs)
-            if use_graph and self._wait_sync and not self._rows_gated(batch.padded_size):
+            histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
+            if use_graph and self._wait_sync and not self._rows_gated(batch.padded_size * rows):
                 bs = batch.padded_size
-                if self._cpp_fill and all(r.input_ids.dtype == torch.int32 for r in reqs):
+                if rows == 1 and self._cpp_fill and all(r.input_ids.dtype == torch.int32 for r in reqs):
                     # Same ENTER-time snapshot rule as the Python builder below, but the
                     # rows are rebuilt in C++ at fill time from these pointers: no
                     # per-request int()/torch.tensor churn between the drain and the
-                    # replay's memop WAIT (that window is pure GPU idle).
+                    # replay's memop WAIT (that window is pure GPU idle). Single-token
+                    # decode only: fill_decode_graph rebuilds one row per request.
                     ids_addrs = [r.input_ids.data_ptr() for r in reqs]
                     positions = [r.device_len - 1 for r in reqs]
                     # The fill dereferences ids_addrs AFTER the drain; holding the
@@ -430,22 +434,20 @@ class DiskRowTable:
                 # sampled token during the drain), while the deferred fill -- which
                 # the engine runs after that drain -- must see ENTER-time state, the
                 # state the captured lookup's rows are keyed by.
-                ctxs = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                self._token_readback[: bs * rows].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
-                histories = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
                 if self._worker is not None:
-                    self._start_fill(histories, bs)
+                    self._start_fill(histories, bs, rows)
                     return None
 
                 def _complete() -> None:
-                    self._fill_decode(histories, bs)
+                    self._fill_decode(histories, bs, rows)
 
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
+            runs = [torch.tensor([*history, *tokens[i * rows : (i + 1) * rows]], dtype=torch.int64)
+                    for i, history in enumerate(histories)]
             self.fill(runs, graph=use_graph)
             return None
         runs = self.prefill_runs(batch)

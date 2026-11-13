@@ -61,6 +61,10 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    # Attach llama.cpp's per-request `timings` object to OpenAI chat/completions and
+    # Responses responses (plus queue_ms and, under speculative decoding, draft_n /
+    # draft_n_accepted). Opt-in like vLLM's --enable-per-request-metrics.
+    enable_timings_report: bool = False
     anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
@@ -133,6 +137,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.format import KV_FORMATS, NONE
     from freetoken.moe import MOE_STRATEGIES
     from freetoken.moe.pool_policy import SCOPES
 
@@ -144,6 +149,12 @@ def parse_args(
         except ValueError as exc:
             raise argparse.ArgumentTypeError(str(exc)) from None
         return value
+
+    def _parse_module_list(value: str) -> tuple[str, ...]:
+        names = tuple(p.strip() for p in value.split(",") if p.strip())
+        if not names:
+            raise argparse.ArgumentTypeError("expected comma-separated module names or glob patterns")
+        return names
 
     def _parse_moe_cache_rate(value: str) -> float:
         try:
@@ -215,6 +226,9 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        # off the checkpoint only: the HF org name ricursiveAI would match other models' paths
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
         if "flint" in marker:
             return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -268,6 +282,8 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
         if "flint" in marker:
             return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -501,48 +517,12 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--kv-cache-dtype",
-        type=str,
-        choices=["auto", "fp8", "fp8_e4m3"],
-        default=ServerArgs.kv_cache_dtype,
-        help=(
-            "Storage dtype of the KV cache. 'auto' (default) keeps the model dtype; "
-            "'fp8_e4m3' ('fp8' for short) stores K/V as fp8 e4m3, halving the bytes per "
-            "cached token (roughly doubling prefix capacity for the same VRAM). Needs an "
-            "sm_89+ GPU and an MHA or SWA-hybrid pool; the attention backend must support it."
-        ),
-    )
-
-    parser.add_argument(
-        "--kv-cache-quant-scale",
-        type=float,
-        default=ServerArgs.kv_cache_quant_scale,
-        help=(
-            "Static scale both K and V divide by before the fp8 store (and multiply back "
-            "on read). Default 1.0; raise it if attention states exceed the e4m3 range "
-            "(-448..448), which would otherwise clamp. Ignored without --kv-cache-dtype."
-        ),
-    )
-
-    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
         default=ServerArgs.attention_backend,
         help="The attention backend to use. If two backends are specified,"
         " the first one is used for prefill and the second one for decode.",
-    )
-
-    parser.add_argument(
-        "--speculative",
-        default=ServerArgs.speculative,
-        choices=["none", "mtp", "lookup"],
-        help="Speculative decoding backend. 'mtp' builds the checkpoint's MTP head"
-        " (qwen4_exp only for now) and drafts one extra token per step at small batch"
-        " sizes; 'lookup' drafts up to four tokens that followed an earlier repeat of the"
-        " context (prompt lookup, no head, greedy only); the scheduler disables either"
-        " automatically when more requests are running or its acceptance floor is missed."
-        " 'none' (default) disables speculative decoding.",
     )
 
     parser.add_argument(
@@ -560,6 +540,17 @@ def parse_args(
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="KV cache strategy (naive | radix). For hybrid GDN models 'radix' is materialized "
         "as a GDN-aware radix (cross-request GDN-state prefix reuse); pass 'naive' to opt out.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
+        help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
+        "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
+        "attention backends read "
+        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format.",
     )
 
     parser.add_argument(
@@ -656,6 +647,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-timings-report",
+        action="store_true",
+        default=ServerArgs.enable_timings_report,
+        help=(
+            "Attach a llama.cpp-shaped per-request timings object to every chat completion, "
+            "completion and Responses response (and to the final stream chunk), so frontends "
+            "like llama-swap and Open Web UI can show prefill/decode rates and cache hits. "
+            "Spans are measured in the scheduler; queue_ms is a FreeToken extension."
+        ),
+    )
+
+    parser.add_argument(
         "--anthropic-inline-system",
         choices=("auto", "preserve", "fold"),
         default=ServerArgs.anthropic_inline_system,
@@ -693,6 +696,7 @@ def parse_args(
             "qwen",
             "qwen25",
             "qwen3_coder",
+            "ricursive",
             "mistral",
             "deepseekv32",
             "deepseekv41",
@@ -713,7 +717,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -769,9 +773,33 @@ def parse_args(
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
         help=(
-            "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
-            "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
-            "Not for a table tied to the LM head."
+            "Where the input token embedding tables live. 'gpu' (default) keeps them in VRAM; 'host' keeps them in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. "
+            "A table tied to the LM head stays on the GPU; Gemma-4 E2B / E4B's per-layer table is the one that moves."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant",
+        default=ServerArgs.online_quant,
+        choices=["df11"],
+        help=(
+            "Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. 'df11' "
+            "compresses them losslessly to ~11 bits per weight and decodes them bit-for-bit on use: about 30%% less "
+            "VRAM for those weights, at the cost of a decode per use. The LM head, a table tied to it, vision encoders and "
+            "layers whose weight the model reads directly stay bf16; refused when no layer qualifies."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant-modules",
+        default=ServerArgs.online_quant_modules,
+        type=_parse_module_list,
+        help=(
+            "Limit --online-quant to these modules: comma-separated checkpoint module names or glob patterns, "
+            "e.g. 'model.layers.*.self_attn,model.embed_tokens' ('model.language_model.layers.*' where the checkpoint "
+            "nests the text model). A name also covers the modules under it; one that selects no convertible layer is "
+            "refused. Default: every layer --online-quant can convert."
         ),
     )
 
@@ -1113,6 +1141,41 @@ def parse_args(
             "(CUDA >= 13.0 or HIP with batch-copy support). Effective with "
             "--moe-cache-size > 2 * num_experts."
         ),
+    )
+
+    parser.add_argument(
+        "--speculative-algorithm",
+        "--spec-algo",
+        type=str,
+        default=ServerArgs.speculative_algorithm,
+        help=(
+            "Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers; dflash: a DFlash 2 draft "
+            "checkpoint from --speculative-draft-model-path). Off by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-num-steps",
+        "--spec-num-steps",
+        type=int,
+        default=ServerArgs.speculative_num_steps,
+        help="Draft tokens per decode step (k); 0 takes the method's default.",
+    )
+
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        "--spec-draft-model",
+        type=str,
+        default=ServerArgs.speculative_draft_model_path,
+        help="Draft weights; by default they come from the target checkpoint. Required for dflash, which reads a separate draft checkpoint.",
+    )
+
+    parser.add_argument(
+        "--speculative-token-map",
+        "--spec-token-map",
+        type=str,
+        default=ServerArgs.speculative_token_map,
+        help="File of little-endian int32 token ids the draft may propose (mtp only). The draft computes logits over those LM head rows alone; the target still verifies over the whole vocabulary. Off by default.",
     )
 
     parser.add_argument(

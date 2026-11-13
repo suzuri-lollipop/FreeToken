@@ -18,12 +18,11 @@ def _runner():
 
 
 def _batch(*, extend_len=128, cached_len=256, can_decode=False, mm=False,
-           track=True, slot=7, stash=False, spec_off=False):
+           track=True, slot=7):
     req = SimpleNamespace(
         can_decode=can_decode, extend_len=extend_len, cached_len=cached_len,
         mm_items=["img"] if mm else None, linear_slot_idx=slot,
         table_idx=3, device_len=cached_len + extend_len,
-        spec_residual=(torch.zeros(4, 4) if stash else None), spec_off=spec_off,
     )
     batch = Batch(reqs=[req], phase="prefill")
     batch.padded_reqs = [req]
@@ -74,27 +73,14 @@ def test_gates_reject_out_of_scope(slot_direct):
     assert not r.eligible(eng, _batch())
 
 
-def test_a_live_mtp_stash_keeps_the_chunk_eager(slot_direct):
-    """The replay returns before the engine's residual-stash gate, so graphing a continuation
-    chunk would commit rows the head has no residual for -- a hole in the span, and the request
-    is off-spec for its whole life. Once the request is off-spec there is nothing to protect."""
-    r = _runner()
-    eng = _engine()
-    assert not r.eligible(eng, _batch(stash=True))
-    assert r.eligible(eng, _batch(stash=True, spec_off=True))
-
-
 def test_not_eligible_without_slot_direct(monkeypatch):
     import freetoken.layers.moe as m
     monkeypatch.setattr(m, "_PREFILL_SLOT_DIRECT", False)
     assert not _runner().eligible(_engine(), _batch())
 
 
-def test_decode_and_spec_batches_never_eligible(slot_direct):
+def test_decode_batches_never_eligible(slot_direct):
     r = _runner()
     d = _batch()
     d.phase = "decode"
     assert not r.eligible(_engine(), d)
-    s = _batch()
-    s.spec_mode = "verify"
-    assert not r.eligible(_engine(), s)

@@ -102,7 +102,9 @@ def _scheduler(num_pages: int, interval: int, budget: int) -> Scheduler:
     s._pending_abort_acks = set()
     s._abort_tombstones = {}
     s._last_data = None  # non-overlap: the loop drains whatever it has just issued
+    s.spec = None
     s._free_req_resources = lambda req: Scheduler._free_req_resources(s, req)
+    s._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(s, req, tokens)
     s._adaptive_prefill_budget = lambda: Scheduler._adaptive_prefill_budget(s)
     s._report_prompt_admissions = lambda batch: Scheduler._report_prompt_admissions(s, batch)
     s._restore_linear_states = lambda batch: Scheduler._restore_linear_states(s, batch)
@@ -159,11 +161,10 @@ class _Soak:
         self.dm.filter_reqs(batch.reqs)  # Scheduler._forward joins the batch to running
         # Token 0 is never EOS and no stop string is set, so a request only ever
         # ends on its own output budget.
-        return SimpleNamespace(
-            next_tokens_gpu=None,
-            next_tokens_cpu=torch.zeros(batch.size, dtype=torch.int32),
-            copy_done_event=SimpleNamespace(synchronize=lambda: None),
-            spec=None,
+        return (
+            None,
+            torch.zeros(batch.size, dtype=torch.int32),
+            SimpleNamespace(synchronize=lambda: None),
         )
 
     # -- one iteration of normal_loop ----------------------------------------

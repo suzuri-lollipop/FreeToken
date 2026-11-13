@@ -22,9 +22,10 @@ def _stream(parser: ReasoningParser, chunks):
 
 @pytest.mark.parametrize("kwargs", [{}, {"enable_thinking": True}, {"enable_thinking": False}])
 @pytest.mark.parametrize("tools", [None, [{"type": "function", "function": {"name": "read"}}]])
-def test_flint_streaming_opens_reasoning_only_on_a_think_tag(kwargs, tools):
+@pytest.mark.parametrize("family", ["flint", "ricursive"])
+def test_streaming_opens_reasoning_only_on_a_think_tag(kwargs, tools, family):
     spec = GenSpec(messages=[], sampling_params=SimpleNamespace(), chat_template_kwargs=kwargs, template_tools=tools)
-    state = SimpleNamespace(config=SimpleNamespace(reasoning_parser="flint"))
+    state = SimpleNamespace(config=SimpleNamespace(reasoning_parser=family))
     thought = "The literal <tool_call> here is a quotation."
     text = f"<think>{thought}</think>42"
     for size in (1, 3, 7, len(text)):
@@ -134,6 +135,22 @@ def test_think_no_reasoning_passthrough(name):
     reasoning, content = parser.parse_non_stream("just an answer")
     assert reasoning == ""
     assert content == "just an answer"
+
+
+def test_qwen3_missing_think_closer_preserves_tool_block_for_tool_parser():
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    text = "I need a shell.<tool_call><function=run_command></function></tool_call>"
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "I need a shell."
+    assert content == "<tool_call><function=run_command></function></tool_call>"
+
+
+def test_qwen3_closed_reasoning_keeps_literal_tool_marker_in_reasoning():
+    parser = ReasoningParser("qwen3", force_reasoning=True)
+    text = "Mention <tool_call> only as documentation.</think>Visible answer"
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "Mention <tool_call> only as documentation."
+    assert content == "Visible answer"
 
 
 # ----------------------------------------------------------------------- gemma

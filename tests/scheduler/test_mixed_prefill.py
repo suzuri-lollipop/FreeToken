@@ -40,10 +40,9 @@ def _req(uid: int, prompt_len: int = 13) -> Req:
 def _last_data(batch, tokens: list[int]):
     return (
         SimpleNamespace(batch=batch),
-        SimpleNamespace(next_tokens_gpu=None,
-                        next_tokens_cpu=torch.tensor(tokens, dtype=torch.int32),
-                        copy_done_event=SimpleNamespace(synchronize=lambda: None),
-                        spec=None),
+        (None,
+         torch.tensor(tokens, dtype=torch.int32),
+         SimpleNamespace(synchronize=lambda: None)),
     )
 
 
@@ -58,7 +57,7 @@ def _drain_stub(cache_req_calls: list[int]):
         evictable_swa_tokens=0,
     )
     sent: list[DetokenizeMsg] = []
-    return SimpleNamespace(
+    stub = SimpleNamespace(
         cache_manager=cache_manager,
         decode_manager=SimpleNamespace(remove_req=lambda r: None, running_reqs=set()),
         prefill_manager=SimpleNamespace(pending_list=[]),
@@ -81,8 +80,11 @@ def _drain_stub(cache_req_calls: list[int]):
         _pending_abort_acks=set(),
         _last_data=None,
         _free_req_resources=lambda _req: None,
+        spec=None,
         replies=sent,
-    ), sent
+    )
+    stub._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(stub, req, tokens)
+    return stub, sent
 
 
 def test_mixed_drain_replies_for_all_rows_but_commits_only_the_prompt():
@@ -97,7 +99,7 @@ def test_mixed_drain_replies_for_all_rows_but_commits_only_the_prompt():
 
     # the ride-along row emitted its token like a decode step...
     assert [m.uid for m in sent] == [1, 2]
-    assert [m.next_token for m in sent] == [42, 43]
+    assert [m.next_tokens for m in sent] == [[42], [43]]
     # ...but only the prompt completion committed a prefix: a live decode's
     # mid-generation prefix must never be radix-committed by the batch it merely rode
     assert commits == [1]
@@ -154,7 +156,7 @@ def test_charge_prefill_time_ignores_the_decode_side():
     prompt.prefill_chunk_tokens = 100
     decode.prefill_chunk_tokens = 5000  # stale snapshot from its own admission
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=time.perf_counter() - 0.5,
         reqs=[prompt, decode], decoding_reqs=[decode],
     )
@@ -180,7 +182,7 @@ def test_mixed_batch_owes_no_stall_debt():
 
     def batch(decoding):
         return SimpleNamespace(
-            is_prefill=True, spec_mode=None,
+            is_prefill=True,
             scheduled_at=stamp, decoding_reqs=decoding,
         )
 
@@ -190,7 +192,7 @@ def test_mixed_batch_owes_no_stall_debt():
 
 def test_mixed_in_flight_never_concedes():
     mixed = SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=time.perf_counter() - 9.0, decoding_reqs=[object()],
     )
     stub = SimpleNamespace(
@@ -202,7 +204,7 @@ def test_mixed_in_flight_never_concedes():
 
 def test_observe_chunk_time_skips_mixed_windows():
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None,
+        is_prefill=True,
         scheduled_at=time.perf_counter() - 1.0, log_new_tokens=512,
         decoding_reqs=[object()],
     )
