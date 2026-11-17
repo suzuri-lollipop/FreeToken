@@ -250,12 +250,13 @@ def test_sample_path_walks_the_selector_lattice(tmp_path):
     assert not torch.isclose(q[3].sum(-1), torch.ones(block - 1, device=DEV)).any()
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_tp2_shards_draft_weights_to_the_rank_buffers(rank, tmp_path):
-    """At TP2 the global checkpoint tensors are cut to the rank's parallel-layer buffers:
+@pytest.mark.parametrize("rank,tp", [(0, 2), (1, 2), (0, 4), (1, 4), (2, 4), (3, 4)])
+def test_tp_shards_draft_weights_to_the_rank_buffers(rank, tp, tmp_path):
+    """Under TP the global checkpoint tensors are cut to the rank's parallel-layer buffers:
     fused qkv/gate_up split into their parts and each part head-sliced, o_proj/down_proj
     input-sliced, replicated leaves untouched. The cuts match an independent manual slice
-    and the meta-built draft's local shapes; the ring carries the rank's KV heads."""
+    and the meta-built draft's local shapes; the ring carries the rank's KV heads. TP4
+    replicates the 2 KV heads: ranks share a head by the loader's rank*kv//tp mapping."""
     from freetoken.distributed import DistributedInfo
     from freetoken.distributed import info as tp_info_mod
     from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
@@ -269,7 +270,7 @@ def test_tp2_shards_draft_weights_to_the_rank_buffers(rank, tmp_path):
     path.mkdir()
     (path / "config.json").write_text(json.dumps(CONFIG))
     saved_tp = tp_info_mod._TP_INFO
-    tp_info_mod._TP_INFO = DistributedInfo(rank, 2)
+    tp_info_mod._TP_INFO = DistributedInfo(rank, tp)
     try:
         cfg = parse_config(cached_load_hf_config(str(path)))
         with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -278,8 +279,9 @@ def test_tp2_shards_draft_weights_to_the_rank_buffers(rank, tmp_path):
             draft = DFlash2DraftModel(cfg, target, NoQuantConfig())
         expected = draft.state_dict()
         lq, lkv, li = _local_sizes(cfg)
-        assert (lq, lkv, li) == (HEADS // 2, KV_HEADS // 2, INTER // 2)
+        assert (lq, lkv, li) == (HEADS // tp, 1 if tp > KV_HEADS else KV_HEADS // tp, INTER // tp)
         hd = HEAD_DIM
+        kv0 = (rank * KV_HEADS // tp) * hd  # models/loader.py's replicated-head mapping
         for i in range(LAYERS):
             p = f"layers.{i}"
             q = w[f"{p}.self_attn.q_proj.weight"]
@@ -287,8 +289,8 @@ def test_tp2_shards_draft_weights_to_the_rank_buffers(rank, tmp_path):
             v = w[f"{p}.self_attn.v_proj.weight"]
             qkv = torch.cat([q, k, v], dim=0)
             want_qkv = torch.cat([q[rank * lq * hd : (rank + 1) * lq * hd],
-                                  k[rank * lkv * hd : (rank + 1) * lkv * hd],
-                                  v[rank * lkv * hd : (rank + 1) * lkv * hd]], dim=0)
+                                  k[kv0 : kv0 + lkv * hd],
+                                  v[kv0 : kv0 + lkv * hd]], dim=0)
             gate, up = w[f"{p}.mlp.gate_proj.weight"], w[f"{p}.mlp.up_proj.weight"]
             want_gu = torch.cat([gate[rank * li : (rank + 1) * li], up[rank * li : (rank + 1) * li]], dim=0)
             cases = {
