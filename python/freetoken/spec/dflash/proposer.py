@@ -12,6 +12,7 @@ import torch
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kernel.triton.dflash import ring_attention_workspace
+from freetoken.models.dflash.model import _local_sizes
 from freetoken.spec.dflash.window import DFlashWindow
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
@@ -80,6 +81,11 @@ def _draft_entry(config) -> tuple[str, str]:
 
 
 class DFlashProposer(Proposer):
+    # the candidate top-K reads the gathered full-vocab logits and the selector walks them
+    # with rank-shared uniforms, so every rank drafts the same path; the draft's attention /
+    # MLP weights and ring KV are rank-sharded like the target's
+    tp_supported = True
+
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
         # one forward drafts [bonus, mask x k], and the draft is trained on blocks of block_size
@@ -127,8 +133,9 @@ class DFlashProposer(Proposer):
         c = cls._draft_config(config)
         block, rows, item = config.speculative_num_steps + 1, config.max_running_req + 1, config.dtype.itemsize
         ring_len = DFlashWindow.length(c.window, block)
-        kv = 2 * c.num_layers * rows * ring_len * c.num_kv_heads * c.head_dim * item
-        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, torch.device("meta")))
+        lq, lkv, _ = _local_sizes(c)
+        kv = 2 * c.num_layers * rows * ring_len * lkv * c.head_dim * item
+        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, lq, lkv, c.head_dim, ring_len, torch.device("meta")))
         aux = config.max_running_req * block * len(c.target_layer_ids) * c.hidden_size * item
         # the rope table is sized by the page table at attach; max_seq_len bounds its width
         rope = config.max_seq_len * c.head_dim * 4

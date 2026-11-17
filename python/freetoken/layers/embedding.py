@@ -220,19 +220,12 @@ class ParallelLMHead(VocabParallelEmbedding):
     # fork alias: TP-sharded logit columns for any number of rows (spec decode callers)
     shard_logits = logits
 
-    @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor, *, export_hidden: bool = True) -> torch.Tensor:
-        """``export_hidden=False``: the model hands its own final hidden to ``batch.features``."""
-        ctx = get_global_ctx()
-        batch = ctx.batch
-        bs = batch.size
-        if export_hidden and (features := batch.features) is not None:
-            features.final_hidden(x)
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(bs)
-            x = x[indices].contiguous()
-            del indices
-        logits = self.logits(x)
+    def gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits from this rank's vocab shard; identity at tp 1.
+
+        Every rank must select from the same global logits (sampling, draft argmax):
+        a shard-local argmax picks a different token per rank and the ranks diverge.
+        """
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
@@ -246,3 +239,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    @nvtx_annotate("LMHead")
+    def forward(self, x: torch.Tensor, *, export_hidden: bool = True) -> torch.Tensor:
+        """``export_hidden=False``: the model hands its own final hidden to ``batch.features``."""
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        bs = batch.size
+        if export_hidden and (features := batch.features) is not None:
+            features.final_hidden(x)
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(bs)
+            x = x[indices].contiguous()
+            del indices
+        return self.gather_logits(self.logits(x))

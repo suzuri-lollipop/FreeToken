@@ -17,10 +17,51 @@ from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParalle
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_quant
 from freetoken.models.blocks import GatedMLP
-from freetoken.utils import cached_load_hf_config, torch_dtype
+from freetoken.distributed import get_tp_info
+from freetoken.utils import cached_load_hf_config, div_even, torch_dtype
 
 from .config import DFlashDraftConfig
 from .weight import iter_weights
+
+
+def _local_sizes(config: DFlashDraftConfig) -> tuple[int, int, int]:
+    """This rank's (q heads, kv heads, intermediate) — the same cuts the parallel layers declare."""
+    tp = get_tp_info().size
+    return (div_even(config.num_heads, tp),
+            div_even(config.num_kv_heads, tp, allow_replicate=True),
+            div_even(config.intermediate_size, tp))
+
+
+def _slice_dense(name: str, tensor: torch.Tensor, config: DFlashDraftConfig) -> torch.Tensor:
+    """Cut a global-shape draft weight to this rank's parallel-layer buffer (tp 1: no-op).
+
+    The fused qkv and gate_up buffers are their parts concatenated, so each part is cut by
+    its own head/intermediate slice and re-concatenated in order; o_proj/down_proj shard the
+    input axis. Replicated leaves (fc, norms, conv, the selector codebooks) pass through.
+    """
+    tp = get_tp_info().size
+    if tp == 1:
+        return tensor
+    rank = get_tp_info().rank
+    lq, lkv, li = _local_sizes(config)
+    hd = config.head_dim
+    if name.endswith("qkv_proj.weight"):
+        q_rows, kv_rows = config.num_heads * hd, config.num_kv_heads * hd
+        q = tensor[:q_rows]
+        k = tensor[q_rows : q_rows + kv_rows]
+        v = tensor[q_rows + kv_rows :]
+        return torch.cat([q[rank * lq * hd : (rank + 1) * lq * hd],
+                          k[rank * lkv * hd : (rank + 1) * lkv * hd],
+                          v[rank * lkv * hd : (rank + 1) * lkv * hd]], dim=0)
+    if name.endswith("gate_up_proj.weight"):
+        i = config.intermediate_size
+        gate, up = tensor[:i], tensor[i:]
+        return torch.cat([gate[rank * li : (rank + 1) * li], up[rank * li : (rank + 1) * li]], dim=0)
+    if name.endswith("o_proj.weight"):
+        return tensor[:, rank * lq * hd : (rank + 1) * lq * hd]
+    if name.endswith("down_proj.weight"):
+        return tensor[:, rank * li : (rank + 1) * li]
+    return tensor
 
 
 @dataclass
@@ -130,6 +171,7 @@ class DFlash2DraftModel(BaseOP):
         for name, tensor in iter_weights(model_path, device):
             if name not in expected:
                 raise ValueError(f"{model_path}: unexpected DFlash tensor {name!r}")
+            tensor = _slice_dense(name, tensor, config)
             if tensor.shape != expected[name].shape:
                 raise ValueError(f"{model_path}: {name} is {tuple(tensor.shape)}, expected {tuple(expected[name].shape)}")
             dst = qkv_slices.get(name)
@@ -141,7 +183,10 @@ class DFlash2DraftModel(BaseOP):
         for op in (draft.fc, draft.layers, draft.candidate_selector):
             finalize_quant(op)
         layers = draft.layers.op_list
-        draft._kv_all = qkv[:, layers[0].self_attn.q_size :]
+        # the K/V rows of the fused qkv: slice at the LOCAL q width (q_size is global; the
+        # fused buffer is rank-local, so a global offset would empty it under TP)
+        lq, _, _ = _local_sizes(config)
+        draft._kv_all = qkv[:, lq * config.head_dim :]
         draft._k_norms = torch.stack([layer.self_attn.k_norm.weight for layer in layers]).contiguous()
         draft._mask_embedding = draft._embed_tokens.forward(torch.tensor([config.mask_token_id], device=device))[0]
         return draft
@@ -149,9 +194,10 @@ class DFlash2DraftModel(BaseOP):
     def make_dflash_ring(self, max_rows: int, block: int, ring_len: int, max_position: int, device: torch.device) -> DFlashRing:
         """A zeroed ring of ``ring_len`` positions for ``max_rows`` table rows, drafting blocks of ``block`` tokens at positions below ``max_position``."""
         c = self.config
+        lq, lkv, _ = _local_sizes(c)
         assert ring_len >= c.window + block, f"a ring of {ring_len} cannot hold the window {c.window} plus the block {block}"
-        k = torch.zeros(c.num_layers, max_rows, ring_len, c.num_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
-        workspace = ring_attention_workspace(max_rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, device)
+        k = torch.zeros(c.num_layers, max_rows, ring_len, lkv, c.head_dim, dtype=self._kv_all.dtype, device=device)
+        workspace = ring_attention_workspace(max_rows, block, lq, lkv, c.head_dim, ring_len, device)
         # not the cached get_rope: max_position follows the page table, so each rebuild would cache one more table
         inv_freq = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float, device=device) / c.head_dim))
         freqs = torch.arange(max_position, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
@@ -186,15 +232,16 @@ class DFlash2DraftModel(BaseOP):
         positions = (starts.view(-1, 1) + torch.arange(block, device=bonus.device)).view(-1).to(torch.int32)
         token_rows = rows.repeat_interleave(block)
         scale = c.head_dim**-0.5
+        lq, _, _ = _local_sizes(c)
         residual = None
         for i, layer in enumerate(self.layers.op_list):
             attn = layer.self_attn
             h, residual = layer.input_layernorm.forward(x, residual)
             h, conv = layer.attention_conv.prepare(h, block)
-            q = torch.empty(bs * block, attn.q_size, dtype=h.dtype, device=h.device)
+            q = torch.empty(bs * block, lq * c.head_dim, dtype=h.dtype, device=h.device)
             # the block's own K/V go into the ring, so the attention reads window and block alike
             norm_rope_store(
-                attn.qkv_proj.forward(h), num_layers=1, num_q_heads=c.num_heads, q_out=q, q_norm=attn.q_norm.weight,
+                attn.qkv_proj.forward(h), num_layers=1, num_q_heads=lq, q_out=q, q_norm=attn.q_norm.weight,
                 k_norms=self._k_norms, cos_sin=dflash_ring.cos_sin, positions=positions, rows=token_rows,
                 ring_k=dflash_ring.k, ring_v=dflash_ring.v, layer0=i, eps=c.rms_norm_eps,
             )
@@ -209,6 +256,9 @@ class DFlash2DraftModel(BaseOP):
 
     def compute_candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The target head's top-K token ids and their fp32 logits over ``hidden [..., H]``, best first, so a tie in the walk takes the first."""
-        vals, ids = self._top_k(self._lm_head.logits(hidden.reshape(-1, hidden.shape[-1])), self.config.selector_top_k)
+        # gather the vocab shards first: a shard-local top-K gives each rank different
+        # candidates and the TP ranks draft divergent paths (same agreement as the mtp argmax)
+        logits = self._lm_head.gather_logits(self._lm_head.logits(hidden.reshape(-1, hidden.shape[-1])))
+        vals, ids = self._top_k(logits, self.config.selector_top_k)
         shape = hidden.shape[:-1] + (-1,)
         return ids.long().view(shape), vals.float().view(shape)

@@ -122,6 +122,9 @@ def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
 
 class MTPProposer(Proposer):
     radix_lookahead = True
+    # the draft argmax reads the gathered full-vocab logits, so every rank drafts the same
+    # tokens; the draft's dense weights are rank-sharded like the target's (ef16b35)
+    tp_supported = True
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
@@ -277,7 +280,10 @@ class MTPProposer(Proposer):
             return self.draft.forward_hidden(embeds, prev_hidden)
 
     def _draft_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        token = self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
+        # gather the vocab shards first: a shard-local argmax drafts a different token per
+        # rank and the TP ranks diverge (the verify collective then mismatches)
+        logits = self.lm_head.gather_logits(self.lm_head.logits(self.draft.head_input(hidden)))
+        token = logits.argmax(dim=-1)
         return token if self.hot_ids is None else self.hot_ids[token]
 
     def _view(self, req, cached_len: int, device_len: int) -> _DraftReq:

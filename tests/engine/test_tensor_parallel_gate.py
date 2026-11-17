@@ -335,3 +335,25 @@ def test_tp_accepts_int8_per_token_head(monkeypatch):
     _patch_env(monkeypatch, major=10)
     config = _config(tp=2, attention_backend="auto", kv_cache_dtype="int8_per_token_head")
     _validate_kv_format(config, config.model_config)
+
+
+def test_spec_tp_gate_follows_the_methods_draft_agreement():
+    """The base proposer gate rejects TP unless the method keeps every rank's drafts
+    identical. mtp gathers the head's vocab shards before its argmax; dflash gathers them
+    before its candidate top-K and walks the path with rank-shared uniforms. Both are
+    tp_supported; a method without that agreement stays tp 1."""
+    from freetoken.spec.dflash.proposer import DFlashProposer
+    from freetoken.spec.mtp.proposer import MTPProposer
+    from freetoken.spec.proposer import Proposer
+
+    config = _config(tp=2)
+    with pytest.raises(ValueError, match="needs --tp 1"):
+        Proposer.adjust_config(config, None)
+
+    class _Agreed(Proposer):
+        tp_supported = True
+
+    _Agreed.adjust_config(config, None)   # must not raise
+    assert MTPProposer.tp_supported is True
+    assert DFlashProposer.tp_supported is True
+
