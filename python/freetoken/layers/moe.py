@@ -73,9 +73,9 @@ _CHUNK_TIMING = os.getenv("FREETOKEN_CHUNK_TIMING", "0") == "1"
 
 
 def _is_spec_batch(batch) -> bool:
-    """MTP spec steps keep phase="prefill" (sequential GDN/QSA/PLE) but must stage
-    experts like decode does: device-driven on-demand fetch, no host readback."""
-    return getattr(batch, "spec_mode", None) is not None
+    """A speculative verify batch stages experts like decode does: device-driven
+    on-demand fetch, no host readback. main's verify batches carry phase="verify"."""
+    return getattr(batch, "phase", None) == "verify"
 
 
 def _prefill_cpu_split(cache: OffloadMoeCache, num_tokens: int):

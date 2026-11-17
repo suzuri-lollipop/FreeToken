@@ -236,6 +236,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=4,
         moe_intermediate_size=2880,
         expert_formats=("mxfp4_triton",),
+        arch_aliases=("GptOssGGUFForCausalLM",),  # the GGUF row builds the same classes
     ),
     AotModel(
         name="openai/gpt-oss-20b",
@@ -245,6 +246,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=4,
         moe_intermediate_size=2880,
         expert_formats=("mxfp4_triton",),
+        arch_aliases=("GptOssGGUFForCausalLM",),
     ),
     AotModel(
         name="zai-org/GLM-4.7",
@@ -387,6 +389,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
+    ),
+    AotModel(
+        name="ricursiveAI/Ripple-65B-Preview",
+        architecture="RicursiveForCausalLM",
+        hidden_size=5120,
+        kv_groups=((8, 128),),  # sliding and full (NoPE) layers share the same geometry
+        aliases=("ricursiveAI/Ripple-65B-Preview-NVFP4",),
+        arch_aliases=("RicursiveGGUFForCausalLM",),
     ),
     AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",

@@ -6,7 +6,7 @@ import torch
 
 from ..registry import LayerKind, register_method
 from ..scheme import FP8_BLOCK as BLOCK, QuantKind, fp8_block_size
-from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod, tp_rows
 
 FP8 = torch.float8_e4m3fn
 
@@ -49,6 +49,14 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
+        if cfg.tp_size > 1:
+            # the reader hands over full experts; this rank banks its own slice of the
+            # intermediate (whole 128-row scale blocks, MoEConfig.local_intermediate_range)
+            lo, hi = cfg.local_intermediate_range
+            pieces = {
+                role: tp_rows(t, 2 if role.startswith("down") else 1, lo, hi, cfg.intermediate)
+                for role, t in pieces.items()
+            }
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["down"].copy_(pieces["down"])
         # the scale banks carry 16-byte padding on the last dim

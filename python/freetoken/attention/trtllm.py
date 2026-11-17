@@ -42,11 +42,6 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
-        # A quantized pool folds its descales into the two GEMM scales trtllm-gen already
-        # takes: bmm1 covers Q.K^T (so it carries k_scale), bmm2 covers P.V (v_scale).
-        self.quant = getattr(self.kvcache, "quant", None)
-        self.bmm1_scale = self.scale if self.quant is None else self.scale * self.quant.k_scale
-        self.bmm2_scale = 1.0 if self.quant is None else self.quant.v_scale
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
@@ -81,8 +76,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 seq_lens=metadata.cache_seqlens,
                 max_q_len=metadata.max_seqlen_q,
                 max_kv_len=metadata.max_seqlen_k,
-                bmm1_scale=self.bmm1_scale,
-                bmm2_scale=self.bmm2_scale,
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
                 cum_seq_lens_q=metadata.cu_seqlens_q,
                 cum_seq_lens_kv=metadata.cu_seqlens_k,
                 kv_layout="NHD",
@@ -97,8 +92,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 block_tables=metadata.page_table,
                 seq_lens=metadata.cache_seqlens,
                 max_seq_len=metadata.max_seqlen_k,
-                bmm1_scale=self.bmm1_scale,
-                bmm2_scale=self.bmm2_scale,
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
                 kv_layout="NHD",
                 out_dtype=q.dtype,
             )
@@ -143,7 +138,9 @@ class TensorRTLLMBackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
+            raise NotImplementedError("trtllm captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(

@@ -6,7 +6,7 @@ import torch
 
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind
-from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod, tp_rows
 
 
 class FusedMoEKernel(MoEKernel):
@@ -24,6 +24,14 @@ class FusedMoEKernel(MoEKernel):
         return {"gate_up": BankSpec((2 * i, cfg.hidden), dt), "down": BankSpec((cfg.hidden, i), dt)}
 
     def pack(self, pieces, cfg: MoEConfig, out):
+        if cfg.tp_size > 1:
+            # the reader hands over full experts; this rank banks its own slice of the
+            # intermediate, so the banks and the PCIe stream shrink with it
+            lo, hi = cfg.local_intermediate_range
+            pieces = {
+                role: tp_rows(t, 2 if role.startswith("down") else 1, lo, hi, cfg.intermediate)
+                for role, t in pieces.items()
+            }
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["down"].copy_(pieces["down"])
         return {}

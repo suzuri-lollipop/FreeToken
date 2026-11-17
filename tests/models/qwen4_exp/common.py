@@ -166,8 +166,8 @@ def fill_weights(op, seed: int, device: torch.device, scale: float = 0.05) -> No
 class Fixture:
     """QSA pool + page table + the sparse backend, with a first-fit page allocator.
 
-    ``quant`` builds a quantized pool: the paged K/V is stored in its dtype and descaled on
-    read, while the layers, the index tiers and the scratch keep ``dtype``.
+    ``num_speculative_tokens`` sizes the index ring for verify rows (main's KV format
+    system stores per-token-head scales; the layers, index tiers and scratch keep ``dtype``).
     """
 
     def __init__(
@@ -178,7 +178,7 @@ class Fixture:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
-        quant=None,
+        num_speculative_tokens: int = 0,
     ) -> None:
         from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
@@ -195,7 +195,7 @@ class Fixture:
             dtype=dtype,
             device=self.device,
             num_req_slots=self.num_req_slots,
-            quant=quant,
+            num_speculative_tokens=num_speculative_tokens,
         )
         self.page_table = torch.zeros(
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device
@@ -234,9 +234,9 @@ class Fixture:
             extend_len=device_len - cached_len,
         )
 
-    def step(self, req: SimpleNamespace) -> None:
-        self.allocate(req.table_idx, req.device_len, req.device_len + 1)
-        req.cached_len, req.device_len, req.extend_len = req.device_len, req.device_len + 1, 1
+    def step(self, req: SimpleNamespace, rows: int = 1) -> None:
+        self.allocate(req.table_idx, req.device_len, req.device_len + rows)
+        req.cached_len, req.device_len, req.extend_len = req.device_len, req.device_len + rows, rows
 
     def batch(self, reqs, phase: str) -> SimpleNamespace:
         positions = torch.cat(

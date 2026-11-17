@@ -25,6 +25,7 @@ from freetoken.server.generation import (  # noqa: E402
     GenSpec,
     generate_events,
     generate_full,
+    timings_block,
 )
 
 
@@ -66,7 +67,7 @@ class FakeState:
 
 def _ack(
     prompt: int = 0, completion: int = 0, out: str = "", finished: bool = False,
-    queue_ms: float = 0.0, prefill_ms: float = 0.0,
+    timings: dict | None = None,
 ) -> UserReply:
     return UserReply(
         uid=42,
@@ -75,9 +76,20 @@ def _ack(
         prompt_tokens_delta=prompt,
         completion_tokens_delta=completion,
         finish_reason="stop" if finished else None,
-        queue_ms=queue_ms,
-        prefill_ms=prefill_ms,
+        timings=timings,
     )
+
+
+def _sched_timings(**over) -> dict:
+    """A scheduler ReqStats.finish payload: raw spans and counts, no derived rates."""
+    t = dict(queue_ms=0.0, cache_n=0, prompt_n=0, prompt_ms=0.0, predicted_n=0,
+             predicted_ms=0.0, draft_n=0, draft_n_accepted=0)
+    t.update(over)
+    return t
+
+
+def _timings_state() -> SimpleNamespace:
+    return SimpleNamespace(config=SimpleNamespace(enable_timings_report=True))
 
 
 def _spec() -> GenSpec:
@@ -110,56 +122,6 @@ def test_stats_reports_backend_page_size(pools, expected):
     assert doc["kv"] == {"used_pages": 0, "total_pages": 130, "page_size": expected}
 
 
-def test_stats_reports_mtp_tallies_whether_or_not_anything_drafts():
-    from freetoken.server.stats import StatsTracker, build_stats
-
-    def doc(speculative, verifies=0, accepted=0, declines=None, steps=0, decode_steps=0):
-        tracker = StatsTracker()
-        tracker.spec_verifies, tracker.spec_accepted = verifies, accepted
-        tracker.spec_declines = dict(declines or {})
-        tracker.spec_steps, tracker.spec_decode_steps = steps, decode_steps
-        config = SimpleNamespace(served_model_name="unit-model", max_seq_len=262144,
-                                 page_size=1, served_modalities=(), speculative=speculative,
-                                 model_config=SimpleNamespace())
-        state = SimpleNamespace(stats=tracker, config=config, cache_pools=None)
-        return build_stats(state, 0, 0)["spec"]
-
-    # no speculative decoding: no section, so a client cannot read someone else's zeros
-    assert doc("none") is None
-    # drafting on and nothing ever qualified: the zeros and the reasons ARE the answer
-    assert doc("mtp", declines={"prefix_hit": 9, "chunked": 12}) == {
-        "verifies": 0, "accepted": 0, "acceptance_rate": None,
-        "declined": {"chunked": 12, "prefix_hit": 9},
-        "steps": 0, "decode_steps": 0, "cold_seeds": 0, "drafted_ratio": None,
-    }
-    assert doc("mtp", verifies=64, accepted=37)["acceptance_rate"] == 0.578
-    # coverage: 16 spec steps against 64 regular decode steps is a request that stopped
-    # drafting, which the acceptance rate alone cannot say
-    assert doc("mtp", verifies=64, accepted=37, steps=16, decode_steps=64) == {
-        "verifies": 64, "accepted": 37, "acceptance_rate": 0.578, "declined": {},
-        "steps": 16, "decode_steps": 64, "cold_seeds": 0, "drafted_ratio": 0.2,
-    }
-    # lookup counts drafts, not verify batches, and names itself so a client can tell the
-    # sections apart without also reading the launch flags
-    lookup = doc("lookup", verifies=40, accepted=34)
-    assert lookup["backend"] == "lookup"
-    assert (lookup["verifies"], lookup["accepted"]) == (40, 34)
-    assert lookup["acceptance_rate"] == 0.85
-
-
-def test_stats_tracker_keeps_the_last_mtp_snapshot():
-    from freetoken.server.stats import StatsTracker
-
-    tracker = StatsTracker()
-    tracker.observe(_ack(completion=2, finished=False))
-    assert (tracker.spec_verifies, tracker.spec_declines) == (0, {})
-    tracker.observe(UserReply(uid=42, incremental_output="", finished=False,
-                              spec_verifies=64, spec_accepted=37,
-                              spec_declines={"prefix_hit": 9}))
-    assert (tracker.spec_verifies, tracker.spec_accepted) == (64, 37)
-    assert tracker.spec_declines == {"prefix_hit": 9}
-
-
 def test_non_stream_records_the_request_with_real_token_totals():
     request_ring.reset()
     st = FakeState([_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)])
@@ -176,7 +138,7 @@ def test_non_stream_records_the_request_with_real_token_totals():
 def test_stream_records_the_totals_from_gendone():
     request_ring.reset()
     st = FakeState([
-        _ack(prompt=7, completion=1, out="x", queue_ms=4.25, prefill_ms=120.5),
+        _ack(prompt=7, completion=1, out="x", timings={"queue_ms": 4.25, "prompt_ms": 120.5}),
         _ack(completion=4, out="yz", finished=True),
     ])
 
@@ -279,7 +241,8 @@ def test_phase_rows_are_only_the_ones_the_engine_stamped():
     own send time with a phase nobody measured."""
     request_ring.reset()
     stamped = FakeState([
-        _ack(prompt=1, completion=1, out="a", finished=True, queue_ms=2.5, prefill_ms=40.0)
+        _ack(prompt=1, completion=1, out="a", finished=True,
+             timings={"queue_ms": 2.5, "prompt_ms": 40.0})
     ])
     asyncio.run(generate_full(42, _spec(), stamped, source="/v1/chat/completions"))
     unstamped = FakeState([_ack(prompt=1, completion=1, out="a", finished=True)])
@@ -320,3 +283,69 @@ def test_high_temperature_guard_applies_min_p_only():
     p = resolve_sampling(temperature=1.0, top_k=1, top_p=None, max_tokens=64,
                          ignore_eos=False, model_sampling={})
     assert p.min_p == 0.0
+
+
+def test_timings_block_follows_llama_cpp_semantics():
+    t = timings_block(_timings_state(), _sched_timings(
+        queue_ms=500.0, cache_n=800, prompt_n=200, prompt_ms=2500.0,
+        predicted_n=21, predicted_ms=2000.0,
+    ))
+    # prompt_n excludes the cache; decode steps are n - 1 (llama.cpp semantics).
+    assert t["cache_n"] == 800
+    assert t["prompt_n"] == 200
+    assert t["prompt_per_second"] == 80.0  # 200 evaluated tokens / 2.5 s
+    assert t["predicted_n"] == 21
+    assert t["predicted_per_second"] == 10.0  # 20 decode steps / 2.0 s
+    assert t["prompt_ms"] == 2500.0 and t["predicted_ms"] == 2000.0
+    assert t["queue_ms"] == 500.0  # FreeToken extension
+    assert "draft_n" not in t and "draft_n_accepted" not in t  # no drafting
+
+
+def test_timings_block_is_opt_in_and_needs_measured_spans():
+    raw = _sched_timings(prompt_n=10, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0)
+    # off without the flag: usage.prompt_tokens - prompt_n would still leak the cache hit
+    assert timings_block(SimpleNamespace(config=SimpleNamespace()), raw) is None
+    # the responses helpers may pass no state at all
+    assert timings_block(None, raw) is None
+    # errors and aborts deliver no scheduler timings
+    assert timings_block(_timings_state(), None) is None
+
+
+def test_timings_block_rates_survive_the_edge_shapes():
+    state = _timings_state()
+    # one output token: the first rides the last prompt batch, so no decode steps
+    t = timings_block(state, _sched_timings(prompt_n=10, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001))
+    assert t["predicted_per_second"] == 0.0 and t["predicted_per_token_ms"] == 0.0
+    # fully cached prompt: nothing was evaluated
+    t = timings_block(state, _sched_timings(prompt_n=0, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0))
+    assert t["prompt_per_second"] == 0.0 and t["prompt_per_token_ms"] == 0.0
+    # values are passed through unrounded
+    t = timings_block(state, _sched_timings(prompt_n=3, prompt_ms=1234.5678, predicted_n=2, predicted_ms=50.0))
+    assert t["prompt_ms"] == 1234.5678 and t["prompt_per_token_ms"] == 1234.5678 / 3
+    # speculative decoding adds the draft counters, and only then
+    t = timings_block(state, _sched_timings(prompt_n=3, prompt_ms=300.0, predicted_n=5,
+                                            predicted_ms=400.0, draft_n=64, draft_n_accepted=40))
+    assert t["draft_n"] == 64 and t["draft_n_accepted"] == 40
+
+
+def test_gen_done_and_result_carry_the_scheduler_timings():
+    raw = _sched_timings(queue_ms=5.0, prompt_n=7, prompt_ms=70.0, predicted_n=5, predicted_ms=80.0)
+    st = FakeState([
+        _ack(prompt=7, completion=1, out="x"),
+        _ack(completion=4, out="yz", finished=True, timings=raw),
+    ])
+
+    async def drain():
+        done = None
+        async for ev in generate_events(42, _spec(), st):
+            if isinstance(ev, GenDone):
+                done = ev
+        return done
+
+    done = asyncio.run(drain())
+    assert done.timings is raw  # the terminal ack's scheduler spans, unchanged
+
+    result = asyncio.run(generate_full(42, _spec(), FakeState(
+        [_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True, timings=raw)]
+    )))
+    assert result.timings is raw

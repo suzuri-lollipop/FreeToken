@@ -133,26 +133,6 @@ def test_page_table_divides_by_page_size(backend):
     assert meta.page_table.tolist() == [[8, 9, 10]]
 
 
-def test_fp8_query_and_descaled_buffers_grow_on_demand(backend):
-    quant = SimpleNamespace(
-        k_scale=torch.tensor(448.0), v_scale=torch.tensor(2.0)
-    )
-    fa_backend, ctx = backend(page_size=1, quant=quant)
-
-    q = torch.tensor([448.0, -448.0, 0.0, 224000.0])
-    q_fp8, q_d, k_d, v_d = fa_backend._fp8_query(q, bs=2)
-    assert q_fp8.dtype == torch.float8_e4m3fn
-    # 224000/448 = 500 clamps to the e4m3 max (448); 1 and 0 are exact
-    assert q_fp8.float().tolist() == [1.0, -1.0, 0.0, 448.0]
-    assert list(fa_backend._descales[0].shape) == [64, 4]  # rows = max(bs, 64)
-    assert torch.all(q_d == 448.0) and torch.all(k_d == 448.0) and torch.all(v_d == 2.0)
-
-    first = fa_backend._descales
-    fa_backend._fp8_query(q, bs=100)  # forces a regrow past the 64-row floor
-    assert fa_backend._descales is not first
-    assert list(fa_backend._descales[0].shape) == [100, 4]
-
-
 def test_capture_init_and_prepare_replay_roundtrip(backend):
     fa_backend, ctx = backend(page_size=2)
     fa_backend.init_capture_graph(max_seq_len=16, bs_list=[1, 4, 2])

@@ -500,84 +500,6 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     assert is_offload_moe_strategy(config.moe_strategy)
 
 
-def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
-    import freetoken.core as core
-    from freetoken.core import Context, Req, get_global_ctx
-    from freetoken.engine.graph import GraphRunner
-
-    events = []
-    _init_tp()
-    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
-
-    class FakeGraph:
-        def pool(self):
-            return "pool"
-
-    @contextmanager
-    def fake_cuda_graph(graph, pool=None, stream=None):
-        events.append("graph_enter")
-        yield
-        events.append("graph_exit")
-
-    class FakeAttnBackend:
-        def init_capture_graph(self, max_seq_len, bs_list):
-            pass
-
-        def prepare_for_capture(self, batch):
-            pass
-
-    class FakeModel:
-        def forward(self):
-            events.append("forward")
-            batch = get_global_ctx().batch
-            return torch.zeros(batch.size, 3)
-
-    class FakeOffloadCache:
-        def reset(self):
-            events.append("reset")
-
-    monkeypatch.setattr("torch.cuda.CUDAGraph", FakeGraph)
-    monkeypatch.setattr("torch.cuda.graph", fake_cuda_graph)
-    monkeypatch.setattr("torch.cuda.synchronize", lambda device=None: None)
-    monkeypatch.setattr("torch.cuda.empty_cache", lambda: None)
-    monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
-    monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
-    monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
-
-    dummy_req = Req(
-        input_ids=torch.tensor([0], dtype=torch.int32),
-        table_idx=0,
-        cached_len=0,
-        output_len=1,
-        uid=-1,
-        sampling_params=None,
-        cache_handle=None,
-    )
-    GraphRunner(
-        stream=None,
-        device=torch.device("cpu"),
-        model=FakeModel(),
-        attn_backend=FakeAttnBackend(),
-        cuda_graph_bs=[1],
-        cuda_graph_max_bs=None,
-        free_memory=1024,
-        max_seq_len=1,
-        vocab_size=3,
-        dummy_req=dummy_req,
-        moe_offload_cache=FakeOffloadCache(),
-    )
-
-    assert events == [
-        "reset",
-        "forward",
-        "graph_enter",
-        "forward",
-        "graph_exit",
-        "reset",
-        "reset",
-    ]
-
-
 def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
     """Regression: a full-layer prefill loads the layer's experts into slots [0, E).
     If that overwrite does not invalidate the previous owners' mappings, a later
@@ -1175,14 +1097,18 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, mem
     # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
     from types import SimpleNamespace
 
-    from freetoken.moe.locked_fetch import LockedLayerFetch
+    from freetoken.moe.locked_fetch import attach_locked_fetch, settle_banks
 
     monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
     torch.manual_seed(0)
     cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
     cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
-    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
+    config = SimpleNamespace(moe_strategy="hybrid", moe_locked_fetch=1.0, moe_locked_max_fetch=2)
+    _, _, staging = settle_banks(config, SimpleNamespace(sources=sources), probe=False, has_locked=True)
+    assert staging is not None
+    cache.cpu_executor = SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops)
+    attach_locked_fetch(cache, config, staging, layer_rows=None)
 
     top_k = 3
     ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")

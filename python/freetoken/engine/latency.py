@@ -136,17 +136,11 @@ class LatencyProbe:
                 gauges["waiting"] = len(sched.prefill_manager.pending_list)
             except AttributeError:
                 pass
-            v = getattr(sched, "_spec_verifies", 0)
-            a = getattr(sched, "_spec_accepted", 0)
-            spec["verifies"] = v - self._spec_base[0]
-            spec["accepted"] = a - self._spec_base[1]
+            reporter = getattr(sched, "status_reporter", None)
+            v, a = getattr(reporter, "_spec_counts", (0, 0))
+            spec["verifies"] = max(0, v - self._spec_base[0])
+            spec["accepted"] = max(0, a - self._spec_base[1])
             self._spec_base = (v, a)
-            rejections = getattr(sched, "_spec_rejections", None) or {}
-            d = self._rej_base
-            for k, n in rejections.items():
-                if n - d.get(k, 0) > 0:
-                    spec["rejections"][k] = n - d.get(k, 0)
-                d[k] = n
         return {
             "ts": time.time(),
             # every TP rank appends to the same out file; pid separates the streams

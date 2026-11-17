@@ -88,11 +88,6 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
-        spec_verifies=64,
-        spec_accepted=37,
-        spec_declines={"prefix_hit": 9, "chunked": 12},
-        queue_ms=4.25,
-        prefill_ms=120.5,
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -107,42 +102,40 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
-    # the MTP counters ride the same reply, and the decline map survives as a dict
-    assert decoded.spec_verifies == 64
-    assert decoded.spec_accepted == 37
-    assert decoded.spec_declines == {"prefix_hit": 9, "chunked": 12}
-    # the queue-wait / prefill pair rides the reply that samples the first token, and every
-    # token after it, so the API can still see it when the terminal reply is built
-    assert (decoded.queue_ms, decoded.prefill_ms) == (4.25, 120.5)
-
-    # a reply from an engine that does not draft them at all still decodes
-    legacy = BaseFrontendMsg.encoder(msg)
-    for key in ("spec_verifies", "spec_accepted", "spec_declines", "queue_ms", "prefill_ms"):
-        legacy.pop(key)
-    old = BaseFrontendMsg.decoder(legacy)
-    assert (old.spec_verifies, old.spec_accepted, old.spec_declines) == (0, 0, {})
-    assert (old.queue_ms, old.prefill_ms) == (0.0, 0.0)
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
     msg = DetokenizeMsg(
-        uid=3, next_token=42, finished=True,
+        uid=3, next_tokens=[42], finished=True,
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
-        spec_verifies=49, spec_accepted=37, spec_declines={"prefix_hit": 9},
-        queue_ms=2.5, prefill_ms=88.5,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
-    # the MTP counters ride the same reply, and a field the scheduler stamps but this message
-    # does not declare kills the detokenizer worker when it decodes the first one
-    assert (decoded.spec_verifies, decoded.spec_accepted) == (49, 37)
-    assert decoded.spec_declines == {"prefix_hit": 9}
-    assert (decoded.queue_ms, decoded.prefill_ms) == (2.5, 88.5)
+
+
+def test_terminal_replies_carry_scheduler_timings_over_the_wire():
+    timings = {"queue_ms": 5.5, "cache_n": 8, "prompt_n": 2, "prompt_ms": 100.0,
+               "predicted_n": 4, "predicted_ms": 250.0, "draft_n": 6, "draft_n_accepted": 3}
+    msg = DetokenizeMsg(uid=3, next_tokens=[42], finished=True, timings=timings)
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(decoded, DetokenizeMsg)
+    assert decoded.timings == timings
+
+    reply = UserReply(uid=3, incremental_output="", finished=True,
+                      completion_tokens_delta=1, timings=timings)
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(out, UserReply)
+    assert out.timings == timings
+    # intermediate replies and aborts/errors never carry timings
+    plain = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(
+        UserReply(uid=3, incremental_output="x", finished=False)
+    ))
+    assert plain.timings is None
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

@@ -304,31 +304,56 @@ def test_no_sharding_backend_available_reports_tp(monkeypatch):
     with pytest.raises(RuntimeError, match="tensor parallelism over 2 ranks"):
         _adjust_config(config)
 
-def _patch_native_fp8(monkeypatch):
-    """Keep --kv-cache-dtype resolution off the GPU: the gate under test is the backend
-    matrix, not whether this machine can store e4m3."""
-    from freetoken.kvcache import kv_quant
 
-    monkeypatch.setattr(kv_quant, "has_native_e4m3", lambda: True)
-
-
-def test_tp_and_a_quantized_cache_keep_the_backend_that_satisfies_both(monkeypatch):
+def test_tp_refuses_a_quantized_cache(monkeypatch):
+    """fp8_per_token_head has no TP-aware descale path yet, so _validate_kv_format refuses
+    it once tp_size > 1 -- before backend resolution. The duck-typed model resolves to the
+    MHA pool, which stores it, so the TP gate is the one that fires."""
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch, major=10)
-    _patch_native_fp8(monkeypatch)
-    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
-    _adjust_config(config)
-    assert config.attention_backend == "fi"
-
-
-def test_tp_and_a_quantized_cache_report_both_gates(monkeypatch):
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_env(monkeypatch, major=10, flashinfer=False)
-    _patch_native_fp8(monkeypatch)
-    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
-    with pytest.raises(RuntimeError, match="quantized KV cache") as excinfo:
+    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="fp8_per_token_head")
+    with pytest.raises(ValueError, match="does not support tensor parallelism"):
         _adjust_config(config)
-    assert "tensor parallelism over 2 ranks" in str(excinfo.value)
+
+
+def test_tp_accepts_the_static_fp8_cache(monkeypatch):
+    """fp8_e4m3 descales with one static scalar, identical on every rank (the fork's
+    pre-#894 fp8), so the TP gate exempts it while fp8_per_token_head stays gated."""
+    from freetoken.engine.engine import _validate_kv_format
+
+    _patch_env(monkeypatch, major=10)
+    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    _validate_kv_format(config, config.model_config)
+
+
+def test_tp_accepts_int8_per_token_head(monkeypatch):
+    """int8_per_token_head's scales are computed and read back per rank on its own heads
+    (Strata's int8 KV shards the same way), so the TP gate exempts it too."""
+    from freetoken.engine.engine import _validate_kv_format
+
+    _patch_env(monkeypatch, major=10)
+    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="int8_per_token_head")
+    _validate_kv_format(config, config.model_config)
+
+
+def test_spec_tp_gate_follows_the_methods_draft_agreement():
+    """The base proposer gate rejects TP unless the method keeps every rank's drafts
+    identical. mtp gathers the head's vocab shards before its argmax; dflash gathers them
+    before its candidate top-K and walks the path with rank-shared uniforms. Both are
+    tp_supported; a method without that agreement stays tp 1."""
+    from freetoken.spec.dflash.proposer import DFlashProposer
+    from freetoken.spec.mtp.proposer import MTPProposer
+    from freetoken.spec.proposer import Proposer
+
+    config = _config(tp=2)
+    with pytest.raises(ValueError, match="needs --tp 1"):
+        Proposer.adjust_config(config, None)
+
+    class _Agreed(Proposer):
+        tp_supported = True
+
+    _Agreed.adjust_config(config, None)   # must not raise
+    assert MTPProposer.tp_supported is True
+    assert DFlashProposer.tp_supported is True
 

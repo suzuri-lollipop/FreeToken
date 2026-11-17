@@ -9,11 +9,24 @@ from types import SimpleNamespace
 from freetoken.calibrate_lookup import (
     ROOT,
     Score,
+    _startup_fatal,
     choose,
     normalize_argv,
     render_script,
     spec_from_args,
 )
+
+
+def test_startup_fatal_fails_a_crash_loop_but_not_a_transient_restart():
+    # a config error crash-looping the backend (frontend stays alive) is fatal at >=3 tries
+    tail = ("ValueError: speculative decoding needs --tp 1 for now\n"
+            "backend restarted (attempt 3) after: ValueError: speculative decoding needs --tp 1")
+    assert _startup_fatal(tail) is not None
+    # one or two transient restarts during load are not fatal yet
+    assert _startup_fatal("backend restarted (attempt 1) after: CUDA out of memory") is None
+    assert _startup_fatal("backend restarted (attempt 2) after: CUDA out of memory") is None
+    # a healthy startup has no restart marker
+    assert _startup_fatal("server ready\nLoading experts: 100%") is None
 
 
 def _score(label: str, tok_s: float) -> Score:

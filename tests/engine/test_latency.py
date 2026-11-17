@@ -36,9 +36,7 @@ class _Sched:
     def __init__(self):
         self.decode_manager = SimpleNamespace(running_reqs=[1, 2])
         self.prefill_manager = SimpleNamespace(pending_list=[3])
-        self._spec_verifies = 10
-        self._spec_accepted = 6
-        self._spec_rejections = {"low_prob": 2, "resync": 1}
+        self.status_reporter = SimpleNamespace(_spec_counts=(10, 6))
 
 
 def test_gate_off_by_default(latency_mod):
@@ -108,17 +106,13 @@ def test_gauges_and_spec_tally_are_window_deltas(tmp_path):
     assert rec["gauges"] == {"running": 2, "waiting": 1}
     assert rec["spec"]["verifies"] == 10
     assert rec["spec"]["accepted"] == 6
-    assert rec["spec"]["rejections"] == {"low_prob": 2, "resync": 1}
 
-    sched._spec_verifies = 18
-    sched._spec_accepted = 9
-    sched._spec_rejections = {"low_prob": 3, "resync": 1}
+    sched.status_reporter._spec_counts = (18, 9)
     _force_window(probe)
     probe.maybe_dump()
     rec2 = json.loads(out.read_text(encoding="utf-8").splitlines()[1])
     assert rec2["spec"]["verifies"] == 8
     assert rec2["spec"]["accepted"] == 3
-    assert rec2["spec"]["rejections"] == {"low_prob": 1}
 
 
 def test_dump_survives_broken_gauges(tmp_path):

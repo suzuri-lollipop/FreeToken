@@ -224,7 +224,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler._schedule_next_batch = lambda: None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
-    late_sample = DetokenizeMsg(uid=5, next_token=99, finished=False)
+    late_sample = DetokenizeMsg(uid=5, next_tokens=[99], finished=False)
     scheduler._process_last_data = lambda _data: scheduler.send_result([late_sample])
 
     Scheduler.normal_loop(scheduler)
@@ -344,7 +344,7 @@ def test_prefill_window_is_split_by_the_tokens_it_forwarded():
     scheduler = Scheduler.__new__(Scheduler)
     long_req, short_req = req(1, 300), req(2, 100)
     batch = SimpleNamespace(
-        is_prefill=True, spec_mode=None, reqs=[long_req, short_req],
+        is_prefill=True, reqs=[long_req, short_req],
         scheduled_at=time.perf_counter() - 0.25,
     )
     Scheduler._charge_prefill_time(scheduler, batch)
@@ -353,7 +353,7 @@ def test_prefill_window_is_split_by_the_tokens_it_forwarded():
 
     first_chunk = long_req.prefill_ms
     chunk = SimpleNamespace(
-        is_prefill=True, spec_mode=None, reqs=[long_req], scheduled_at=time.perf_counter() - 0.05
+        is_prefill=True, reqs=[long_req], scheduled_at=time.perf_counter() - 0.05
     )
     Scheduler._charge_prefill_time(scheduler, chunk)
     # the next chunk adds to the prompt's total, it does not replace it
@@ -361,9 +361,8 @@ def test_prefill_window_is_split_by_the_tokens_it_forwarded():
 
 
 def test_prefill_window_skips_batches_that_forwarded_no_prompt():
-    """A spec verify rides phase="prefill" but is a decode step, a decode batch has no prompt,
-    and an unstamped batch never reached the engine; charging any of them invents a prompt phase
-    for a request that did not run one."""
+    """A decode batch has no prompt, and an unstamped batch never reached the engine; charging
+    either invents a prompt phase for a request that did not run one."""
 
     scheduler = Scheduler.__new__(Scheduler)
     req = Req(
@@ -373,9 +372,8 @@ def test_prefill_window_skips_batches_that_forwarded_no_prompt():
     req.prefill_chunk_tokens = 64  # it did forward a prompt: only the guards can stop the charge
     stamp = time.perf_counter() - 0.25
     for batch in (
-        SimpleNamespace(is_prefill=False, spec_mode=None, reqs=[req], scheduled_at=stamp),
-        SimpleNamespace(is_prefill=True, spec_mode="verify", reqs=[req], scheduled_at=stamp),
-        SimpleNamespace(is_prefill=True, spec_mode=None, reqs=[req], scheduled_at=0.0),
+        SimpleNamespace(is_prefill=False, reqs=[req], scheduled_at=stamp),
+        SimpleNamespace(is_prefill=True, reqs=[req], scheduled_at=0.0),
     ):
         Scheduler._charge_prefill_time(scheduler, batch)
     assert req.prefill_ms == 0.0

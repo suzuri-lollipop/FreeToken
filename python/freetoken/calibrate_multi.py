@@ -30,6 +30,20 @@ most TPS_LOSS_MAX of aggregate throughput. The throughput guard is deliberately 
 concurrency trades prompt-side throughput for the running streams' gaps -- that is the
 feature -- so only a catastrophic loss (a link too slow to share) rejects an arm.
 
+A second dimension compares speculative backends (--spec, default auto = mtp + dflash;
+dflash needs a draft checkpoint). Each spec arm runs with prefill off and wins on
+aggregate tok/s (>= SPEC_MIN_GAIN) without worsening the worst stall by more than
+SPEC_STALL_TOL. The winner is then stacked on the prefill winner in a combo arm: under
+piped the engine refuses speculation (spec verify shares the PLE/plan staging with the
+pipe's chunk -- Strata lifts this with STRATA_PIPED_MTP, this port has not yet), so the
+combo verifies that empirically and the report records why the two cannot stack.
+
+Scoring uses the server's own measurement when available: --enable-timings-report plus
+timings_per_token gives per-chunk engine-side predicted_ms (the inter-token gap without
+HTTP/client jitter), and continuous_usage_stats gives the exact token count even when a
+chunk carries several tokens. FREETOKEN_LATENCY_OUT is collected per arm as a diagnostic.
+Client arrival times remain the fallback and are reported alongside.
+
 Arm validity is read from the arm's own server log (the "piped prefill enabled" line,
 the [chunktime] mix= markers, the "piping disabled" fallback): an arm whose mechanism
 never activated is EXCLUDED, not silently scored as if it did.
@@ -97,6 +111,21 @@ TPS_LOSS_MAX = 0.25
 TIE_S = 0.15
 STALL_EVENT_S = 0.5  # the launcher bench's stall threshold; keep the two in step
 
+# Speculative-decoding dimension. Only backends this engine actually registers are
+# offered (spec.PROPOSERS: mtp, dflash); "lookup" is not a live backend in this fork.
+SPEC_ALGOS = ("mtp", "dflash")
+SPEC_MIN_GAIN = 0.03   # a spec arm must add >=3% aggregate tok/s over the no-spec arm
+SPEC_STALL_TOL = 0.1   # ...while worsening the worst stall by at most this many seconds
+SPEC_COMBO_TPS_TOL = 0.02  # a prefill+spec combo keeps the spec win within this fraction
+# every flag that arms a speculative backend, both spellings, stripped so the tool owns
+# the dimension (the profile's own --speculative-* would otherwise leak into every arm)
+SPEC_FLAGS = (
+    "--speculative", "--speculative-algorithm", "--spec-algo",
+    "--speculative-num-steps", "--spec-num-steps",
+    "--speculative-draft-model-path", "--spec-draft-model",
+    "--speculative-token-map", "--spec-token-map",
+)
+
 
 def arms_for(spec: dict, smoke: bool = False) -> list[tuple[str, dict[str, str], str]]:
     """The arms to MEASURE on this config: all four on any TP. (Piping under TP runs
@@ -137,6 +166,71 @@ def argv_with_port(argv, port: int) -> list[str]:
         out.append(t)
         i += 1
     return out + ["--port", str(int(port))]
+
+
+def strip_spec_args(argv) -> list[str]:
+    """Drop every speculative-backend flag (both spellings, value or = form) so the
+    calibration owns the spec dimension instead of inheriting the profile's."""
+    out: list[str] = []
+    items = [str(x) for x in argv]
+    i = 0
+    while i < len(items):
+        t = items[i]
+        if t in SPEC_FLAGS:
+            i += 2
+            continue
+        if any(t.startswith(f + "=") for f in SPEC_FLAGS):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def spec_argv(algo: str, draft_path: str | None = None,
+              num_steps: int | None = None) -> list[str]:
+    """The server flags that arm one speculative backend (mtp drafts from the target;
+    dflash needs its own draft checkpoint)."""
+    if algo == "none":
+        return []
+    out = ["--speculative-algorithm", algo]
+    if algo == "dflash":
+        if not draft_path:
+            raise ValueError("dflash needs --spec-draft-path (a DFlash 2 draft checkpoint)")
+        out += ["--speculative-draft-model-path", str(draft_path)]
+    if num_steps:
+        out += ["--speculative-num-steps", str(int(num_steps))]
+    return out
+
+
+def spec_backends_for(requested: str, draft_path: str | None) -> list[tuple[str, str]]:
+    """Resolve --spec into (algo, skip_reason) pairs. 'auto' offers every registered
+    backend; dflash is skipped without a draft checkpoint rather than failing the run."""
+    if requested.strip().lower() in ("none", "off", ""):
+        return []
+    if requested.strip().lower() == "auto":
+        algos = list(SPEC_ALGOS)
+    else:
+        algos = [a.strip().lower() for a in requested.split(",") if a.strip()]
+        for a in algos:
+            if a not in SPEC_ALGOS:
+                raise ValueError(f"--spec: unknown backend {a!r} (have: {', '.join(SPEC_ALGOS)})")
+    out = []
+    for a in algos:
+        if a == "dflash" and not draft_path:
+            out.append((a, "no DFlash 2 draft checkpoint (--spec-draft-path)"))
+        else:
+            out.append((a, ""))
+    return out
+
+
+def argv_with_timings(argv) -> list[str]:
+    """Add --enable-timings-report once (the server-side gate for per-chunk timings)."""
+    items = [str(x) for x in argv]
+    if any(t == "--enable-timings-report" or t.startswith("--enable-timings-report=")
+           for t in items):
+        return items
+    return items + ["--enable-timings-report"]
 
 
 def _syllables(n: int, seed: int = 7) -> str:
@@ -184,6 +278,11 @@ def request_body(model: str, prompt: str, max_tokens: int,
         "max_tokens": max_tokens,
         "ignore_eos": True, "stream": True,
         "chat_template_kwargs": {"enable_thinking": False},
+        # server-side measurement (#887/#868): per-chunk timings need the server's
+        # --enable-timings-report too; continuous usage gives the exact token count
+        # even when one chunk carries several tokens.
+        "timings_per_token": True,
+        "stream_options": {"include_usage": True, "continuous_usage_stats": True},
     }
     if temperature is not None:
         body["temperature"] = temperature
@@ -208,6 +307,9 @@ def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
     t0 = time.perf_counter()
     with opener.open(req, timeout=timeout) as r:
         arrivals, ttft, usage_tokens = [], None, 0
+        engine_gaps: list[float | None] = []
+        last_pred_ms: float | None = None
+        timings_final: dict | None = None
         for raw in r:
             if not raw.startswith(b"data: "):
                 continue
@@ -220,6 +322,10 @@ def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
                 continue
             if obj.get("usage"):
                 usage_tokens = int((obj["usage"] or {}).get("completion_tokens") or 0)
+            t = obj.get("timings")
+            if t:
+                timings_final = t
+            pred_ms = t.get("predicted_ms") if t else None
             for ch in obj.get("choices", []):
                 d = ch.get("delta") or {}
                 piece = d.get("content") or d.get("reasoning_content")
@@ -227,9 +333,19 @@ def _stream_chat(server: Server, model: str, prompt: str, max_tokens: int,
                     now = time.perf_counter()
                     if ttft is None:
                         ttft = now - t0
+                    else:
+                        # engine-side gap since the previous delivered chunk: the
+                        # cumulative predicted_ms delta carries no HTTP/client jitter
+                        if pred_ms is not None and last_pred_ms is not None:
+                            engine_gaps.append(max(0.0, (pred_ms - last_pred_ms) / 1000.0))
+                        else:
+                            engine_gaps.append(None)
                     arrivals.append(now)
+                    if pred_ms is not None:
+                        last_pred_ms = pred_ms
     return {"ttft": ttft or 0.0, "arrivals": arrivals, "tokens": len(arrivals),
-            "usage_tokens": usage_tokens, "end": time.perf_counter()}
+            "usage_tokens": usage_tokens, "engine_gaps": engine_gaps,
+            "timings": timings_final, "end": time.perf_counter()}
 
 
 def run_workload(server: Server, model: str, items: list[dict],
@@ -260,29 +376,41 @@ def run_workload(server: Server, model: str, items: list[dict],
     victim = {f"{i}": results[f"{i}"] for i in range(len(items) - 1)}
     scored = score_window(victim, open_at)
     wall = max(r["end"] for r in results.values()) - t_start
-    tokens = sum(r["tokens"] for r in results.values())
+    # exact server token count when continuous usage reported it, else the chunk count
+    tokens = sum(r["usage_tokens"] or r["tokens"] for r in results.values())
+    used_engine = any(g is not None for r in victim.values()
+                      for g in (r.get("engine_gaps") or []))
     scored |= {
         "ttft_long": agg["ttft"],
         "ttft_short": statistics.mean([r["ttft"] for r in victim.values()]) if victim else 0.0,
         "out_tps": tokens / max(wall, 1e-6), "tokens": tokens, "wall": wall,
+        "measurement": "server-timings" if used_engine else "client-arrivals",
     }
     return scored
 
 
 def score_window(victims: dict[str, dict], open_at: float) -> dict:
-    """Pure: the victims' inter-token gaps after the aggressor was admitted."""
-    worst = count = 0
+    """Pure: the victims' inter-token gaps after the aggressor was admitted. The window
+    boundary uses the client clock (when the aggressor was sent); each gap's MAGNITUDE
+    uses the engine-side predicted_ms delta when present (no HTTP/client jitter), else
+    the client arrival delta. stall_worst_client always reports the client-side number."""
+    worst = worst_client = count = 0
     secs = 0.0
     for r in victims.values():
-        for a, b in zip(r["arrivals"], r["arrivals"][1:]):
+        arrivals = r["arrivals"]
+        egaps = r.get("engine_gaps") or []
+        for i, (a, b) in enumerate(zip(arrivals, arrivals[1:])):
             if b < open_at:  # a gap ENDING before the window never involved the aggressor
                 continue
-            gap = b - a
+            client_gap = b - a
+            gap = egaps[i] if i < len(egaps) and egaps[i] is not None else client_gap
             if gap > STALL_EVENT_S:
                 count += 1
                 secs += gap
             worst = max(worst, gap)
-    return {"stall_worst": worst, "stall_count": count, "stall_secs": secs}
+            worst_client = max(worst_client, client_gap)
+    return {"stall_worst": worst, "stall_count": count, "stall_secs": secs,
+            "stall_worst_client": worst_client}
 
 
 @dataclass
@@ -300,17 +428,24 @@ class MultiScore:
     reps: list[dict] = field(default_factory=list)
     valid: bool = True
     note: str = ""
+    stall_worst_client: float = 0.0
+    measurement: str = "client-arrivals"
+    spec: str | None = None
+    latency: dict = field(default_factory=dict)
 
     def line(self) -> str:
-        return (f"{self.label:9s} stall={self.stall_worst:5.2f}s x{self.stall_count:3d} "
+        return (f"{self.label:13s} stall={self.stall_worst:5.2f}s x{self.stall_count:3d} "
                 f"ttft={self.ttft_long:6.2f}s short={self.ttft_short:5.2f}s "
                 f"tps={self.out_tps:6.1f}"
                 + (f"  [{self.note}]" if self.note else ""))
 
 
 def arm_active(label: str, log_text: str) -> tuple[bool, str]:
-    """Did the arm's mechanism actually engage? Read the arm's own server log."""
-    if label in ("piped", "piped-sf"):
+    """Did the arm's mechanism actually engage? Read the arm's own server log. A combo
+    label '<prefill>+spec-<algo>' is judged on its prefill part; a pure spec arm is valid
+    once the server ran (its drafts show in the timings block, not a log marker)."""
+    prefill = label.split("+spec-", 1)[0]
+    if prefill in ("piped", "piped-sf"):
         if "piped prefill enabled" in log_text:
             return True, ""
         if "piping disabled" in log_text:
@@ -318,20 +453,50 @@ def arm_active(label: str, log_text: str) -> tuple[bool, str]:
                         for ln in log_text.splitlines() if "piping disabled" in ln), "")
             return False, f"piping disabled: {why}"
         return False, "no 'piped prefill enabled' line"
-    if label == "mixed":
+    if prefill == "mixed":
         if " mix=" in log_text:
             return True, ""
         return False, "no [chunktime] mix= line (mixed steps never ran)"
     return True, ""
 
 
+def _latency_summary(path: Path) -> dict:
+    """The arm's FREETOKEN_LATENCY_OUT JSONL: window count, mean phase share, and the
+    spec-verify tally. Diagnostic only (the probe is host-side, never a device sync);
+    an absent/empty file means it never ran. Every TP rank appends, pid separates them."""
+    try:
+        recs = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not recs:
+        return {}
+    phases: dict[str, list] = {}
+    verifies = accepted = 0
+    for rec in recs:
+        for name, ph in (rec.get("phases") or {}).items():
+            phases.setdefault(name, []).append(ph.get("pct", 0.0))
+        sp = rec.get("spec") or {}
+        verifies += sp.get("verifies", 0)
+        accepted += sp.get("accepted", 0)
+    out: dict = {"windows": len(recs),
+                 "phase_pct_mean": {k: round(statistics.mean(v), 1) for k, v in phases.items()}}
+    if verifies:
+        out["spec_verifies"] = verifies
+        out["spec_accepted"] = accepted
+    return out
+
+
 def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                    reps: int, log_dir: Path, port: int,
-                   temperature: float | None = None) -> MultiScore:
-    run_spec = {**spec, "port": port,
-                "argv": argv_with_port(list(spec["argv"]), port)}
-    full_env = {**env, "FREETOKEN_CHUNK_TIMING": "1"}
+                   temperature: float | None = None,
+                   spec_args: list[str] | None = None, spec_algo: str | None = None,
+                   fatal: bool = True) -> MultiScore:
+    # the tool owns the spec dimension: strip the profile's spec flags, then arm this
+    # arm's backend; --enable-timings-report gates the per-chunk server timings (#887)
+    base_argv = argv_with_timings(argv_with_port(strip_spec_args(spec["argv"]), port))
+    base_argv = base_argv + list(spec_args or [])
     last_error: Exception | None = None
+    latency_path = log_dir / f"{_sanitize(label)}-latency.jsonl"
     for attempt in range(3):
         arm_port = port + 2 * attempt
         if not _port_free(arm_port) or not _port_free(arm_port + 1):
@@ -339,6 +504,10 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
         items = workload(cfg)
         per: list[dict] = []
         log_name = f"{_sanitize(label)}.log" if attempt == 0 else f"{_sanitize(label)}-try{attempt + 1}.log"
+        latency_path = log_dir / (Path(log_name).stem + "-latency.jsonl")
+        run_spec = {**spec, "port": arm_port, "argv": argv_with_port(base_argv, arm_port)}
+        full_env = {**env, "FREETOKEN_CHUNK_TIMING": "1", "FREETOKEN_LATENCY": "1",
+                    "FREETOKEN_LATENCY_OUT": str(latency_path)}
         try:
             with Server(run_spec, full_env, log_dir / log_name) as server:
                 model = spec.get("model_name") or "default"
@@ -356,9 +525,19 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
             last_error = e
             time.sleep(3)
     else:
+        if not fatal:
+            # a spec backend the checkpoint cannot serve (no MTP layers, bad draft) is
+            # an excluded arm with a reason, not a failed calibration
+            return MultiScore(label=label, env=dict(env), stall_worst=0.0, stall_count=0,
+                              stall_secs=0.0, ttft_long=0.0, ttft_short=0.0, out_tps=0.0,
+                              tokens=0, wall=0.0, valid=False, spec=spec_algo,
+                              note=f"server failed: {last_error}")
         raise ServerError(f"{label}: three attempts failed (last: {last_error})") from last_error
 
-    med = {k: statistics.median([p[k] for p in per]) for k in per[0]}
+    # measurement is a per-rep label, not a number: median only the numeric keys
+    med = {k: statistics.median([p[k] for p in per]) for k, v in per[0].items()
+           if isinstance(v, (int, float))}
+    med["measurement"] = per[0]["measurement"]
     valid, note = arm_active(label, log_text)
     return MultiScore(
         label=label, env=dict(env),
@@ -367,6 +546,9 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
         ttft_short=float(med["ttft_short"]), out_tps=float(med["out_tps"]),
         tokens=int(med["tokens"]), wall=float(med["wall"]), reps=per,
         valid=valid, note=note,
+        stall_worst_client=float(med.get("stall_worst_client", 0.0)),
+        measurement=str(med.get("measurement", "client-arrivals")),
+        spec=spec_algo, latency=_latency_summary(latency_path),
     )
 
 
@@ -390,14 +572,36 @@ def choose_multi(scores: list[MultiScore]) -> tuple[str, str]:
                         f"tps {base.out_tps:.1f} -> {best.out_tps:.1f}")
 
 
+def choose_spec(spec_scores: list[MultiScore], base: MultiScore) -> tuple[str | None, str]:
+    """The spec dimension's contract: a backend wins when it adds >= SPEC_MIN_GAIN
+    aggregate tok/s over the no-spec arm AND does not worsen the worst stall by more
+    than SPEC_STALL_TOL (spec speeds decode; it must not freeze the running streams).
+    Pure so the unit tests pin it. Returns (algo, note)."""
+    cands = [s for s in spec_scores if s.valid and s.spec and s.out_tps > 0]
+    if not cands:
+        return None, "no speculative arm activated on this machine"
+    best = max(cands, key=lambda s: s.out_tps)
+    gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
+    if gain < SPEC_MIN_GAIN:
+        return None, f"{best.spec} adds only {100 * gain:.1f}% tok/s (need {100 * SPEC_MIN_GAIN:.0f}%)"
+    if best.stall_worst > base.stall_worst + SPEC_STALL_TOL:
+        return None, (f"{best.spec} worsens the worst stall {base.stall_worst:.2f}s -> "
+                      f"{best.stall_worst:.2f}s (max +{SPEC_STALL_TOL}s)")
+    return best.spec, (f"tok/s {base.out_tps:.1f} -> {best.out_tps:.1f} (+{100 * gain:.1f}%), "
+                       f"stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s")
+
+
 def render_script_multi(spec: dict, chosen: dict | None) -> str:
-    """The runnable pair to the lookup tool's script: same argv, winner env exported."""
+    """The runnable pair to the lookup tool's script: same argv, winner env exported,
+    plus the winning speculative backend's flags when it was applied."""
     env = {str(k): str(v) for k, v in (spec.get("env") or {}).items() if k not in MULTI_KEYS}
     if chosen:
         env.update({str(k): str(v) for k, v in (chosen.get("env") or {}).items()})
     cwd = spec.get("cwd") or str(ROOT)
     python = spec.get("python") or sys.executable
-    argv = argv_with_port(list(spec["argv"]), int(spec.get("port") or DEFAULT_PORT))
+    argv = argv_with_port(strip_spec_args(spec["argv"]), int(spec.get("port") or DEFAULT_PORT))
+    if chosen and (chosen.get("spec") or {}).get("applied"):
+        argv = argv + list(chosen["spec"].get("argv") or [])
     lines = ["#!/bin/sh",
              f"# generated by freetoken.calibrate_multi.py on {time.strftime('%Y-%m-%d %H:%M:%S')}",
              f"cd {shlex.quote(str(cwd))}"]
@@ -425,10 +629,15 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     reps = 1 if (a.quick or a.smoke) else max(1, a.reps)
     arms = arms_for(spec, a.smoke)
     base_port = int(spec.get("port") or DEFAULT_PORT)
-    spec["argv"] = ensure_distributed_timeout(spec["argv"])
-    # strip stale multi-knob values from the launch env: the arms own them
-    spec = {**spec, "env": {k: v for k, v in (spec.get("env") or {}).items()
-                            if k not in MULTI_KEYS}}
+    # the tool owns both dimensions: strip the profile's spec flags (remembering its
+    # draft path for dflash) and its stale multi-knob env values
+    draft_path = (getattr(a, "spec_draft_path", "")
+                  or _arg_value(list(spec.get("argv") or []), "--speculative-draft-model-path")
+                  or _arg_value(list(spec.get("argv") or []), "--spec-draft-model"))
+    num_steps = getattr(a, "spec_num_steps", 0) or None
+    spec = {**spec,
+            "argv": strip_spec_args(ensure_distributed_timeout(spec["argv"])),
+            "env": {k: v for k, v in (spec.get("env") or {}).items() if k not in MULTI_KEYS}}
 
     scores: list[MultiScore] = []
     next_port = [base_port]
@@ -440,6 +649,15 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
             if _port_free(port) and _port_free(port + 1):
                 return port
 
+    def measure(label, env, spec_args=None, spec_algo=None, fatal=True) -> MultiScore:
+        print(f"  measuring {label} ...", flush=True)
+        s = evaluate_multi(spec, label, env, cfg, reps, log_dir, take_port(),
+                           a.temperature, spec_args=spec_args, spec_algo=spec_algo, fatal=fatal)
+        print("    " + s.line(), flush=True)
+        scores.append(s)
+        return s
+
+    # --- prefill dimension (speculation off) ---
     for label, env, skip in arms:
         if skip:
             print(f"  skipping {label}: {skip}", flush=True)
@@ -448,29 +666,75 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                                      ttft_short=0.0, out_tps=0.0, tokens=0, wall=0.0,
                                      valid=False, note=skip))
             continue
-        print(f"  measuring {label} ...", flush=True)
-        score = evaluate_multi(spec, label, env, cfg, reps, log_dir, take_port(),
-                               a.temperature)
-        print("    " + score.line(), flush=True)
-        scores.append(score)
+        measure(label, env)
 
     label, note = choose_multi(scores)
     by = {s.label: s for s in scores}
     base = by["none"]
+
+    # --- speculative dimension (prefill off): mtp / dflash compared on the same workload ---
+    backends = spec_backends_for(getattr(a, "spec", "auto"), draft_path)
+    if a.smoke:
+        backends = [b for b in backends if b[0] == "mtp"] or backends[:1]
+    spec_scores: list[MultiScore] = []
+    for algo, skip in backends:
+        slabel = f"spec-{algo}"
+        if skip:
+            print(f"  skipping {slabel}: {skip}", flush=True)
+            s = MultiScore(label=slabel, env=winner_env("none"), stall_worst=0.0,
+                           stall_count=0, stall_secs=0.0, ttft_long=0.0, ttft_short=0.0,
+                           out_tps=0.0, tokens=0, wall=0.0, valid=False, note=skip, spec=algo)
+            scores.append(s)
+            spec_scores.append(s)
+            continue
+        spec_scores.append(measure(slabel, winner_env("none"),
+                                   spec_args=spec_argv(algo, draft_path, num_steps),
+                                   spec_algo=algo, fatal=False))
+
+    salgo, snote = choose_spec(spec_scores, base)
+    spec_chosen = {"algorithm": salgo, "argv": [], "applied": False, "compatible": False,
+                   "out_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": snote}
+    if salgo:
+        sargs = spec_argv(salgo, draft_path, num_steps)
+        sarm = next(s for s in spec_scores if s.spec == salgo)
+        spec_chosen.update(argv=sargs, out_tps=sarm.out_tps, stall_worst=sarm.stall_worst,
+                           gain_tps_pct=round(100 * (sarm.out_tps / base.out_tps - 1), 1)
+                           if base.out_tps > 0 else 0.0)
+        if label == "none":
+            # no prefill winner: the spec arm itself is the launch
+            spec_chosen.update(applied=True, compatible=True)
+        else:
+            # try to stack the spec winner on the prefill winner. Under piped the engine
+            # refuses speculation (spec verify shares the PLE/plan staging with the pipe's
+            # chunk), so this arm verifies that empirically and reports the reason.
+            combo = measure(f"{label}+spec-{salgo}", winner_env(label), spec_args=sargs,
+                            spec_algo=salgo, fatal=False)
+            holds = (combo.valid
+                     and combo.out_tps >= sarm.out_tps * (1 - SPEC_COMBO_TPS_TOL)
+                     and combo.stall_worst <= by[label].stall_worst + TIE_S)
+            spec_chosen.update(
+                applied=holds, compatible=combo.valid,
+                note=(snote if holds else
+                      f"{salgo} wins alone but not beside {label}: "
+                      f"{combo.note or 'combo regressed'}"))
+            if holds:
+                spec_chosen.update(out_tps=combo.out_tps, stall_worst=combo.stall_worst)
+
     chosen = {
-        "label": label, "env": winner_env(label),
-        "note": note,
+        "label": label, "env": winner_env(label), "note": note,
         "stall_worst": by[label].stall_worst, "out_tps": by[label].out_tps,
         "gain_stall_s": round(base.stall_worst - by[label].stall_worst, 2),
         "gain_tps_pct": round(100 * (by[label].out_tps / base.out_tps - 1), 1)
         if base.out_tps > 0 else 0.0,
+        "spec": spec_chosen,
     }
     return {
         "schema_version": 1, "backend": "freetoken-multi",
         "hardware": hardware(), "workload": {**cfg, "reps": reps},
-        "arms": [{k: v for k, v in s.__dict__.items() if k != "reps"} | {
-            "env": s.env} for s in scores],
+        "arms": [{k: v for k, v in s.__dict__.items() if k != "reps"} | {"env": s.env}
+                 for s in scores],
         "chosen": chosen, "multi_enabled": label != "none",
+        "spec_enabled": bool(spec_chosen["applied"]),
     }
 
 
@@ -515,6 +779,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="probe sampling temperature; default OMITs it so the server's "
                          "production defaults (generation_config + the high-temp guard) "
                          "apply. 0.0 = deterministic greedy arms")
+    ap.add_argument("--spec", default="auto",
+                    help="speculative backends to compare: 'auto' (mtp + dflash), 'none', "
+                         "or a comma list of mtp,dflash. dflash is skipped without a draft "
+                         "checkpoint. Each is measured beside the prefill winner when the "
+                         "engine allows it")
+    ap.add_argument("--spec-draft-path", default="",
+                    help="DFlash 2 draft checkpoint for the dflash arm (else taken from the "
+                         "profile's --speculative-draft-model-path)")
+    ap.add_argument("--spec-num-steps", type=int, default=0,
+                    help="draft tokens per step for the spec arms (0 = each method's default)")
     a = ap.parse_args(argv)
     import signal as _signal
     if hasattr(_signal, "SIGTERM"):
@@ -551,14 +825,21 @@ def main(argv: list[str] | None = None) -> int:
     result["tag"] = tag
 
     chosen = result["chosen"]
-    script_text = render_script_multi(spec, chosen if result["multi_enabled"] else None)
+    # pass the winner when EITHER dimension won: prefill=none + a spec win still exports
+    # the explicit-zero knob set and the spec flags
+    has_winner = result["multi_enabled"] or result["spec_enabled"]
+    script_text = render_script_multi(spec, chosen if has_winner else None)
     json_path = out_dir / f"freetoken-multi-{tag}.json"
     script_path = out_dir / f"run-freetoken-multi-{tag}.sh"
     _atomic_write(json_path, json.dumps(result, indent=1, ensure_ascii=False) + "\n")
     _atomic_write(script_path, script_text)
     script_path.chmod(0o755)
 
-    print(f"\nchosen: {chosen['label']} -- {chosen['note']}", flush=True)
+    print(f"\nchosen prefill: {chosen['label']} -- {chosen['note']}", flush=True)
+    sp = chosen.get("spec") or {}
+    if sp.get("algorithm"):
+        state = "applied" if sp.get("applied") else "NOT applied"
+        print(f"chosen spec: {sp['algorithm']} ({state}) -- {sp.get('note', '')}", flush=True)
     if not result["multi_enabled"]:
         print("the concurrency knobs stay off on this machine; the script starts without them",
               flush=True)

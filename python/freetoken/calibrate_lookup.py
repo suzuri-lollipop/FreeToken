@@ -459,6 +459,21 @@ def _port_free(port: int) -> bool:
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
+_RESTART_RE = re.compile(r"backend restarted \(attempt (\d+)\)")
+
+
+def _startup_fatal(tail: str) -> str | None:
+    """A deterministic startup failure the health wait must not wait out: a config error
+    (e.g. speculation needs TP1) crash-loops the backend while the frontend keeps /health
+    alive, so the process never exits and the Gloo marker never fires. The supervisor's
+    restart counter is the reliable signal -- three restarts on the same error is fatal,
+    not a transient load hiccup. Returns the reason, or None to keep waiting."""
+    m = _RESTART_RE.search(tail)
+    if m and int(m.group(1)) >= 3:
+        return f"backend crash-looping during startup (restart attempt {m.group(1)})"
+    return None
+
+
 def _last_engine_line(tail: str) -> str:
     """The engine's newest own line, colour codes off: the tqdm bars (weights, then the
     63 GB of experts) are the useful part, so headers, uvicorn and the ServerArgs dump go."""
@@ -501,6 +516,9 @@ class Server:
             # instead of waiting the full startup budget and then timing out on a request.
             if "Timed out waiting" in tail and "gloo" in tail:
                 raise ServerError(f"scheduler died during startup\n{tail}")
+            fatal = _startup_fatal(tail)
+            if fatal:
+                raise ServerError(f"{fatal}\n{tail}")
             try:
                 with urllib.request.urlopen(self.base + "/health", timeout=2) as r:
                     doc = json.load(r)

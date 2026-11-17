@@ -60,6 +60,7 @@ def _setup():
         finished_reqs=set(),
         eos_token_ids=set(),
         toolcall_anchor_id=None,
+        spec=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         engine=SimpleNamespace(run_pending_host_fill=lambda: None),
@@ -77,7 +78,7 @@ def _setup():
         _last_data=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
-    stub._release_spec_scratch = lambda req: Scheduler._release_spec_scratch(stub, req)
+    stub._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(stub, req, tokens)
     return pool, cm, tm, dm, pm, sent, stub
 
 
@@ -100,13 +101,12 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
 
 
 def _as_last_data(batch):
-    # mirrors the ForwardOutput NamedTuple the engine returns (attrs, not positions)
+    # mirrors the ForwardOutput NamedTuple the engine returns (positional, output[:3])
     return (
         SimpleNamespace(batch=batch),
-        SimpleNamespace(next_tokens_gpu=None,
-                        next_tokens_cpu=torch.tensor([42], dtype=torch.int32),
-                        copy_done_event=SimpleNamespace(synchronize=lambda: None),
-                        spec=None),
+        (None,
+         torch.tensor([42], dtype=torch.int32),
+         SimpleNamespace(synchronize=lambda: None)),
     )
 
 

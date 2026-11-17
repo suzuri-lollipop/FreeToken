@@ -15,10 +15,15 @@ from freetoken.calibrate_multi import (
     arms_for,
     parse_live_servers,
     argv_with_port,
+    argv_with_timings,
     arm_active,
     choose_multi,
+    choose_spec,
     render_script_multi,
     score_window,
+    spec_argv,
+    spec_backends_for,
+    strip_spec_args,
     victims_from_spec,
     winner_env,
     workload,
@@ -177,3 +182,113 @@ def test_request_body_probes_the_production_sampling_by_default():
 
     greedy = request_body("m", "p", 64, 0.0)
     assert greedy["temperature"] == 0.0 and greedy["top_k"] == 1 and greedy["top_p"] == 1.0
+
+
+def test_request_body_asks_for_server_side_timings_and_usage():
+    from freetoken.calibrate_multi import request_body
+
+    body = request_body("m", "p", 64, None)
+    assert body["timings_per_token"] is True
+    assert body["stream_options"]["include_usage"] is True
+    assert body["stream_options"]["continuous_usage_stats"] is True
+
+
+def test_strip_spec_args_removes_every_backend_flag_both_spellings():
+    argv = ["-m", "freetoken", "--speculative-algorithm", "mtp", "--spec-num-steps=3",
+            "--speculative-draft-model-path", "/d", "--spec-token-map=/t",
+            "--speculative", "lookup", "--tp-size", "2", "--port", "1919"]
+    assert strip_spec_args(argv) == ["-m", "freetoken", "--tp-size", "2", "--port", "1919"]
+    # idempotent and leaves a spec-free argv untouched
+    assert strip_spec_args(["-m", "freetoken", "--tp-size", "2"]) == ["-m", "freetoken", "--tp-size", "2"]
+
+
+def test_spec_argv_arms_each_backend_and_dflash_needs_a_draft():
+    assert spec_argv("none") == []
+    assert spec_argv("mtp") == ["--speculative-algorithm", "mtp"]
+    assert spec_argv("mtp", num_steps=4) == ["--speculative-algorithm", "mtp",
+                                             "--speculative-num-steps", "4"]
+    assert spec_argv("dflash", "/draft") == ["--speculative-algorithm", "dflash",
+                                             "--speculative-draft-model-path", "/draft"]
+    with pytest.raises(ValueError):
+        spec_argv("dflash")
+
+
+def test_spec_backends_for_auto_skips_dflash_without_a_draft():
+    assert spec_backends_for("none", None) == []
+    auto = spec_backends_for("auto", None)
+    assert [a for a, _ in auto] == ["mtp", "dflash"]
+    assert auto[0][1] == "" and "draft" in auto[1][1]  # dflash skipped, mtp runnable
+    assert spec_backends_for("auto", "/draft")[1][1] == ""  # with a draft dflash runs
+    assert [a for a, _ in spec_backends_for("mtp", None)] == ["mtp"]
+    with pytest.raises(ValueError):
+        spec_backends_for("lookup", None)  # not a live backend in this fork
+
+
+def test_argv_with_timings_adds_the_gate_once():
+    assert argv_with_timings(["-m", "freetoken"]) == ["-m", "freetoken", "--enable-timings-report"]
+    once = argv_with_timings(["-m", "freetoken", "--enable-timings-report"])
+    assert once.count("--enable-timings-report") == 1
+
+
+def _spec_score(algo, tps, stall, valid=True):
+    return MultiScore(label=f"spec-{algo}", env={}, stall_worst=stall, stall_count=0,
+                      stall_secs=0.0, ttft_long=5.0, ttft_short=1.0, out_tps=tps,
+                      tokens=1000, wall=10.0, valid=valid, spec=algo)
+
+
+def test_choose_spec_needs_a_tps_gain_without_a_stall_regression():
+    base = _score("none", 1.0, 50.0)
+    # +20% tok/s, stall unchanged -> mtp wins
+    algo, note = choose_spec([_spec_score("mtp", 60.0, 1.0)], base)
+    assert algo == "mtp" and "+20.0%" in note
+    # only +1% -> below SPEC_MIN_GAIN
+    algo, note = choose_spec([_spec_score("mtp", 50.5, 1.0)], base)
+    assert algo is None and "tok/s" in note
+    # +20% but worsens the stall beyond SPEC_STALL_TOL -> rejected
+    algo, note = choose_spec([_spec_score("mtp", 60.0, 1.5)], base)
+    assert algo is None and "stall" in note
+    # invalid arms never win; the faster valid backend is chosen
+    algo, _ = choose_spec([_spec_score("mtp", 70.0, 1.0, valid=False),
+                           _spec_score("dflash", 60.0, 1.0)], base)
+    assert algo == "dflash"
+    assert choose_spec([], base)[0] is None
+
+
+def test_score_window_uses_engine_gaps_for_magnitude_client_for_the_boundary():
+    # client arrivals show a 6 s gap, but the engine only stalled 2 s (the rest was
+    # delivery jitter): the scored stall is the engine's 2 s, the client's 6 s is kept
+    victims = {"0": {"arrivals": [0.0, 1.0, 7.0, 7.1],
+                     "engine_gaps": [1.0, 2.0, 0.1]}}
+    out = score_window(victims, open_at=6.0)
+    assert out["stall_worst"] == pytest.approx(2.0)
+    assert out["stall_worst_client"] == pytest.approx(6.0)
+    assert out["stall_count"] == 1  # 2 s > STALL_EVENT_S
+    # without engine gaps the client delta is scored (backwards compatible)
+    plain = {"0": {"arrivals": [0.0, 1.0, 7.0, 7.1]}}
+    assert score_window(plain, open_at=6.0)["stall_worst"] == pytest.approx(6.0)
+
+
+def test_arm_active_judges_a_combo_on_its_prefill_part():
+    # piped+spec is refused while spec is armed: the combo is invalid with the reason
+    ok, why = arm_active("piped+spec-mtp", "FREETOKEN_PIPED_PREFILL: speculative decoding "
+                                           "armed; piping disabled (spec verify...)")
+    assert not ok and "speculative" in why
+    assert arm_active("piped+spec-mtp", "... piped prefill enabled ...")[0]
+    # a pure spec arm is valid once the server ran
+    assert arm_active("spec-mtp", "whatever")[0]
+    assert arm_active("mixed+spec-mtp", "[chunktime] #3 T=1024 mix=2")[0]
+
+
+def test_render_script_applies_the_spec_flags_only_when_applied():
+    spec = {"python": "/py", "argv": ["-m", "freetoken", "--speculative-algorithm", "mtp",
+                                      "--port", "1919"], "cwd": "/w", "env": {}, "port": 1919}
+    chosen = {"env": winner_env("none"),
+              "spec": {"applied": True, "argv": spec_argv("mtp")}}
+    text = render_script_multi(spec, chosen)
+    # the profile's own spec flag is stripped, the winner's added once
+    assert text.count("--speculative-algorithm mtp") == 1
+    assert "exec /py -m freetoken --port 1919 --speculative-algorithm mtp" in text
+    # not applied -> no spec flags at all
+    off = render_script_multi(spec, {"env": winner_env("none"),
+                                     "spec": {"applied": False, "argv": spec_argv("mtp")}})
+    assert "--speculative-algorithm" not in off

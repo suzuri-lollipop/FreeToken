@@ -61,6 +61,16 @@ def _generic_config(num_page_override=None):
     )
 
 
+def test_quantized_kv_cost_prices_codes_and_scales():
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    config.kv_format = FP8_PER_TOKEN_HEAD
+    # 2 slabs x (head_dim + fp32 scale) x kv_heads x layers
+    assert MHAKVCache.kv_cost(config)[0] == 2 * (64 + 4) * 2 * 2 * config.page_size
+
+
 def test_generic_kv_cost_and_solve_parity():
     from freetoken.kvcache.base import spec_kv_bytes_per_token
     from freetoken.kvcache.mha_pool import MHAKVCache
@@ -292,55 +302,6 @@ def test_linear_state_pool_prices_itself():
     # models without a linear group price to zero
     config.model_config.linear_attention_group = lambda: None
     assert state_pool_bytes(config) == 0
-
-
-def test_spec_scratch_reserve_is_priced_into_the_state_pool():
-    """MTP clones one GDN slot per running request per verify; lookup reserves no slot because
-    its scratch is opportunistic. MTP's reserve has to show up in the slot count, in the floor
-    a rebuild refuses to go below, and in the byte estimate the budget plans with
-    (state_pool_bytes follows the slot count); lookup must leave the plain pool untouched."""
-    from freetoken.kvcache.linear_state_pool import (
-        _linear_pool_min_slots, _linear_pool_num_slots, _linear_spec_reserve, state_pool_bytes,
-    )
-    from freetoken.models.config import LinearGatedDeltaGroupConfig
-
-    group = LinearGatedDeltaGroupConfig(
-        name="linear", layer_ids=(1, 3), num_key_heads=2, num_value_heads=4,
-        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
-    )
-
-    def cfg(cache_type):
-        c = _generic_config()
-        c.linear_state_cache_ratio = 0.5
-        c.cache_type = cache_type
-        c.model_config.linear_attention_group = lambda: group
-        return c
-
-    for cache_type in ("radix", "hybrid_radix"):
-        plain, mtp = cfg(cache_type), cfg(cache_type)
-        mtp.speculative = "mtp"
-        # one scratch slot per running request, nothing more
-        assert _linear_spec_reserve(plain) == 0
-        assert _linear_spec_reserve(mtp) == mtp.max_running_req
-        assert _linear_pool_num_slots(mtp) == _linear_pool_num_slots(plain) + 4
-        assert _linear_pool_min_slots(mtp) == _linear_pool_min_slots(plain) + 4
-        # the VRAM estimate follows, so the KV budget shrinks instead of the pool
-        assert state_pool_bytes(mtp) > state_pool_bytes(plain)
-        lookup = cfg(cache_type)
-        lookup.speculative = "lookup"
-        # lookup takes its scratch from the pool's spare snapshots at verify time; a fixed
-        # reserve shrank the GDN pool even when the default ceiling means no verify at four
-        # running requests (the old max_running_req reserve was the 22 -> 26 slot difference).
-        assert _linear_spec_reserve(lookup) == 0
-        assert _linear_pool_num_slots(lookup) == _linear_pool_num_slots(plain)
-        assert _linear_pool_min_slots(lookup) == _linear_pool_min_slots(plain)
-        assert state_pool_bytes(lookup) == state_pool_bytes(plain)
-    # a model with no GDN state has nothing to reserve
-    no_linear = cfg("hybrid_radix")
-    no_linear.speculative = "mtp"
-    no_linear.model_config.linear_attention_group = lambda: None
-    assert _linear_spec_reserve(no_linear) == 0
-
 
 def test_validate_rebuild_targets_flow_by_kv_cost_signature():
     """The base template hands each family's kv_cost exactly the non-None target keys its

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from freetoken.core import SamplingParams
@@ -27,7 +27,8 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
-    next_token: int
+    # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
+    next_tokens: List[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -59,19 +60,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     moe_total_slots: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
-    # MTP draft tallies since the engine started, passed through to the frontend like the pool
-    # snapshots above: the acceptance pair, the decline reasons and the drafted-step coverage.
-    # 0/empty when speculative decoding is off.
-    spec_verifies: int = 0
-    spec_accepted: int = 0
-    spec_declines: dict[str, int] = field(default_factory=dict)
-    spec_steps: int = 0
-    spec_decode_steps: int = 0
-    spec_cold_seeds: int = 0
-    # This request's phase timings in ms, measured in the scheduler: time spent in the prefill
-    # queue, and the prefill forward charged to it. Constant once its first token drains.
-    queue_ms: float = 0.0
-    prefill_ms: float = 0.0
+    # Scheduler-measured per-request timings (ReqStats.finish): on the terminal reply,
+    # plus every intermediate reply when sampling_params.timings_per_token was set;
+    # None on other intermediate replies, errors and aborts.
+    timings: dict | None = None
 
 
 @dataclass

@@ -29,52 +29,13 @@ from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod, tp_piece, tp_rows
 
 logger = init_logger(__name__)
 
 FP8 = torch.float8_e4m3fn
 MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
-
-
-def tp_piece(
-    piece: torch.Tensor, axis: int, lo: int, hi: int, total: int
-) -> torch.Tensor:
-    """This rank's [lo, hi) rows of one expert piece along ``axis``, where the piece tiles
-    ``total`` units.
-
-    A scale grid is thinner than its weight by the quant group, so the cut is taken in the
-    piece's own units; anything that does not tile ``total`` exactly (a per-tensor scale held
-    as one column, or a hidden-sized row vector) is returned whole. ``lo``/``hi`` come from
-    ``MoEConfig.local_intermediate_range`` and may be an uneven (bandwidth-weighted) split;
-    a range that does not align to the piece's own grain falls back to whole (which the
-    layout then rejects loudly rather than banking silently wrong rows).
-    """
-    if piece.dim() <= axis:
-        return piece
-    blocks = piece.shape[axis]
-    if not blocks or total % blocks:
-        return piece
-    per = total // blocks
-    if lo % per or (hi - lo) % per:
-        return piece
-    return piece.narrow(axis, lo // per, (hi - lo) // per)
-
-
-def tp_rows(
-    piece: torch.Tensor, axis: int, lo: int, hi: int, total: int
-) -> torch.Tensor:
-    """``tp_piece`` for an axis that may hold the fused [gate | up] pair: two cuts, not one."""
-    if piece.dim() > axis and piece.shape[axis] == 2 * total:
-        return torch.cat(
-            [
-                piece.narrow(axis, lo, hi - lo),
-                piece.narrow(axis, total + lo, hi - lo),
-            ],
-            dim=axis,
-        )
-    return tp_piece(piece, axis, lo, hi, total)
 
 
 class TritonNvfp4MoEKernel(MoEKernel):
@@ -228,7 +189,7 @@ def _marlin_symbols_ok() -> bool:
         )
         from vllm.scalar_type import scalar_types  # noqa: F401
     except Exception as exc:
-        logger.warning(
+        logger.warning_once(
             f"NVFP4 marlin backend is installed but unusable ({exc!r}); "
             "falling back to the Triton inline-dequant backend"
         )
@@ -436,7 +397,7 @@ def _b12x_symbols_ok() -> bool:
             prepare_w4a16_packed_weights,
         )
     except Exception as exc:
-        logger.warning(
+        logger.warning_once(
             f"NVFP4 b12x backend is installed but unusable ({exc!r}); "
             "falling back to the Triton inline-dequant backend"
         )
