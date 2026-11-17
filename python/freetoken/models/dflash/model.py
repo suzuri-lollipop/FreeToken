@@ -50,9 +50,11 @@ def _slice_dense(name: str, tensor: torch.Tensor, config: DFlashDraftConfig) -> 
         q = tensor[:q_rows]
         k = tensor[q_rows : q_rows + kv_rows]
         v = tensor[q_rows + kv_rows :]
+        # replicated kv heads (tp > kv heads): ranks share a head by the loader's mapping
+        kv0 = (rank * config.num_kv_heads // tp) * hd
         return torch.cat([q[rank * lq * hd : (rank + 1) * lq * hd],
-                          k[rank * lkv * hd : (rank + 1) * lkv * hd],
-                          v[rank * lkv * hd : (rank + 1) * lkv * hd]], dim=0)
+                          k[kv0 : kv0 + lkv * hd],
+                          v[kv0 : kv0 + lkv * hd]], dim=0)
     if name.endswith("gate_up_proj.weight"):
         i = config.intermediate_size
         gate, up = tensor[:i], tensor[i:]

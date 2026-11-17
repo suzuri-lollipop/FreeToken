@@ -137,7 +137,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
-    from freetoken.kvcache.format import KV_FORMATS, NONE
+    from freetoken.kvcache.format import KV_DTYPE_ALIASES, KV_FORMATS, NONE
     from freetoken.moe import MOE_STRATEGIES
     from freetoken.moe.pool_policy import SCOPES
 
@@ -546,7 +546,7 @@ def parse_args(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,
-        choices=["auto", "fp8", "int8", *(name for name in KV_FORMATS if name != NONE.name)],
+        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name), *KV_DTYPE_ALIASES],
         help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
         "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
         "attention backends read "
