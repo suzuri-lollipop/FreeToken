@@ -135,6 +135,9 @@ class MTPProposer(Proposer):
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
         super().adjust_config(config, override)
+        # keep_rows cuts the head's rows on a tp 1 weight layout; fail here, not after the target loads
+        if config.speculative_token_map and config.tp_info.size > 1:
+            raise ValueError("--speculative-token-map needs --tp 1: the kept-row draft head is not rank-sharded yet")
         arch = config.hf_config.architectures[0]
         if "mtp" not in dict(config.model_spec.spec_drafts):
             raise ValueError(f"MTP is not supported for {arch} yet")
