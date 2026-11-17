@@ -21,6 +21,8 @@ def _backend(name: str):
     config = SimpleNamespace(num_qo_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM)
     if name == "fa":
         pytest.importorskip("sgl_kernel")
+        if torch.cuda.get_device_capability()[0] == 12:
+            pytest.skip("sgl-kernel ships no FA3/FA4 kernels for sm_120/121")
         from freetoken.attention.fa import FlashAttentionBackend
 
         return FlashAttentionBackend(config)

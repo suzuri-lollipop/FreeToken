@@ -259,11 +259,6 @@ def iter_weights(
     """
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
-    if get_tp_info().size > 1 and config.is_moe:
-        raise NotImplementedError(
-            "qwen3_5_moe keeps its routed experts at the full intermediate width, so only "
-            "the dense checkpoints of this family shard for tensor parallelism today"
-        )
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     shard = tp_shard(config)
     # the tower builds its buffers in models/qwen3_vl/vision.py and cuts them by its own leaves,
@@ -342,9 +337,15 @@ _MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+
 
 
 def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
-    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's.
+
+    The draft's attention buffers are TP-aware, so the dense tensors are cut to this rank exactly
+    like the target's dense reader; the routed experts come separately through iter_mtp_expert_pieces.
+    """
     hf_config = cached_load_hf_config(model_path)
-    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    spec = get_model_spec(hf_config.architectures[0])
+    shard = tp_shard(parse_config(hf_config))
+    reader = _DenseReader(get_quant_config(), spec, shard)
     seen = False
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
@@ -357,7 +358,8 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
                 tensor = f.get_tensor(raw_name)
                 emitted = reader.add(raw_name, tensor)
                 if emitted is None:
-                    yield raw_name[len("mtp."):], tensor
+                    name = raw_name[len("mtp."):]
+                    yield name, tensor if shard is None else shard.tensor(module_leaf(name), tensor)
                 else:
                     yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
     if not seen:
@@ -408,9 +410,6 @@ def iter_weights_parallel(
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe weight loading currently supports TP=1 only")
-
     def _is_expert(raw_name: str) -> bool:
         name = _rename(raw_name)
         return name is not None and _STACKED_EXPERT_RE.match(name) is not None
@@ -446,8 +445,6 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 

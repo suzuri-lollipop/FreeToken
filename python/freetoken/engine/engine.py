@@ -410,7 +410,10 @@ def _validate_kv_format(config, model_config) -> None:
         raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
     if config.dtype != torch.bfloat16:
         raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
-    if config.tp_info.size != 1:
+    # fp8_e4m3 descales with one static scalar, identical on every rank (the fork's pre-#894
+    # behavior). int8_per_token_head computes and reads its scales per rank on its own heads,
+    # so no cross-rank agreement is needed either (Strata's int8 KV sharding works the same way).
+    if config.tp_info.size != 1 and kv_format.name not in ("fp8_e4m3", "int8_per_token_head"):
         raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
 
 

@@ -7,7 +7,7 @@ import torch
 
 from freetoken.kvcache.format import KV_FORMATS, NONE
 
-KV_QUANT_FORMATS = ["fp8_per_token_head", "int8_per_token_head"]
+KV_QUANT_FORMATS = ["fp8_e4m3", "fp8_per_token_head", "int8_per_token_head"]
 
 
 class _PlainKVStorage:
@@ -126,7 +126,7 @@ def test_triton_attention_high_physical_slots(path: str, offset_bits: int):
 
 
 def _dequantize(fmt_name: str, codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    if fmt_name == "fp8_per_token_head":
+    if fmt_name in ("fp8_per_token_head", "fp8_e4m3"):
         values = codes.cpu().view(torch.float8_e4m3fn).float().to(codes.device)
     else:
         values = codes.float()
@@ -193,6 +193,15 @@ def test_store_kv_rows_round_trips_within_the_format_error_bound(fmt_name: str):
     for raw, codes, scale in ((k, k_cache, k_scale), (v, v_cache, v_scale)):
         expected = raw.float().view(tokens, heads, head_dim)
         stored = _dequantize(fmt_name, codes[rows], scale[rows])
+        if fmt_name == "fp8_e4m3":
+            # a static scale clamps outliers to the e4m3 edge instead of scaling the row
+            # max to it; in-range values round to the grid like fp8_per_token_head
+            edge = 448.0 * scale[rows]
+            out = expected.abs() > edge
+            assert torch.equal(stored[out], (edge * expected.sign())[out])
+            bound = torch.maximum(expected.abs() / 16, scale[rows] * 2.0**-10)
+            assert ((stored - expected).abs()[~out] <= (bound * (1 + 1e-5))[~out]).all()
+            continue
         amax = expected.abs().amax(dim=-1)
         # the largest element of a row is exactly representable after scaling
         torch.testing.assert_close(stored.abs().amax(dim=-1), amax, rtol=1e-5, atol=0.0)

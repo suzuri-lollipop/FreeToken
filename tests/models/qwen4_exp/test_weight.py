@@ -388,6 +388,66 @@ def test_fp8_block_scales_scheme_resolves_for_mtp_experts():
     assert cfg.scheme_for_name("mtp.fc_embedding") is None
 
 
+@contextlib.contextmanager
+def _tp_rank(rank: int, world: int):
+    from freetoken.distributed import DistributedInfo, info
+
+    saved = info._TP_INFO
+    info._TP_INFO = DistributedInfo(rank, world)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
+
+
+def test_mtp_draft_dense_weights_shard_for_tp():
+    """The draft's attention/shared-expert buffers are rank-local under TP, so the draft reader's
+    slicer must cut a fused global tensor to this rank exactly like the target reader; the
+    replicated fc front end and norms stay whole. Reverting the draft slice to a no-op turns this
+    red (the rank's qkv_proj buffer is half the global rows)."""
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPDraft
+    from freetoken.models.qwen4_exp.weight import _dense_slicer
+    from freetoken.models.register import get_model_spec
+    from freetoken.models.tp_shard import tp_shard_for
+    from freetoken.spec.mtp.proposer import with_resident_moe
+    from freetoken.utils.torch_utils import torch_dtype
+
+    from .common import hf_config, parsed_config
+
+    config = with_resident_moe(parsed_config())
+    spec = get_model_spec(hf_config().architectures[0])
+    parts_of = {fused: parts for fused, parts in spec.packed_modules_mapping}
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=None))
+    from freetoken.layers import rotary
+
+    saved_rope = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
+    rotary.get_rope.cache_clear()
+    try:
+        for rank in (0, 1):
+            with _tp_rank(rank, 2), torch.device("meta"), torch_dtype(torch.bfloat16):
+                draft = Qwen4ExpMTPDraft(config, target)
+            expected = draft.state_dict()
+            shard = tp_shard_for(config, rank, 2)
+            slice_dense = _dense_slicer(shard, parts_of)
+            u = shard.units
+            hid = config.hidden_size
+            # the fused qkv buffer: global rows cut to this rank's q|k|v runs
+            qkv_rows = u["q_proj"] + u["k_proj"] + u["v_proj"]
+            qkv = slice_dense("layers.0.self_attn.qkv_proj.weight", torch.zeros(qkv_rows, hid))
+            assert qkv.shape == expected["layers.0.self_attn.qkv_proj.weight"].shape
+            assert qkv.shape[0] == qkv_rows // 2
+            # o_proj is column-sharded: [hidden, global q cols] cut to this rank's input cols
+            o = slice_dense("layers.0.self_attn.o_proj.weight", torch.zeros(hid, u["o_proj"]))
+            assert o.shape == expected["layers.0.self_attn.o_proj.weight"].shape
+            # the replicated front end is untouched by the shard
+            fc = slice_dense("fc_embedding.weight", torch.zeros(hid, hid))
+            assert fc.shape == (hid, hid) == expected["fc_embedding.weight"].shape
+    finally:
+        rotary.set_rope_device(saved_rope)
+        rotary.get_rope.cache_clear()
+
+
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
     _folder, raw = checkpoint
     key = "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"

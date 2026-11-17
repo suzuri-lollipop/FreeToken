@@ -90,19 +90,25 @@ class SpecRunner:
 
     def propose_into(self, reqs: List[Req], token_pool: torch.Tensor) -> None:
         """Draft k tokens per request into token_pool after its pending token at cached_len."""
+        from torch.profiler import record_function
+
         rows = make_device_tensor([r.table_idx for r in reqs], torch.int64, self.device)
         cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device)
-        self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
+        with record_function("spec_draft"):
+            self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
         token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(token_pool.dtype)
 
     def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
+        from torch.profiler import record_function
+
         engine = self.engine
         bs, width = batch.size, self.k + 1
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
-        logits = engine.forward_logits(batch)[: bs * width]
+        with record_function("spec_verify_forward"):
+            logits = engine.forward_logits(batch)[: bs * width]
         proposal, self._proposal = self._proposal, None
         if proposal.draft_support_probs is not None:
             out, emitted = reject_with_draft_probs(

@@ -46,11 +46,15 @@ class Proposer:
 
     # True: the draft's KV slot i depends on token i+1, so the prefix cache keys position i by (t_i, t_{i+1})
     radix_lookahead: ClassVar[bool] = False
+    # True: the method keeps every rank's drafts identical under TP (mtp gathers the head's
+    # vocab shards before the argmax). Methods without that agreement stay tp 1.
+    tp_supported: ClassVar[bool] = False
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
-        """Raise if this proposer cannot serve the config; the base rejects TP > 1."""
-        if config.tp_info.size > 1:
+        """Raise if this proposer cannot serve the config; the base rejects TP > 1
+        unless the method guarantees cross-rank draft agreement (tp_supported)."""
+        if config.tp_info.size > 1 and not cls.tp_supported:
             raise ValueError(
                 "speculative decoding needs --tp 1 for now: without a cross-rank agreement on the drafts, "
                 "near-tied draft argmaxes can differ between ranks and the ranks diverge"

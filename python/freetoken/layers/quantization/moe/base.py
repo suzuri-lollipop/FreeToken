@@ -26,6 +26,41 @@ def block_aligned_range(total: int, block: int, rank: int, size: int) -> tuple[i
     return blocks * rank // size * block, blocks * (rank + 1) // size * block
 
 
+def tp_piece(piece: torch.Tensor, axis: int, lo: int, hi: int, total: int) -> torch.Tensor:
+    """This rank's [lo, hi) rows of one expert piece along ``axis``, where the piece tiles
+    ``total`` units.
+
+    A scale grid is thinner than its weight by the quant group, so the cut is taken in the
+    piece's own units; anything that does not tile ``total`` exactly (a per-tensor scale held
+    as one column, or a hidden-sized row vector) is returned whole. ``lo``/``hi`` come from
+    ``MoEConfig.local_intermediate_range`` and may be an uneven (bandwidth-weighted) split;
+    a range that does not align to the piece's own grain falls back to whole (which the
+    layout then rejects loudly rather than banking silently wrong rows).
+    """
+    if piece.dim() <= axis:
+        return piece
+    blocks = piece.shape[axis]
+    if not blocks or total % blocks:
+        return piece
+    per = total // blocks
+    if lo % per or (hi - lo) % per:
+        return piece
+    return piece.narrow(axis, lo // per, (hi - lo) // per)
+
+
+def tp_rows(piece: torch.Tensor, axis: int, lo: int, hi: int, total: int) -> torch.Tensor:
+    """``tp_piece`` for an axis that may hold the fused [gate | up] pair: two cuts, not one."""
+    if piece.dim() > axis and piece.shape[axis] == 2 * total:
+        return torch.cat(
+            [
+                piece.narrow(axis, lo, hi - lo),
+                piece.narrow(axis, total + lo, hi - lo),
+            ],
+            dim=axis,
+        )
+    return tp_piece(piece, axis, lo, hi, total)
+
+
 def weighted_block_ranges(
     total: int, block: int, weights: "tuple[float, ...]"
 ) -> "list[tuple[int, int]] | None":

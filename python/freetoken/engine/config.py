@@ -137,8 +137,13 @@ class EngineConfig:
     page_size: int = 1
     memory_ratio: float = 0.9
     # --kv-cache-dtype: "auto" stores K and V in the compute dtype; fp8_per_token_head /
-    # int8_per_token_head store quantized rows with per-token-head scales (kvcache/format.py).
+    # int8_per_token_head store quantized rows with per-token-head scales; fp8_e4m3 ("fp8")
+    # stores the same rows with one static scale (kvcache/format.py).
     kv_cache_dtype: str = "auto"
+    # --kv-cache-quant-scale: the static scale fp8_e4m3 divides K and V by on the way in
+    # (and multiplies back on read). 1.0 fits normalized attention states; raise it when
+    # activations exceed the e4m3 range (-448..448). Ignored by the other formats.
+    kv_cache_quant_scale: float = 1.0
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -173,9 +178,14 @@ class EngineConfig:
 
     @property
     def kv_format(self) -> KVFormat:
-        return resolve_kv_format(self.kv_cache_dtype)
+        fmt = resolve_kv_format(self.kv_cache_dtype)
+        if fmt.name == "fp8_e4m3":
+            fmt = replace(fmt, static_scale=self.kv_cache_quant_scale)
+        return fmt
 
     def __post_init__(self):
+        if not self.kv_cache_quant_scale > 0.0:
+            raise ValueError(f"kv_cache_quant_scale must be positive, got {self.kv_cache_quant_scale}")
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:

@@ -258,12 +258,55 @@ set (explicit zeros included) is written to `freetoken-multi-<tag>.json` +
 .venv/bin/ft calibrate multi --config launch.json --out-dir ~/calibration/qwen38-multi
 ```
 
-Unlike the lookup tool, a multi arm keeps the config's `--speculative` flag: it measures the
-server the profile actually starts, and rejects piping on it with the reason if the spec path
-makes the side stream unsafe. All four arms run on any TP size (piping under TP uses a
-dedicated second NCCL group). Expect ~15 min (4 arms x one engine start). The launcher's
-Calibration tab exposes this as the multi choice next to the single-stream (auto) one, and
-writes the winner into the profile's / the launch JSON's `env` the same way lookup does.
+All four prefill arms run on any TP size (piping under TP uses a dedicated second NCCL
+group). The launcher's Calibration tab exposes this as the multi choice next to the
+single-stream (auto) one, and writes the winner into the profile's / the launch JSON's `env`
+the same way lookup does.
+
+### Speculative backends in the same run (`--spec`)
+
+The multi tool now owns a second dimension: it compares speculative backends on the same
+staggered workload, not just the prefill knobs. `--spec auto` (the default) measures `mtp`
+and `dflash`; `--spec none` disables the dimension; `--spec mtp,dflash` picks a subset. Only
+backends this engine registers are offered (`mtp`, `dflash`); `dflash` is skipped with a
+reason unless a DFlash 2 draft checkpoint is given (`--spec-draft-path`, or the profile's
+`--speculative-draft-model-path`). `--spec-num-steps` overrides the draft width. The tool
+strips the profile's own `--speculative-*` flags so every arm starts from the same base.
+
+Each spec arm runs with prefill off and is judged on aggregate throughput: it wins only when
+it adds at least 3% tok/s over the no-spec arm **and** does not worsen the worst inter-token
+stall by more than 0.1 s (speculation speeds decode; it must not freeze the running streams).
+The winner is then stacked on the prefill winner in a combo arm, kept only when it holds the
+throughput win and does not regress the prefill winner's stall. The report's `chosen.spec`
+carries `algorithm`, `argv`, `applied`, `compatible`, and the gains; the start script adds the
+spec flags only when `applied` is true. A backend the checkpoint cannot serve (no MTP layers,
+a bad draft) is an excluded arm with a reason, not a failed run.
+
+**Why piped + speculation cannot stack yet.** Under `piped`/`piped-sf` the engine refuses
+speculation: a spec verify shares the PLE staging slots / plan slot 0 with the pipe's in-flight
+chunk (`scheduler.py::_make_pipe`), and the piped decode graph is captured without the K-split
+fetch overlap to keep the staging buffers single-writer (`engine.py`). The combo arm is still
+measured, so the report shows the refusal empirically (`piping disabled: speculative decoding
+armed`) rather than assuming it. Strata lifts exactly this limitation with `STRATA_PIPED_MTP`
+(opt-in, beside `STRATA_PIPED_CONCURRENT`): it gives the prompt path its own stream and memory,
+locks the PLE table, reserves the drafter's prefill graphs with nothing in flight, drafts as an
+asynchronous chain and commits after the verdict. Porting that staging separation is the engine
+work needed before piped + MTP can be calibrated as a winning combination here; until then a
+piped prefill win and a spec win are reported as alternatives, and the stall-first prefill
+winner is what the script applies.
+
+### Server-side measurement
+
+Every arm starts with `--enable-timings-report` and requests `timings_per_token` plus
+`continuous_usage_stats`. The scored inter-token gap uses the engine's own cumulative
+`predicted_ms` delta between delivered chunks (no HTTP/client jitter); the client arrival delta
+remains the fallback and is reported as `stall_worst_client`, with `measurement` saying which
+was used. Token counts come from the server's running usage, so a chunk carrying several tokens
+is counted exactly. `FREETOKEN_LATENCY=1` / `FREETOKEN_LATENCY_OUT` are collected per arm into
+`logs/<arm>-latency.jsonl` and summarized in the report (`latency.windows`, `phase_pct_mean`,
+`spec_verifies`/`spec_accepted`) as a diagnostic of where the window time went. Expect ~15 min
+for the prefill arms plus one engine start per spec backend (and one combo arm when both
+dimensions win).
 
 ## Notes
 
