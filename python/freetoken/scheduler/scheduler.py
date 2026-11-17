@@ -658,16 +658,25 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
+        from freetoken.engine import profiler as _profiler_mod
+
+        _prof = _profiler_mod.from_env()
+        if _prof is not None:
+            _prof.start()
         if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self.normal_loop()
+                    if _prof is not None:
+                        _prof.step()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
+                if _prof is not None:
+                    _prof.step()
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)

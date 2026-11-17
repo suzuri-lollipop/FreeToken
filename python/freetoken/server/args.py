@@ -546,11 +546,24 @@ def parse_args(
         "--kv-cache-dtype",
         type=str,
         default=ServerArgs.kv_cache_dtype,
-        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
+        choices=["auto", "fp8", "int8", *(name for name in KV_FORMATS if name != NONE.name)],
         help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
         "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
         "attention backends read "
-        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format.",
+        "them. They need --dtype bfloat16. 'int8_per_token_head' ('int8' for short, as in Strata) also runs under "
+        "tensor parallelism: its scales are rank-local. 'fp8_per_token_head' still needs tp 1. 'fp8_e4m3' ('fp8' for "
+        "short) stores the same rows with one static scale (--kv-cache-quant-scale) instead of per-row amax scales; "
+        "the descale is rank-invariant, so it also runs under tensor parallelism. An mtp draft stores its KV in the "
+        "same format.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-quant-scale",
+        type=float,
+        default=ServerArgs.kv_cache_quant_scale,
+        help="Static scale both K and V divide by before the fp8_e4m3 store (and multiply back "
+        "on read). Default 1.0; raise it if attention states exceed the e4m3 range "
+        "(-448..448), which would otherwise clamp. Ignored by the other formats.",
     )
 
     parser.add_argument(

@@ -95,3 +95,29 @@ def test_embed_w8a16_forward_matches_reference_directly():
     exp = ref[idx].to(torch.bfloat16)
     rel = ((y.float() - exp.float()).norm() / exp.float().norm()).item()
     assert rel < 0.04, f"rel err {rel}"
+
+
+def test_gather_logits_reassembles_vocab_shards_for_any_row_count():
+    """The draft argmax and the sampler must select from the same global logits on every
+    rank: gather_logits turns this rank's vocab shard back into the full row (tp 1: identity)."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.embedding import ParallelLMHead
+
+    full = torch.arange(2 * 8, dtype=torch.float32).view(2, 8)
+    shards = [full[:, :4].contiguous(), full[:, 4:].contiguous()]
+
+    class _Comm:
+        def all_gather(self, x):
+            # rank-major stack, as all_gather_into_tensor: every rank contributes x's rows
+            return torch.cat([s[: x.shape[0]] for s in shards], dim=0)
+
+    head = SimpleNamespace(tp_size=2, num_embeddings=8, _comm=_Comm())
+    torch.testing.assert_close(ParallelLMHead.gather_logits(head, shards[0]), full)
+    torch.testing.assert_close(ParallelLMHead.gather_logits(head, shards[1]), full)
+    # a single row (one decode request) takes the flat view path
+    torch.testing.assert_close(ParallelLMHead.gather_logits(head, shards[0][:1]), full[:1])
+    # the global argmax is the same from either rank's shard
+    assert ParallelLMHead.gather_logits(head, shards[0]).argmax(-1).tolist() == full.argmax(-1).tolist()
+    head.tp_size = 1
+    assert ParallelLMHead.gather_logits(head, full) is full

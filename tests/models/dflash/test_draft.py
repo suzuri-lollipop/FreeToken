@@ -248,3 +248,73 @@ def test_sample_path_walks_the_selector_lattice(tmp_path):
     assert torch.equal(tokens[2], cand[2, :, 0]) and torch.equal(q[2], F.one_hot(torch.zeros(block - 1, dtype=torch.int64, device=DEV), TOP_K).float())
     assert ((tokens >= 0) & (tokens < VOCAB)).all() and ((cand >= 0) & (cand < VOCAB)).all()
     assert not torch.isclose(q[3].sum(-1), torch.ones(block - 1, device=DEV)).any()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp2_shards_draft_weights_to_the_rank_buffers(rank, tmp_path):
+    """At TP2 the global checkpoint tensors are cut to the rank's parallel-layer buffers:
+    fused qkv/gate_up split into their parts and each part head-sliced, o_proj/down_proj
+    input-sliced, replicated leaves untouched. The cuts match an independent manual slice
+    and the meta-built draft's local shapes; the ring carries the rank's KV heads."""
+    from freetoken.distributed import DistributedInfo
+    from freetoken.distributed import info as tp_info_mod
+    from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.models.dflash import DFlash2DraftModel, parse_config
+    from freetoken.models.dflash.model import _local_sizes, _slice_dense
+    from freetoken.utils import cached_load_hf_config, torch_dtype
+
+    w = _weights()
+    path = tmp_path / "draft"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(CONFIG))
+    saved_tp = tp_info_mod._TP_INFO
+    tp_info_mod._TP_INFO = DistributedInfo(rank, 2)
+    try:
+        cfg = parse_config(cached_load_hf_config(str(path)))
+        with torch.device("meta"), torch_dtype(torch.bfloat16):
+            target = SimpleNamespace(model=SimpleNamespace(embed_tokens=VocabParallelEmbedding(VOCAB, H)),
+                                     lm_head=ParallelLMHead(VOCAB, H))
+            draft = DFlash2DraftModel(cfg, target, NoQuantConfig())
+        expected = draft.state_dict()
+        lq, lkv, li = _local_sizes(cfg)
+        assert (lq, lkv, li) == (HEADS // 2, KV_HEADS // 2, INTER // 2)
+        hd = HEAD_DIM
+        for i in range(LAYERS):
+            p = f"layers.{i}"
+            q = w[f"{p}.self_attn.q_proj.weight"]
+            k = w[f"{p}.self_attn.k_proj.weight"]
+            v = w[f"{p}.self_attn.v_proj.weight"]
+            qkv = torch.cat([q, k, v], dim=0)
+            want_qkv = torch.cat([q[rank * lq * hd : (rank + 1) * lq * hd],
+                                  k[rank * lkv * hd : (rank + 1) * lkv * hd],
+                                  v[rank * lkv * hd : (rank + 1) * lkv * hd]], dim=0)
+            gate, up = w[f"{p}.mlp.gate_proj.weight"], w[f"{p}.mlp.up_proj.weight"]
+            want_gu = torch.cat([gate[rank * li : (rank + 1) * li], up[rank * li : (rank + 1) * li]], dim=0)
+            cases = {
+                f"{p}.self_attn.qkv_proj.weight": (qkv, want_qkv),
+                f"{p}.self_attn.o_proj.weight": (w[f"{p}.self_attn.o_proj.weight"],
+                                                 w[f"{p}.self_attn.o_proj.weight"][:, rank * lq * hd : (rank + 1) * lq * hd]),
+                f"{p}.mlp.gate_up_proj.weight": (torch.cat([gate, up], dim=0), want_gu),
+                f"{p}.mlp.down_proj.weight": (w[f"{p}.mlp.down_proj.weight"],
+                                              w[f"{p}.mlp.down_proj.weight"][:, rank * li : (rank + 1) * li]),
+            }
+            for name, (global_t, want) in cases.items():
+                got = _slice_dense(name, global_t, cfg)
+                assert got.shape == expected[name].shape == want.shape, name
+                assert torch.equal(got, want), name
+        # replicated leaves pass through untouched
+        for name in ("fc.weight", "candidate_selector.predecessor_codebook", f"layers.0.input_layernorm.weight"):
+            assert torch.equal(_slice_dense(name, w[name], cfg), w[name])
+        # the ring carries this rank's KV heads, not the global count
+        draft._kv_all = torch.empty(LAYERS, 2 * lkv * HEAD_DIM, dtype=torch.bfloat16, device=DEV)
+        ring = draft.make_dflash_ring(max_rows=2, block=8, ring_len=RING, max_position=4096, device=DEV)
+        assert ring.k.shape[3] == lkv and ring.v.shape[3] == lkv
+        # regression: load() slices the context K/V projection out of the fused qkv at the
+        # LOCAL q width. The global q_size (HEADS*HEAD_DIM) overshoots the rank-local buffer
+        # and empties it, which crashed the draft's graph capture under TP.
+        local_qkv_width = (lq + 2 * lkv) * HEAD_DIM
+        assert HEADS * HEAD_DIM >= local_qkv_width
+        assert local_qkv_width - lq * HEAD_DIM == 2 * lkv * HEAD_DIM
+    finally:
+        tp_info_mod._TP_INFO = saved_tp

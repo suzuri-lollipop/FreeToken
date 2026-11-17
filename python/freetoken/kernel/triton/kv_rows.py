@@ -20,7 +20,7 @@ def kv_tile(ptrs, mask, FMT: tl.constexpr):
     """One K or V tile in the dtype ``tl.dot`` takes."""
     if FMT == "none":
         tile = tl.load(ptrs, mask=mask, other=0.0)
-    elif FMT == "fp8_per_token_head":
+    elif FMT == "fp8_per_token_head" or FMT == "fp8_e4m3":
         codes = tl.load(ptrs, mask=mask, other=0)
         if e4m3_native_cx():
             tile = codes.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
@@ -46,7 +46,7 @@ def kv_tile_staged(ptrs, mask, FMT: tl.constexpr):
         tile = tl.load(ptrs, mask=mask, other=0.0)
     else:
         codes = tl.load(ptrs, mask=mask, other=0)
-        if FMT == "fp8_per_token_head":
+        if FMT == "fp8_per_token_head" or FMT == "fp8_e4m3":
             if e4m3_native_cx():
                 x = codes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             else:
@@ -89,20 +89,22 @@ def kv_scale_args(
 
 
 @triton.jit
-def _encode_row(x, FMT: tl.constexpr):
+def _encode_row(x, FMT: tl.constexpr, static_scale):
     amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-10)
-    if FMT == "fp8_per_token_head":
-        scale = amax / 448.0
+    if FMT == "int8_per_token_head":
+        scale = amax / 127.0
+        q = x / scale
+        # the int8 cast truncates, so round half away from zero first
+        codes = tl.clamp(tl.where(q >= 0, q + 0.5, q - 0.5), -128.0, 127.0).to(tl.int8)
+    else:
+        # fp8_e4m3 stores the one static config scale on every row; the clamp keeps an
+        # outlier on the grid edge instead of the NaN code an out-of-range cast produces
+        scale = amax / 448.0 if FMT == "fp8_per_token_head" else static_scale
         q = tl.clamp(x / scale, -448.0, 448.0)
         if e4m3_native_cx():
             codes = f32_to_e4m3(q).to(tl.uint8, bitcast=True)
         else:
             codes = e4m3_f32_to_u8(round_e4m3(q))
-    elif FMT == "int8_per_token_head":
-        scale = amax / 127.0
-        q = x / scale
-        # the int8 cast truncates, so round half away from zero first
-        codes = tl.clamp(tl.where(q >= 0, q + 0.5, q - 0.5), -128.0, 127.0).to(tl.int8)
     return codes, scale
 
 
@@ -121,6 +123,7 @@ def _kv_store_kernel(
     stride_vd,
     stride_ks,
     stride_vs,
+    static_scale,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     FMT: tl.constexpr,
@@ -134,8 +137,8 @@ def _kv_store_kernel(
 
     k_row = tl.load(k_src + token * stride_kt + row, mask=mask, other=0.0).to(tl.float32)
     v_row = tl.load(v_src + token * stride_vt + row, mask=mask, other=0.0).to(tl.float32)
-    k_codes, k_scale = _encode_row(k_row, FMT)
-    v_codes, v_scale = _encode_row(v_row, FMT)
+    k_codes, k_scale = _encode_row(k_row, FMT, static_scale)
+    v_codes, v_scale = _encode_row(v_row, FMT, static_scale)
 
     tl.store(k_dst + slot * stride_kd + row, k_codes, mask=mask)
     tl.store(v_dst + slot * stride_vd + row, v_codes, mask=mask)
@@ -178,6 +181,7 @@ def store_kv_rows(
         v_cache.stride(0),
         k_scale.stride(0),
         v_scale.stride(0),
+        fmt.static_scale,
         D=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         FMT=fmt.name,
@@ -199,6 +203,7 @@ def _latent_store_kernel(
     stride_rd,
     stride_d,
     stride_s,
+    static_scale,
     D_V: tl.constexpr,
     D_R: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -210,14 +215,14 @@ def _latent_store_kernel(
     offs_v = tl.arange(0, BLOCK_V)
     mask_v = offs_v < D_V
     latent = tl.load(c_src + token * stride_ct + offs_v * stride_cd, mask=mask_v, other=0.0).to(tl.float32)
-    codes, scale = _encode_row(latent, FMT)
+    codes, scale = _encode_row(latent, FMT, static_scale)
     tl.store(dst + slot * stride_d + offs_v, codes, mask=mask_v)
     tl.store(scale_dst + slot * stride_s, scale)
     if D_R > 0:
         offs_r = tl.arange(0, BLOCK_R)
         mask_r = offs_r < D_R
         rope = tl.load(r_src + token * stride_rt + offs_r * stride_rd, mask=mask_r, other=0.0).to(tl.float32)
-        codes, scale = _encode_row(rope, FMT)
+        codes, scale = _encode_row(rope, FMT, static_scale)
         tl.store(dst + slot * stride_d + D_V + offs_r, codes, mask=mask_r)
         tl.store(scale_dst + slot * stride_s + 1, scale)
 
@@ -250,6 +255,7 @@ def store_latent_rows(
         k_rope.stride(1),
         rows.stride(0),
         scale.stride(0),
+        fmt.static_scale,
         D_V=d_v,
         D_R=d_r,
         BLOCK_V=triton.next_power_of_2(d_v),
