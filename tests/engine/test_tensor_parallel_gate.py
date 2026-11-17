@@ -306,9 +306,9 @@ def test_no_sharding_backend_available_reports_tp(monkeypatch):
 
 
 def test_tp_refuses_a_quantized_cache(monkeypatch):
-    """A quantized --kv-cache-dtype has no TP-aware descale path yet, so _validate_kv_format
-    refuses it once tp_size > 1 -- before backend resolution. The duck-typed model resolves to
-    the MHA pool, which stores fp8_per_token_head, so the TP gate is the one that fires."""
+    """fp8_per_token_head has no TP-aware descale path yet, so _validate_kv_format refuses
+    it once tp_size > 1 -- before backend resolution. The duck-typed model resolves to the
+    MHA pool, which stores it, so the TP gate is the one that fires."""
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch, major=10)
@@ -316,3 +316,22 @@ def test_tp_refuses_a_quantized_cache(monkeypatch):
     with pytest.raises(ValueError, match="does not support tensor parallelism"):
         _adjust_config(config)
 
+
+def test_tp_accepts_the_static_fp8_cache(monkeypatch):
+    """fp8_e4m3 descales with one static scalar, identical on every rank (the fork's
+    pre-#894 fp8), so the TP gate exempts it while fp8_per_token_head stays gated."""
+    from freetoken.engine.engine import _validate_kv_format
+
+    _patch_env(monkeypatch, major=10)
+    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="fp8_e4m3")
+    _validate_kv_format(config, config.model_config)
+
+
+def test_tp_accepts_int8_per_token_head(monkeypatch):
+    """int8_per_token_head's scales are computed and read back per rank on its own heads
+    (Strata's int8 KV shards the same way), so the TP gate exempts it too."""
+    from freetoken.engine.engine import _validate_kv_format
+
+    _patch_env(monkeypatch, major=10)
+    config = _config(tp=2, attention_backend="auto", kv_cache_dtype="int8_per_token_head")
+    _validate_kv_format(config, config.model_config)

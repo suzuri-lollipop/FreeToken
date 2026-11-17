@@ -38,7 +38,7 @@ def test_mha_kv_cache_rebuild_changes_pages_preserves_identity():
     assert pool.k_cache(0).shape == (10, 16, 8, 64)
 
 
-@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("name", ["fp8_e4m3", "fp8_per_token_head", "int8_per_token_head"])
 def test_mha_quantized_pool_allocates_prices_and_rebuilds_the_scales(name: str):
     from freetoken.kvcache.format import KV_FORMATS
     from freetoken.kvcache.mha_pool import MHAKVCache
@@ -91,7 +91,7 @@ def test_mla_and_dsa_rebuild_from_config_and_unit_bytes():
     assert dsa.unit_bytes() == (layers * latent * 2 + n_idx * idx_dim * 2, 0)
 
 
-@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("name", ["fp8_e4m3", "fp8_per_token_head", "int8_per_token_head"])
 def test_mla_quantized_pool_prices_and_rebuilds_one_scale_per_segment(name: str):
     from freetoken.kvcache.dsa_pool import MLAKVCache
     from freetoken.kvcache.format import KV_FORMATS
@@ -122,7 +122,7 @@ def _hybrid_groups():
     return [full, swa]
 
 
-@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("name", ["fp8_e4m3", "fp8_per_token_head", "int8_per_token_head"])
 def test_hybrid_swa_quantized_pool_prices_and_rebuilds_both_groups(name: str):
     from freetoken.kvcache.format import KV_FORMATS
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache

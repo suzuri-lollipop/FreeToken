@@ -504,7 +504,7 @@ def test_capture_graph_provisions_the_block_topk_scratch():
 
 
 @requires_cuda
-@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("fmt_name", ["fp8_e4m3", "fp8_per_token_head", "int8_per_token_head"])
 def test_sparse_attention_reads_quantized_kv(fmt_name: str):
     from freetoken.kernel.triton.kv_rows import store_kv_rows
     from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
@@ -537,7 +537,7 @@ def test_sparse_attention_reads_quantized_kv(fmt_name: str):
     )
 
     def dequantize(codes, scale):
-        if fmt_name == "fp8_per_token_head":
+        if fmt_name in ("fp8_per_token_head", "fp8_e4m3"):
             return codes.cpu().view(torch.float8_e4m3fn).float().to(device) * scale
         return codes.float() * scale
 
