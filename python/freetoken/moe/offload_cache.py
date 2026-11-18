@@ -166,6 +166,14 @@ class OffloadMoeCache:
     # x4 rank (7.1 GB/s) at T=150, 82 missing experts cost 16.0 ms over PCIe and the
     # balanced split 10.1 ms.
     prefill_fetch_fraction: float = 1.0
+    # Duty-cycle yield (FREETOKEN_PREFILL_YIELD_MS, opt-in): after each on-demand
+    # chunk layer, spin this many ms on the prefill stream so the PCIe link drains
+    # for the running decodes' fetches and collectives. Narrowing the gather grid
+    # (prefill_h2d_blocks_per_bank) bounds their QUEUE delay; this bounds their
+    # BANDWIDTH share -- the chunk still offers ~100% load, so a waiting decode
+    # trades ~yield/chunk-layer of TTFT for near-normal ITL. 0 = off. The gate
+    # (set by the engine) keeps solo prefills from paying it.
+    prefill_yield_ms: float = 0.0
     # Hybrid prefill promotion: share of each layer's touched-and-missing experts to
     # LRU-assign a SLOT to and H2D once (copy_missing) BEFORE the on-demand plan runs,
     # so the plan classifies them as hits and gathers them D2D into the double buffer.
@@ -332,6 +340,8 @@ class OffloadMoeCache:
         # Measurement probe (FREETOKEN_TOUCH_OVERLAP_PROBE=1): per-layer cross-chunk
         # touched-expert overlap -- the go/no-go number for ANY cross-chunk expert reuse
         # scheme (promote family). Pure measurement: staging behavior is untouched.
+        self.prefill_yield_gate = None  # engine-set callable: decodes runnable?
+        self._yield_cyc_per_ms: float | None = None
         self._touch_probe = os.environ.get("FREETOKEN_TOUCH_OVERLAP_PROBE", "0") == "1"
         self._probe_prev_touched: torch.Tensor | None = None
         self._probe_acc: torch.Tensor | None = None
@@ -1676,6 +1686,25 @@ class OffloadMoeCache:
             self._prefill_miss_num,
             blocks_per_bank=self._prefill_h2d_bpb,
         )
+
+    def yield_prefill_layer(self) -> None:
+        """One duty-cycle gap after a chunk layer: a device-side spin on the CURRENT
+        (prefill) stream issues no PCIe, so the running decodes' queued fetches and
+        collectives drain with the link to themselves. Cycles-per-ms is calibrated
+        once from the device clock (the spin kernel's duration is clock-relative)."""
+        if self.prefill_yield_ms <= 0 or self.prefill_yield_gate is None:
+            return
+        if not self.prefill_yield_gate():
+            return
+        if self._yield_cyc_per_ms is None:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch.cuda._sleep(20_000_000)
+            end.record()
+            end.synchronize()
+            self._yield_cyc_per_ms = 20_000_000 / max(start.elapsed_time(end), 0.1)
+        torch.cuda._sleep(int(self.prefill_yield_ms * self._yield_cyc_per_ms))
 
     def _move_prefill_layer_ondemand_pageable(self, layer_id: int) -> None:
         """Touched-only gather for an unpinned layer. File-backed rows come in by

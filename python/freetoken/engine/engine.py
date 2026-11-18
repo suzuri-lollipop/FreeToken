@@ -699,6 +699,10 @@ class Engine:
         # never share those buffers with the decode graph's fetch overlap -- concurrent
         # writers into one pinned staging region is a heap corruption, not a race.
         self.piped_prefill = os.environ.get("FREETOKEN_PIPED_PREFILL", "0") == "1"
+        # Duty-cycle yield between chunk layers while decodes run (see
+        # OffloadMoeCache.prefill_yield_ms); the scheduler refreshes decode_running.
+        self.prefill_yield_ms = max(0.0, float(os.environ.get("FREETOKEN_PREFILL_YIELD_MS", "0") or 0))
+        self.decode_running = False
         if self.piped_prefill:
             # Piped prefill runs a second NCCL comm (the pipe's torch group) concurrent
             # with the decode graph's collectives. NCCL kernels spin for their peer and
@@ -1885,6 +1889,14 @@ class Engine:
                 # promotion writes the decode-owned LRU; keep it off while piping
                 cache.auto_promote = False
             cache.ondemand_prefill = True
+            # inline/mixed prefills carry no concurrent decode to yield for
+            cache.prefill_yield_ms = self.prefill_yield_ms if self.piped_prefill else 0.0
+            cache.prefill_yield_gate = lambda: self.decode_running
+            if cache.prefill_yield_ms > 0:
+                logger.info_rank0(
+                    f"piped prefill: yielding {cache.prefill_yield_ms:.0f}ms per chunk "
+                    "layer while decodes run (FREETOKEN_PREFILL_YIELD_MS)"
+                )
             cache.ondemand_max_tokens = max(
                 0, int(os.getenv("FREETOKEN_ONDEMAND_PREFILL_MAX", "8192"))
             )

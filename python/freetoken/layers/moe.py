@@ -839,6 +839,7 @@ class OffloadMoELayer(MoELayer):
                 out = out + executor.decode_sync(pending)
             if dbg is not None:
                 dbg.prefill_layer_done(self.layer_id, topk_ids)
+            cache.yield_prefill_layer()
             return out
         if cache.prefill_overlap:
             from freetoken.moe import _debug_stats
