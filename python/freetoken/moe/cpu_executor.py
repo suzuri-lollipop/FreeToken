@@ -112,6 +112,33 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+def flag_sync_available(device: torch.device) -> bool:
+    """Whether the flag handshake (and its coordinator-core reservation) applies here."""
+    if not _FLAG_SYNC or device.type != "cuda":
+        return False
+    from freetoken.kernel import _cpu_moe
+
+    return bool(_cpu_moe.memops_probe(torch.cuda.current_stream(device).cuda_stream))
+
+
+def resolve_worker_pool(requested: int, flag_sync: bool) -> tuple[int, list[int], int]:
+    """(worker count, worker cores, coordinator core or -1) of the CPU MoE pool.
+
+    Single source of truth for the sizing: ``ft bench bw`` resolves a profile row's
+    thread count with the same rule the serving executor applies, so the key the
+    server looks up matches the row the bench wrote.
+    """
+    nthreads, core_ids = resolve_threads_and_affinity(requested)
+    coord_core = -1
+    if flag_sync and requested == 0 and nthreads > 2:
+        # Auto sizing: give the coordinator the last physical core instead of
+        # oversubscribing (workers drop from N to N-1).
+        coord_core = core_ids[-1]
+        nthreads -= 1
+        core_ids = core_ids[:-1]
+    return nthreads, core_ids, coord_core
+
+
 def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
     if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
@@ -280,24 +307,16 @@ class CpuMoeExecutor:
         # probe): its coordinator needs a core of its own, which the auto thread sizing
         # below reserves (a coordinator time-slicing against the GEMV workers measurably
         # destabilizes throughput on fully-subscribed boxes).
-        self._flag_sync = _FLAG_SYNC and device.type == "cuda"
-        if self._flag_sync and not _cpu_moe.memops_probe(torch.cuda.current_stream().cuda_stream):
+        self._flag_sync = flag_sync_available(device)
+        if _FLAG_SYNC and device.type == "cuda" and not self._flag_sync:
             logger.info_rank0(
                 "cpu-moe flag handshake unavailable: stream memory operations failed the "
                 "startup probe; using the cudaLaunchHostFunc sync"
             )
-            self._flag_sync = False
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
-        coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
-            # Auto sizing: give the coordinator the last physical core instead of
-            # oversubscribing (workers drop from N to N-1).
-            coord_core = core_ids[-1]
-            nthreads -= 1
-            core_ids = core_ids[:-1]
+        nthreads, core_ids, coord_core = resolve_worker_pool(num_threads, self._flag_sync)
         self._coord_core = coord_core
         alloc_io = (
             (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))

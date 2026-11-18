@@ -358,6 +358,8 @@ strategies alike (DeepSeek-V4 experts serve offload only);
 ft bench bw --model /path/to/model.gguf   # every MoE layer kind of a checkpoint (GGUF or HF)
 ft bench bw                               # canonical geometry per expert format
 ft bench bw --gpu 1                       # a specific GPU (UUID or nvidia-smi index, as for ft serve)
+ft bench bw --model /path/to/model --tp-size 2 --gpu 0   # the per-rank view a TP=2 server looks up
+ft bench bw --model /path/to/model --tp-size 2 --gpu 1   # repeat for each GPU of the TP group
 ```
 
 Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes one
@@ -369,6 +371,10 @@ to split each layer's misses.
 - A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
   threads; a layer without an exact row keeps a fetch cap of 1. Bench with the same
   `--cpu-threads` as the server's `--moe-cpu-threads`.
+- Under tensor parallelism pass the serving `--tp-size N`: the server looks up the row by
+  its LOCAL expert shard (hybrid's even split) and its own rank's executor thread count
+  (the per-rank core slice), so a full-geometry TP=1 row never matches. One run benches
+  every distinct per-rank thread count; run it once per GPU of the TP group.
 - Each run replaces the rows it benched and keeps the others.
 - What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats

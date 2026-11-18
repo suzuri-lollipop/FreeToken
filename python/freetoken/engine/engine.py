@@ -2083,9 +2083,11 @@ class Engine:
             )
         if missing := sorted({label for label, f in groups if f is None}):
             capped = sum(n for (_, f), n in groups.items() if f is None)
+            tp = config.tp_info.size
+            hint = "ft bench bw --model <checkpoint>" + (f" --tp-size {tp}" if tp > 1 else "")
             logger.warning_rank0(
                 f"--moe-hybrid-max-fetch auto: no `ft bench bw` row for {capped} MoE layers ({', '.join(missing)}) at "
-                f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `ft bench bw --model <checkpoint>` benches each layer kind"
+                f"{executor.num_threads} CPU threads; using a fixed fetch cap of 1 there. `{hint}` benches each layer kind"
             )
         benched_isas = {rows[key].get("cpu_moe_isa") for key, f in zip(keys, fractions) if f is not None} - {None}
         if other := sorted(benched_isas - set(executor.isa.split(","))):

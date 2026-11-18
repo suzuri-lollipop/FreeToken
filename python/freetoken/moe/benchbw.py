@@ -46,7 +46,7 @@ import statistics
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -60,7 +60,12 @@ from freetoken.gpu_select import (
 )
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.moe.bench_profile import PROFILE_VERSION
-from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
+from freetoken.moe.cpu_executor import (
+    flag_sync_available,
+    physical_core_cpus,
+    resolve_threads_and_affinity,
+    resolve_worker_pool,
+)
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -700,8 +705,8 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 # the actual per-format kernel doesn't distinguish. Disclose the real story.
                 if fmt == "nvfp4":  # nvfp4 is the only use_vnni format
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
-                                 "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI; "
-                                 "a tier without its VNNI runs fp32 W4A16)")
+                                 "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI "
+                                 "or maddubs; only the scalar tier runs fp32 W4A16)")
                 elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
@@ -841,6 +846,7 @@ def run_benchbw(
     kernel_cpu_iters: int = 64,
     kernel_pcie_iters: int = 20,
     checkpoints: tuple[str, ...] = (),
+    tp_size: int = 1,
 ) -> dict:
     from freetoken.moe.bench_profile import layer_kind_key
     from freetoken.moe.cpu_executor import _format_label
@@ -862,23 +868,46 @@ def run_benchbw(
     torch.cuda.set_device(device)
     gpu = gpu_identity(device_index)
 
+    # The serving view is per-rank under TP: the expert geometry is the local shard and
+    # the executor sizes its pool from the rank's core slice. Bench that view, or the
+    # rows keyed here never match the keys a TP server looks up (silent fetch cap of 1).
+    from freetoken.distributed import tp_view
+
+    if tp_size < 1:
+        raise RuntimeError(f"tp_size must be >= 1, got {tp_size}")
+
     # kind -> (workload, sources); checkpoints are read before any timing so a bad one fails fast
     units: dict[tuple, tuple[Workload, list[str]]] = {}
+    # ranks whose serving view produced each kind: an odd physical-core count sizes the
+    # ranks' pools differently, and each distinct thread count needs its own row
+    unit_ranks: dict[tuple, set[int]] = {}
 
-    def add(fmt: str, wl: Workload, source: str) -> None:
-        sources = units.setdefault(_kind(fmt, wl), (wl, []))[1]
+    def add(fmt: str, wl: Workload, source: str, ranks) -> None:
+        kind = _kind(fmt, wl)
+        sources = units.setdefault(kind, (wl, []))[1]
         if source not in sources:
             sources.append(source)
+        unit_ranks.setdefault(kind, set()).update(ranks)
 
+    all_ranks = range(tp_size)
     for fmt in dtypes or ():
-        add(fmt, DTYPE_WORKLOADS[fmt], f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}")
+        wl = DTYPE_WORKLOADS[fmt]
+        if tp_size > 1:
+            # hybrid's even shard split (the only one a CPU-executor format takes)
+            wl = replace(wl, inter=wl.inter // tp_size)
+        add(fmt, wl, f"dtype:{_FORMAT_DISPLAY.get(fmt, fmt)}", all_ranks)
     for mname in models:
         for fmt in formats or WORKLOADS[mname].formats:
-            add(fmt, WORKLOADS[mname], f"preset:{mname}")
+            wl = WORKLOADS[mname]
+            if tp_size > 1:
+                wl = replace(wl, inter=wl.inter // tp_size)
+            add(fmt, wl, f"preset:{mname}", all_ranks)
     for path in checkpoints:
         logger.info(f"benchbw: reading the MoE layer kinds of {path} ...")
-        for kind, wl in checkpoint_layer_kinds(path, device).items():
-            add(kind[0], wl, path)
+        for rank in all_ranks:
+            with tp_view(rank, tp_size):
+                for kind, wl in checkpoint_layer_kinds(path, device).items():
+                    add(kind[0], wl, path, (rank,))
 
     # Machine-parseable progress on stdout (opt-in), so the daemon/Desktop can stream feedback
     # while the bench runs -- mirrors ft checkpoint's FTCONVERT lines. `done`/`total` count the
@@ -893,7 +922,8 @@ def run_benchbw(
 
     _prog("ceilings")
     logger.info(f"benchbw: measuring hardware ceilings on cuda:{device_index} ...")
-    cpu = measure_cpu_mem_bw(num_threads=cpu_threads, iters=cpu_iters)
+    with tp_view(0, tp_size):
+        cpu = measure_cpu_mem_bw(num_threads=cpu_threads, iters=cpu_iters)
     pcie = measure_pcie_bw(device, nbytes=pcie_bytes, iters=pcie_iters)
     done = 1
 
@@ -905,22 +935,32 @@ def run_benchbw(
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     build = _freetoken_build()
     rows: dict = {}
+    flag_sync = flag_sync_available(device)
     try:
         for (fmt, opts, hidden, inter, top_k), (wl, sources) in units.items():
             label = f"{_format_label(fmt, opts)} {hidden}x{inter} top{top_k}"
             _prog(label)
             logger.info(f"benchbw: {label} real kernels ...")
-            entry = _bench_format(fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas)
+            # one pass per distinct per-rank worker count, benched on a rank that sizes
+            # to it: the row key carries the count the serving executor will report
+            counts: dict[int, int] = {}
+            for rank in sorted(unit_ranks[(fmt, opts, hidden, inter, top_k)]):
+                with tp_view(rank, tp_size):
+                    n, _, _ = resolve_worker_pool(cpu_threads, flag_sync)
+                counts.setdefault(n, rank)
+            for rank in counts.values():
+                with tp_view(rank, tp_size):
+                    entry = _bench_format(fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas)
+                if not entry["cpu_cores"]:
+                    logger.warning(f"benchbw: no CPU MoE result for {label}, so no row: {entry['note']}")
+                    break
+                threads = len(entry["cpu_cores"])
+                rows[layer_kind_key(fmt, dict(opts), hidden, inter, top_k, threads)] = {
+                    "format": fmt, "options": dict(opts), "hidden": hidden, "inter": inter, "top_k": top_k,
+                    "cpu_threads": threads, "activation": wl.activation, "sources": sources,
+                    "threshold": threshold, "measured_at": now, "freetoken": build, **entry,
+                }
             done += 1
-            if not entry["cpu_cores"]:
-                logger.warning(f"benchbw: no CPU MoE result for {label}, so no row: {entry['note']}")
-                continue
-            threads = len(entry["cpu_cores"])
-            rows[layer_kind_key(fmt, dict(opts), hidden, inter, top_k, threads)] = {
-                "format": fmt, "options": dict(opts), "hidden": hidden, "inter": inter, "top_k": top_k,
-                "cpu_threads": threads, "activation": wl.activation, "sources": sources,
-                "threshold": threshold, "measured_at": now, "freetoken": build, **entry,
-            }
     finally:
         exec_log.setLevel(prev_level)
     _prog("done")
@@ -933,6 +973,7 @@ def run_benchbw(
         # index is the CUDA ordinal the bench ran on; uuid keys the profile file
         "gpu": {"index": device_index, "name": gpu["name"], "uuid": gpu["uuid"]},
         "cpu": _cpu_info(),
+        "tp_size": tp_size,
         "ceilings": {
             "cpu_stream_read_gbs": round(cpu["bw_gbs"], 2),
             "cpu_stream_threads": cpu["threads"],
@@ -987,9 +1028,11 @@ def _print_report(r: dict) -> None:
     from freetoken.moe.cpu_executor import _format_label
 
     c, cpu, rows = r["ceilings"], r["cpu"], r["layer_kinds"]
+    tp = r.get("tp_size", 1)
+    tp_s = f"   tp={tp} (per-rank shard + core slice)" if tp > 1 else ""
     print()
     print(f"  host {r['host']}   gpu cuda:{r['gpu']['index']} ({r['gpu']['name']})   "
-          f"cpu {cpu['model']} ({cpu['physical_cores']}c, {cpu['numa_nodes']} NUMA)")
+          f"cpu {cpu['model']} ({cpu['physical_cores']}c, {cpu['numa_nodes']} NUMA){tp_s}")
     print(f"  ceilings: CPU STREAM read {c['cpu_stream_read_gbs']:.1f}  |  "
           f"PCIe linear H2D {c['pcie_linear_h2d_gbs']:.1f}  D2H {c['pcie_linear_d2h_gbs']:.1f}  GB/s")
     benched = [rows[key] for key in r["benched"]]
@@ -1102,6 +1145,10 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
                         "nvidia-smi index (default: the first visible GPU)")
     p.add_argument("--cpu-threads", type=_nonneg_int, default=0,
                    help="CPU worker threads (0 = one per physical core)")
+    p.add_argument("--tp-size", type=_positive_int, default=1, metavar="N",
+                   help="bench the per-rank view a TP=N server looks up: the sharded expert "
+                        "geometry and each rank's CPU core slice (match the serving --tp-size; "
+                        "default 1)")
     p.add_argument("--cpu-iters", type=_positive_int, default=8, help="STREAM read passes to time")
     p.add_argument("--pcie-mib", type=_positive_int, default=256, help="linear PCIe copy size in MiB")
     p.add_argument("--pcie-iters", type=_positive_int, default=30, help="linear PCIe copies to time")
@@ -1131,7 +1178,7 @@ def main(argv: list[str] | None = None, prog: str = "ft bench bw") -> int:
             dtypes=dtypes, formats=ns.formats, isas=ns.isas, cpu_threads=ns.cpu_threads,
             cpu_iters=ns.cpu_iters, pcie_bytes=ns.pcie_mib << 20, pcie_iters=ns.pcie_iters,
             kernel_cpu_iters=ns.kernel_cpu_iters, kernel_pcie_iters=ns.kernel_pcie_iters,
-            checkpoints=checkpoints,
+            checkpoints=checkpoints, tp_size=ns.tp_size,
         )
     except (RuntimeError, OSError) as e:
         print(f"error: {e}")

@@ -61,7 +61,9 @@ instead of `/ p`.
 
 `ft bench bw --model <checkpoint>` measures `p` and `c` for each MoE layer
 kind, and `ft serve` derives the split from them. Run it once per GPU and
-model, with `--cpu-threads` equal to the server's `--moe-cpu-threads`.
+model, with `--cpu-threads` equal to the server's `--moe-cpu-threads` and
+`--tp-size` equal to the server's `--tp-size` (the rows key by the rank's
+local expert shard and its own CPU core slice).
 Without a matching row, the server warns
 `no ft bench bw row ... using a fixed fetch cap of 1` and hybrid fetches at
 most one expert per layer per step.
