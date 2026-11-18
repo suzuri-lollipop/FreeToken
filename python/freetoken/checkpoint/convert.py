@@ -372,7 +372,7 @@ def convert_banks_sidecar(
 
     names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name))
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
-    sink = _ConvertSink(writer, desc="Converting expert banks (disk-tier sidecar)", names=names)
+    sink = _ConvertSink(writer, desc="Converting expert banks (banks sidecar)", names=names)
     banks = load_expert_banks(
         model_path, model_config, method=method, device=dev, layer_sink=sink
     )
@@ -408,7 +408,7 @@ def convert_banks_sidecar(
             if getattr(banks, an, None) is not None:
                 items.append((an, getattr(banks, an)))
         total_bytes = sum(t.numel() * t.element_size() for _, t in items)
-        bar = byte_bar(total_bytes, "Converting expert banks (disk-tier sidecar)")
+        bar = byte_bar(total_bytes, "Converting expert banks (banks sidecar)")
         done_bytes = 0
         _progress("experts", 0, total_bytes)
         for name, tensor in items:

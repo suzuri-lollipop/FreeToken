@@ -27,7 +27,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
+from freetoken.moe.expert_banks import attach_resident_banks, ftw_banks_compatible, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
@@ -1658,8 +1658,20 @@ class Engine:
                 # the one-time sidecar repack reads the checkpoint like the load does,
                 # so its failures surface as WeightLoadError too
                 banks_path = None
-                if disk_layer_ids and not config.use_dummy_weight:
-                    banks_path = _ensure_disk_banks(config, method, device=self.device)
+                if not config.use_dummy_weight and method is not None and layer_methods is None:
+                    if disk_layer_ids:
+                        banks_path = _ensure_banks_sidecar(config, method, device=self.device)
+                    elif (
+                        is_offload_moe_strategy(config.moe_strategy)
+                        and config.expert_load == "auto"
+                        and os.getenv("FREETOKEN_BANKS_SIDECAR", "1").strip().lower()
+                        not in ("0", "false", "no", "off")
+                    ):
+                        # host-resident offload: the same sidecar spares every boot the
+                        # source-checkpoint repack (FREETOKEN_BANKS_SIDECAR=0 opts out)
+                        banks_path = _ensure_banks_sidecar(
+                            config, method, device=self.device, required=False
+                        )
                 banks = load_expert_banks(
                     config.model_path,
                     config.model_config,
@@ -1759,7 +1771,7 @@ class Engine:
                     f"expert banks hold experts of several formats ({sorted(set(banks.layer_formats))}) but the model "
                     f"binds {method.kind} / {method.kernel.name} on every MoE layer; reconvert the checkpoint"
                 )
-            if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
+            if banks.kind is not None and not ftw_banks_compatible(banks, method):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
@@ -3371,16 +3383,23 @@ def _disk_banks_dir(model_path: str, *, rank: int = 0, size: int = 1) -> str:
     return base if size <= 1 else f"{base}-tp{size}r{rank}"
 
 
-def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
-    """The FTW the disk-tier banks come from: the model's own FTW, or a banks-only sidecar.
+def _ensure_banks_sidecar(config: EngineConfig, method, *, device, required: bool = True) -> str | None:
+    """The FTW the offload banks come from: the model's own FTW, or a banks-only sidecar.
 
     Building the sidecar is a one-time repack of the routed experts (the dense weights
-    are not duplicated). A stale sidecar (fingerprint mismatch) is rebuilt; the FTW
-    writer only lists the shards it wrote, so stale extra shards are removed with the
-    directory."""
+    are not duplicated); subsequent boots read the repacked banks instead of re-reading
+    and repacking the source checkpoint. The disk tier mmaps them file-backed; the
+    host-resident offload loads them into its pinned banks. A stale sidecar (checkpoint
+    fingerprint or expert shard layout mismatch) is rebuilt; the FTW writer only lists
+    the shards it wrote, so stale extra shards are removed with the directory.
+
+    ``required=False`` (the host-resident case) skips the sidecar when the disk cannot
+    hold it and returns None -- the caller falls back to the source-checkpoint build.
+    """
     from freetoken.checkpoint.convert import convert_banks_sidecar
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
     from freetoken.distributed import try_get_tp_info
+    from freetoken.moe.expert_banks import ftw_shard_compatible
     from freetoken.utils import download_hf_weight
 
     if config.use_dummy_weight:
@@ -3401,27 +3420,52 @@ def _ensure_disk_banks(config: EngineConfig, method, *, device) -> str:
                 meta = json.load(f)
             if meta.get("fingerprint") == _source_fingerprint(
                 local, config.model_config, device=device
-            ):
+            ) and ftw_shard_compatible(meta, method):
                 return sidecar
         except (OSError, ValueError):
             pass  # unreadable index: rebuild
         logger.info_rank0(
-            "MoE disk tier: the banks sidecar is stale (source checkpoint changed); rebuilding"
+            "MoE banks: the sidecar is stale (source checkpoint or expert shard layout "
+            "changed); rebuilding"
         )
         if "-ftw-banks" in os.path.basename(sidecar):
             shutil.rmtree(sidecar, ignore_errors=True)  # our own sidecar naming, never the model
+    if not required:
+        need = _bank_bytes(config, method) or 0
+        free = shutil.disk_usage(os.path.dirname(sidecar) or ".").free
+        if free < need + (8 << 30):
+            logger.warning_rank0(
+                f"MoE banks: sidecar skipped ({need / 2**30:.1f} GiB needed, "
+                f"{free / 2**30:.1f} GiB free); loading from the source checkpoint"
+            )
+            return None
     # At TP>1 each rank builds its OWN rank-local sidecar (a distinct expert slice); the
     # builds are staggered by the bank fence inside convert_banks_sidecar's load. This is
-    # a one-time repack per rank -- subsequent boots mmap the file-backed disk tier off it
-    # instead of holding anonymous (swappable) banks in RAM, which is what made TP=2 thrash.
+    # a one-time repack per rank -- subsequent boots read it instead of repacking the
+    # source checkpoint (the disk tier mmaps it file-backed instead of holding anonymous
+    # (swappable) banks in RAM, which is what made TP=2 thrash).
     logger.info_rank0(
-        f"MoE disk tier: repacking the routed experts into {sidecar} (one-time"
+        f"MoE banks: repacking the routed experts into {sidecar} (one-time"
         + (f", rank {rank}/{size}" if size > 1 else "")
         + "; ~the size of the expert banks, dense weights are not copied)"
     )
     convert_banks_sidecar(
         local, sidecar, model_config=config.model_config, method=method, device=device
     )
+    # Record the shard layout the rows were repacked for: a later boot replays the
+    # sidecar only while its local intermediate range still matches (the bandwidth-
+    # weighted split can move the boundary between boots).
+    try:
+        with open(index_path) as f:
+            meta = json.load(f)
+        meta["shard_range"] = list(method.cfg.local_intermediate_range)
+        meta["tp"] = [rank, size]
+        tmp = index_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(meta, f, indent=1)
+        os.replace(tmp, index_path)
+    except (OSError, ValueError, AttributeError):
+        pass  # unrecorded layout: the next boot treats it as legacy (even-split only)
     return sidecar
 
 
