@@ -940,7 +940,14 @@ class OffloadMoeCache:
         for p in range(len(self.pool_sizes)):
             ids = self._gather_bank_ids[self._pool_layout(p)]
             self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
-        self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
+        # the decode/locked serial gather shares the link with the chunk's gather and
+        # the TP collectives: same knee as the prefill miss gather, not the wide default.
+        # FREETOKEN_H2D_BLOCKS_PER_BANK stays the decode-side manual link calibration.
+        self._copy_blocks_per_bank = (
+            default_blocks_per_bank(self.device)
+            if os.environ.get("FREETOKEN_H2D_BLOCKS_PER_BANK") is not None
+            else prefill_h2d_blocks_per_bank(self.device)
+        )
         self._prefill_h2d_bpb = prefill_h2d_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 

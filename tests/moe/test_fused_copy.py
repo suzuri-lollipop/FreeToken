@@ -135,3 +135,41 @@ def test_prefill_h2d_width_env_override(monkeypatch):
     monkeypatch.setenv("FREETOKEN_PREFILL_H2D_BPB", "0")
     with pytest.raises(AssertionError):
         fic.prefill_h2d_blocks_per_bank(torch.device("cuda"))
+
+
+@CUDA
+def test_decode_manual_link_calibration_stays_independent(monkeypatch):
+    """FREETOKEN_H2D_BLOCKS_PER_BANK calibrates the decode/locked serial gather
+    without widening the chunk's miss gather (the two share the link, not the knob)."""
+    from freetoken.kernel import fast_index_copy as fic
+
+    monkeypatch.setenv("FREETOKEN_H2D_BLOCKS_PER_BANK", "8")
+    monkeypatch.delenv("FREETOKEN_PREFILL_H2D_BPB", raising=False)
+    cache = _build_cache(2, 8, 32)
+    assert cache._copy_blocks_per_bank == 8
+    assert cache._prefill_h2d_bpb == fic.prefill_h2d_blocks_per_bank(cache.device)
+
+
+@CUDA
+def test_copy_missing_launches_at_the_link_knee(monkeypatch):
+    """The serial decode/locked gather must launch at the resolved link width, not
+    the kernel's wide default (a wide grid queues concurrent chunk/AR traffic)."""
+    from freetoken.kernel import fast_index_copy as fic
+
+    cache = _build_cache(2, 8, 32)
+    cache._pending_src_layer = 1
+    cache.num_indices.fill_(2)
+    dev = torch.device("cuda")
+    cache.evict_slots[:2] = torch.tensor([5, 9], dtype=torch.int32, device=dev)
+    cache.src_indices[:2] = torch.tensor([1, 3], dtype=torch.int32, device=dev)
+    widths = []
+    real = fic.fast_index_copy_multi_jit
+
+    def spy(*args, **kwargs):
+        widths.append(kwargs.get("blocks_per_bank", 8))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fic, "fast_index_copy_multi_jit", spy)
+    cache.copy_missing()
+    torch.cuda.synchronize()
+    assert widths == [cache._copy_blocks_per_bank]
