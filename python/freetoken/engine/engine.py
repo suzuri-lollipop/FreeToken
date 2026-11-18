@@ -31,7 +31,7 @@ from freetoken.moe.expert_banks import attach_resident_banks, ftw_banks_compatib
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, resolve_scope, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig, tp_preflight_error
@@ -1699,7 +1699,11 @@ class Engine:
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
         locked_fetch = staging is not None
         layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
-        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
+        scope = resolve_scope(config.moe_cache_scope, has_cpu_layers=bool(cpu_layer_ids),
+                              mixed_formats=layer_methods is not None)
+        if scope != config.moe_cache_scope:
+            object.__setattr__(config, "moe_cache_scope", scope)
+        self._moe_pool_groups = group_layers(scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
@@ -3503,7 +3507,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cache_mem": None,
-    "moe_cache_scope": "unified",
+    "moe_cache_scope": "auto",
     "moe_cache_split": "equal",
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
