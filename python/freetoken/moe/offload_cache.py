@@ -28,7 +28,10 @@ _PREFILL_STAGING_ROWS = int(os.getenv("FREETOKEN_PREFILL_STAGING_ROWS", "64") or
 # are SM copies, not batch memcpys, so they take every bank regardless.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
-from freetoken.kernel.fast_index_copy import default_blocks_per_bank
+from freetoken.kernel.fast_index_copy import (
+    default_blocks_per_bank,
+    prefill_h2d_blocks_per_bank,
+)
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -445,6 +448,7 @@ class OffloadMoeCache:
         # tensor); dst pointers are per pool and row bytes per layout.
         self._copy_fused_ok = False
         self._copy_blocks_per_bank = 8
+        self._prefill_h2d_bpb = 8
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_dst_ptrs_pool: list[torch.Tensor] | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
@@ -927,6 +931,7 @@ class OffloadMoeCache:
             ids = self._gather_bank_ids[self._pool_layout(p)]
             self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
+        self._prefill_h2d_bpb = prefill_h2d_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
     def validate_rebuild(self, cache_size: int, pool_sizes: list[int] | None = None) -> None:
@@ -1660,6 +1665,8 @@ class OffloadMoeCache:
             self._prefill_hit_num,
             blocks_per_bank=64,
         )
+        # Narrow grid: past the link's knee, width only queues concurrent decode
+        # fetches and TP collectives behind this gather (see prefill_h2d_blocks_per_bank).
         fast_index_copy_multi_jit(
             self._copy_dst_ptrs,
             self._copy_src_ptrs[layer_id],
@@ -1667,6 +1674,7 @@ class OffloadMoeCache:
             self._prefill_miss_dst,
             self._prefill_miss_src,
             self._prefill_miss_num,
+            blocks_per_bank=self._prefill_h2d_bpb,
         )
 
     def _move_prefill_layer_ondemand_pageable(self, layer_id: int) -> None:

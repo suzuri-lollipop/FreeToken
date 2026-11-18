@@ -1894,7 +1894,8 @@ class Engine:
                 logger.info_rank0(
                     "MoE on-demand prefill enabled for chunks <= "
                     f"{cache.ondemand_max_tokens} tokens: only routing-touched experts "
-                    "cross PCIe (whole-layer streaming above that)"
+                    "cross PCIe (whole-layer streaming above that); "
+                    f"miss gather {cache._prefill_h2d_bpb} blocks/bank"
                 )
                 # Hybrid prefill split; policy-resolved (auto) in _resolve_hybrid_fetch once the
                 # decode split and live link are known. The decode fraction balances expert

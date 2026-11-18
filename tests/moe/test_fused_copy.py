@@ -107,3 +107,31 @@ def test_fused_copy_identity_rows_and_wait_flag():
         for i, slot in enumerate([5, 2, 9]):
             assert torch.equal(d[slot * f:(slot + 1) * f].cpu(), s[i * f:(i + 1) * f])
         assert not d[0:f].any(), "num_indices bounds the rows"
+
+
+# The prefill miss gather's grid width is a PCIe queue-depth policy, not a copy
+# correctness one: a wide grid silently re-queues concurrent decode fetches behind
+# the chunk (the piped-prefill ITL regression), so pin the resolution here.
+@pytest.mark.parametrize(
+    "device_name,expected",
+    [("RTX PRO 4000 Blackwell", 2), ("H100", 2), ("GH200", 32), ("GB200", 32)],
+)
+def test_prefill_h2d_width_stays_at_the_link_knee(monkeypatch, device_name, expected):
+    from freetoken.kernel import fast_index_copy as fic
+
+    monkeypatch.delenv("FREETOKEN_PREFILL_H2D_BPB", raising=False)
+    monkeypatch.delenv("FREETOKEN_H2D_BLOCKS_PER_BANK", raising=False)
+    monkeypatch.setattr(fic.torch.cuda, "get_device_name", lambda device: device_name)
+    assert fic.prefill_h2d_blocks_per_bank(torch.device("cuda")) == expected
+
+
+def test_prefill_h2d_width_env_override(monkeypatch):
+    from freetoken.kernel import fast_index_copy as fic
+
+    monkeypatch.setenv("FREETOKEN_PREFILL_H2D_BPB", "8")
+    assert fic.prefill_h2d_blocks_per_bank(torch.device("cuda")) == 8
+    monkeypatch.setenv("FREETOKEN_PREFILL_H2D_BPB", "1")
+    assert fic.prefill_h2d_blocks_per_bank(torch.device("cuda")) == 1
+    monkeypatch.setenv("FREETOKEN_PREFILL_H2D_BPB", "0")
+    with pytest.raises(AssertionError):
+        fic.prefill_h2d_blocks_per_bank(torch.device("cuda"))
