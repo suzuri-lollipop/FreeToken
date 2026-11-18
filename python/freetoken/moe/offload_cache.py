@@ -966,9 +966,23 @@ class OffloadMoeCache:
         the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
         cold-start after rebuild. Object identity is preserved so attached layers and
         ``Engine.moe_offload_cache`` stay valid.
+
+        ``pool_sizes=None`` keeps the CURRENT pool structure, rescaling it
+        proportionally (the headroom-growth path passes only a total; assuming one
+        pool there crashed every per-layer cache). Pass explicit sizes to re-split.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
-        sizes = [cache_size] if pool_sizes is None else list(pool_sizes)
+        if pool_sizes is None:
+            cur = self.pool_sizes
+            if len(cur) == 1:
+                sizes = [cache_size]
+            else:
+                total_cur = sum(cur)
+                sizes = [cache_size * s // total_cur for s in cur]
+                for p in range(cache_size - sum(sizes)):  # rounding remainder, < len(cur)
+                    sizes[p] += 1
+        else:
+            sizes = list(pool_sizes)
         assert len(sizes) == len(self.pool_sizes) and sum(sizes) == cache_size and min(sizes) > 0, (sizes, cache_size)
         self.validate_rebuild(cache_size, sizes)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
