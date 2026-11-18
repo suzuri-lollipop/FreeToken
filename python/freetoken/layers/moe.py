@@ -550,7 +550,9 @@ class OffloadMoELayer(MoELayer):
                 )
         join = torch.cuda.Event()
         join.record(side)
-        views = cache.bank_views()
+        # ensure rewrites routes to POOL-LOCAL slots: the GEMVs must read this
+        # layer's pool views, not the whole cache (wrong rows under per-layer pools)
+        views = cache.pool_bank_views(self.layer_id)
         alphas = cache.alphas_for_slots(self.layer_id)
         # Per-call transient read by the nvfp4 kernel's apply (SKIP_W0 for both GEMVs).
         self._moe_skip_w0 = True
@@ -604,7 +606,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
