@@ -295,6 +295,31 @@ work needed before piped + MTP can be calibrated as a winning combination here; 
 piped prefill win and a spec win are reported as alternatives, and the stall-first prefill
 winner is what the script applies.
 
+### MoE strategies in the same run (`--moe`)
+
+The multi tool owns a third dimension: `--moe auto` (the default) compares `offload` and
+`hybrid` on the same staggered workload; `--moe none` disables it, `--moe hybrid` (or a
+comma list) picks a subset. The profile's own `--moe-strategy` / `--moe-backend` is
+stripped so every arm starts from the same `auto` baseline. Each strategy arm runs with
+prefill and speculation off and is judged like a spec arm: it wins only when it adds at
+least 3% aggregate tok/s over the base arm without worsening the worst inter-token stall
+by more than 0.1 s. The winner's `--moe-strategy` goes into `chosen.moe.argv` in the
+report and into the generated start script; when a prefill or spec winner exists, a combo
+arm verifies the strategy stacks on it (no regression of the stack's own throughput or
+stall) before `applied` is set. The launcher's multi calibration writes an applied
+`chosen.moe.argv` into the launch JSON's argv (replacing any stale strategy flag).
+
+hybrid computes part of each decode step's expert misses on the CPU instead of fetching
+them over PCIe; it pays when the CPU MoE bandwidth beats the link. The bandwidth-matched
+fetch split needs a `ft bench bw --model <checkpoint> --tp-size N` row per GPU (the rows
+key by the rank's local expert shard and core slice). Without a matching row the hybrid
+arm still runs and is scored, but with a fetch cap of 1 -- the arm's note says so.
+
+```bash
+.venv/bin/ft calibrate multi --config launch.json --moe auto --spec none \
+  --out-dir ~/calibration/qwen38-moe
+```
+
 ### Server-side measurement
 
 Every arm starts with `--enable-timings-report` and requests `timings_per_token` plus
