@@ -1815,6 +1815,8 @@ class Engine:
             # Piped prefill keeps the staging buffers single-writer: the double buffer
             # and plan slot 1 belong to the pipe thread's chunks, so the decode graph is
             # captured WITHOUT the K-split fetch overlap (it would stage into both).
+            # The on-demand setup below re-enables the SINGLE-plan overlap when every
+            # chunk stages on-demand (plan 0 stays decode-only).
             decode_fetch_overlap=(
                 False if self.piped_prefill else config.decode_fetch_overlap
             ),
@@ -1909,6 +1911,27 @@ class Engine:
                     "cross PCIe (whole-layer streaming above that); "
                     f"miss gather {cache._prefill_h2d_bpb} blocks/bank"
                 )
+                if (
+                    self.piped_prefill
+                    and config.decode_fetch_overlap
+                    and cache.ondemand_max_tokens >= config.max_extend_tokens
+                    and os.getenv("FREETOKEN_PIPED_FETCH_OVERLAP", "0") == "1"
+                ):
+                    # Every chunk stages on-demand (its own _prefill_* tensors, never
+                    # the decode plans), so plan 0 is decode-only and the fetch overlap
+                    # is safe while its routes fit ONE plan; the K-split's second plan
+                    # would alias the pipe's staging and stays off (decode_single_plan).
+                    # Opt-in: on the 2x gen3 x8 rig the serial narrow gather matched or
+                    # beat it on real-text routing (the miss fetch is link-bound, not
+                    # hideable under the small hit GEMV); fast-link rigs may still win.
+                    cache.decode_fetch_overlap = True
+                    cache.decode_single_plan = True
+                    # the constructor skipped the overlap scratch (flag was off)
+                    cache._alloc_miss_scratch()
+                    logger.info_rank0(
+                        "piped prefill: decode fetch overlap enabled (single-plan; "
+                        "batches over the K-split size stay serial)"
+                    )
                 # Hybrid prefill split; policy-resolved (auto) in _resolve_hybrid_fetch once the
                 # decode split and live link are known. The decode fraction balances expert
                 # BYTES on both sides; a chunk's CPU cost scales with ROUTES (~18 per missing

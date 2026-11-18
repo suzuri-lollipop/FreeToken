@@ -208,6 +208,11 @@ class OffloadMoeCache:
     # the join (see layers/moe.py _decode_fetch_overlap). Measured on the 2x24GB NVFP4
     # rig at bs16: aggregate +25% (greedy, paired), det16 bit-identical to the serial path.
     decode_fetch_overlap: bool = True
+    # Piped prefill: the fetch overlap may only use ONE decode plan buffer (plan 0).
+    # The K-split's second plan and the whole-layer materialize are the pipe thread's
+    # staging; the engine sets this when on-demand staging covers every chunk, so a
+    # batch whose routes fit one plan overlaps safely and a larger one stays serial.
+    decode_single_plan: bool = False
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.

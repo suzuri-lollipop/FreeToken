@@ -467,6 +467,25 @@ def test_fetch_overlap_reads_the_layers_own_pool(monkeypatch):
     assert all(v is pool_views for v in seen), "overlap GEMV read whole-cache views"
 
 
+def test_single_plan_overlap_refuses_the_k_split():
+    """Under piped prefill the second K-split plan is the pipe thread's staging:
+    the fetch overlap must fall back to serial for a batch that needs two plans,
+    before touching any cache state."""
+    from types import SimpleNamespace
+
+    layer = _bf16_offload_layer(0, 16, 10, 8, 16)
+    calls = []
+    cache = SimpleNamespace(
+        decode_single_plan=True,
+        src_indices2=object(),
+        ensure_experts=lambda *a, **k: calls.append(a),
+    )
+    ids = torch.zeros(30, 10, dtype=torch.int32)  # 300 routes > the 128 K-split
+    out = layer._decode_fetch_overlap(cache, torch.zeros(30, 8), torch.zeros(30, 10), ids)
+    assert out is None
+    assert not calls
+
+
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     import pytest
     from freetoken.moe.offload_cache import OffloadMoeCache
