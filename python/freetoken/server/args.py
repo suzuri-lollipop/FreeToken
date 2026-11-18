@@ -890,8 +890,10 @@ def parse_args(
         choices=SCOPES,
         default=ServerArgs.moe_cache_scope,
         help=(
-            "How MoE layers share the GPU expert slot cache: unified = one LRU pool per expert quant "
-            "(all layers when they share one quant format); per-layer = each layer has its own pool. "
+            "How MoE layers share the GPU expert slot cache: auto = per-layer when every layer "
+            "decodes from the GPU slot cache in one format (cyclic decode walks thrash a shared "
+            "LRU less this way), else unified; unified = one LRU pool per expert quant (all layers "
+            "when they share one quant format); per-layer = each layer has its own pool. "
             "Pools are sized by --moe-cache-split."
         ),
     )

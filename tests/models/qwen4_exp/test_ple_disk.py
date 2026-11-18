@@ -651,3 +651,35 @@ def test_wait_sync_large_graph(tmp_path, rows_per_req):
         [sys.executable, "-c", script], cwd=root, env=env, capture_output=True, text=True, timeout=45,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@requires_cuda
+def test_gated_cpp_fill_matches_python_fallback(tmp_path, monkeypatch):
+    """The bs>=2 launch-gating fill stages the oracle's rows in C++ exactly as the
+    Python fallback does: the shm K2 interlock gates these graphs, and the C++ path
+    removes the per-step tensor churn, not the bytes."""
+    disk, oracle, args = _make_table(tmp_path)
+    if not disk._cpp_fill:
+        pytest.skip("prebuilt _row_store without fill_decode_graph")
+    emb = _embedding()
+    # simulate the shm one-shot interlock: bs>=2 graphs gate, bs1 keeps wait-sync
+    monkeypatch.setattr(disk, "_rows_gated", lambda rows: rows >= 2)
+
+    histories, tokens = [[3, 4], [7, 9]], [5, 11]
+    reqs = [SimpleNamespace(input_ids=torch.tensor(h, dtype=torch.int32),
+                            device_len=len(h) + 1, cached_len=len(h)) for h in histories]
+    batch = SimpleNamespace(is_decode=True,
+                            input_ids=torch.tensor(tokens, dtype=torch.int32, device="cuda"),
+                            reqs=reqs, size=2, padded_size=2)
+
+    assert disk.host_fill_batch(batch, use_graph=True) is None  # gated: inline fill
+    torch.cuda.synchronize()
+    n = 2 * disk._token_bytes
+    ids = emb.row_ids(_meta([[t] for t in tokens], histories, decode=True)).cuda()
+    want = oracle.weight[ids].view(torch.uint8).reshape(-1).cpu()
+    assert torch.equal(disk._graph_pinned[:n].view(torch.uint8), want), "C++ gated fill"
+
+    disk._cpp_fill = False
+    assert disk.host_fill_batch(batch, use_graph=True) is None
+    torch.cuda.synchronize()
+    assert torch.equal(disk._graph_pinned[:n].view(torch.uint8), want), "python gated fill"

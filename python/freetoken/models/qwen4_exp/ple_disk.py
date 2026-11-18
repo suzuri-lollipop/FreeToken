@@ -387,7 +387,6 @@ class DiskRowTable:
         rows = getattr(batch, "rows_per_req", None) or 1
         if batch.is_decode or rows > 1:
             reqs = list(batch.reqs)
-            histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
             if use_graph and self._wait_sync and not self._rows_gated(batch.padded_size * rows):
                 bs = batch.padded_size
                 if rows == 1 and self._cpp_fill and all(r.input_ids.dtype == torch.int32 for r in reqs):
@@ -434,6 +433,7 @@ class DiskRowTable:
                 # sampled token during the drain), while the deferred fill -- which
                 # the engine runs after that drain -- must see ENTER-time state, the
                 # state the captured lookup's rows are keyed by.
+                histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
                 self._token_readback[: bs * rows].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
                 if self._worker is not None:
@@ -444,7 +444,28 @@ class DiskRowTable:
                     self._fill_decode(histories, bs, rows)
 
                 return _complete
-            # launch-gating: this D2H is the step's readback and orders the fill after sampling
+            # launch-gating: the fill completes BEFORE the launch (no WAIT node).
+            # Single-token rows stage in C++ straight from the request buffers: the
+            # readback event orders the fill after the previous replay's sampling --
+            # the same point the blocking D2H waited -- and flag=0 keeps the shared
+            # flag untouched for a later bs1 wait-sync replay.
+            if use_graph and rows == 1 and self._cpp_fill and all(
+                r.input_ids.dtype == torch.int32 for r in reqs
+            ):
+                bs = batch.padded_size
+                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                self._readback_event.record(torch.cuda.current_stream(self._device))
+                ids_addrs = [r.input_ids.data_ptr() for r in reqs]
+                positions = [r.device_len - 1 for r in reqs]
+                with self._fill_lock:
+                    self._store.fill_decode_graph(
+                        self._readback_event.cuda_event, ids_addrs, positions,
+                        self._token_readback.data_ptr(), self._graph_pinned.data_ptr(),
+                        self.image_token_id if self.image_token_id is not None else -1,
+                        MM_PAD_SHIFT_VALUE, 0,
+                    )
+                return None
+            histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
             runs = [torch.tensor([*history, *tokens[i * rows : (i + 1) * rows]], dtype=torch.int64)
                     for i, history in enumerate(histories)]

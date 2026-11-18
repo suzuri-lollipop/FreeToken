@@ -2143,3 +2143,107 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert not _host_ram_fits_parallel(str(tmp_path))
+
+
+def test_ftw_shard_compatibility_replays_matching_layouts_only():
+    """The sidecar replays while its recorded intermediate range matches the serving
+    shard. A bandwidth-weighted split that rounds to the same whole scale groups is
+    the same layout (replay); one that moves the boundary is not (rebuild). Legacy
+    indexes without a recorded range keep the even-split-only rule."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.moe.expert_banks import _ftw_index_meta, ftw_shard_compatible
+
+    def cfg(rank, size=2, strategy="hybrid"):
+        return MoEConfig(num_experts=8, hidden=256, intermediate=640, top_k=4,
+                         tp_rank=rank, tp_size=size, strategy=strategy)
+
+    def method(lo, hi, uneven):
+        return SimpleNamespace(cfg=SimpleNamespace(
+            local_intermediate_range=(lo, hi), uneven_tp_shard=uneven))
+
+    assert ftw_shard_compatible({}, None)
+    # even split: legacy index (no range) replays; recorded matching range replays
+    m0 = SimpleNamespace(cfg=cfg(0))
+    assert ftw_shard_compatible({}, m0)
+    assert ftw_shard_compatible({"shard_range": [0, 320]}, m0)
+    assert ftw_shard_compatible({"shard_range": [320, 640]}, SimpleNamespace(cfg=cfg(1)))
+    # the other rank's range is not this rank's layout
+    assert not ftw_shard_compatible({"shard_range": [320, 640]}, m0)
+    # a truly uneven split: legacy index rebuilds, a recorded matching range replays
+    uneven = method(0, 480, True)
+    assert not ftw_shard_compatible({}, uneven)
+    assert ftw_shard_compatible({"shard_range": [0, 480]}, uneven)
+    # the probe moved the boundary since the repack: rebuild
+    assert not ftw_shard_compatible({"shard_range": [0, 448]}, uneven)
+    # an unreadable index falls back to the legacy rule, not to "replay anything"
+    assert _ftw_index_meta("/nonexistent-ftw-dir") == {}
+    assert not ftw_shard_compatible(_ftw_index_meta("/nonexistent-ftw-dir"), uneven)
+
+
+def test_ftw_banks_compatibility_follows_the_layout_tag_and_alphas():
+    """Kernels sharing a quant_format tag replay each other's FTWs (nvfp4 triton
+    and w4a4 bank the same rows); a kernel that adds resident alphas needs them
+    present. Unknown tags keep the exact (kind, kernel) match."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.moe.expert_banks import ftw_banks_compatible
+
+    def method(kind, kernel, alphas=False):
+        layout = {"gate_up": SimpleNamespace(resident=False)}
+        if alphas:
+            layout["gate_up_alpha"] = SimpleNamespace(resident=True)
+            layout["down_alpha"] = SimpleNamespace(resident=True)
+        return SimpleNamespace(kind=kind, kernel=SimpleNamespace(name=kernel),
+                               cfg=object(), layout=lambda: layout)
+
+    def banks(kind, kernel, with_alphas):
+        return SimpleNamespace(kind=kind, kernel=kernel,
+                               gate_up_alpha=object() if with_alphas else None,
+                               down_alpha=object() if with_alphas else None)
+
+    nvfp4 = QuantKind.NVFP4
+    # exact match always replays
+    assert ftw_banks_compatible(banks(nvfp4, "triton", False), method(nvfp4, "triton"))
+    # same layout tag: triton-packed rows serve w4a4 when the alphas came along
+    assert ftw_banks_compatible(banks(nvfp4, "triton", True), method(nvfp4, "w4a4", alphas=True))
+    assert not ftw_banks_compatible(banks(nvfp4, "triton", False), method(nvfp4, "w4a4", alphas=True))
+    # a different layout tag never replays
+    assert not ftw_banks_compatible(banks(nvfp4, "marlin", True), method(nvfp4, "w4a4", alphas=True))
+    assert not ftw_banks_compatible(banks(nvfp4, "triton", True), method(nvfp4, "marlin"))
+    # unknown tags (gguf): exact match only
+    gguf = QuantKind.GGUF
+    assert ftw_banks_compatible(banks(gguf, "ggml", False), method(gguf, "ggml"))
+    assert not ftw_banks_compatible(banks(gguf, "ggml", False), method(gguf, "other"))
+
+
+def test_offload_cache_rebuild_without_sizes_keeps_per_layer_pools():
+    """The headroom-growth path rebuilds with a TOTAL only: a per-layer cache must
+    rescale its pools proportionally, not collapse them into one (a 524288-KV
+    profile crash-looped on AssertionError ([7320], 7320) against 48 pools)."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=4, num_experts=4, cache_size=24,
+                            device=torch.device("cpu"),
+                            pool_of_layer=[0, 1, 2, 3], pool_sizes=[6, 6, 6, 6])
+    gate_up = [torch.randn(4, 32, 8) for _ in range(4)]
+    down = [torch.randn(4, 8, 16) for _ in range(4)]
+    cache.set_bank_sources({"gate_up": gate_up, "down": down})
+
+    cache.rebuild(40)  # no pool_sizes: the growth-path call
+    assert cache.pool_sizes == [10, 10, 10, 10]
+    assert cache.cache_size == 40
+    assert cache.id_of_slot.shape == (40,)
+    assert cache.pool_of_layer == [0, 1, 2, 3]
+
+    # rounding remainder lands deterministically and the sum stays exact
+    cache.rebuild(41)
+    assert sum(cache.pool_sizes) == 41 and len(cache.pool_sizes) == 4
+    assert cache.pool_sizes == [11, 10, 10, 10]
+
+    # explicit sizes still re-split (the runtime-rebuild path)
+    cache.rebuild(40, [8, 12, 8, 12])
+    assert cache.pool_sizes == [8, 12, 8, 12]

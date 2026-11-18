@@ -38,6 +38,17 @@ piped the engine refuses speculation (spec verify shares the PLE/plan staging wi
 pipe's chunk -- Strata lifts this with STRATA_PIPED_MTP, this port has not yet), so the
 combo verifies that empirically and the report records why the two cannot stack.
 
+A third dimension compares MoE serving strategies (--moe, default auto = offload +
+hybrid). The profile's own --moe-strategy is stripped so every arm starts from the same
+auto baseline; each strategy arm runs with prefill and speculation off and wins on the
+same contract as spec (>= MOE_MIN_GAIN tok/s, worst stall within MOE_STALL_TOL). hybrid
+computes part of each step's expert misses on the CPU instead of fetching them over
+PCIe, so it pays on boxes whose CPU MoE bandwidth beats the link -- exactly what
+`ft bench bw --model <ckpt> --tp-size N` measures; without a matching profile row the
+hybrid arm still runs but keeps a fetch cap of 1, and the report says so. The winner's
+flags go into the report's chosen.moe.argv and the generated script, and a combo arm
+verifies it stacks on the prefill/spec winners before it is applied.
+
 Scoring uses the server's own measurement when available: --enable-timings-report plus
 timings_per_token gives per-chunk engine-side predicted_ms (the inter-token gap without
 HTTP/client jitter), and continuous_usage_stats gives the exact token count even when a
@@ -125,6 +136,16 @@ SPEC_FLAGS = (
     "--speculative-draft-model-path", "--spec-draft-model",
     "--speculative-token-map", "--spec-token-map",
 )
+
+# MoE-strategy dimension. Only the offload family is offered: 'fused' needs every
+# expert resident in VRAM (a wrong guess is a weight-load OOM, not a slower arm) and
+# 'cpu' computes EVERYTHING on the CPU (a different serving regime, not a miss split).
+MOE_STRATEGIES = ("offload", "hybrid")
+MOE_MIN_GAIN = 0.03    # same contract as spec: >=3% aggregate tok/s over the base arm
+MOE_STALL_TOL = 0.1    # ...without worsening the worst stall by more than this
+MOE_COMBO_TPS_TOL = 0.02  # stacking on the other winners keeps the win within this
+# both spellings of the strategy flag, stripped so the tool owns the dimension
+MOE_FLAGS = ("--moe-strategy", "--moe-backend")
 
 
 def arms_for(spec: dict, smoke: bool = False) -> list[tuple[str, dict[str, str], str]]:
@@ -222,6 +243,48 @@ def spec_backends_for(requested: str, draft_path: str | None) -> list[tuple[str,
         else:
             out.append((a, ""))
     return out
+
+
+def strip_moe_args(argv) -> list[str]:
+    """Drop the strategy flag (both spellings, value or = form) so the calibration
+    owns the MoE dimension instead of inheriting the profile's."""
+    out: list[str] = []
+    items = [str(x) for x in argv]
+    i = 0
+    while i < len(items):
+        t = items[i]
+        if t in MOE_FLAGS:
+            i += 2
+            continue
+        if any(t.startswith(f + "=") for f in MOE_FLAGS):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def moe_argv(strategy: str) -> list[str]:
+    """The server flags that arm one MoE strategy. Explicit even for offload: the
+    winner must survive a later 'auto' resolution change, and an explicit offload
+    clears a stale hybrid out of the launch argv."""
+    return ["--moe-strategy", strategy]
+
+
+def moe_strategies_for(requested: str) -> list[tuple[str, str]]:
+    """Resolve --moe into (strategy, skip_reason) pairs. 'auto' offers the offload
+    family; a dense model or an unsupported expert format fails its arm at server
+    start and is excluded with the reason (the spec dimension's contract)."""
+    if requested.strip().lower() in ("none", "off", ""):
+        return []
+    if requested.strip().lower() == "auto":
+        strategies = list(MOE_STRATEGIES)
+    else:
+        strategies = [s.strip().lower() for s in requested.split(",") if s.strip()]
+        for s in strategies:
+            if s not in MOE_STRATEGIES:
+                raise ValueError(f"--moe: unknown strategy {s!r} (have: {', '.join(MOE_STRATEGIES)})")
+    return [(s, "") for s in strategies]
 
 
 def argv_with_timings(argv) -> list[str]:
@@ -431,6 +494,7 @@ class MultiScore:
     stall_worst_client: float = 0.0
     measurement: str = "client-arrivals"
     spec: str | None = None
+    moe: str | None = None
     latency: dict = field(default_factory=dict)
 
     def line(self) -> str:
@@ -442,9 +506,10 @@ class MultiScore:
 
 def arm_active(label: str, log_text: str) -> tuple[bool, str]:
     """Did the arm's mechanism actually engage? Read the arm's own server log. A combo
-    label '<prefill>+spec-<algo>' is judged on its prefill part; a pure spec arm is valid
-    once the server ran (its drafts show in the timings block, not a log marker)."""
-    prefill = label.split("+spec-", 1)[0]
+    label '<prefill>+spec-<algo>' or '<prefill>+moe-<strategy>' is judged on its prefill
+    part; a pure spec arm is valid once the server ran (its drafts show in the timings
+    block, not a log marker); a pure MoE arm must show the strategy it asked for."""
+    prefill = label.split("+spec-", 1)[0].split("+moe-", 1)[0]
     if prefill in ("piped", "piped-sf"):
         if "piped prefill enabled" in log_text:
             return True, ""
@@ -457,6 +522,15 @@ def arm_active(label: str, log_text: str) -> tuple[bool, str]:
         if " mix=" in log_text:
             return True, ""
         return False, "no [chunktime] mix= line (mixed steps never ran)"
+    if label.startswith("moe-"):
+        strategy = label[len("moe-"):]
+        if f"moe_strategy='{strategy}'" not in log_text:
+            return False, f"no resolved moe_strategy='{strategy}' line"
+        if strategy == "hybrid" and "fixed fetch cap of 1" in log_text:
+            # the arm ran, but without a matching `ft bench bw` row the fetch split
+            # fell back -- score it honestly and say how to unlock the matched split
+            return True, ("hybrid ran with fetch cap 1: run `ft bench bw --model "
+                          "<checkpoint> --tp-size N` for the bandwidth-matched split")
     return True, ""
 
 
@@ -490,11 +564,12 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                    reps: int, log_dir: Path, port: int,
                    temperature: float | None = None,
                    spec_args: list[str] | None = None, spec_algo: str | None = None,
+                   moe_args: list[str] | None = None, moe_strategy: str | None = None,
                    fatal: bool = True) -> MultiScore:
-    # the tool owns the spec dimension: strip the profile's spec flags, then arm this
-    # arm's backend; --enable-timings-report gates the per-chunk server timings (#887)
-    base_argv = argv_with_timings(argv_with_port(strip_spec_args(spec["argv"]), port))
-    base_argv = base_argv + list(spec_args or [])
+    # the tool owns the spec and MoE dimensions: strip the profile's flags, then arm
+    # this arm's backend/strategy; --enable-timings-report gates the per-chunk timings (#887)
+    base_argv = argv_with_timings(argv_with_port(strip_moe_args(strip_spec_args(spec["argv"])), port))
+    base_argv = base_argv + list(spec_args or []) + list(moe_args or [])
     last_error: Exception | None = None
     latency_path = log_dir / f"{_sanitize(label)}-latency.jsonl"
     for attempt in range(3):
@@ -531,6 +606,7 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
             return MultiScore(label=label, env=dict(env), stall_worst=0.0, stall_count=0,
                               stall_secs=0.0, ttft_long=0.0, ttft_short=0.0, out_tps=0.0,
                               tokens=0, wall=0.0, valid=False, spec=spec_algo,
+                              moe=moe_strategy,
                               note=f"server failed: {last_error}")
         raise ServerError(f"{label}: three attempts failed (last: {last_error})") from last_error
 
@@ -548,7 +624,7 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
         valid=valid, note=note,
         stall_worst_client=float(med.get("stall_worst_client", 0.0)),
         measurement=str(med.get("measurement", "client-arrivals")),
-        spec=spec_algo, latency=_latency_summary(latency_path),
+        spec=spec_algo, moe=moe_strategy, latency=_latency_summary(latency_path),
     )
 
 
@@ -591,17 +667,39 @@ def choose_spec(spec_scores: list[MultiScore], base: MultiScore) -> tuple[str | 
                        f"stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s")
 
 
+def choose_moe(moe_scores: list[MultiScore], base: MultiScore) -> tuple[str | None, str]:
+    """The MoE dimension's contract: a strategy wins when it adds >= MOE_MIN_GAIN
+    aggregate tok/s over the base arm AND does not worsen the worst stall by more
+    than MOE_STALL_TOL (hybrid trades PCIe misses for CPU compute; it must not freeze
+    the running streams). Pure so the unit tests pin it. Returns (strategy, note)."""
+    cands = [s for s in moe_scores if s.valid and s.moe and s.out_tps > 0]
+    if not cands:
+        return None, "no MoE strategy arm activated on this machine"
+    best = max(cands, key=lambda s: s.out_tps)
+    gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
+    if gain < MOE_MIN_GAIN:
+        return None, f"{best.moe} adds only {100 * gain:.1f}% tok/s (need {100 * MOE_MIN_GAIN:.0f}%)"
+    if best.stall_worst > base.stall_worst + MOE_STALL_TOL:
+        return None, (f"{best.moe} worsens the worst stall {base.stall_worst:.2f}s -> "
+                      f"{best.stall_worst:.2f}s (max +{MOE_STALL_TOL}s)")
+    return best.moe, (f"tok/s {base.out_tps:.1f} -> {best.out_tps:.1f} (+{100 * gain:.1f}%), "
+                      f"stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s")
+
+
 def render_script_multi(spec: dict, chosen: dict | None) -> str:
     """The runnable pair to the lookup tool's script: same argv, winner env exported,
-    plus the winning speculative backend's flags when it was applied."""
+    plus the winning speculative backend's and MoE strategy's flags when applied."""
     env = {str(k): str(v) for k, v in (spec.get("env") or {}).items() if k not in MULTI_KEYS}
     if chosen:
         env.update({str(k): str(v) for k, v in (chosen.get("env") or {}).items()})
     cwd = spec.get("cwd") or str(ROOT)
     python = spec.get("python") or sys.executable
-    argv = argv_with_port(strip_spec_args(spec["argv"]), int(spec.get("port") or DEFAULT_PORT))
+    argv = argv_with_port(strip_moe_args(strip_spec_args(spec["argv"])),
+                          int(spec.get("port") or DEFAULT_PORT))
     if chosen and (chosen.get("spec") or {}).get("applied"):
         argv = argv + list(chosen["spec"].get("argv") or [])
+    if chosen and (chosen.get("moe") or {}).get("applied"):
+        argv = argv + list(chosen["moe"].get("argv") or [])
     lines = ["#!/bin/sh",
              f"# generated by freetoken.calibrate_multi.py on {time.strftime('%Y-%m-%d %H:%M:%S')}",
              f"cd {shlex.quote(str(cwd))}"]
@@ -636,7 +734,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                   or _arg_value(list(spec.get("argv") or []), "--spec-draft-model"))
     num_steps = getattr(a, "spec_num_steps", 0) or None
     spec = {**spec,
-            "argv": strip_spec_args(ensure_distributed_timeout(spec["argv"])),
+            "argv": strip_moe_args(strip_spec_args(ensure_distributed_timeout(spec["argv"]))),
             "env": {k: v for k, v in (spec.get("env") or {}).items() if k not in MULTI_KEYS}}
 
     scores: list[MultiScore] = []
@@ -649,10 +747,12 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
             if _port_free(port) and _port_free(port + 1):
                 return port
 
-    def measure(label, env, spec_args=None, spec_algo=None, fatal=True) -> MultiScore:
+    def measure(label, env, spec_args=None, spec_algo=None, moe_args=None,
+                moe_strategy=None, fatal=True) -> MultiScore:
         print(f"  measuring {label} ...", flush=True)
         s = evaluate_multi(spec, label, env, cfg, reps, log_dir, take_port(),
-                           a.temperature, spec_args=spec_args, spec_algo=spec_algo, fatal=fatal)
+                           a.temperature, spec_args=spec_args, spec_algo=spec_algo,
+                           moe_args=moe_args, moe_strategy=moe_strategy, fatal=fatal)
         print("    " + s.line(), flush=True)
         scores.append(s)
         return s
@@ -720,6 +820,63 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
             if holds:
                 spec_chosen.update(out_tps=combo.out_tps, stall_worst=combo.stall_worst)
 
+    # --- MoE dimension (prefill off, speculation off): offload / hybrid on the same workload ---
+    strategies = moe_strategies_for(getattr(a, "moe", "auto"))
+    if a.smoke:
+        strategies = [s for s in strategies if s[0] == "hybrid"] or strategies[:1]
+    moe_scores: list[MultiScore] = []
+    for strategy, skip in strategies:
+        mlabel = f"moe-{strategy}"
+        if skip:
+            print(f"  skipping {mlabel}: {skip}", flush=True)
+            s = MultiScore(label=mlabel, env=winner_env("none"), stall_worst=0.0,
+                           stall_count=0, stall_secs=0.0, ttft_long=0.0, ttft_short=0.0,
+                           out_tps=0.0, tokens=0, wall=0.0, valid=False, note=skip,
+                           moe=strategy)
+            scores.append(s)
+            moe_scores.append(s)
+            continue
+        moe_scores.append(measure(mlabel, winner_env("none"),
+                                  moe_args=moe_argv(strategy), moe_strategy=strategy,
+                                  fatal=False))
+
+    mstrategy, mnote = choose_moe(moe_scores, base)
+    moe_chosen = {"strategy": mstrategy, "argv": [], "applied": False, "compatible": False,
+                  "out_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": mnote}
+    if mstrategy:
+        margs = moe_argv(mstrategy)
+        marm = next(s for s in moe_scores if s.moe == mstrategy)
+        moe_chosen.update(argv=margs, out_tps=marm.out_tps, stall_worst=marm.stall_worst,
+                          gain_tps_pct=round(100 * (marm.out_tps / base.out_tps - 1), 1)
+                          if base.out_tps > 0 else 0.0)
+        if label == "none" and not spec_chosen["applied"]:
+            # no other winner: the strategy arm itself is the launch
+            moe_chosen.update(applied=True, compatible=True)
+        else:
+            # verify the strategy stacks on the current winner stack (prefill env +
+            # the spec flags when they were applied). The combo must not regress the
+            # stack's own throughput/stall -- the gain itself was proven standalone.
+            ref_tps = spec_chosen["out_tps"] if spec_chosen["applied"] else (
+                by[label].out_tps if label != "none" else base.out_tps)
+            ref_stall = spec_chosen["stall_worst"] if spec_chosen["applied"] else (
+                by[label].stall_worst if label != "none" else base.stall_worst)
+            parts = ([label] if label != "none" else []) + (
+                [f"spec-{salgo}"] if spec_chosen["applied"] else []) + [f"moe-{mstrategy}"]
+            combo = measure("+".join(parts), winner_env(label),
+                            spec_args=spec_chosen["argv"] if spec_chosen["applied"] else None,
+                            spec_algo=salgo if spec_chosen["applied"] else None,
+                            moe_args=margs, moe_strategy=mstrategy, fatal=False)
+            holds = (combo.valid
+                     and combo.out_tps >= ref_tps * (1 - MOE_COMBO_TPS_TOL)
+                     and combo.stall_worst <= ref_stall + TIE_S)
+            moe_chosen.update(
+                applied=holds, compatible=combo.valid,
+                note=(mnote if holds else
+                      f"{mstrategy} wins alone but regresses the {'+'.join(parts[:-1])} stack: "
+                      f"{combo.note or 'combo regressed'}"))
+            if holds:
+                moe_chosen.update(out_tps=combo.out_tps, stall_worst=combo.stall_worst)
+
     chosen = {
         "label": label, "env": winner_env(label), "note": note,
         "stall_worst": by[label].stall_worst, "out_tps": by[label].out_tps,
@@ -727,6 +884,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
         "gain_tps_pct": round(100 * (by[label].out_tps / base.out_tps - 1), 1)
         if base.out_tps > 0 else 0.0,
         "spec": spec_chosen,
+        "moe": moe_chosen,
     }
     return {
         "schema_version": 1, "backend": "freetoken-multi",
@@ -735,6 +893,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                  for s in scores],
         "chosen": chosen, "multi_enabled": label != "none",
         "spec_enabled": bool(spec_chosen["applied"]),
+        "moe_enabled": bool(moe_chosen["applied"]),
     }
 
 
@@ -751,7 +910,9 @@ def parse_live_servers(pgrep_out: str) -> list[str]:
 def find_live_servers() -> list[str]:
     import subprocess
 
-    r = subprocess.run(["pgrep", "-af", "-m freetoken"], capture_output=True, text=True)
+    # '--' ends pgrep's options: the pattern starts with a dash, and without it
+    # pgrep exits 2 with empty stdout -- the guard silently never fires.
+    r = subprocess.run(["pgrep", "-af", "--", "-m freetoken"], capture_output=True, text=True)
     return parse_live_servers(r.stdout)
 
 
@@ -789,6 +950,12 @@ def main(argv: list[str] | None = None) -> int:
                          "profile's --speculative-draft-model-path)")
     ap.add_argument("--spec-num-steps", type=int, default=0,
                     help="draft tokens per step for the spec arms (0 = each method's default)")
+    ap.add_argument("--moe", default="auto",
+                    help="MoE strategies to compare: 'auto' (offload + hybrid), 'none', or a "
+                         "comma list of offload,hybrid. hybrid needs a CPU MoE executor the "
+                         "checkpoint supports; without a matching `ft bench bw --tp-size N` "
+                         "row it runs with a fetch cap of 1 (the report says so). The winner's "
+                         "--moe-strategy goes into the report and the start script")
     a = ap.parse_args(argv)
     import signal as _signal
     if hasattr(_signal, "SIGTERM"):
@@ -825,9 +992,9 @@ def main(argv: list[str] | None = None) -> int:
     result["tag"] = tag
 
     chosen = result["chosen"]
-    # pass the winner when EITHER dimension won: prefill=none + a spec win still exports
-    # the explicit-zero knob set and the spec flags
-    has_winner = result["multi_enabled"] or result["spec_enabled"]
+    # pass the winner when ANY dimension won: prefill=none + a spec or MoE win still
+    # exports the explicit-zero knob set and the winner's flags
+    has_winner = result["multi_enabled"] or result["spec_enabled"] or result["moe_enabled"]
     script_text = render_script_multi(spec, chosen if has_winner else None)
     json_path = out_dir / f"freetoken-multi-{tag}.json"
     script_path = out_dir / f"run-freetoken-multi-{tag}.sh"
@@ -840,6 +1007,10 @@ def main(argv: list[str] | None = None) -> int:
     if sp.get("algorithm"):
         state = "applied" if sp.get("applied") else "NOT applied"
         print(f"chosen spec: {sp['algorithm']} ({state}) -- {sp.get('note', '')}", flush=True)
+    mo = chosen.get("moe") or {}
+    if mo.get("strategy"):
+        state = "applied" if mo.get("applied") else "NOT applied"
+        print(f"chosen moe: {mo['strategy']} ({state}) -- {mo.get('note', '')}", flush=True)
     if not result["multi_enabled"]:
         print("the concurrency knobs stay off on this machine; the script starts without them",
               flush=True)

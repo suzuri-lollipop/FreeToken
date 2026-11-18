@@ -18,11 +18,15 @@ from freetoken.calibrate_multi import (
     argv_with_timings,
     arm_active,
     choose_multi,
+    choose_moe,
     choose_spec,
+    moe_argv,
+    moe_strategies_for,
     render_script_multi,
     score_window,
     spec_argv,
     spec_backends_for,
+    strip_moe_args,
     strip_spec_args,
     victims_from_spec,
     winner_env,
@@ -172,6 +176,26 @@ def test_parse_live_servers_spots_the_server_not_the_calibrator():
     assert len(live) == 1 and live[0].startswith("100 ")
 
 
+def test_find_live_servers_gives_pgrep_a_parseable_pattern(monkeypatch):
+    # the pattern starts with a dash: without an end-of-options marker pgrep exits 2
+    # with empty stdout, and the refuse-to-calibrate-beside-a-live-server guard
+    # silently never fires (double expert-bank load -> OOM kill)
+    import subprocess
+    from freetoken.calibrate_multi import find_live_servers
+
+    got = {}
+
+    def fake_run(argv, **kw):
+        got["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="100 /py -m freetoken --model-path /m\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert find_live_servers() == ["100 /py -m freetoken --model-path /m"]
+    argv = got["argv"]
+    pattern = argv[-1]
+    assert pattern.startswith("-") and argv[argv.index(pattern) - 1] == "--"
+
+
 def test_request_body_probes_the_production_sampling_by_default():
     from freetoken.calibrate_multi import request_body
 
@@ -292,3 +316,77 @@ def test_render_script_applies_the_spec_flags_only_when_applied():
     off = render_script_multi(spec, {"env": winner_env("none"),
                                      "spec": {"applied": False, "argv": spec_argv("mtp")}})
     assert "--speculative-algorithm" not in off
+
+
+def _moe_score(strategy, tps, stall, valid=True, note=""):
+    return MultiScore(label=f"moe-{strategy}", env={}, stall_worst=stall, stall_count=0,
+                      stall_secs=0.0, ttft_long=5.0, ttft_short=1.0, out_tps=tps,
+                      tokens=1000, wall=10.0, valid=valid, moe=strategy, note=note)
+
+
+def test_strip_moe_args_removes_both_spellings_and_forms():
+    argv = ["-m", "freetoken", "--moe-strategy", "hybrid", "--moe-backend=offload",
+            "--tp-size", "2"]
+    assert strip_moe_args(argv) == ["-m", "freetoken", "--tp-size", "2"]
+
+
+def test_moe_strategies_for_auto_offers_the_offload_family():
+    assert moe_strategies_for("auto") == [("offload", ""), ("hybrid", "")]
+    assert moe_strategies_for("none") == []
+    assert moe_strategies_for("hybrid") == [("hybrid", "")]
+    with pytest.raises(ValueError):
+        moe_strategies_for("fused")
+
+
+def test_choose_moe_needs_a_tps_gain_without_a_stall_regression():
+    base = _score("none", 1.0, 50.0)
+    # +20% tok/s, stall unchanged -> hybrid wins
+    strategy, note = choose_moe([_moe_score("hybrid", 60.0, 1.0)], base)
+    assert strategy == "hybrid" and "+20.0%" in note
+    # only +1% -> below MOE_MIN_GAIN
+    strategy, note = choose_moe([_moe_score("hybrid", 50.5, 1.0)], base)
+    assert strategy is None and "tok/s" in note
+    # +20% but worsens the stall beyond MOE_STALL_TOL -> rejected
+    strategy, note = choose_moe([_moe_score("hybrid", 60.0, 1.5)], base)
+    assert strategy is None and "stall" in note
+    # invalid arms never win; the faster valid strategy is chosen
+    strategy, _ = choose_moe([_moe_score("hybrid", 70.0, 1.0, valid=False),
+                              _moe_score("offload", 55.0, 1.0)], base)
+    assert strategy == "offload"
+    assert choose_moe([], base)[0] is None
+
+
+def test_arm_active_checks_the_moe_strategy_marker():
+    resolved = "Resolved config: moe_strategy='hybrid', attention_backend='qsa_sparse'"
+    assert arm_active("moe-hybrid", resolved) == (True, "")
+    ok, why = arm_active("moe-hybrid", "Resolved config: moe_strategy='offload'")
+    assert not ok and "hybrid" in why
+    # a cap-1 fallback still ran: valid, with the bench-bw hint in the note
+    ok, note = arm_active("moe-hybrid", resolved + "\nusing a fixed fetch cap of 1 there")
+    assert ok and "ft bench bw" in note
+    assert arm_active("moe-offload", "Resolved config: moe_strategy='offload'")[0]
+    # a combo is judged on its prefill part, not the strategy marker
+    ok, why = arm_active("piped+moe-hybrid", "piping disabled (spec verify...)")
+    assert not ok and "piping" in why
+    assert arm_active("piped+moe-hybrid", "... piped prefill enabled ...")[0]
+
+
+def test_render_script_applies_the_moe_flags_only_when_applied():
+    spec = {"python": "/py", "argv": ["-m", "freetoken", "--moe-strategy", "offload",
+                                      "--port", "1919"], "cwd": "/w", "env": {}, "port": 1919}
+    chosen = {"env": winner_env("none"),
+              "moe": {"applied": True, "argv": moe_argv("hybrid")}}
+    text = render_script_multi(spec, chosen)
+    # the profile's own strategy is stripped, the winner's added once
+    assert text.count("--moe-strategy hybrid") == 1
+    assert "--moe-strategy offload" not in text
+    assert "exec /py -m freetoken --port 1919 --moe-strategy hybrid" in text
+    # not applied -> no strategy flag at all (auto resolution stays in charge)
+    off = render_script_multi(spec, {"env": winner_env("none"),
+                                     "moe": {"applied": False, "argv": moe_argv("hybrid")}})
+    assert "--moe-strategy" not in off
+    # spec and moe winners stack in the script
+    both = render_script_multi(spec, {"env": winner_env("none"),
+                                      "spec": {"applied": True, "argv": spec_argv("mtp")},
+                                      "moe": {"applied": True, "argv": moe_argv("hybrid")}})
+    assert "--speculative-algorithm mtp --moe-strategy hybrid" in both

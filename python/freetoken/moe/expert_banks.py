@@ -9,6 +9,7 @@ banks from them (``build_expert_banks``). GGUF experts keep their packed ggml ro
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -496,6 +497,57 @@ def bank_bytes_estimate(model_config, method=None, layer_methods=None) -> int | 
     return layers * experts * per_expert(hidden, inter)
 
 
+def _ftw_index_meta(path: str) -> dict:
+    """The FTW index's meta fields ({} when unreadable -- the caller falls back)."""
+    from freetoken.checkpoint.ftw import INDEX_NAME
+
+    try:
+        with open(os.path.join(path, INDEX_NAME)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def ftw_shard_compatible(meta: dict | None, method) -> bool:
+    """Whether an FTW's repacked rows match this method's local expert shard.
+
+    The sidecar records the absolute [lo, hi) intermediate range it was built for;
+    a bandwidth-weighted split that rounds to the same whole scale groups replays
+    fine, one that moves the boundary rebuilds. Legacy indexes (no shard_range)
+    only replay the even split -- the historical blanket rule.
+    """
+    if method is None:
+        return True
+    rng = (meta or {}).get("shard_range")
+    if rng is None:
+        return not getattr(method.cfg, "uneven_tp_shard", False)
+    return list(rng) == list(method.cfg.local_intermediate_range)
+
+
+def ftw_banks_compatible(banks, method) -> bool:
+    """Whether loaded FTW banks can serve this expert method.
+
+    The quant_format tag names the bank LAYOUT: kernels that share it (nvfp4
+    triton / w4a4 -- the same rows, w4a4 adding resident input-scale alphas)
+    replay each other's FTWs, so a sidecar packed by one serves the other. A
+    kernel whose layout adds resident alphas still needs them present in the
+    loaded banks. Unknown tags (gguf) keep the exact (kind, kernel) match.
+    """
+    from freetoken.moe.legacy_format import LEGACY_FORMAT
+
+    packed = (banks.kind, banks.kernel)
+    bound = (method.kind, method.kernel.name)
+    if packed == bound:
+        return True
+    if LEGACY_FORMAT.get(packed) is None or LEGACY_FORMAT.get(packed) != LEGACY_FORMAT.get(bound):
+        return False
+    return all(
+        getattr(banks, name, None) is not None
+        for name, spec in method.layout().items()
+        if spec.resident and name.endswith("_alpha")
+    )
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -554,19 +606,18 @@ def load_expert_banks(
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
     ftw_banks_path = banks_path or model_path
-    # FTW banks are repacked for the shard split they were converted with, so an uneven
-    # (bandwidth-weighted) split cannot replay them. At TP>1 the disk-tier sidecar is
-    # built per rank (rank-local expert slices), so the fast path replays it correctly;
-    # only an uneven split still has to rebuild from the source checkpoint.
-    uneven = method is not None and getattr(method.cfg, "uneven_tp_shard", False)
+    # FTW banks are repacked for the shard split they were converted with. The sidecar
+    # records the absolute intermediate range it was built for, so a bandwidth-weighted
+    # split that rounds to the same whole scale groups replays fine and one that moves
+    # the boundary rebuilds; legacy indexes (no range) keep the even-split-only rule.
     if ftw_banks_path and is_ftw_checkpoint(ftw_banks_path) and not dummy:
         if resident:
             banks = load_ftw_banks_to_device(ftw_banks_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
-        elif uneven:
+        elif not ftw_shard_compatible(_ftw_index_meta(ftw_banks_path), method):
             banks = None
             logger.warning_rank0(
-                "expert banks: FTW fast path skipped (uneven bandwidth-weighted expert "
-                "shard); rebuilding from the source checkpoint"
+                "expert banks: FTW fast path skipped (the expert shard layout differs "
+                "from the converted one); rebuilding from the source checkpoint"
             )
         else:
             # the same build fence as the slow path: two ranks reading the sidecar

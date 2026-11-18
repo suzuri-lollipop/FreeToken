@@ -413,3 +413,65 @@ def test_a_measured_link_replaces_the_profiled_pcie_term(tmp_path):
         row, cpu_share=share, hide=hide, pcie_gbs=12.5)
     # a non-positive measurement is ignored, not trusted as "no PCIe"
     assert fetch_fraction(row, pcie_gbs=0.0) == pytest.approx(0.25)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_benchbw_rows_match_the_serving_lookup_under_tp(tmp_path, monkeypatch):
+    """The profile writer must key rows the way a TP server reads them.
+
+    The server looks up a layer's row by its LOCAL expert shard and its own rank's
+    executor thread count. Expert TP sharding made the bench's full-geometry TP=1
+    rows silently miss (every layer fell back to a fetch cap of 1); an odd physical
+    core count also sizes the ranks' pools differently, so one row per kind is not
+    enough either. The expectations come from the serving-side derivation
+    (MoEConfig.local_intermediate + resolve_worker_pool), not from the writer.
+    """
+    import freetoken.moe.benchbw as bw
+    import freetoken.moe.cpu_executor as ce
+    from freetoken.distributed import tp_view, try_get_tp_info
+    from freetoken.layers.quantization.moe.base import MoEConfig
+
+    # 7 physical cores: rank0's stride slice sizes to 3 workers, rank1's to 2 (the
+    # coordinator reservation included) -- distinct counts the writer must cover both
+    reps = list(range(7))
+    monkeypatch.setattr(ce, "physical_core_cpus", lambda: reps)
+    monkeypatch.setattr(bw, "physical_core_cpus", lambda: reps)
+    monkeypatch.setattr(bw, "flag_sync_available", lambda device: True)
+
+    def serving_cfg(rank):
+        return MoEConfig(num_experts=8, hidden=2048, intermediate=768, top_k=8,
+                         tp_rank=rank, tp_size=2, strategy="hybrid")
+
+    def serving_key(rank):
+        with tp_view(rank, 2):
+            n, _, _ = ce.resolve_worker_pool(0, True)
+        return layer_kind_key("nvfp4", {}, 2048, serving_cfg(rank).local_intermediate, 8, n)
+
+    keys = [serving_key(r) for r in range(2)]
+    assert keys[0] != keys[1]  # the odd-core split really sizes the ranks differently
+
+    def kinds(path, device):
+        tp = try_get_tp_info()
+        cfg = serving_cfg(tp.rank)
+        wl = bw.Workload("fake", cfg.hidden, cfg.local_intermediate, cfg.num_experts,
+                         cfg.top_k, ("nvfp4",))
+        return {bw._kind("nvfp4", wl): wl}
+
+    def bench_format(fmt, wl, device, threshold, cpu_threads, *a, **k):
+        _, cores, _ = ce.resolve_worker_pool(cpu_threads, True)
+        return {"cpu_moe_gbs": 100.0, "cpu_moe_isa": "avx2", "cpu_cores": cores,
+                "pcie_gather_gbs": 40.0, "cpu_moe_overlap_gbs": 90.0,
+                "pcie_gather_overlap_gbs": 30.0, "recommended": "hybrid", "note": None}
+
+    monkeypatch.setattr(bw, "checkpoint_layer_kinds", kinds)
+    monkeypatch.setattr(bw, "_bench_format", bench_format)
+    monkeypatch.setattr(bw, "measure_cpu_mem_bw", lambda **k: {"bw_gbs": 100.0, "threads": 3})
+    monkeypatch.setattr(bw, "measure_pcie_bw", lambda *a, **k: {"h2d_gbs": 5.0, "d2h_gbs": 6.0})
+
+    out = tmp_path / "benchbw.json"
+    bw.run_benchbw(out_path=str(out), checkpoints=("fake-ckpt",), tp_size=2)
+    rows = json.loads(out.read_text())["layer_kinds"]
+    assert keys[0] in rows and keys[1] in rows
+    assert all(rows[k]["inter"] == 384 for k in keys)
+    # the unsharded TP=1 geometry is not what a TP=2 server looks up
+    assert layer_kind_key("nvfp4", {}, 2048, 768, 8, rows[keys[0]]["cpu_threads"]) not in rows

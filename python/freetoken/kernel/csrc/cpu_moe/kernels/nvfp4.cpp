@@ -183,6 +183,20 @@ inline __m256i w4a8_dot256_vnni(__m256i corr, __m256i lo, __m256i qe, __m256i hi
   return _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(corr, lo, qe), hi, qo);
 }
 
+// dpbusd without VNNI (Broadwell / Haswell / client Skylake...): maddubs does the
+// u8 x s8 byte pairs -> i16, madd with ones folds them into the same i32 lanes.
+// The biased nibble LUT keeps the weight bytes unsigned, so the integer result is
+// bit-identical to the VNNI dot; the i16 pair sums cannot saturate (24*127*2 =
+// 6096 < 32767). This keeps W4A8's ~4x arithmetic edge over the fp32 W4A16 dequant
+// dot on every AVX2 CPU, not just the VNNI ones -- decode batches above one token
+// are compute-bound there.
+CPU_MOE_TARGET("avx2,fma,f16c")
+inline __m256i w4a8_dot256_maddubs(__m256i corr, __m256i lo, __m256i qe, __m256i hi, __m256i qo) {
+  const __m256i ones = _mm256_set1_epi16(1);
+  __m256i d = _mm256_add_epi32(corr, _mm256_madd_epi16(_mm256_maddubs_epi16(lo, qe), ones));
+  return _mm256_add_epi32(d, _mm256_madd_epi16(_mm256_maddubs_epi16(hi, qo), ones));
+}
+
 // sum of e4m3(scale) * act scale * int dot over blocks [b0, nb) in 2^-8 units, before the final 0.5 * global
 CPU_MOE_TARGET("avx2,fma,f16c")
 float w4a8_blocks_scalar(const uint8_t* packed, const uint8_t* scale, const W4a8Act& a, int b0, int nb) {
@@ -237,6 +251,53 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
     const __m256i d = w4a8_dot256_vnni(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.corr + (size_t)b * 2)), lo,
                                        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q)), hi,
                                        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 8 * n)));
+    acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(sc, lanes_lo), acc0);
+    b += 4;
+  }
+  const float tail = w4a8_blocks_scalar(packed, scale, a, b, nb);
+  return (hsum256(_mm256_add_ps(acc0, acc1)) + tail) * (0.5f * kE4m3ViaF16 * global);
+}
+
+// Same lane layout and integer math as dot_nvfp4_i8_vnni, on the maddubs dot:
+// bit-identical output for CPUs without AVX-VNNI (the quant, scales and corr are
+// the shared avx2 ones).
+CPU_MOE_TARGET("avx2,fma,f16c")
+float dot_nvfp4_i8_avx2(const uint8_t* packed, const uint8_t* scale, float global, const W4a8Act& a, int K) {
+  const __m256i lut = _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2u)));
+  const __m256i lanes_lo = _mm256_set_epi32(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m256i lanes_hi = _mm256_set_epi32(7, 7, 6, 6, 5, 5, 4, 4);
+  const int nb = K / 16, pf = w4a8_pf(nb);
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256i lo, hi;
+  int b = 0;
+  for (; b + 8 <= nb; b += 8) {
+    const uint8_t* pk = packed + (size_t)b * 8;
+    if (pf > 0) _mm_prefetch(reinterpret_cast<const char*>(pk + (size_t)pf * 8), _MM_HINT_T0);
+    const int8_t* q = a.q + (size_t)b * 16;
+    const int32_t* c = a.corr + (size_t)b * 2;
+    const __m256 sc = w4a8_scales256(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scale + b)), a.scale + b);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pk)), lut, lo, hi);
+    __m256i d = w4a8_dot256_maddubs(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c)), lo,
+                                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q)), hi,
+                                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 64)));
+    acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(sc, lanes_lo), acc0);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pk + 32)), lut, lo, hi);
+    d = w4a8_dot256_maddubs(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + 8)), lo,
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32)), hi,
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 96)));
+    acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(sc, lanes_hi), acc1);
+  }
+  if (b + 4 <= nb) {
+    const int n = nb - b;
+    const int8_t* q = a.q + (size_t)b * 16;
+    int s4;
+    std::memcpy(&s4, scale + b, 4);
+    float as8[8] = {a.scale[b], a.scale[b + 1], a.scale[b + 2], a.scale[b + 3]};
+    const __m256 sc = w4a8_scales256(_mm_cvtsi32_si128(s4), as8);
+    w4a8_split256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)b * 8)), lut, lo, hi);
+    const __m256i d = w4a8_dot256_maddubs(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(a.corr + (size_t)b * 2)), lo,
+                                          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q)), hi,
+                                          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 8 * n)));
     acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_permutevar8x32_ps(sc, lanes_lo), acc0);
     b += 4;
   }
@@ -406,7 +467,9 @@ struct W4a8Kernel {
   const char* isa;
 };
 
-// Best W4A8 (int8-activation) nvfp4 dot for the picked ISA tier, or a null dot if that tier has no VNNI (caller keeps the faithful fp32 nvdot path).
+// Best W4A8 (int8-activation) nvfp4 dot for the picked ISA tier; a null dot (scalar
+// tier / non-x86) keeps the faithful fp32 nvdot path. AVX2 without VNNI still runs
+// W4A8 on the maddubs dot -- bit-identical to the VNNI one.
 W4a8Kernel select_nvi8dot() {
 #if CPU_MOE_X86
   const IsaTier t = pick_isa();
@@ -414,6 +477,7 @@ W4a8Kernel select_nvi8dot() {
   if (t >= ISA_AVX512 && cpu_has_avx512vnni()) return {dot_nvfp4_i8_avx512vnni, quant_i8_avx512, "+avx512vnni(nvfp4-w4a8)"};
 #endif
   if (t >= ISA_AVX2 && cpu_has_avxvnni()) return {dot_nvfp4_i8_vnni, quant_i8_avx2, "+vnni(nvfp4-w4a8)"};
+  if (t >= ISA_AVX2) return {dot_nvfp4_i8_avx2, quant_i8_avx2, "+maddubs(nvfp4-w4a8)"};
 #endif
   return {};
 }
