@@ -910,7 +910,9 @@ def parse_live_servers(pgrep_out: str) -> list[str]:
 def find_live_servers() -> list[str]:
     import subprocess
 
-    r = subprocess.run(["pgrep", "-af", "-m freetoken"], capture_output=True, text=True)
+    # '--' ends pgrep's options: the pattern starts with a dash, and without it
+    # pgrep exits 2 with empty stdout -- the guard silently never fires.
+    r = subprocess.run(["pgrep", "-af", "--", "-m freetoken"], capture_output=True, text=True)
     return parse_live_servers(r.stdout)
 
 

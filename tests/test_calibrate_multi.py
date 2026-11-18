@@ -176,6 +176,26 @@ def test_parse_live_servers_spots_the_server_not_the_calibrator():
     assert len(live) == 1 and live[0].startswith("100 ")
 
 
+def test_find_live_servers_gives_pgrep_a_parseable_pattern(monkeypatch):
+    # the pattern starts with a dash: without an end-of-options marker pgrep exits 2
+    # with empty stdout, and the refuse-to-calibrate-beside-a-live-server guard
+    # silently never fires (double expert-bank load -> OOM kill)
+    import subprocess
+    from freetoken.calibrate_multi import find_live_servers
+
+    got = {}
+
+    def fake_run(argv, **kw):
+        got["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="100 /py -m freetoken --model-path /m\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert find_live_servers() == ["100 /py -m freetoken --model-path /m"]
+    argv = got["argv"]
+    pattern = argv[-1]
+    assert pattern.startswith("-") and argv[argv.index(pattern) - 1] == "--"
+
+
 def test_request_body_probes_the_production_sampling_by_default():
     from freetoken.calibrate_multi import request_body
 
