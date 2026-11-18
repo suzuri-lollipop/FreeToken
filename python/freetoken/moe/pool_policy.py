@@ -20,7 +20,24 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-SCOPES = ("unified", "per-layer")
+SCOPES = ("auto", "unified", "per-layer")
+
+
+def resolve_scope(scope: str, *, has_cpu_layers: bool, mixed_formats: bool) -> str:
+    """Resolve 'auto': per-layer when every MoE layer decodes from the GPU slot
+    cache in one format, unified otherwise.
+
+    Decode walks the layers cyclically every step; a unified LRU lets one layer's
+    promotions evict the next layer's rows, and the thrash grows with the batch
+    (each request adds its own routes). Per-layer pools keep each layer's recent
+    experts to itself -- measured on 2x RTX PRO 4000 TP2 (Qwen3.8-Flash-Next,
+    hybrid, mrr4): c2 aggregate 32.8 -> 69.6 tok/s, c4 82.5 -> 111.2, c1 neutral.
+    CPU-decoded layers and mixed formats need the unified flexibility (locked
+    pools, per-format slot sizes), so auto keeps unified for them.
+    """
+    if scope != "auto":
+        return scope
+    return "unified" if (has_cpu_layers or mixed_formats) else "per-layer"
 
 
 @dataclass(frozen=True)

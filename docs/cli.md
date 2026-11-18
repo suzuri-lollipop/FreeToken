@@ -201,7 +201,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | - | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
-| `--moe-cache-scope` | unified | `unified`: one LRU pool of slots per expert quant (quant type and bank layout), so all MoE layers share one pool when they share a quant format; `per-layer`: each layer has its own pool. `per-layer` does not combine with `--moe-strategy cpu` or `--moe-cpu-layers` |
+| `--moe-cache-scope` | auto | `auto`: `per-layer` when every MoE layer decodes from the GPU slot cache in one quant format, else `unified` (CPU-decoded layers and mixed formats keep the unified flexibility). `unified`: one LRU pool of slots per expert quant (quant type and bank layout), so all MoE layers share one pool when they share a quant format; `per-layer`: each layer has its own pool -- the cyclic decode walk stops evicting the next layer's rows, which pays with batch size. `per-layer` does not combine with `--moe-strategy cpu` or `--moe-cpu-layers` |
 | `--moe-cache-split` | equal | How the pools share the slots: `equal` (in proportion to their layer counts), or `profile:<path>`: every pool keeps `top_k` slots and the rest go to the most used experts in the profile's per-layer expert counts. With `offload`, a pool smaller than the expert count lowers `--max-running-requests` to its slots / top_k |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
@@ -358,6 +358,8 @@ strategies alike (DeepSeek-V4 experts serve offload only);
 ft bench bw --model /path/to/model.gguf   # every MoE layer kind of a checkpoint (GGUF or HF)
 ft bench bw                               # canonical geometry per expert format
 ft bench bw --gpu 1                       # a specific GPU (UUID or nvidia-smi index, as for ft serve)
+ft bench bw --model /path/to/model --tp-size 2 --gpu 0   # the per-rank view a TP=2 server looks up
+ft bench bw --model /path/to/model --tp-size 2 --gpu 1   # repeat for each GPU of the TP group
 ```
 
 Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes one
@@ -369,6 +371,10 @@ to split each layer's misses.
 - A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
   threads; a layer without an exact row keeps a fetch cap of 1. Bench with the same
   `--cpu-threads` as the server's `--moe-cpu-threads`.
+- Under tensor parallelism pass the serving `--tp-size N`: the server looks up the row by
+  its LOCAL expert shard (hybrid's even split) and its own rank's executor thread count
+  (the per-rank core slice), so a full-geometry TP=1 row never matches. One run benches
+  every distinct per-rank thread count; run it once per GPU of the TP group.
 - Each run replaces the rows it benched and keeps the others.
 - What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats

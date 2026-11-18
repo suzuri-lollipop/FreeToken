@@ -8,12 +8,13 @@ from .impl import (
     pipe_distributed_ready,
     register_pipe_comm_thread,
 )
-from .info import DistributedInfo, get_tp_info, set_tp_info, try_get_tp_info
+from .info import DistributedInfo, get_tp_info, set_tp_info, tp_view, try_get_tp_info
 
 __all__ = [
     "DistributedInfo",
     "get_tp_info",
     "set_tp_info",
+    "tp_view",
     "enable_pynccl_distributed",
     "DistributedCommunicator",
     "try_get_tp_info",

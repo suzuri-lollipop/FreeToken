@@ -1108,3 +1108,19 @@ def test_decode_batch_clamp_no_gpu_pool_on_this_rank_adopts_peer_cap():
          patch("freetoken.engine.engine.torch.distributed.all_reduce", side_effect=fake_all_reduce):
         _clamp_decode_batch_to_pools(config, [16, 32], object(), "gpu")  # no pool < num_experts
     assert config.max_running_req == 2
+
+
+def test_scope_auto_resolves_to_per_layer_only_for_pure_gpu_slot_decode():
+    from freetoken.moe.pool_policy import group_layers, resolve_scope
+
+    # auto: per-layer when every layer decodes from the GPU slot cache in one format
+    assert resolve_scope("auto", has_cpu_layers=False, mixed_formats=False) == "per-layer"
+    # CPU-decoded layers / mixed formats keep the unified flexibility
+    assert resolve_scope("auto", has_cpu_layers=True, mixed_formats=False) == "unified"
+    assert resolve_scope("auto", has_cpu_layers=False, mixed_formats=True) == "unified"
+    # explicit choices pass through untouched
+    assert resolve_scope("unified", has_cpu_layers=False, mixed_formats=False) == "unified"
+    assert resolve_scope("per-layer", has_cpu_layers=True, mixed_formats=True) == "per-layer"
+    # grouping takes the RESOLVED scope: auto is not a pool layout
+    with pytest.raises(ValueError):
+        group_layers("auto", [0, 0], [1, 1])

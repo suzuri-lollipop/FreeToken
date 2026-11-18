@@ -120,7 +120,7 @@ _NVFP4_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, isa, monkeypatch):
     """CPU NVFP4 GEMV vs. canonical dequant_nvfp4 + bf16 GPU decode, per ISA tier.
 
-    Both paths read byte-identical quantized banks. The avx2 / avx512 tiers run W4A8 when the CPU has their VNNI, and the int8 activation rounding dominates the spread; the fp32 dots differ only by weight bf16-rounding + reduction order.
+    Both paths read byte-identical quantized banks. The avx2 / avx512 tiers run W4A8 (VNNI where the CPU has it, maddubs otherwise on avx2), and the int8 activation rounding dominates the spread; the fp32 dots differ only by weight bf16-rounding + reduction order.
     """
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
     from freetoken.moe.cpu_executor import CpuMoeExecutor
