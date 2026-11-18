@@ -1575,6 +1575,11 @@ class Scheduler(SchedulerIOMixin):
         from freetoken.moe import _debug_stats
 
         _dbg = _debug_stats.probe()
+        # the piped chunk's duty-cycle yield gates on this (read by the pipe thread);
+        # getattr: Scheduler.__new__ stubs predate the engine handle
+        _engine = getattr(self, "engine", None)
+        if _engine is not None:
+            _engine.decode_running = self.decode_manager.runnable
         if getattr(self, "_pipe", None) is not None:
             # getattr: Scheduler.__new__ stubs predate the pipe (same rule as mixed)
             return self._schedule_next_batch_piped()

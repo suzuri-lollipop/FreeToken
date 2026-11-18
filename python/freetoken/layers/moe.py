@@ -452,7 +452,10 @@ class OffloadMoELayer(MoELayer):
             # beyond two chunks fall back to the serial (chunked) path.
             k = topk_ids.numel()
             mk = _LRU_ENSURE_MAX_K if _LRU_ENSURE_MAX_K > 0 else k
-            if mk <= 0 or -(-k // mk) <= 2:
+            # under piped prefill the second K-split plan is the pipe's staging:
+            # only a single-plan batch may overlap (decode_single_plan)
+            max_chunks = 1 if cache.decode_single_plan else 2
+            if mk <= 0 or -(-k // mk) <= max_chunks:
                 out = self._decode_fetch_overlap(
                     cache, hidden_states, topk_weights, topk_ids
                 )
@@ -521,6 +524,8 @@ class OffloadMoELayer(MoELayer):
         mk = _LRU_ENSURE_MAX_K if _LRU_ENSURE_MAX_K > 0 else rows * top_k
         rows_chunk = max(1, mk // top_k) if mk > 0 else rows
         starts = list(range(0, rows, rows_chunk))[:2]
+        if cache.decode_single_plan and len(starts) > 1:
+            return None  # the second plan is the pipe's staging; caller stays serial
         if len(starts) > 1 and cache.src_indices2 is None:
             # K-split needs the second plan buffer (the graph runner materializes it
             # before capture; a graphs-disabled eager run may not have it): fall back
@@ -550,7 +555,9 @@ class OffloadMoELayer(MoELayer):
                 )
         join = torch.cuda.Event()
         join.record(side)
-        views = cache.bank_views()
+        # ensure rewrites routes to POOL-LOCAL slots: the GEMVs must read this
+        # layer's pool views, not the whole cache (wrong rows under per-layer pools)
+        views = cache.pool_bank_views(self.layer_id)
         alphas = cache.alphas_for_slots(self.layer_id)
         # Per-call transient read by the nvfp4 kernel's apply (SKIP_W0 for both GEMVs).
         self._moe_skip_w0 = True
@@ -604,7 +611,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -839,6 +846,7 @@ class OffloadMoELayer(MoELayer):
                 out = out + executor.decode_sync(pending)
             if dbg is not None:
                 dbg.prefill_layer_done(self.layer_id, topk_ids)
+            cache.yield_prefill_layer()
             return out
         if cache.prefill_overlap:
             from freetoken.moe import _debug_stats

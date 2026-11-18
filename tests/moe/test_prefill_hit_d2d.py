@@ -288,6 +288,28 @@ def test_prefill_ondemand_hits_gather_from_cache():
     assert int(cache.slot_for_id[2, 1].item()) == 19
 
 
+@CUDA
+@JIT
+def test_prefill_ondemand_miss_gather_launches_at_the_link_width(monkeypatch):
+    """The H2D miss gather must use the resolved link width (a wide grid queues
+    concurrent decode fetches behind the chunk); the D2D hit gather stays wide."""
+    from freetoken.kernel import fast_index_copy as fic
+
+    cache, _sources = _make_cache()
+    widths = []
+    real = fic.fast_index_copy_multi_jit
+
+    def spy(*args, **kwargs):
+        widths.append(kwargs.get("blocks_per_bank", 8))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fic, "fast_index_copy_multi_jit", spy)
+    topk = torch.tensor([[1, 3], [5, 7]], dtype=torch.int32, device="cuda")
+    cache.prefetch_prefill_layer_ondemand(0, topk)
+    torch.cuda.synchronize()
+    assert widths == [64, cache._prefill_h2d_bpb]
+
+
 # ---------------------------------------------------------------- promotion
 
 

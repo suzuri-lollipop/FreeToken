@@ -167,6 +167,24 @@ def default_blocks_per_bank(device: torch.device) -> int:
         return 32
     return 8
 
+def prefill_h2d_blocks_per_bank(device: torch.device) -> int:
+    """H2D gather grid width for a prefill chunk's miss set. The chunk's gather shares
+    the PCIe link with running decodes' miss fetches and the TP collectives: past the
+    saturation knee extra width only deepens the queue of in-flight 16B reads and
+    delays that latency-sensitive traffic (piped prefill: decode ITL ~3x while a chunk
+    streams). 2 blocks/bank saturates every PCIe host measured (gen3 x8 .. gen5 x16);
+    C2C keeps its wider knee. FREETOKEN_PREFILL_H2D_BPB overrides (8 = historical)."""
+    env = os.environ.get("FREETOKEN_PREFILL_H2D_BPB")
+    if env is not None:
+        width = int(env)
+        assert width > 0, (
+            f"FREETOKEN_PREFILL_H2D_BPB must be greater than 0, got {env}"
+        )
+        return width
+    base = default_blocks_per_bank(device)
+    return base if base > 8 else 2
+
+
 def fast_index_copy_multi_jit(
     dst_ptrs: torch.Tensor,
     src_ptrs: torch.Tensor,

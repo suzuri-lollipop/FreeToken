@@ -428,6 +428,64 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
 
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fetch_overlap_reads_the_layers_own_pool(monkeypatch):
+    """The overlap GEMVs must read the layer's POOL views: ensure rewrites routes to
+    pool-local slots, so whole-cache views silently read another pool's rows under
+    per-layer pools (the regression the per-layer default introduced)."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    dev = torch.device("cuda")
+    E = 4
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=E, cache_size=12, device=dev,
+        pool_of_layer=[0, 1], pool_sizes=[6, 6], decode_fetch_overlap=True,
+    )
+    cache.set_bank_sources(sources)
+    layer = _bf16_offload_layer(1, E, 2, 8, 16)
+    layer.offload_cache = cache
+    seen = []
+
+    def fake_gemm(*args, **kwargs):
+        seen.append(kwargs.get("views"))
+        return torch.zeros(2, 8, device=dev, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(layer, "_expert_gemm", fake_gemm)
+    hidden = torch.randn(2, 8, device=dev, dtype=torch.bfloat16)
+    w = torch.rand(2, 2, device=dev)
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=dev)
+    out = layer._decode_fetch_overlap(cache, hidden, w, ids)
+    torch.cuda.synchronize()
+    assert out is not None
+    assert len(seen) == 2
+    pool_views = cache.pool_bank_views(1)
+    assert all(v is pool_views for v in seen), "overlap GEMV read whole-cache views"
+
+
+def test_single_plan_overlap_refuses_the_k_split():
+    """Under piped prefill the second K-split plan is the pipe thread's staging:
+    the fetch overlap must fall back to serial for a batch that needs two plans,
+    before touching any cache state."""
+    from types import SimpleNamespace
+
+    layer = _bf16_offload_layer(0, 16, 10, 8, 16)
+    calls = []
+    cache = SimpleNamespace(
+        decode_single_plan=True,
+        src_indices2=object(),
+        ensure_experts=lambda *a, **k: calls.append(a),
+    )
+    ids = torch.zeros(30, 10, dtype=torch.int32)  # 300 routes > the 128 K-split
+    out = layer._decode_fetch_overlap(cache, torch.zeros(30, 8), torch.zeros(30, 10), ids)
+    assert out is None
+    assert not calls
+
+
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     import pytest
     from freetoken.moe.offload_cache import OffloadMoeCache
