@@ -1,7 +1,8 @@
-"""Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5), /metrics
-(per-request phase split for llm-launcher's bench), /v1/meminfo (VRAM breakdown) + /meminfo
-(its HTML dashboard).
+"""Read-only control-plane endpoints consumed by the desktop app and llm-launcher:
+/health (lifecycle), /v1/stats (runtime metrics, Task 6), /v1/requests (request log ring,
+Task 5), /metrics (per-request phase split for llm-launcher's bench PLUS basalt-shaped
+engine/live/history blocks for its dashboard slot graph), /slots (basalt-shaped per-slot
+rows), /v1/meminfo (VRAM breakdown) + /meminfo (its HTML dashboard).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -96,7 +97,11 @@ def register_control_routes(
         is the wall-clock arrival, ``prompt_ms`` the engine's prefill forward, and
         ``first_engine_token_s`` the time to the first token as the API measured it, so a client
         that knows when it sent the request gets ``queue wait = first - prompt``. Rows the HTTP
-        middleware logged carry no arrival stamp and no engine pair, so they are left out."""
+        middleware logged carry no arrival stamp and no engine pair, so they are left out.
+
+        The same doc carries basalt's engine/live/history blocks (live.slots = {total, active,
+        queue_depth}, rows on /slots): the launcher's dashboard relay reads those, the bench
+        reads ``requests`` -- one poll feeds both."""
         rows = []
         for rec in request_ring.requests_phase_rows(max(1, min(limit, 512))):
             prefill_s = rec["prefill_ms"] / 1000.0
@@ -115,7 +120,19 @@ def register_control_routes(
                 "duration_ms": rec["duration_ms"],
                 "stream": rec["stream"],
             })
-        return {"kind": "freetoken", "requests": rows}
+        from .slots import build_metrics_blocks
+
+        return {"kind": "freetoken", "requests": rows, **build_metrics_blocks(get_state())}
+
+    @app.get("/slots")
+    async def slot_table():
+        """basalt-shaped per-slot rows (one per running-request slot, idle rows kept): the
+        launcher dashboard draws them with the same slot grid it draws for basalt."""
+        state = get_state()
+        stats = getattr(state, "stats", None)
+        slots = getattr(stats, "slots", None)
+        n_ctx = int(getattr(getattr(state, "config", None), "max_seq_len", 0) or 0)
+        return slots.rows(n_ctx) if slots is not None else []
 
     from .stats import build_stats
 

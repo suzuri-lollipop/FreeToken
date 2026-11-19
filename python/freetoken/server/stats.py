@@ -1,7 +1,11 @@
 """Runtime metrics for /v1/stats. The FrontendManager owns one StatsTracker and feeds it
 every UserReply (the single chokepoint in listen()). kv/mamba/vram keep their last-known-value
 semantics like ShellStats; throughput uses an independent sliding-window rate (NOT cumulative
-average like tok_s), so idle polls decay to zero by wall clock."""
+average like tok_s), so idle polls decay to zero by wall clock.
+
+The same feed drives the per-request SlotTracker (/slots + /metrics live blocks): forwarding
+here keeps every admission/abort/terminal path in api_server covered without a second set of
+call sites."""
 
 from __future__ import annotations
 
@@ -9,10 +13,17 @@ import time
 from collections import deque
 from typing import Any
 
+from freetoken.utils import init_logger
+
+from .slots import SlotTracker
+
+logger = init_logger(__name__)
+
 
 class StatsTracker:
-    def __init__(self, window_s: float = 5.0) -> None:
+    def __init__(self, window_s: float = 5.0, slots_total: int = 4) -> None:
         self.window_s = window_s
+        self.slots = SlotTracker(total=slots_total, window_s=window_s)
         # maxlen bounds memory on the headless path: stale-sample eviction is poll-driven
         # (only _rate() trims to window_s), and clients that never hit /v1/stats (e.g.
         # codex/claude via /v1/chat/completions) would otherwise grow these unbounded.
@@ -56,13 +67,16 @@ class StatsTracker:
     def on_new_user(self, uid: int) -> None:
         self._inflight.add(uid)
         self._aborting.discard(uid)
+        self.slots.on_new_user(uid)
 
     def on_abort(self, uid: int) -> None:
         if uid in self._inflight:
             self._aborting.add(uid)
+        self.slots.on_abort(uid)
 
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
+        self.slots.observe(reply, now=t)
         if getattr(reply, "completion_tokens_delta", 0) > 0:
             self._decode.append((t, reply.completion_tokens_delta))
             self.completion_tokens_total += reply.completion_tokens_delta
@@ -112,6 +126,34 @@ class StatsTracker:
 
     def prefill_tps(self, now: float | None = None) -> float:
         return self._rate(self._prefill, now)
+
+    # ---------------------------------------------------------------- per-slot view (/slots, /metrics)
+
+    def set_slots_total(self, total: int) -> None:
+        self.slots.set_total(total)
+
+    def reset_slots(self) -> None:
+        self.slots.reset()
+
+    def sample_history(self, now: float | None = None) -> None:
+        """One 1 Hz history point: the combined decode rate (sum of the slot rates, the same
+        figure /metrics live reports) plus every slot's own rate."""
+        t = time.monotonic() if now is None else now
+        rates = self.slots.slot_rates(t)
+        self.slots.push_history(sum(rates), rates)
+
+    def sample_loop(self, interval_s: float = 1.0) -> None:
+        """Daemon-thread target (started once in run_api_server): keeps the 60 s speed
+        history current even when nobody polls, like basalt's telemetry sampler."""
+        warned = False
+        while True:
+            time.sleep(interval_s)
+            try:
+                self.sample_history()
+            except Exception:  # noqa: BLE001 -- a metrics nicety must never kill the server
+                if not warned:
+                    warned = True
+                    logger.exception("metrics history sampler failed; history stops updating")
 
 
 def derive_model_card(config: Any) -> dict:
