@@ -2024,6 +2024,12 @@ class Engine:
                 cache.hybrid_min_bs = max(1, int(os.getenv("FREETOKEN_HYBRID_MIN_BS", "2")))
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
+        if self.piped_prefill and config.decode_fetch_overlap and not cache.decode_fetch_overlap:
+            logger.info_rank0(
+                "piped prefill: decode fetch overlap off (single-writer staging); "
+                "FREETOKEN_PIPED_FETCH_OVERLAP=1 re-enables it single-plan when every "
+                "chunk stages on-demand"
+            )
         self.moe_offload_cache = cache
         return cache
 

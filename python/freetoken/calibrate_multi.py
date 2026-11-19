@@ -30,6 +30,21 @@ most TPS_LOSS_MAX of aggregate throughput. The throughput guard is deliberately 
 concurrency trades prompt-side throughput for the running streams' gaps -- that is the
 feature -- so only a catastrophic loss (a link too slow to share) rejects an arm.
 
+Every arm also runs two regime probes BEFORE the staggered workload, and a winner must keep
+its aggregate tok/s within the probe's tolerance of the baseline's: a decode-only probe
+(one short request per running slot -- the profile's full --max-running-requests, not the
+staggered workload's capped victims -- launched together, fixed answers, no aggressor;
+DECODE_TPS_LOSS_MAX) and a short-interleave probe (the same slots with ~1024-token prompts
+admitted 5 s apart -- the launcher bench's gap -- with 1024-token answers;
+INTERLEAVE_TPS_LOSS_MAX). The
+staggered wall is aggressor-dominated, so the loose guard above can pass an arm that
+regresses the traffic a profile actually serves: piped prefill structurally disables the
+decode fetch overlap (single-writer staging) and, under TP, the shm one-shot all-reduce --
+on a fast-link rig that cost lands on EVERY decode step -- and even where decode is
+neutral, sharing the link with short chunks costs the interleaved regime (reported: a
+200+ tok/s production rig dropped below 200 after piped won the calibration). The spec and
+MoE dimensions carry the same guards.
+
 A second dimension compares speculative backends (--spec, default auto = mtp + dflash;
 dflash needs a draft checkpoint). Each spec arm runs with prefill off and wins on
 aggregate tok/s (>= SPEC_MIN_GAIN) without worsening the worst stall by more than
@@ -66,7 +81,8 @@ Feed it an existing launch config to keep the profile's argv:
     python -m freetoken.calibrate_multi --config freetoken-<model>.json
 
 The server must not already be running on the chosen port; this tool owns it for the
-duration. Expect ~15 min full (4 arms x one engine start), ~5 min --quick.
+duration. Expect ~25 min full (one engine start per arm, two regime probes plus the
+staggered workload per rep), ~8 min --quick.
 """
 from __future__ import annotations
 
@@ -119,6 +135,14 @@ ARMS: list[tuple[str, dict[str, str]]] = [
 STALL_GAIN_S = 0.5
 STALL_FLOOR_S = 0.5
 TPS_LOSS_MAX = 0.25
+# decode-only probe guard: a winner keeps at least this share of the baseline's
+# concurrent decode tok/s. 5% covers probe noise; a real fast-path loss (piped's
+# fetch-overlap / shm-AR disable) is larger and must reject the arm, not pass it.
+DECODE_TPS_LOSS_MAX = 0.05
+# short-interleave probe guard: same contract for the staggered short-prompt regime
+# (the launcher bench's shape). Even where pure decode is neutral, sharing the link
+# with concurrent chunks costs here; measured -6% on the 2x gen3 dev rig.
+INTERLEAVE_TPS_LOSS_MAX = 0.05
 TIE_S = 0.15
 STALL_EVENT_S = 0.5  # the launcher bench's stall threshold; keep the two in step
 
@@ -452,6 +476,61 @@ def run_workload(server: Server, model: str, items: list[dict],
     return scored
 
 
+def decode_workload(cfg: dict) -> list[dict]:
+    """The decode-only probe: one short request per running slot (the profile's full
+    --max-running-requests), all launched together, fixed answers, no aggressor. After
+    the brief prefill ramp every step is a concurrent decode at the served batch -- the
+    regime long-answer traffic lives in, which the staggered workload's
+    aggressor-dominated wall does not score."""
+    n = cfg.get("concurrency") or cfg["victims"] + 1
+    return [{"prompt": f"Repeat after me exactly: decode probe {i}. Then count "
+                       + _syllables(24),
+             "max_tokens": cfg["out"], "at": 0.0}
+            for i in range(n)]
+
+
+def interleave_workload(cfg: dict) -> list[dict]:
+    """The short-interleave probe: one ~1024-token prompt per running slot, admitted
+    5 s apart (the launcher bench's gap) with 1024-token answers -- staggered chat
+    traffic into a decoding batch, no 16k aggressor. The spacing matches the bench:
+    a tighter 1 s spacing piles the prefills up and flatters piped, which is not the
+    regime the profile serves. The decode-only probe covers the full-batch steady
+    state; this one scores what sharing the machine with short chunks costs the
+    running decodes at the bench's arrival cadence."""
+    # per-request seed: identical prompts would radix-hit and turn the probe into a
+    # cache test (the launcher bench varies its seed for the same reason)
+    n = cfg.get("concurrency") or cfg["victims"] + 1
+    return [{"prompt": "Summarize this text: " + _syllables(1010, seed=100 + i),
+             "max_tokens": 1024, "at": 5.0 * i}
+            for i in range(n)]
+
+
+def run_concurrent_probe(server: Server, model: str, items: list[dict],
+                         prefix: str, temperature: float | None = None) -> dict:
+    """Launch one regime probe; score aggregate tok/s plus the worst inter-token gap
+    (a smoothness diagnostic, not a selection input). prefix names the report keys."""
+    t_start = time.perf_counter()
+    results: list[dict | None] = [None] * len(items)
+
+    def one(i: int, item: dict) -> None:
+        results[i] = _stream_chat(server, model, item["prompt"], item["max_tokens"],
+                                  t_start, item["at"], temperature=temperature)
+
+    threads = [threading.Thread(target=one, args=(i, it)) for i, it in enumerate(items)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    wall = max(r["end"] for r in results) - t_start
+    tokens = sum(r["usage_tokens"] or r["tokens"] for r in results)
+    worst = 0.0
+    for r in results:
+        a = r["arrivals"]
+        worst = max(worst, max((y - x for x, y in zip(a, a[1:])), default=0.0))
+    return {f"{prefix}_tps": tokens / max(wall, 1e-6), f"{prefix}_tokens": tokens,
+            f"{prefix}_wall": wall, f"{prefix}_itl_worst": worst}
+
+
 def score_window(victims: dict[str, dict], open_at: float) -> dict:
     """Pure: the victims' inter-token gaps after the aggressor was admitted. The window
     boundary uses the client clock (when the aggressor was sent); each gap's MAGNITUDE
@@ -496,11 +575,16 @@ class MultiScore:
     spec: str | None = None
     moe: str | None = None
     latency: dict = field(default_factory=dict)
+    decode_tps: float = 0.0
+    decode_itl_worst: float = 0.0
+    interleave_tps: float = 0.0
+    interleave_itl_worst: float = 0.0
 
     def line(self) -> str:
         return (f"{self.label:13s} stall={self.stall_worst:5.2f}s x{self.stall_count:3d} "
                 f"ttft={self.ttft_long:6.2f}s short={self.ttft_short:5.2f}s "
-                f"tps={self.out_tps:6.1f}"
+                f"tps={self.out_tps:6.1f} dec={self.decode_tps:6.1f} "
+                f"ilv={self.interleave_tps:6.1f}"
                 + (f"  [{self.note}]" if self.note else ""))
 
 
@@ -577,7 +661,11 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
         if not _port_free(arm_port) or not _port_free(arm_port + 1):
             continue
         items = workload(cfg)
+        ditems = decode_workload(cfg)
+        iitems = interleave_workload(cfg)
         per: list[dict] = []
+        dper: list[dict] = []
+        iper: list[dict] = []
         log_name = f"{_sanitize(label)}.log" if attempt == 0 else f"{_sanitize(label)}-try{attempt + 1}.log"
         latency_path = log_dir / (Path(log_name).stem + "-latency.jsonl")
         run_spec = {**spec, "port": arm_port, "argv": argv_with_port(base_argv, arm_port)}
@@ -593,6 +681,12 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                 print(f"    {label}: running the staggered workload "
                       f"({len(items)} requests x {max(1, reps)} reps)", flush=True)
                 for _ in range(max(1, reps)):
+                    # regime probes first: they score the clean-cache steady decode and
+                    # the short-interleave regime, before the aggressor fills the cache
+                    dper.append(run_concurrent_probe(server, model, ditems, "decode",
+                                                     temperature))
+                    iper.append(run_concurrent_probe(server, model, iitems, "interleave",
+                                                     temperature))
                     per.append(run_workload(server, model, items, temperature))
             log_text = (log_dir / log_name).read_text(errors="replace")
             break
@@ -625,7 +719,40 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
         stall_worst_client=float(med.get("stall_worst_client", 0.0)),
         measurement=str(med.get("measurement", "client-arrivals")),
         spec=spec_algo, moe=moe_strategy, latency=_latency_summary(latency_path),
+        decode_tps=float(statistics.median([d["decode_tps"] for d in dper])),
+        decode_itl_worst=float(statistics.median([d["decode_itl_worst"] for d in dper])),
+        interleave_tps=float(statistics.median([d["interleave_tps"] for d in iper])),
+        interleave_itl_worst=float(statistics.median([d["interleave_itl_worst"] for d in iper])),
     )
+
+
+def _regime_guard(cands: list[MultiScore], base: MultiScore) -> tuple[list[MultiScore], str]:
+    """Drop arms whose decode-only or short-interleave probe regresses beyond its
+    tolerance. Returns (kept, note); when none survive, the note names the fastest
+    regressing arm and the probe it failed. An unmeasured probe (0.0 -- an excluded
+    arm, an old report) cannot judge and passes."""
+    checks = (("decode-only", base.decode_tps, "decode_tps", DECODE_TPS_LOSS_MAX),
+              ("short-interleave", base.interleave_tps, "interleave_tps",
+               INTERLEAVE_TPS_LOSS_MAX))
+    kept: list[MultiScore] = []
+    dropped: list[tuple[MultiScore, str]] = []
+    for s in cands:
+        note = ""
+        for name, bval, attr, tol in checks:
+            v = getattr(s, attr)
+            if bval > 0 and 0 < v < bval * (1 - tol):
+                note = (f"{100 * (1 - v / bval):.0f}% {name} tok/s "
+                        f"({bval:.1f} -> {v:.1f}; max {100 * tol:.0f}%)")
+                break
+        if note:
+            dropped.append((s, note))
+        else:
+            kept.append(s)
+    if kept or not cands:
+        return kept, ""
+    worst, note = max(dropped, key=lambda sn: sn[0].out_tps)
+    name = worst.spec or worst.moe or worst.label
+    return kept, f"{name} costs {note}"
 
 
 def choose_multi(scores: list[MultiScore]) -> tuple[str, str]:
@@ -635,6 +762,9 @@ def choose_multi(scores: list[MultiScore]) -> tuple[str, str]:
     cands = [s for s in scores if s.label != "none" and s.valid]
     if not cands:
         return "none", "no concurrency arm activated on this machine"
+    cands, dnote = _regime_guard(cands, base)
+    if not cands:
+        return "none", dnote
     best = min(cands, key=lambda s: (round(s.stall_worst / TIE_S), -s.out_tps, s.ttft_short))
     gained = base.stall_worst - best.stall_worst
     floor_win = best.stall_worst <= STALL_FLOOR_S and base.stall_worst > STALL_FLOOR_S
@@ -656,6 +786,9 @@ def choose_spec(spec_scores: list[MultiScore], base: MultiScore) -> tuple[str | 
     cands = [s for s in spec_scores if s.valid and s.spec and s.out_tps > 0]
     if not cands:
         return None, "no speculative arm activated on this machine"
+    cands, dnote = _regime_guard(cands, base)
+    if not cands:
+        return None, dnote
     best = max(cands, key=lambda s: s.out_tps)
     gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
     if gain < SPEC_MIN_GAIN:
@@ -675,6 +808,9 @@ def choose_moe(moe_scores: list[MultiScore], base: MultiScore) -> tuple[str | No
     cands = [s for s in moe_scores if s.valid and s.moe and s.out_tps > 0]
     if not cands:
         return None, "no MoE strategy arm activated on this machine"
+    cands, dnote = _regime_guard(cands, base)
+    if not cands:
+        return None, dnote
     best = max(cands, key=lambda s: s.out_tps)
     gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
     if gain < MOE_MIN_GAIN:
@@ -718,12 +854,25 @@ def victims_from_spec(spec: dict, default: int = 3) -> int:
     return max(1, min(default, mrr - 1))
 
 
+def concurrency_from_spec(spec: dict, default: int = 4) -> int:
+    """The profile's full --max-running-requests. The regime probes score the batch
+    the profile actually serves: the staggered workload caps its victims at 3, but an
+    8-parallel profile decodes at bs8, and the fast-path cost scales with the batch."""
+    raw = _arg_value(list(spec.get("argv") or []), "--max-running-requests")
+    try:
+        mrr = int(raw) if raw else default
+    except ValueError:
+        mrr = default
+    return max(1, mrr)
+
+
 def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     out_dir = Path(a.out_dir).expanduser().resolve()
     log_dir = out_dir / "logs"
     cfg = {"short": 128, "long": 2048 if a.smoke else a.long,
            "out": 32 if a.smoke else a.out_tokens, "gap": 6.0,
-           "victims": victims_from_spec(spec)}
+           "victims": victims_from_spec(spec),
+           "concurrency": concurrency_from_spec(spec)}
     reps = 1 if (a.quick or a.smoke) else max(1, a.reps)
     arms = arms_for(spec, a.smoke)
     base_port = int(spec.get("port") or DEFAULT_PORT)
@@ -880,6 +1029,9 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     chosen = {
         "label": label, "env": winner_env(label), "note": note,
         "stall_worst": by[label].stall_worst, "out_tps": by[label].out_tps,
+        "decode_tps": by[label].decode_tps, "base_decode_tps": base.decode_tps,
+        "interleave_tps": by[label].interleave_tps,
+        "base_interleave_tps": base.interleave_tps,
         "gain_stall_s": round(base.stall_worst - by[label].stall_worst, 2),
         "gain_tps_pct": round(100 * (by[label].out_tps / base.out_tps - 1), 1)
         if base.out_tps > 0 else 0.0,
