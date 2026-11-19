@@ -302,7 +302,9 @@ class FrontendManager:
 
     def __post_init__(self) -> None:
         if self.stats is None:
-            self.stats = StatsTracker()
+            self.stats = StatsTracker(
+                slots_total=int(getattr(self.config, "max_running_req", 4) or 4)
+            )
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -446,6 +448,10 @@ class FrontendManager:
         self.nonpool_overhead_bytes = 0
         self.rank_metas = {}
         self.last_rebuild = None
+        # The slot rows and speed history belong to the generation that died; fail_pending_
+        # generations already aborted every pending uid, this clears the rest (idle-slot last
+        # request figures, history) so a revive starts its graph empty.
+        self.stats.reset_slots()
 
     async def listen(self):
         while True:
@@ -1354,6 +1360,12 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         ),
     )
 
+    # 1 Hz speed history for /metrics (basalt's telemetry sampler equivalent): runs from boot
+    # so the dashboard graph has points waiting when it first polls, idle zeros included.
+    threading.Thread(
+        target=_GLOBAL_STATE.stats.sample_loop, daemon=True, name="freetoken-metrics-sampler"
+    ).start()
+
     from .supervisor import FrozenEngine, LoadProgress, run_backend_supervisor
 
     _GLOBAL_STATE.load_progress = LoadProgress()
@@ -1508,6 +1520,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.weights_bytes = int(meta.pop("weights_bytes", 0) or 0)
         _GLOBAL_STATE.device_total_bytes = int(meta.pop("device_total_bytes", 0) or 0)
         _GLOBAL_STATE.nonpool_overhead_bytes = int(meta.pop("nonpool_overhead_bytes", 0) or 0)
+        # The engine may clamp max_running_req at load (decode-graph cap); the slot grid must
+        # show the effective count, not the requested one. 0/absent = older engine: keep the
+        # config-derived total.
+        _GLOBAL_STATE.stats.set_slots_total(int(meta.pop("max_running_req", 0) or 0))
         _GLOBAL_STATE.unit_bytes = meta
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind
