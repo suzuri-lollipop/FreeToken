@@ -20,6 +20,8 @@ from freetoken.calibrate_multi import (
     choose_multi,
     choose_moe,
     choose_spec,
+    decode_workload,
+    interleave_workload,
     moe_argv,
     moe_strategies_for,
     render_script_multi,
@@ -34,10 +36,12 @@ from freetoken.calibrate_multi import (
 )
 
 
-def _score(label, stall, tps, base_stall=None, valid=True, ttft_short=1.0):
+def _score(label, stall, tps, base_stall=None, valid=True, ttft_short=1.0, decode_tps=0.0,
+           interleave_tps=0.0):
     return MultiScore(label=label, env={}, stall_worst=stall, stall_count=1,
                       stall_secs=stall, ttft_long=5.0, ttft_short=ttft_short,
-                      out_tps=tps, tokens=1000, wall=10.0, valid=valid)
+                      out_tps=tps, tokens=1000, wall=10.0, valid=valid,
+                      decode_tps=decode_tps, interleave_tps=interleave_tps)
 
 
 def test_winner_env_is_the_full_knob_set_with_explicit_zeros():
@@ -87,6 +91,39 @@ def test_choose_multi_prefers_the_lower_short_ttft_arm_inside_a_tie():
     assert label == "piped-sf"
 
 
+def test_choose_multi_rejects_a_decode_regression_the_staggered_wall_hid():
+    # piped wins the stall contract and keeps 88% of the staggered tps, but the
+    # decode-only probe shows the fast-path cost (200 -> 170): the production regime
+    # regresses, so the arm must not win
+    scores = [_score("none", 3.8, 51.0, decode_tps=200.0),
+              _score("piped", 0.1, 45.0, decode_tps=170.0)]
+    label, note = choose_multi(scores)
+    assert label == "none" and "decode-only" in note and "170.0" in note
+    # within the noise band the stall win stands
+    scores[1] = _score("piped", 0.1, 45.0, decode_tps=195.0)
+    assert choose_multi(scores)[0] == "piped"
+    # a decode-safe candidate still wins when another arm regresses
+    scores = [_score("none", 3.8, 51.0, decode_tps=200.0),
+              _score("piped", 0.1, 45.0, decode_tps=170.0),
+              _score("mixed", 1.0, 48.0, decode_tps=198.0)]
+    assert choose_multi(scores)[0] == "mixed"
+    # an unmeasured probe (old reports, excluded arms) cannot judge: old contract
+    scores = [_score("none", 3.8, 51.0), _score("piped", 0.1, 45.0)]
+    assert choose_multi(scores)[0] == "piped"
+
+
+def test_choose_multi_rejects_an_interleave_regression_with_neutral_decode():
+    # the dev-rig shape: pure decode is neutral under piped, but sharing the link with
+    # short chunks costs the staggered chat regime (132.7 -> 124.5 measured)
+    scores = [_score("none", 3.8, 51.0, decode_tps=169.0, interleave_tps=133.0),
+              _score("piped", 0.1, 45.0, decode_tps=167.5, interleave_tps=124.5)]
+    label, note = choose_multi(scores)
+    assert label == "none" and "short-interleave" in note and "124.5" in note
+    # both probes inside the band: the stall win stands
+    scores[1] = _score("piped", 0.1, 45.0, decode_tps=167.5, interleave_tps=130.0)
+    assert choose_multi(scores)[0] == "piped"
+
+
 def test_argv_with_port_keeps_speculative_and_rewrites_both_port_forms():
     argv = argv_with_port(["-m", "freetoken", "--speculative", "mtp", "--port", "1919",
                            "--port=1918", "--tp-size", "2"], 1921)
@@ -120,6 +157,28 @@ def test_workload_staggers_victims_and_one_aggressor():
     assert [it["at"] for it in items] == [0.0, 2.0, 4.0, 6.0]
     assert items[-1]["max_tokens"] == 128
     assert len(items[-1]["prompt"].split()) >= 16384
+
+
+def test_decode_workload_launches_everyone_together_without_an_aggressor():
+    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3}
+    items = decode_workload(cfg)
+    assert len(items) == cfg["victims"] + 1  # the full concurrency, incl. the aggressor slot
+    assert all(it["at"] == 0.0 for it in items)
+    assert all(it["max_tokens"] == 256 for it in items)
+    # short prompts: the probe is decode-dominated, not a second prefill benchmark
+    assert all(len(it["prompt"].split()) < 64 for it in items)
+
+
+def test_interleave_workload_is_the_bench_shape_without_the_aggressor():
+    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3}
+    items = interleave_workload(cfg)
+    assert len(items) == cfg["victims"] + 1
+    assert [it["at"] for it in items] == [0.0, 5.0, 10.0, 15.0]
+    assert all(it["max_tokens"] == 256 for it in items)
+    # ~1024-token prompts: the launcher bench's input length, not the 16k aggressor
+    assert all(900 <= len(it["prompt"].split()) <= 1100 for it in items)
+    # distinct prompts: a radix prefix hit would turn the probe into a cache test
+    assert len({it["prompt"] for it in items}) == len(items)
 
 
 def test_cli_dispatches_the_mode_without_breaking_the_bare_default(monkeypatch):
@@ -254,10 +313,11 @@ def test_argv_with_timings_adds_the_gate_once():
     assert once.count("--enable-timings-report") == 1
 
 
-def _spec_score(algo, tps, stall, valid=True):
+def _spec_score(algo, tps, stall, valid=True, decode_tps=0.0, interleave_tps=0.0):
     return MultiScore(label=f"spec-{algo}", env={}, stall_worst=stall, stall_count=0,
                       stall_secs=0.0, ttft_long=5.0, ttft_short=1.0, out_tps=tps,
-                      tokens=1000, wall=10.0, valid=valid, spec=algo)
+                      tokens=1000, wall=10.0, valid=valid, spec=algo,
+                      decode_tps=decode_tps, interleave_tps=interleave_tps)
 
 
 def test_choose_spec_needs_a_tps_gain_without_a_stall_regression():
@@ -276,6 +336,20 @@ def test_choose_spec_needs_a_tps_gain_without_a_stall_regression():
                            _spec_score("dflash", 60.0, 1.0)], base)
     assert algo == "dflash"
     assert choose_spec([], base)[0] is None
+
+
+def test_choose_spec_carries_the_decode_guard():
+    base = _score("none", 1.0, 50.0, decode_tps=200.0)
+    # +20% on the staggered wall but -10% on pure decode: the gain is aggressor-side,
+    # the decode regime regresses -> rejected
+    algo, note = choose_spec([_spec_score("mtp", 60.0, 1.0, decode_tps=180.0)], base)
+    assert algo is None and "decode-only" in note
+    algo, _ = choose_spec([_spec_score("mtp", 60.0, 1.0, decode_tps=210.0)], base)
+    assert algo == "mtp"
+    # the interleave probe guards the same way
+    base = _score("none", 1.0, 50.0, interleave_tps=133.0)
+    algo, note = choose_spec([_spec_score("mtp", 60.0, 1.0, interleave_tps=120.0)], base)
+    assert algo is None and "short-interleave" in note
 
 
 def test_score_window_uses_engine_gaps_for_magnitude_client_for_the_boundary():
@@ -318,10 +392,12 @@ def test_render_script_applies_the_spec_flags_only_when_applied():
     assert "--speculative-algorithm" not in off
 
 
-def _moe_score(strategy, tps, stall, valid=True, note=""):
+def _moe_score(strategy, tps, stall, valid=True, note="", decode_tps=0.0,
+               interleave_tps=0.0):
     return MultiScore(label=f"moe-{strategy}", env={}, stall_worst=stall, stall_count=0,
                       stall_secs=0.0, ttft_long=5.0, ttft_short=1.0, out_tps=tps,
-                      tokens=1000, wall=10.0, valid=valid, moe=strategy, note=note)
+                      tokens=1000, wall=10.0, valid=valid, moe=strategy, note=note,
+                      decode_tps=decode_tps, interleave_tps=interleave_tps)
 
 
 def test_strip_moe_args_removes_both_spellings_and_forms():
@@ -354,6 +430,20 @@ def test_choose_moe_needs_a_tps_gain_without_a_stall_regression():
                               _moe_score("offload", 55.0, 1.0)], base)
     assert strategy == "offload"
     assert choose_moe([], base)[0] is None
+
+
+def test_choose_moe_carries_the_decode_guard():
+    base = _score("none", 1.0, 50.0, decode_tps=200.0)
+    # hybrid can win the aggressor-shared wall on CPU compute while the pure-decode
+    # split regresses: the guard rejects it
+    strategy, note = choose_moe([_moe_score("hybrid", 60.0, 1.0, decode_tps=180.0)], base)
+    assert strategy is None and "decode-only" in note
+    strategy, _ = choose_moe([_moe_score("hybrid", 60.0, 1.0, decode_tps=210.0)], base)
+    assert strategy == "hybrid"
+    # the interleave probe guards the same way
+    base = _score("none", 1.0, 50.0, interleave_tps=133.0)
+    strategy, note = choose_moe([_moe_score("hybrid", 60.0, 1.0, interleave_tps=120.0)], base)
+    assert strategy is None and "short-interleave" in note
 
 
 def test_arm_active_checks_the_moe_strategy_marker():

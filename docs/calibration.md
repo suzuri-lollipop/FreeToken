@@ -248,6 +248,15 @@ tool stays greedy always: draft/verify acceptance is defined on argmax parity).
 
 An arm wins only when it cuts the worst inter-token stall by 0.5 s (or lands under the 0.5 s
 human threshold while the baseline is above it) and gives up at most 25% of aggregate tok/s.
+Every arm also runs two regime probes first, and the winner must keep at least 95% of the
+baseline's tok/s on each: a decode-only probe (victims+1 short requests launched together,
+fixed answers, no aggressor) and a short-interleave probe (the same requests with ~1024-token
+prompts admitted 5 s apart -- the launcher bench's shape). The staggered wall is
+aggressor-dominated, and piped structurally disables the decode fetch overlap (and, under TP,
+the shm one-shot all-reduce), so an arm can pass the loose staggered guard while regressing
+the decode-heavy traffic the profile actually serves; even where pure decode is neutral,
+sharing the link with short chunks costs the interleaved regime. The spec and MoE dimensions
+carry the same guards.
 Arms whose mechanism never activated - piping is refused while `--speculative` is armed, and the
 tool reads its own server log for the `piped prefill enabled` / `[chunktime] mix=` markers -
 are excluded with the reason in the report, not scored as if they ran. The winner's FULL knob
@@ -275,7 +284,8 @@ strips the profile's own `--speculative-*` flags so every arm starts from the sa
 
 Each spec arm runs with prefill off and is judged on aggregate throughput: it wins only when
 it adds at least 3% tok/s over the no-spec arm **and** does not worsen the worst inter-token
-stall by more than 0.1 s (speculation speeds decode; it must not freeze the running streams).
+stall by more than 0.1 s (speculation speeds decode; it must not freeze the running streams),
+while keeping both regime probes within 5% of the base.
 The winner is then stacked on the prefill winner in a combo arm, kept only when it holds the
 throughput win and does not regress the prefill winner's stall. The report's `chosen.spec`
 carries `algorithm`, `argv`, `applied`, `compatible`, and the gains; the start script adds the
@@ -303,7 +313,7 @@ comma list) picks a subset. The profile's own `--moe-strategy` / `--moe-backend`
 stripped so every arm starts from the same `auto` baseline. Each strategy arm runs with
 prefill and speculation off and is judged like a spec arm: it wins only when it adds at
 least 3% aggregate tok/s over the base arm without worsening the worst inter-token stall
-by more than 0.1 s. The winner's `--moe-strategy` goes into `chosen.moe.argv` in the
+by more than 0.1 s, while keeping both regime probes within 5% of the base. The winner's `--moe-strategy` goes into `chosen.moe.argv` in the
 report and into the generated start script; when a prefill or spec winner exists, a combo
 arm verifies the strategy stacks on it (no regression of the stack's own throughput or
 stall) before `applied` is set. The launcher's multi calibration writes an applied
