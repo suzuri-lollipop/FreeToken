@@ -1006,7 +1006,13 @@ def _arg_value(argv: list[str], flag: str) -> str | None:
     try:
         return argv[argv.index(flag) + 1]
     except (ValueError, IndexError):
-        return None
+        pass
+    # the --flag=value spelling is equally valid CLI syntax
+    prefix = flag + "="
+    for tok in argv:
+        if isinstance(tok, str) and tok.startswith(prefix):
+            return tok[len(prefix):]
+    return None
 
 
 def lookup_worth_keeping(gain_at_parallel: float) -> bool:

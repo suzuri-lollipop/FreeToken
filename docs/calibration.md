@@ -249,9 +249,12 @@ tool stays greedy always: draft/verify acceptance is defined on argmax parity).
 An arm wins only when it cuts the worst inter-token stall by 0.5 s (or lands under the 0.5 s
 human threshold while the baseline is above it) and gives up at most 25% of aggregate tok/s.
 Every arm also runs two regime probes first, and the winner must keep at least 95% of the
-baseline's tok/s on each: a decode-only probe (victims+1 short requests launched together,
-fixed answers, no aggressor) and a short-interleave probe (the same requests with ~1024-token
-prompts admitted 5 s apart -- the launcher bench's shape). The staggered wall is
+baseline's tok/s on each: a decode-only probe (one short request per running slot -- the
+profile's full `--max-running-requests`, launched together, fixed answers, no aggressor) and
+a short-interleave probe (the same slots with ~1024-token prompts admitted 5 s apart -- the
+launcher bench's gap -- with 1024-token answers). The probes' batch is the
+report's `workload.concurrency`; the staggered workload keeps its capped victim count
+(`workload.victims`). The staggered wall is
 aggressor-dominated, and piped structurally disables the decode fetch overlap (and, under TP,
 the shm one-shot all-reduce), so an arm can pass the loose staggered guard while regressing
 the decode-heavy traffic the profile actually serves; even where pure decode is neutral,

@@ -32,9 +32,11 @@ feature -- so only a catastrophic loss (a link too slow to share) rejects an arm
 
 Every arm also runs two regime probes BEFORE the staggered workload, and a winner must keep
 its aggregate tok/s within the probe's tolerance of the baseline's: a decode-only probe
-(victims+1 short requests launched together, fixed answers, no aggressor;
-DECODE_TPS_LOSS_MAX) and a short-interleave probe (victims+1 requests with ~1024-token
-prompts admitted 5 s apart -- the launcher bench's shape; INTERLEAVE_TPS_LOSS_MAX). The
+(one short request per running slot -- the profile's full --max-running-requests, not the
+staggered workload's capped victims -- launched together, fixed answers, no aggressor;
+DECODE_TPS_LOSS_MAX) and a short-interleave probe (the same slots with ~1024-token prompts
+admitted 5 s apart -- the launcher bench's gap -- with 1024-token answers;
+INTERLEAVE_TPS_LOSS_MAX). The
 staggered wall is aggressor-dominated, so the loose guard above can pass an arm that
 regresses the traffic a profile actually serves: piped prefill structurally disables the
 decode fetch overlap (single-writer staging) and, under TP, the shm one-shot all-reduce --
@@ -475,26 +477,32 @@ def run_workload(server: Server, model: str, items: list[dict],
 
 
 def decode_workload(cfg: dict) -> list[dict]:
-    """The decode-only probe: victims+1 short requests, all launched together, fixed
-    answers, no aggressor. After the brief prefill ramp every step is a concurrent
-    decode -- the regime long-answer traffic lives in, which the staggered workload's
+    """The decode-only probe: one short request per running slot (the profile's full
+    --max-running-requests), all launched together, fixed answers, no aggressor. After
+    the brief prefill ramp every step is a concurrent decode at the served batch -- the
+    regime long-answer traffic lives in, which the staggered workload's
     aggressor-dominated wall does not score."""
+    n = cfg.get("concurrency") or cfg["victims"] + 1
     return [{"prompt": f"Repeat after me exactly: decode probe {i}. Then count "
                        + _syllables(24),
              "max_tokens": cfg["out"], "at": 0.0}
-            for i in range(cfg["victims"] + 1)]
+            for i in range(n)]
 
 
 def interleave_workload(cfg: dict) -> list[dict]:
-    """The short-interleave probe: victims+1 ~1024-token prompts admitted 5 s apart,
-    fixed answers -- the launcher bench's shape (staggered chat traffic, no 16k
-    aggressor). Scores what sharing the machine with short chunks costs the running
-    decodes, which neither the decode-only probe nor the aggressor wall isolates."""
+    """The short-interleave probe: one ~1024-token prompt per running slot, admitted
+    5 s apart (the launcher bench's gap) with 1024-token answers -- staggered chat
+    traffic into a decoding batch, no 16k aggressor. The spacing matches the bench:
+    a tighter 1 s spacing piles the prefills up and flatters piped, which is not the
+    regime the profile serves. The decode-only probe covers the full-batch steady
+    state; this one scores what sharing the machine with short chunks costs the
+    running decodes at the bench's arrival cadence."""
     # per-request seed: identical prompts would radix-hit and turn the probe into a
     # cache test (the launcher bench varies its seed for the same reason)
+    n = cfg.get("concurrency") or cfg["victims"] + 1
     return [{"prompt": "Summarize this text: " + _syllables(1010, seed=100 + i),
-             "max_tokens": cfg["out"], "at": 5.0 * i}
-            for i in range(cfg["victims"] + 1)]
+             "max_tokens": 1024, "at": 5.0 * i}
+            for i in range(n)]
 
 
 def run_concurrent_probe(server: Server, model: str, items: list[dict],
@@ -846,12 +854,25 @@ def victims_from_spec(spec: dict, default: int = 3) -> int:
     return max(1, min(default, mrr - 1))
 
 
+def concurrency_from_spec(spec: dict, default: int = 4) -> int:
+    """The profile's full --max-running-requests. The regime probes score the batch
+    the profile actually serves: the staggered workload caps its victims at 3, but an
+    8-parallel profile decodes at bs8, and the fast-path cost scales with the batch."""
+    raw = _arg_value(list(spec.get("argv") or []), "--max-running-requests")
+    try:
+        mrr = int(raw) if raw else default
+    except ValueError:
+        mrr = default
+    return max(1, mrr)
+
+
 def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     out_dir = Path(a.out_dir).expanduser().resolve()
     log_dir = out_dir / "logs"
     cfg = {"short": 128, "long": 2048 if a.smoke else a.long,
            "out": 32 if a.smoke else a.out_tokens, "gap": 6.0,
-           "victims": victims_from_spec(spec)}
+           "victims": victims_from_spec(spec),
+           "concurrency": concurrency_from_spec(spec)}
     reps = 1 if (a.quick or a.smoke) else max(1, a.reps)
     arms = arms_for(spec, a.smoke)
     base_port = int(spec.get("port") or DEFAULT_PORT)

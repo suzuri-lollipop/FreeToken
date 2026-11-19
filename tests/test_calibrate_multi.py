@@ -20,6 +20,7 @@ from freetoken.calibrate_multi import (
     choose_multi,
     choose_moe,
     choose_spec,
+    concurrency_from_spec,
     decode_workload,
     interleave_workload,
     moe_argv,
@@ -160,25 +161,43 @@ def test_workload_staggers_victims_and_one_aggressor():
 
 
 def test_decode_workload_launches_everyone_together_without_an_aggressor():
-    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3}
+    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3,
+           "concurrency": 4}
     items = decode_workload(cfg)
-    assert len(items) == cfg["victims"] + 1  # the full concurrency, incl. the aggressor slot
+    assert len(items) == 4
     assert all(it["at"] == 0.0 for it in items)
     assert all(it["max_tokens"] == 256 for it in items)
     # short prompts: the probe is decode-dominated, not a second prefill benchmark
     assert all(len(it["prompt"].split()) < 64 for it in items)
+    # the probe batch follows the profile concurrency, not the capped victim count
+    assert len(decode_workload({**cfg, "concurrency": 8})) == 8
+    # a cfg without concurrency (old reports) falls back to victims+1
+    assert len(decode_workload({"victims": 3, "out": 256})) == 4
 
 
-def test_interleave_workload_is_the_bench_shape_without_the_aggressor():
-    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3}
+def test_interleave_workload_matches_the_bench_cadence_at_the_profile_concurrency():
+    cfg = {"short": 128, "long": 16384, "out": 256, "gap": 6.0, "victims": 3,
+           "concurrency": 4}
     items = interleave_workload(cfg)
-    assert len(items) == cfg["victims"] + 1
+    assert len(items) == 4
+    # the launcher bench's 5 s gap: a tighter spacing piles prefills up and flatters
+    # piped, which is not the regime the profile serves
     assert [it["at"] for it in items] == [0.0, 5.0, 10.0, 15.0]
-    assert all(it["max_tokens"] == 256 for it in items)
+    assert all(it["max_tokens"] == 1024 for it in items)
     # ~1024-token prompts: the launcher bench's input length, not the 16k aggressor
     assert all(900 <= len(it["prompt"].split()) <= 1100 for it in items)
     # distinct prompts: a radix prefix hit would turn the probe into a cache test
     assert len({it["prompt"] for it in items}) == len(items)
+    assert len(interleave_workload({**cfg, "concurrency": 8})) == 8
+
+
+def test_concurrency_from_spec_reads_the_full_max_running_requests():
+    assert concurrency_from_spec({"argv": ["--max-running-requests", "8"]}) == 8
+    assert concurrency_from_spec({"argv": ["--max-running-requests=8"]}) == 8
+    assert concurrency_from_spec({"argv": []}) == 4
+    assert concurrency_from_spec({"argv": ["--max-running-requests", "1"]}) == 1
+    # the staggered workload's victims stay capped; the regime probes do not
+    assert victims_from_spec({"argv": ["--max-running-requests", "8"]}) == 3
 
 
 def test_cli_dispatches_the_mode_without_breaking_the_bare_default(monkeypatch):
