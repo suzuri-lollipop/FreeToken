@@ -321,6 +321,139 @@ def test_interleaved_decode_keeps_residency_across_chunk_invalidation():
     assert int(cache.slot_for_id[0, 0].item()) == slot
 
 
+def test_dedicated_staging_keeps_decode_out_of_the_staging_region():
+    # Piped prefill runs a chunk concurrently with decode replays for the whole chunk.
+    # The borrowed staging scheme (pools share the bank base with the double buffer)
+    # then races: under per-layer pools sized <= num_experts the borrowed slots are
+    # evict-first (depriable = max(size - E, 0) = 0), so decode admits misses into the
+    # very bytes the chunk's staging gather writes -- torn expert rows, garbage logits
+    # (broken text, early EOS). Dedicated staging shifts the pools past the staging
+    # region so no slot is ever borrowed. Reverting the pool-offset shift or the
+    # dedicated bank growth turns this red: decode lands back in the staging region.
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+    E = 4
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, dtype=torch.bfloat16) for _ in range(2)],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16) for _ in range(2)],
+    }
+
+    def build(dedicated):
+        c = OffloadMoeCache(
+            num_layers=2, num_experts=E, cache_size=8, device=torch.device("cpu"),
+            prefill_overlap=True, pool_of_layer=[0, 1], pool_sizes=[4, 4],
+            dedicated_staging=dedicated,
+        )
+        c.set_bank_sources({k: [t.clone() for t in v] for k, v in sources.items()})
+        return c
+
+    ded = build(True)
+    # every pool sits entirely after the two staging buffers, in every bank
+    for k in range(len(ded.banks)):
+        for p in range(len(ded.pool_sizes)):
+            assert ded._pool_offsets[k][p] >= 2 * ded._stage_bytes[k]
+    assert ded._pool_stable_from == [0, 0]
+    assert all(s == slice(0, 0) for s in ded._inval)
+    # invalidation is a no-op: slot 0 is a real pool slot now, not a borrowed one
+    ded.id_of_slot[0] = 0
+    ded.slot_for_id[0, 0] = 0
+    ded._invalidate_prefill_buffer(0, 0)
+    assert int(ded.id_of_slot[0].item()) == 0
+
+    # decode admits into pool storage disjoint from staging
+    ids = torch.tensor([[0]], dtype=torch.int32)
+    ensure_experts_hybrid(ded, 0, ids, torch.ones_like(ids, dtype=torch.float32), 4, 0.0)
+    local = int(ded.slot_for_id[0, 0].item())
+    assert local >= 0
+    pool = ded.pool_of_layer[0]
+    for k in range(len(ded.banks)):
+        row = ded._row_bytes[ded._pool_layout(pool)][k]
+        assert ded._pool_offsets[k][pool] + local * row >= 2 * ded._stage_bytes[k], (
+            "decode admitted into the staging region"
+        )
+
+    # staging writes and pool writes do not clobber each other
+    for buf in range(2):
+        for view in ded.stage_views(0, buf):
+            view.fill_(7.0)
+    pview = ded.pool_bank_views(0)
+    for view in pview:
+        view[local].fill_(3.0)
+    for buf in range(2):
+        for view in ded.stage_views(0, buf):
+            assert torch.all(view == 7.0), "pool write clobbered staging"
+    for view in pview:
+        assert torch.all(view[local] == 3.0), "staging write clobbered the pool slot"
+
+    # the borrowing layout this replaces structurally overlaps pool 0 with staging
+    # under these small per-layer pools -- the hazard dedicated staging removes
+    bor = build(False)
+    assert bor._pool_stable_from[0] > 0
+    assert any(bor._pool_offsets[k][0] < 2 * bor._stage_bytes[k] for k in range(len(bor.banks)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dedicated_staging_interleaved_decode_and_prefill_stay_coherent():
+    # GPU counterpart under per-layer pools sized <= num_experts (evict-first when
+    # borrowed): interleaved decode fetches and whole-layer prefill staging must keep
+    # every resident row intact. Under borrowing the staging gather clobbers decode's
+    # rows here; dedicated staging keeps the regions disjoint. A revert turns the
+    # resident-row check red.
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, top_k = 4, 8, 4
+    sources = {
+        "gate_up": [torch.randn(E, 1024, 256, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+        "down": [torch.randn(E, 512, 256, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=32, device=torch.device("cuda"),
+        prefill_overlap=True, pool_of_layer=[0, 1, 2, 3], pool_sizes=[8, 8, 8, 8],
+        dedicated_staging=True,
+    )
+    cache.set_bank_sources(sources)
+    assert cache._pool_stable_from == [0, 0, 0, 0]
+
+    def check_resident():
+        torch.cuda.synchronize()
+        for layer in range(L):
+            for e, s in enumerate(cache.slot_for_id[layer].tolist()):
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                        assert torch.equal(view[s].cpu(), src[layer][e]), (layer, e, s)
+
+    def decode(steps):
+        for _ in range(steps):
+            for layer in range(L):
+                cache.ensure_experts(layer, torch.randperm(E)[:top_k].to(torch.int32).view(1, top_k).cuda())
+                cache.copy_missing()
+        check_resident()
+
+    decode(10)
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        views = cache.wait_prefill_layer(layer)
+        torch.cuda.synchronize()
+        for (src, _), view in zip(cache.banks, views):
+            assert torch.equal(view.cpu(), src[layer])
+        cache.release_prefill_layer(layer)
+    check_resident()
+    decode(10)
+    # no decode slot's storage lies in the staging region
+    for layer in range(L):
+        pool = cache.pool_of_layer[layer]
+        for s in cache.slot_for_id[layer].tolist():
+            if s >= 0:
+                for k in range(len(cache.banks)):
+                    row = cache._row_bytes[cache._pool_layout(pool)][k]
+                    assert cache._pool_offsets[k][pool] + s * row >= 2 * cache._stage_bytes[k]
+
+
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
