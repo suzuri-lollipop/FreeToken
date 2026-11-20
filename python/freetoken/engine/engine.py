@@ -1396,6 +1396,9 @@ class Engine:
         spec_fixed, draft_page = self._spec_budget(config)
         fixed_cache_size += spec_fixed
         cache_per_page += draft_page
+        # dedicated piped staging is a fixed VRAM cost outside the slot budget; include
+        # it before the cross-rank MAX so the solved KV geometry stays rank-identical
+        fixed_cache_size += getattr(self, "_moe_staging_reserve_bytes", 0)
         num_experts = config.model_config.num_experts
         num_moe_layers = config.model_config.num_moe_layers
         total_experts = num_moe_layers * num_experts
@@ -1700,6 +1703,15 @@ class Engine:
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
+        # piped dedicated staging reserves its own VRAM outside the slot pools; account
+        # for it in every sizing path (auto budget, --moe-cache-mem fit, pool-byte targets)
+        from freetoken.engine.cache_budget import dedicated_staging_bytes
+
+        self._moe_staging_reserve_bytes = (
+            dedicated_staging_bytes(banks.sources, config.model_config.num_experts)
+            if self.piped_prefill
+            else 0
+        )
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
         locked_fetch = staging is not None
         layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
@@ -1820,6 +1832,7 @@ class Engine:
             decode_fetch_overlap=(
                 False if self.piped_prefill else config.decode_fetch_overlap
             ),
+            dedicated_staging=self.piped_prefill,
             quant_format=banks.quant_format,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -2078,7 +2091,10 @@ class Engine:
         return decode_target, split_residency
 
     def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
-        return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
+        # the dedicated piped staging region is part of the bank footprint, not the slots
+        return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes)) + getattr(
+            self, "_moe_staging_reserve_bytes", 0
+        )
 
     def _moe_pools(self, batch: int) -> list:
         """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
