@@ -19,7 +19,8 @@ Commands:
   profile     Write or inspect an expert profile (FTXP; see --moe-bank-profile)
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
   calibrate   Measure on this PC; write config + start script. "single" (default) tunes
-              --speculative lookup; "multi" tunes concurrent prefill (piped/mixed)
+              --speculative lookup; "multi" maximizes concurrent tok/s at the profile's
+              --max-running-requests (piped/mixed prefill, spec, MoE)
 
 Use "ft <command> --help" for command-specific options.
 Use "ft --version" to print the FreeToken version.""",

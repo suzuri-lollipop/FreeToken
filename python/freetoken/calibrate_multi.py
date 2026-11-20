@@ -1,53 +1,56 @@
-"""Tune the concurrent-prefill knobs (FREETOKEN_PIPED_PREFILL / MIXED / ADMIT_*) for THIS PC.
+"""Tune the concurrent-serving knobs (FREETOKEN_PIPED_PREFILL / MIXED / ADMIT_*) for THIS PC.
 
 The single-stream calibrator (`calibrate_lookup`) makes one request fast. This one makes
-MANY requests fast together: while a long prompt is being prefilled, do the running
-decodes keep streaming? The mechanism is machine-dependent in exactly the way lookup's
-width is -- chunk cost, PCIe share between prefill and decode expert streaming, and the
-stream priorities all decide whether piping pays here -- so the tool measures the real
-server on this PC instead of trusting the defaults measured on one box.
+MANY requests fast together: it maximizes the aggregate tok/s of the profile's FULL
+concurrent batch (--max-running-requests), and keeps a long prefill from freezing the
+running decodes. The mechanism is machine-dependent in exactly the way lookup's width
+is -- chunk cost, PCIe share between prefill and decode expert streaming, and the stream
+priorities all decide whether piping pays here -- so the tool measures the real server
+on this PC instead of trusting the defaults measured on one box.
 
 Arms are probed at the server's PRODUCTION sampling by default (the request omits
 temperature, so sampling_defaults=model and the high-temperature guard apply exactly as
 they do for real traffic); --temperature 0.0 switches to deterministic greedy, whose
 lower variance suits a re-run that must diff against an older report.
 
-Every arm answers the SAME staggered workload:
+Every arm answers the SAME three workloads:
 
-  - `victims` short greedy requests (a 128-token prompt, a fixed 256-token answer)
-    launched 2 s apart, then ONE long aggressor (a 16384-token prompt) 6 s in, while
-    the victims are mid-decode;
-  - what is scored: the worst inter-token gap of the victims AFTER the aggressor is
-    admitted (the stall a human feels), the aggressor's TTFT, and aggregate tok/s;
+  - two regime probes at the profile's FULL --max-running-requests, run BEFORE the
+    staggered workload: a decode-only probe (one short request per running slot,
+    launched together, fixed answers, no aggressor) and a short-interleave probe (the
+    same slots with ~1024-token prompts admitted 5 s apart -- the launcher bench's gap
+    -- with 1024-token answers). Their MEAN aggregate tok/s is the selection score:
+    the batch the profile actually serves, steady decode and mixed short-chat traffic
+    alike;
+  - a staggered workload for the stall guard: `victims` short requests (a 128-token
+    prompt, a fixed 256-token answer) launched 2 s apart, then ONE long aggressor (a
+    16384-token prompt) 6 s in, while the victims are mid-decode. It measures the worst
+    inter-token gap of the victims AFTER the aggressor is admitted (the stall a human
+    feels) and the aggressor's TTFT. Victims stay capped at 3: the aggressor stall is
+    per-stream, and the full-batch cost is the regime probes' job;
   - the arms: `none` (the inline prefill/decode interleave), `mixed` (decode rows ride
     the chunk's forward, FREETOKEN_MIXED_PREFILL_TOKENS=1024), `piped` (chunks run on a
     worker thread and a side stream while decode replays keep the high-priority engine
     stream), and `piped-sf` (piping plus short-first admission).
 
-A candidate wins only when it cuts the worst stall by at least STALL_GAIN_S (or lands
-below the human-perceptible STALL_FLOOR while the baseline is above it) AND gives up at
-most TPS_LOSS_MAX of aggregate throughput. The throughput guard is deliberately loose:
-concurrency trades prompt-side throughput for the running streams' gaps -- that is the
-feature -- so only a catastrophic loss (a link too slow to share) rejects an arm.
+A candidate wins only when it adds at least TPS_MIN_GAIN mean regime tok/s over the
+baseline AND does not worsen the worst staggered stall by more than MULTI_STALL_TOL.
+Each regime also keeps a floor of the baseline's tok/s (DECODE_TPS_LOSS_MAX /
+INTERLEAVE_TPS_LOSS_MAX), so an arm cannot buy a mean win by regressing one regime.
+The staggered wall's own tok/s is reported but never selects: it is aggressor-dominated
+and capped at 3 victims, so it does not measure the batch the profile serves.
 
-Every arm also runs two regime probes BEFORE the staggered workload, and a winner must keep
-its aggregate tok/s within the probe's tolerance of the baseline's: a decode-only probe
-(one short request per running slot -- the profile's full --max-running-requests, not the
-staggered workload's capped victims -- launched together, fixed answers, no aggressor;
-DECODE_TPS_LOSS_MAX) and a short-interleave probe (the same slots with ~1024-token prompts
-admitted 5 s apart -- the launcher bench's gap -- with 1024-token answers;
-INTERLEAVE_TPS_LOSS_MAX). The
-staggered wall is aggressor-dominated, so the loose guard above can pass an arm that
-regresses the traffic a profile actually serves: piped prefill structurally disables the
-decode fetch overlap (single-writer staging) and, under TP, the shm one-shot all-reduce --
-on a fast-link rig that cost lands on EVERY decode step -- and even where decode is
-neutral, sharing the link with short chunks costs the interleaved regime (reported: a
-200+ tok/s production rig dropped below 200 after piped won the calibration). The spec and
-MoE dimensions carry the same guards.
+Why the probes select instead of the staggered wall: piped prefill structurally disables
+the decode fetch overlap (single-writer staging) and, under TP, the shm one-shot
+all-reduce -- on a fast-link rig that cost lands on EVERY decode step -- and even where
+decode is neutral, sharing the link with short chunks costs the interleaved regime
+(reported: a 200+ tok/s production rig dropped below 200 after piped won a stall-first
+calibration whose staggered wall had shown +17.7% tok/s). The spec and MoE dimensions
+carry the same score and guards.
 
 A second dimension compares speculative backends (--spec, default auto = mtp + dflash;
-dflash needs a draft checkpoint). Each spec arm runs with prefill off and wins on
-aggregate tok/s (>= SPEC_MIN_GAIN) without worsening the worst stall by more than
+dflash needs a draft checkpoint). Each spec arm runs with prefill off and wins on the
+same mean regime tok/s (>= SPEC_MIN_GAIN) without worsening the worst stall by more than
 SPEC_STALL_TOL. The winner is then stacked on the prefill winner in a combo arm: under
 piped the engine refuses speculation (spec verify shares the PLE/plan staging with the
 pipe's chunk -- Strata lifts this with STRATA_PIPED_MTP, this port has not yet), so the
@@ -132,14 +135,18 @@ ARMS: list[tuple[str, dict[str, str]]] = [
     ("piped-sf", {"FREETOKEN_PIPED_PREFILL": "1",
                   "FREETOKEN_ADMIT_SHORT_FIRST": "1024"}),
 ]
-STALL_GAIN_S = 0.5
-STALL_FLOOR_S = 0.5
-TPS_LOSS_MAX = 0.25
-# decode-only probe guard: a winner keeps at least this share of the baseline's
+# Selection score: the mean aggregate tok/s of the two full-concurrency regime probes
+# (regime_tps). A prefill arm must add at least this much over the baseline -- the same
+# 3% bar as the spec/MoE dimensions, above the probes' rep-median noise.
+TPS_MIN_GAIN = 0.03
+# ...and must not worsen the worst staggered stall by more than this (the spec/MoE bar):
+# throughput is the objective, but an arm that freezes the running streams is not a win.
+MULTI_STALL_TOL = 0.1
+# decode-only probe floor: a winner keeps at least this share of the baseline's
 # concurrent decode tok/s. 5% covers probe noise; a real fast-path loss (piped's
 # fetch-overlap / shm-AR disable) is larger and must reject the arm, not pass it.
 DECODE_TPS_LOSS_MAX = 0.05
-# short-interleave probe guard: same contract for the staggered short-prompt regime
+# short-interleave probe floor: same contract for the staggered short-prompt regime
 # (the launcher bench's shape). Even where pure decode is neutral, sharing the link
 # with concurrent chunks costs here; measured -6% on the 2x gen3 dev rig.
 INTERLEAVE_TPS_LOSS_MAX = 0.05
@@ -507,8 +514,9 @@ def interleave_workload(cfg: dict) -> list[dict]:
 
 def run_concurrent_probe(server: Server, model: str, items: list[dict],
                          prefix: str, temperature: float | None = None) -> dict:
-    """Launch one regime probe; score aggregate tok/s plus the worst inter-token gap
-    (a smoothness diagnostic, not a selection input). prefix names the report keys."""
+    """Launch one regime probe; score aggregate tok/s (the selection score's input)
+    plus the worst inter-token gap (a smoothness diagnostic, not a selection input).
+    prefix names the report keys."""
     t_start = time.perf_counter()
     results: list[dict | None] = [None] * len(items)
 
@@ -586,6 +594,13 @@ class MultiScore:
                 f"tps={self.out_tps:6.1f} dec={self.decode_tps:6.1f} "
                 f"ilv={self.interleave_tps:6.1f}"
                 + (f"  [{self.note}]" if self.note else ""))
+
+
+def regime_tps(s: MultiScore) -> float:
+    """The selection score: mean aggregate tok/s of the two full-concurrency regime
+    probes. The staggered wall (out_tps) is aggressor-dominated and capped at 3
+    victims, so it measures the stall, not the batch the profile serves."""
+    return (s.decode_tps + s.interleave_tps) / 2.0
 
 
 def arm_active(label: str, log_text: str) -> tuple[bool, str]:
@@ -678,8 +693,9 @@ def evaluate_multi(spec: dict, label: str, env: dict[str, str], cfg: dict,
                 _stream_chat(server, model, "Repeat after me exactly: warm up.", 16,
                              time.perf_counter(), 0.0, timeout=WARMUP_TIMEOUT,
                              temperature=temperature)
-                print(f"    {label}: running the staggered workload "
-                      f"({len(items)} requests x {max(1, reps)} reps)", flush=True)
+                print(f"    {label}: running the regime probes + staggered workload "
+                      f"({len(ditems)}-slot probes, {len(items)} staggered requests "
+                      f"x {max(1, reps)} reps)", flush=True)
                 for _ in range(max(1, reps)):
                     # regime probes first: they score the clean-cache steady decode and
                     # the short-interleave regime, before the aggressor fills the cache
@@ -756,69 +772,79 @@ def _regime_guard(cands: list[MultiScore], base: MultiScore) -> tuple[list[Multi
 
 
 def choose_multi(scores: list[MultiScore]) -> tuple[str, str]:
-    """The selection contract (see module docstring). Pure so the unit tests pin it."""
+    """The selection contract (see module docstring): the highest mean regime tok/s at
+    the profile's full concurrency wins, provided the gain clears TPS_MIN_GAIN and the
+    worst staggered stall does not worsen beyond MULTI_STALL_TOL. Pure so the unit
+    tests pin it."""
     by = {s.label: s for s in scores}
     base = by["none"]
-    cands = [s for s in scores if s.label != "none" and s.valid]
+    cands = [s for s in scores if s.label != "none" and s.valid and regime_tps(s) > 0]
     if not cands:
         return "none", "no concurrency arm activated on this machine"
     cands, dnote = _regime_guard(cands, base)
     if not cands:
         return "none", dnote
-    best = min(cands, key=lambda s: (round(s.stall_worst / TIE_S), -s.out_tps, s.ttft_short))
-    gained = base.stall_worst - best.stall_worst
-    floor_win = best.stall_worst <= STALL_FLOOR_S and base.stall_worst > STALL_FLOOR_S
-    if not (gained >= STALL_GAIN_S or floor_win):
-        return "none", (f"{best.label} cuts the worst stall only {gained:.2f}s "
-                        f"(need {STALL_GAIN_S}s or sub-{STALL_FLOOR_S}s floor)")
-    if best.out_tps < base.out_tps * (1 - TPS_LOSS_MAX):
-        return "none", (f"{best.label} costs {100 * (1 - best.out_tps / base.out_tps):.0f}% "
-                        f"aggregate throughput (max {100 * TPS_LOSS_MAX:.0f}%)")
-    return best.label, (f"worst stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s, "
-                        f"tps {base.out_tps:.1f} -> {best.out_tps:.1f}")
+    best = max(cands, key=lambda s: (regime_tps(s), -s.stall_worst, -s.ttft_short))
+    base_tps = regime_tps(base)
+    gain = regime_tps(best) / base_tps - 1 if base_tps > 0 else 0.0
+    if gain < TPS_MIN_GAIN:
+        return "none", (f"{best.label} adds only {100 * gain:.1f}% concurrent tok/s "
+                        f"(need {100 * TPS_MIN_GAIN:.0f}%)")
+    if best.stall_worst > base.stall_worst + MULTI_STALL_TOL:
+        return "none", (f"{best.label} worsens the worst stall {base.stall_worst:.2f}s -> "
+                        f"{best.stall_worst:.2f}s (max +{MULTI_STALL_TOL}s)")
+    return best.label, (f"concurrent tok/s {base_tps:.1f} -> {regime_tps(best):.1f} "
+                        f"(+{100 * gain:.1f}%), stall {base.stall_worst:.2f}s -> "
+                        f"{best.stall_worst:.2f}s")
 
 
 def choose_spec(spec_scores: list[MultiScore], base: MultiScore) -> tuple[str | None, str]:
     """The spec dimension's contract: a backend wins when it adds >= SPEC_MIN_GAIN
-    aggregate tok/s over the no-spec arm AND does not worsen the worst stall by more
+    mean regime tok/s over the no-spec arm AND does not worsen the worst stall by more
     than SPEC_STALL_TOL (spec speeds decode; it must not freeze the running streams).
     Pure so the unit tests pin it. Returns (algo, note)."""
-    cands = [s for s in spec_scores if s.valid and s.spec and s.out_tps > 0]
+    cands = [s for s in spec_scores if s.valid and s.spec and regime_tps(s) > 0]
     if not cands:
         return None, "no speculative arm activated on this machine"
     cands, dnote = _regime_guard(cands, base)
     if not cands:
         return None, dnote
-    best = max(cands, key=lambda s: s.out_tps)
-    gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
+    best = max(cands, key=regime_tps)
+    base_tps = regime_tps(base)
+    gain = regime_tps(best) / base_tps - 1 if base_tps > 0 else 0.0
     if gain < SPEC_MIN_GAIN:
-        return None, f"{best.spec} adds only {100 * gain:.1f}% tok/s (need {100 * SPEC_MIN_GAIN:.0f}%)"
+        return None, (f"{best.spec} adds only {100 * gain:.1f}% concurrent tok/s "
+                      f"(need {100 * SPEC_MIN_GAIN:.0f}%)")
     if best.stall_worst > base.stall_worst + SPEC_STALL_TOL:
         return None, (f"{best.spec} worsens the worst stall {base.stall_worst:.2f}s -> "
                       f"{best.stall_worst:.2f}s (max +{SPEC_STALL_TOL}s)")
-    return best.spec, (f"tok/s {base.out_tps:.1f} -> {best.out_tps:.1f} (+{100 * gain:.1f}%), "
+    return best.spec, (f"concurrent tok/s {base_tps:.1f} -> {regime_tps(best):.1f} "
+                       f"(+{100 * gain:.1f}%), "
                        f"stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s")
 
 
 def choose_moe(moe_scores: list[MultiScore], base: MultiScore) -> tuple[str | None, str]:
     """The MoE dimension's contract: a strategy wins when it adds >= MOE_MIN_GAIN
-    aggregate tok/s over the base arm AND does not worsen the worst stall by more
+    mean regime tok/s over the base arm AND does not worsen the worst stall by more
     than MOE_STALL_TOL (hybrid trades PCIe misses for CPU compute; it must not freeze
     the running streams). Pure so the unit tests pin it. Returns (strategy, note)."""
-    cands = [s for s in moe_scores if s.valid and s.moe and s.out_tps > 0]
+    cands = [s for s in moe_scores if s.valid and s.moe and regime_tps(s) > 0]
     if not cands:
         return None, "no MoE strategy arm activated on this machine"
     cands, dnote = _regime_guard(cands, base)
     if not cands:
         return None, dnote
-    best = max(cands, key=lambda s: s.out_tps)
-    gain = best.out_tps / base.out_tps - 1 if base.out_tps > 0 else 0.0
+    best = max(cands, key=regime_tps)
+    base_tps = regime_tps(base)
+    gain = regime_tps(best) / base_tps - 1 if base_tps > 0 else 0.0
     if gain < MOE_MIN_GAIN:
-        return None, f"{best.moe} adds only {100 * gain:.1f}% tok/s (need {100 * MOE_MIN_GAIN:.0f}%)"
+        return None, (f"{best.moe} adds only {100 * gain:.1f}% concurrent tok/s "
+                      f"(need {100 * MOE_MIN_GAIN:.0f}%)")
     if best.stall_worst > base.stall_worst + MOE_STALL_TOL:
         return None, (f"{best.moe} worsens the worst stall {base.stall_worst:.2f}s -> "
                       f"{best.stall_worst:.2f}s (max +{MOE_STALL_TOL}s)")
-    return best.moe, (f"tok/s {base.out_tps:.1f} -> {best.out_tps:.1f} (+{100 * gain:.1f}%), "
+    return best.moe, (f"concurrent tok/s {base_tps:.1f} -> {regime_tps(best):.1f} "
+                      f"(+{100 * gain:.1f}%), "
                       f"stall {base.stall_worst:.2f}s -> {best.stall_worst:.2f}s")
 
 
@@ -942,13 +968,14 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
 
     salgo, snote = choose_spec(spec_scores, base)
     spec_chosen = {"algorithm": salgo, "argv": [], "applied": False, "compatible": False,
-                   "out_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": snote}
+                   "regime_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": snote}
     if salgo:
         sargs = spec_argv(salgo, draft_path, num_steps)
         sarm = next(s for s in spec_scores if s.spec == salgo)
-        spec_chosen.update(argv=sargs, out_tps=sarm.out_tps, stall_worst=sarm.stall_worst,
-                           gain_tps_pct=round(100 * (sarm.out_tps / base.out_tps - 1), 1)
-                           if base.out_tps > 0 else 0.0)
+        spec_chosen.update(argv=sargs, regime_tps=regime_tps(sarm),
+                           stall_worst=sarm.stall_worst,
+                           gain_tps_pct=round(100 * (regime_tps(sarm) / regime_tps(base) - 1), 1)
+                           if regime_tps(base) > 0 else 0.0)
         if label == "none":
             # no prefill winner: the spec arm itself is the launch
             spec_chosen.update(applied=True, compatible=True)
@@ -959,7 +986,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
             combo = measure(f"{label}+spec-{salgo}", winner_env(label), spec_args=sargs,
                             spec_algo=salgo, fatal=False)
             holds = (combo.valid
-                     and combo.out_tps >= sarm.out_tps * (1 - SPEC_COMBO_TPS_TOL)
+                     and regime_tps(combo) >= regime_tps(sarm) * (1 - SPEC_COMBO_TPS_TOL)
                      and combo.stall_worst <= by[label].stall_worst + TIE_S)
             spec_chosen.update(
                 applied=holds, compatible=combo.valid,
@@ -967,7 +994,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                       f"{salgo} wins alone but not beside {label}: "
                       f"{combo.note or 'combo regressed'}"))
             if holds:
-                spec_chosen.update(out_tps=combo.out_tps, stall_worst=combo.stall_worst)
+                spec_chosen.update(regime_tps=regime_tps(combo), stall_worst=combo.stall_worst)
 
     # --- MoE dimension (prefill off, speculation off): offload / hybrid on the same workload ---
     strategies = moe_strategies_for(getattr(a, "moe", "auto"))
@@ -991,13 +1018,14 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
 
     mstrategy, mnote = choose_moe(moe_scores, base)
     moe_chosen = {"strategy": mstrategy, "argv": [], "applied": False, "compatible": False,
-                  "out_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": mnote}
+                  "regime_tps": 0.0, "gain_tps_pct": 0.0, "stall_worst": 0.0, "note": mnote}
     if mstrategy:
         margs = moe_argv(mstrategy)
         marm = next(s for s in moe_scores if s.moe == mstrategy)
-        moe_chosen.update(argv=margs, out_tps=marm.out_tps, stall_worst=marm.stall_worst,
-                          gain_tps_pct=round(100 * (marm.out_tps / base.out_tps - 1), 1)
-                          if base.out_tps > 0 else 0.0)
+        moe_chosen.update(argv=margs, regime_tps=regime_tps(marm),
+                          stall_worst=marm.stall_worst,
+                          gain_tps_pct=round(100 * (regime_tps(marm) / regime_tps(base) - 1), 1)
+                          if regime_tps(base) > 0 else 0.0)
         if label == "none" and not spec_chosen["applied"]:
             # no other winner: the strategy arm itself is the launch
             moe_chosen.update(applied=True, compatible=True)
@@ -1005,8 +1033,8 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
             # verify the strategy stacks on the current winner stack (prefill env +
             # the spec flags when they were applied). The combo must not regress the
             # stack's own throughput/stall -- the gain itself was proven standalone.
-            ref_tps = spec_chosen["out_tps"] if spec_chosen["applied"] else (
-                by[label].out_tps if label != "none" else base.out_tps)
+            ref_tps = spec_chosen["regime_tps"] if spec_chosen["applied"] else (
+                regime_tps(by[label]) if label != "none" else regime_tps(base))
             ref_stall = spec_chosen["stall_worst"] if spec_chosen["applied"] else (
                 by[label].stall_worst if label != "none" else base.stall_worst)
             parts = ([label] if label != "none" else []) + (
@@ -1016,7 +1044,7 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                             spec_algo=salgo if spec_chosen["applied"] else None,
                             moe_args=margs, moe_strategy=mstrategy, fatal=False)
             holds = (combo.valid
-                     and combo.out_tps >= ref_tps * (1 - MOE_COMBO_TPS_TOL)
+                     and regime_tps(combo) >= ref_tps * (1 - MOE_COMBO_TPS_TOL)
                      and combo.stall_worst <= ref_stall + TIE_S)
             moe_chosen.update(
                 applied=holds, compatible=combo.valid,
@@ -1024,24 +1052,26 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                       f"{mstrategy} wins alone but regresses the {'+'.join(parts[:-1])} stack: "
                       f"{combo.note or 'combo regressed'}"))
             if holds:
-                moe_chosen.update(out_tps=combo.out_tps, stall_worst=combo.stall_worst)
+                moe_chosen.update(regime_tps=regime_tps(combo), stall_worst=combo.stall_worst)
 
     chosen = {
         "label": label, "env": winner_env(label), "note": note,
         "stall_worst": by[label].stall_worst, "out_tps": by[label].out_tps,
+        "regime_tps": regime_tps(by[label]), "base_regime_tps": regime_tps(base),
         "decode_tps": by[label].decode_tps, "base_decode_tps": base.decode_tps,
         "interleave_tps": by[label].interleave_tps,
         "base_interleave_tps": base.interleave_tps,
         "gain_stall_s": round(base.stall_worst - by[label].stall_worst, 2),
-        "gain_tps_pct": round(100 * (by[label].out_tps / base.out_tps - 1), 1)
-        if base.out_tps > 0 else 0.0,
+        "gain_tps_pct": round(100 * (regime_tps(by[label]) / regime_tps(base) - 1), 1)
+        if regime_tps(base) > 0 else 0.0,
         "spec": spec_chosen,
         "moe": moe_chosen,
     }
     return {
         "schema_version": 1, "backend": "freetoken-multi",
         "hardware": hardware(), "workload": {**cfg, "reps": reps},
-        "arms": [{k: v for k, v in s.__dict__.items() if k != "reps"} | {"env": s.env}
+        "arms": [{k: v for k, v in s.__dict__.items() if k != "reps"}
+                 | {"env": s.env, "regime_tps": regime_tps(s)}
                  for s in scores],
         "chosen": chosen, "multi_enabled": label != "none",
         "spec_enabled": bool(spec_chosen["applied"]),
@@ -1070,7 +1100,8 @@ def find_live_servers() -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Tune concurrent prefill (piped/mixed/short-first) on this PC; "
+        description="Tune concurrent serving (piped/mixed/short-first prefill, spec, MoE) "
+                    "for the highest aggregate tok/s at the profile's concurrency; "
                     "write a run config and start script.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
