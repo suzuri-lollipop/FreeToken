@@ -170,25 +170,40 @@ answer correctly and stop cleanly. The weights themselves were never the problem
 the BF16 base within 3.4% rel L2, unquantized tensors bit-identical).
 
 **Decode throughput (open).** On the 2x RTX PRO 4000 (PCIe, no P2P) FP8 decode
-runs ~4-5 tok/s at bs1. Profiling (`FREETOKEN_MOE_STATS=1` / `FREETOKEN_LATENCY=1`)
-shows ~90% of wall time host-blocking inside the forward call: the VRAM expert
-slot cache hits ~80% of routes and the ~3.3 miss experts/layer (x41 MoE layers)
-are decoded **synchronously on the CPU executor** (`fetched=0`, `cpu=miss`)
-rather than streamed to the GPU over PCIe with the decode fetch overlap. Routing
-those misses through the overlapped GPU H2D path (or enlarging the VRAM slot
-cache / shrinking the dense VRAM footprint to raise the hit rate) is the lever;
-maya reaches ~18 tok/s on the same rig. The auto host-RAM budget also spills the
-head+tail MoE layers to NVMe CPU decode when banks exceed it (`--moe-ram-budget`
-raises it), but that spill was not the dominant cost here.
+runs ~4-5 tok/s at bs1 (TP=2). Profiling (`FREETOKEN_MOE_STATS=1` /
+`FREETOKEN_LATENCY=1`) shows ~90% of wall time host-blocking inside the forward
+call: the VRAM expert slot cache hits ~80% of routes and the ~3.3 miss
+experts/layer (x41 MoE layers) are decoded **synchronously on the CPU executor**
+(`fetched=0`, `cpu=miss`) rather than streamed to the GPU over PCIe with the
+decode fetch overlap. TP=1 is *slower* (~1.7 tok/s, forward block ~570ms): it
+removes the per-layer all-reduce but doubles each expert's CPU GEMV (full-width
+banks) and shrinks the VRAM slot cache, so the CPU decode volume -- not the
+all-reduce -- is the cost. maya reaches ~18 tok/s on the same 2 GPUs by a
+different strategy: it rejects TP (a member needs ~50 GB VRAM), **layer-splits**
+(pipeline: GPU0 layers 0-15, GPU1 16-41, no per-layer all-reduce) and runs a
+**44-thread CPU lane** for the 77% of experts not in VRAM, overlapping CPU expert
+decode with GPU work across layers. The levers for this port are overlapping the
+CPU miss decode with GPU compute (pipeline across layers), raising the VRAM slot
+cache hit rate (smaller dense/KV footprint), or a faster CPU GEMV path. The auto
+host-RAM budget also spills the head+tail MoE layers to NVMe CPU decode when
+banks exceed it (`--moe-ram-budget` raises it), but that spill was not the
+dominant cost here. The practical mitigation today is the NVFP4 conversion
+(below): its half-size experts raise the VRAM cache hit rate enough to reach
+~14 tok/s on the same rig without any engine change.
 
-**Naive NVFP4 PTQ degrades this model.** The conversion is format-correct and
-its weight error matches a known-good ModelOpt conversion (measured 8.6%
-relative L2 on Hy4 experts with MSE-optimal block scales, vs 9.8% on
-RadixArk/Qwen3.8-Flash-Next-NVFP4 against its FP8 source). But Hy4-flash is
-sensitive to that noise: the routed-expert output error is ~9-16% per layer on
-real hidden states, and across 41 MoE layers it accumulates -- factual answers
-survive in the first tokens, then generation turns repetitive and fragmented
-even with the serving fixes above. Until an official calibration-aware NVFP4
-(or QAT) release lands, treat this conversion as best-effort PTQ and serve the
-FP8 release directly when quality matters more than the ~2x expert memory
-saving.
+**NVFP4 PTQ serves correctly and faster (re-tested 2026-11-20 after the RoPE
+fix).** The conversion is format-correct; its weight error matches a known-good
+ModelOpt conversion (8.6% relative L2 on Hy4 experts with MSE-optimal block
+scales, vs 9.8% on RadixArk/Qwen3.8-Flash-Next-NVFP4 against its FP8 source;
+~9-16% routed-expert output error per layer on real hidden states). The earlier
+finding that this noise "degrades generation" was **confounded by the RoPE bug
+above**, which fragmented FP8 and NVFP4 alike. With the interleaved RoPE fix the
+NVFP4 conversion answers Japanese and English prompts correctly and stops
+cleanly (capital, arithmetic, list prompts verified on TP=2 / int8 KV). It is
+also ~3x faster than the FP8 release on the same rig (~14 tok/s vs ~4-5 at bs1):
+the 4-bit experts are roughly half the bytes, so the VRAM slot cache holds more
+of them and far fewer routes spill to the synchronous CPU decode that dominates
+FP8 latency. NVFP4 is now the recommended serve for this model on memory- or
+speed-constrained rigs; keep FP8 when the last bit of weight fidelity matters.
+An official calibration-aware NVFP4 (or QAT) release would still tighten the
+expert noise floor.
