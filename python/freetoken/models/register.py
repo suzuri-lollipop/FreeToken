@@ -320,6 +320,27 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
             "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
         ),
     ),
+    # Hy4-flash (model_type hy_v4_flash): 42-layer gated MLA (12 compressed-indexer
+    # sparse layers + 30 SWA layers) on 4 iHC residual streams, Engram n-gram memory at
+    # 1/11/21/31, 512-expert top-16 LatentMoE in a 1536-wide latent space. The NVFP4
+    # release stores per-expert ModelOpt FP4 and serves experts from the offload cache;
+    # everything else is bf16. Text-only today: the multimodal wrapper's vision tower
+    # and DFly2 draft are not served (their tensors are skipped by the reader).
+    # checkpoint_roots: the FP8 release's modules_to_not_convert names the text
+    # tower under the HF wrapper (language_model.model.<internal name>); the NVFP4
+    # conversion's ignore list carries both spellings.
+    "HYV4FlashForCausalLM": ModelSpec(
+        "freetoken.models.hy_v4_flash",
+        "HyV4FlashForCausalLM",
+        tp_supported=True,
+        checkpoint_roots=(("model", "language_model.model.model"), ("lm_head", "language_model.model.lm_head")),
+    ),
+    "HYV4FlashForConditionalGeneration": ModelSpec(
+        "freetoken.models.hy_v4_flash",
+        "HyV4FlashForCausalLM",
+        tp_supported=True,
+        checkpoint_roots=(("model", "language_model.model.model"), ("lm_head", "language_model.model.lm_head")),
+    ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoeForConditionalGeneration",

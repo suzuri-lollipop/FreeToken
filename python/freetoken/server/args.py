@@ -308,6 +308,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "hy_v4_flash" in marker or "hyv4flash" in marker or "hy4-flash" in marker:
+            return "hy4"
         return None
 
     parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")

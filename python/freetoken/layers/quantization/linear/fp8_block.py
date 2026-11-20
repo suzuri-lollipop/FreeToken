@@ -38,7 +38,12 @@ class Dsv4Fp8BlockLinearKernel(LinearKernel):
 
 
 class TritonFp8BlockLinearKernel(LinearKernel):
-    """W8A16 GEMV at M=1, dynamic 1x128 W8A8 GEMM above."""
+    """W8A16 GEMV at M=1, dynamic 1x128 W8A8 GEMM above.
+
+    A layer marked ``fp8_w8a16`` (a bf16-trained model whose activations do not
+    survive per-group fp8 quantization, e.g. Hy4-flash) stays weight-only at
+    every M: dequantize the block-fp8 weight and run the bf16 GEMM.
+    """
 
     name = "triton"
 
@@ -50,6 +55,12 @@ class TritonFp8BlockLinearKernel(LinearKernel):
         return None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "fp8_w8a16", False):
+            import torch.nn.functional as F
+
+            from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+            return F.linear(x, dequant_block_fp8(layer.weight, layer.weight_scale_inv), layer.bias)
         from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear
 
         return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias)

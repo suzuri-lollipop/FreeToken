@@ -499,6 +499,25 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+class Hy4ReasoningParser(BaseReasoningParser):
+    """Hy4-flash's suffixed think tags (``<think:opensource>`` / ``</think:opensource>``).
+
+    The chat template opens generation inside the think block; a tool block
+    (``<tool_calls:opensource>``) ends reasoning without a closing tag, as in the
+    Qwen3 recovery path. The suffixed tool-call grammar itself has no dedicated
+    function-call parser yet (the family falls back to the generic one).
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token="<think:opensource>",
+            think_end_token="</think:opensource>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_calls:opensource>",
+        )
+
+
 class Qwen3ReasoningParser(ThinkReasoningParser):
     """Qwen3 reasoning with recovery for an omitted ``</think>`` before XML tools.
 
@@ -1072,6 +1091,7 @@ class ReasoningParser:
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
+        "hy4": Hy4ReasoningParser,
     }
 
     def __init__(

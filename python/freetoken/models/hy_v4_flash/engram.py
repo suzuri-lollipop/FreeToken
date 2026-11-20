@@ -66,11 +66,13 @@ class EngramHash:
         self.pad_id = args.engram_pad_id
         self.lookup = lookup_table.to(torch.int64).cpu()
         self.table_size = self.lookup.numel()
-        # The reference bounds the multiplier draw by config.engram_lookup_table_size
-        # (the table LENGTH), not by the largest compressed id: the checkpoint's map
-        # compresses the vocab to fewer ids than the table holds, and using max+1
-        # here draws different multipliers -> wrong hashes -> unreadable memory.
-        self.multipliers = draw_hash_multipliers(args.engram_seed, layer_id + 1, self.max_ngram, self.table_size)
+        # The reference (_init_weights) redraws from the loaded map bounded by its
+        # largest compressed id + 1, not the table length: the released map compresses
+        # to fewer ids than the table holds, and the wrong bound draws different
+        # multipliers -> wrong hashes -> unreadable memory.
+        self.multipliers = draw_hash_multipliers(
+            args.engram_seed, layer_id + 1, self.max_ngram, int(self.lookup.max().item()) + 1
+        )
         sizes = args.engram_head_vocab_sizes[layer_id]
         assert len(sizes) == (self.max_ngram - 1) * self.n_heads
         self.moduli = torch.tensor(sizes, dtype=torch.int64)

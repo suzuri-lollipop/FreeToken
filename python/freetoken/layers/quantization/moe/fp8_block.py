@@ -71,7 +71,9 @@ class TritonFp8BlockMoEKernel(MoEKernel):
 
         t = view.tensors
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
-        if is_prefill:
+        # fp8_w8a16: bf16-trained model, activations stay bf16 -- the inline-dequant
+        # W8A16 kernel serves every M (the W8A8 grouped GEMM would quantize them)
+        if is_prefill and not getattr(layer, "fp8_w8a16", False):
             n = view.n if view.n is not None else layer.num_experts
             return fused_experts_fp8_block(x, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"], topk_weights, topk_ids, n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
         return fused_experts_decode_fp8_block(x, t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"], topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)

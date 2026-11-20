@@ -410,10 +410,11 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
     if geometry:
         return f"--tensor-parallel-size {tp_size}: {geometry}"
     # Auto resolves a MoE model to the offload family, so treat it as the same request here.
-    # The offload banks are TP-sharded for nvfp4 only: the layout declares the rank's slice
-    # and pack cuts the pieces, while the bf16 / mxfp4 / block-fp8 stacks keep their readers at
-    # full width. The CPU executor reads the same per-rank native banks (its H/I come from the
-    # bank shapes), so cpu/hybrid are TP-correct for nvfp4: each rank's pool computes the
+    # The offload banks are TP-sharded for nvfp4 and block-fp8: the layout declares the rank's
+    # slice (block-fp8 by whole 128-row scale blocks, MoEConfig.local_intermediate_range) and
+    # pack cuts the full-width pieces, while the bf16 / mxfp4 stacks keep their readers at full
+    # width. The CPU executor reads the same per-rank native banks (its H/I come from the bank
+    # shapes), so cpu/hybrid are TP-correct for those kinds: each rank's pool computes the
     # rank's intermediate shard and the layer's all-reduce sums the partials.
     from freetoken.moe import is_offload_moe_strategy
 
@@ -421,7 +422,7 @@ def tp_preflight_error(config: EngineConfig) -> str | None:
     moe = getattr(model_config, "is_moe", False) or getattr(model_config, "moe_enabled", False)
     expert_quant = str(getattr(model_config, "expert_quant", "none"))
     if moe and (is_offload_moe_strategy(strategy) or strategy == "auto"):
-        if expert_quant != "nvfp4":
+        if expert_quant not in ("nvfp4", "fp8_block"):
             return (
                 f"{expert_quant} experts are not TP-sharded in the offload banks yet; run a bf16 "
                 "MoE with --moe-strategy fused (experts resident on every rank), or a single rank"

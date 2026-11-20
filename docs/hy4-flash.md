@@ -138,28 +138,48 @@ On the KV side, the static-scale `fp8` alias fragments generation into word
 salad; use bf16 or `fp8_per_token_head` (per-row scales).
 
 **Engram hash multipliers.** The odd multipliers that hash an n-gram into the
-memory table are drawn bounded by `config.engram_lookup_table_size` (the table
-LENGTH, 120818), not by the largest compressed id + 1. The checkpoint's
-normalized-vocab map compresses to fewer ids (max 92619) than the table holds,
-so the two bounds differ and the wrong one reads unrelated memory rows. The
-family draws them with the table length, matching the reference
-`draw_hash_multipliers`; `test_engram_multiplier_bound` guards it (the fixture
-uses a compression map so the bounds are distinguishable).
+memory table are drawn bounded by the largest compressed id + 1 of the loaded
+map (92620 on the released checkpoint), not by `config.engram_lookup_table_size`
+(the table LENGTH, 120818). The checkpoint's normalized-vocab map compresses to
+fewer ids (max 92619) than the table holds, so the two bounds differ and the
+wrong one reads unrelated memory rows. The family draws them from the loaded
+map, matching the reference `_init_weights` redraw (the PR's test pins the
+released layer-2 multipliers); `test_engram_multiplier_bound` guards it (the
+fixture uses a compression map so the bounds are distinguishable).
 
-**Known issue: generation still degenerates.** Even with the fixes above, chat
-and Japanese prompts produce repetitive / fragmented output. The eager bf16
-reference (independent of the engine kernels, real weights dequantized to bf16)
-degenerates the same way, so the gap is in the shared model computation rather
-than the kernels. Ablating the engram residual makes the output more coherent
-(though it still loops), and the engram residual is large (~1.6x the stream
-norm) by the reference formula. The port matches the PR's `modular_hy_v4_flash.py`
-component-by-component, but the PR's generated `modeling_hy_v4_flash.py` is stale
-(it expects non-latent experts and `gate_proj` where the checkpoint stores
-`linear_gate`), so it cannot load this checkpoint as a runtime ground truth. The
-checkpoint appears to come from a slightly different architecture revision than
-the public PR; resolving the remaining degeneration needs that revision's
-reference code (or the official vLLM/SGLang `hy4-flash` images) to compare
-against. Treat current text quality as experimental.
+**RoPE convention (the word-salad root cause, fixed 2026-11-20).** Hy4-flash
+rotates **adjacent (even, odd) channel pairs** -- the GLM / GPT-J *interleaved*
+RoPE (`rotate_half` over `x[..., 0::2]` / `x[..., 1::2]`, each frequency
+`repeat_interleave(2)`), as in the PR's `apply_rotary_pos_emb`. The port had
+transcribed the DeepSeek **NeoX half-split** (`x[:d/2]` / `x[d/2:]`,
+`cat(freqs, freqs)`, `is_neox=True`). The two rotate the same vectors
+differently, so attention scores were wrong on trained weights and generation
+fragmented into word salad. Random-weight parity tests hid it because the engine
+and the eager reference shared the same wrong convention. A full-depth comparison
+of the PR runtime (huggingface/transformers#50903, head `b865850d`) against the
+reference on a real-weight bf16 prefix isolated the first divergence to layer-0
+attention (input identical, output 17% rel L2); switching the reference to
+interleaved made the attention output bit-exact (0 rel L2). The fix sets
+`is_neox=False` on the main MLA and indexer ropes, rotates the indexer query and
+the kpool group-key kernel (`_kpool_rope_rows_kernel`) over adjacent pairs, and
+uses the interleaved `rotate_half` / `repeat_interleave` cache in the reference.
+Verified on the FP8 release (TP=2, int8 KV): Japanese and English prompts now
+answer correctly and stop cleanly. The weights themselves were never the problem
+(re-downloaded at `bd0e136e`; upstream unchanged since 2026-11-18 apart from
+`chat_template.jinja` dropping the `max` effort; block-fp8 experts dequantize to
+the BF16 base within 3.4% rel L2, unquantized tensors bit-identical).
+
+**Decode throughput (open).** On the 2x RTX PRO 4000 (PCIe, no P2P) FP8 decode
+runs ~4-5 tok/s at bs1. Profiling (`FREETOKEN_MOE_STATS=1` / `FREETOKEN_LATENCY=1`)
+shows ~90% of wall time host-blocking inside the forward call: the VRAM expert
+slot cache hits ~80% of routes and the ~3.3 miss experts/layer (x41 MoE layers)
+are decoded **synchronously on the CPU executor** (`fetched=0`, `cpu=miss`)
+rather than streamed to the GPU over PCIe with the decode fetch overlap. Routing
+those misses through the overlapped GPU H2D path (or enlarging the VRAM slot
+cache / shrinking the dense VRAM footprint to raise the hit rate) is the lever;
+maya reaches ~18 tok/s on the same rig. The auto host-RAM budget also spills the
+head+tail MoE layers to NVMe CPU decode when banks exceed it (`--moe-ram-budget`
+raises it), but that spill was not the dominant cost here.
 
 **Naive NVFP4 PTQ degrades this model.** The conversion is format-correct and
 its weight error matches a known-good ModelOpt conversion (measured 8.6%

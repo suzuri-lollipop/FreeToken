@@ -55,6 +55,9 @@ class AotModel:
     top_k: int | None = None
     moe_intermediate_size: int | None = None
     expert_formats: tuple[str, ...] = ()
+    # LatentMoE experts run in a narrower space than the residual stream (Hy4-flash):
+    # the bank rows derive from this width, the embedding row from hidden_size.
+    expert_hidden_size: int | None = None
     embed_indexing: bool = True
     aliases: tuple[str, ...] = ()
     # Further register.py keys this entry's checkpoints load under (text-only /
@@ -294,6 +297,36 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
     ),
     AotModel(
+        # Hy4-flash: gated MLA (12 compressed-indexer + 30 SWA layers) on the kpool
+        # latent pool -- latent writes go through the pool's scatter / row-store
+        # kernels, not store_cache (GLM-5.2 precedent). LatentMoE: the 512 experts
+        # run in a 1536-wide latent space, so the bank rows derive from 1536 while
+        # the embedding row stays hidden_size 3072. NVFP4 converted from the FP8
+        # release (scripts/convert_hy4_fp8_to_nvfp4.py).
+        name="tencent/Hy4-flash-NVFP4",
+        architecture="HYV4FlashForConditionalGeneration",
+        arch_aliases=("HYV4FlashForCausalLM",),
+        hidden_size=3072,
+        kv_groups=(),
+        top_k=16,
+        moe_intermediate_size=1536,
+        expert_hidden_size=1536,
+        expert_formats=_NVFP4_FORMATS,
+        aliases=("tencent/Hy4-flash",),
+    ),
+    AotModel(
+        # The FP8 release: block-fp8 attention projections + stacked block-fp8
+        # experts (same latent geometry as the NVFP4 conversion).
+        name="tencent/Hy4-flash-FP8",
+        architecture="HYV4FlashForConditionalGeneration",
+        hidden_size=3072,
+        kv_groups=(),
+        top_k=16,
+        moe_intermediate_size=1536,
+        expert_hidden_size=1536,
+        expert_formats=("fp8_block",),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.
@@ -448,10 +481,11 @@ def index_variants(model: AotModel) -> set[tuple[int, int]]:
 
 def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
     sizes: set[int] = set()
+    expert_hidden = model.expert_hidden_size or model.hidden_size
     for fmt in model.expert_formats:
         assert model.moe_intermediate_size is not None
         sizes.update(
-            expert_bank_row_bytes(fmt, model.hidden_size, model.moe_intermediate_size).values()
+            expert_bank_row_bytes(fmt, expert_hidden, model.moe_intermediate_size).values()
         )
     return sizes
 

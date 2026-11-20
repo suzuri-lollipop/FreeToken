@@ -137,6 +137,11 @@ def create_dsv41_sparse_backend(config: ModelConfig):
     ),
 )
 def create_dsa_backend(config: ModelConfig):
+    # Hy4-flash: kpool storage + own-group/sink/SWA selection semantics.
+    if config.model_type == "hy_v4_flash":
+        from .hy4_sparse import Hy4DSABackend
+
+        return Hy4DSABackend(config)
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
     if any(s.mla and s.index_ratio > 1 for s in config.kv_cache_group_specs()):
         from .dsa_indexer_kpool import Glm5NextDSABackend

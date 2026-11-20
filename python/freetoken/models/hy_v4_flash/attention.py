@@ -75,10 +75,11 @@ class Hy4CompressedIndexer(BaseOP):
         self.key_gate_projection = Fp32Linear(self.head_dim, self.head_dim)
         self.key_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
         self.intra_group_ape = torch.empty(self.ratio, self.head_dim, dtype=torch.float32)
-        # same frequencies as the indexed layers' main rope (NeoX for text-only)
+        # same frequencies as the indexed layers' main rope; Hy4-flash rotates
+        # adjacent (even, odd) pairs (GLM interleaved), not the NeoX half-split
         self.rope = get_rope(
             head_dim=self.rope_dim, rotary_dim=self.rope_dim,
-            max_position=args.max_position, base=args.rope_theta_indexed, is_neox=True,
+            max_position=args.max_position, base=args.rope_theta_indexed, is_neox=False,
         )
 
     def compute(self, x: torch.Tensor, q_resid: torch.Tensor, positions: torch.Tensor):
@@ -93,17 +94,16 @@ class Hy4CompressedIndexer(BaseOP):
         k = self.key_value_projection.forward(tk)
         gate = self.key_gate_projection.forward(tk)
         q = self.query_projection.forward(q_resid).view(t, self.n_heads, self.head_dim)
-        # partial NeoX rope on the TRAILING rope_dim channels (the reference rotates
-        # the last 64 of the 128-dim index heads; queries at their token position)
+        # partial interleaved (GLM) rope on the TRAILING rope_dim channels: adjacent
+        # (even, odd) pairs rotate by one frequency (the PR's apply_rotary_pos_emb),
+        # the last 64 of the 128-dim index heads; queries at their token position
         half = self.rope_dim // 2
         cs = self.rope._cos_sin_cache[positions.long()]
         cos, sin = cs[:, :half], cs[:, half:]
         q_pass, q_rot = q.split([self.head_dim - self.rope_dim, self.rope_dim], dim=-1)
-        x1, x2 = q_rot.split([half, half], dim=-1)
-        q_rot = torch.cat(
-            [x1 * cos[:, None, :] - x2 * sin[:, None, :], x2 * cos[:, None, :] + x1 * sin[:, None, :]],
-            dim=-1,
-        )
+        q_even, q_odd = q_rot[..., 0::2], q_rot[..., 1::2]
+        c, s = cos[:, None, :], sin[:, None, :]
+        q_rot = torch.stack([q_even * c - q_odd * s, q_odd * c + q_even * s], dim=-1).flatten(-2)
         q = torch.cat([q_pass, q_rot], dim=-1).to(torch.bfloat16)
         # the backend's index_scale folds in head_dim**-0.5 (dsa_decode_scores / dsa_prefill_logits)
         w = self.head_weight_projection.forward(x).float() * (self.n_heads**-0.5)
@@ -132,7 +132,7 @@ class Hy4Attention(BaseOP):
         self.kv_lora_rank = args.kv_lora_rank
         self.rope = get_rope(
             head_dim=args.qk_rope_head_dim, rotary_dim=args.qk_rope_head_dim,
-            max_position=args.max_position, base=args.theta_of(layer_id), is_neox=True,
+            max_position=args.max_position, base=args.theta_of(layer_id), is_neox=False,
         )
         self.q_a_proj = LinearReplicated(
             args.dim, args.q_lora_rank, has_bias=False,

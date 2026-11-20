@@ -380,6 +380,10 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Hy4-flash (hy_v4_flash) payload (HyV4FlashArgs): hybrid MLA/SWA dims, the compressed
+    # indexer geometry, iHC knobs, LatentMoE widths and the Engram hash geometry. Opaque to
+    # model-agnostic engine code; None for every other model.
+    hy4_args: Any | None = None
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None

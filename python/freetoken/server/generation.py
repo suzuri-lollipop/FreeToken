@@ -553,6 +553,10 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
+    elif parser_name == "hy4":
+        # Hy4's template pre-opens <think:opensource> for every reasoning_effort
+        # except no_think, so generation starts inside the block by default.
+        force_reasoning = (spec.chat_template_kwargs or {}).get("reasoning_effort") != "no_think"
     elif parser_name in ("flint", "ricursive"):
         # These families open their own optional think block, including when tools are present.
         force_reasoning = False

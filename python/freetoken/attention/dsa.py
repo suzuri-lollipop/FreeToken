@@ -73,6 +73,11 @@ class DSAIndexerInputs:
     w:    torch.Tensor              # [T, Hi] fp32
     gate: torch.Tensor | None = None
     ape:  torch.Tensor | None = None
+    # Hy4-flash kpool extras: the RMSNorm weight applied to each pooled group key
+    # before the bf16 store, and the cos|sin table rotating it at the group's first
+    # token position (None for GLM-5.3, whose pooled keys are NoPE and unnormed).
+    norm_weight: torch.Tensor | None = None
+    rope_cache:  torch.Tensor | None = None
     # fmt: on
 
 

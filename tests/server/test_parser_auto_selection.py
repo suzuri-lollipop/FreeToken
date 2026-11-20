@@ -40,7 +40,14 @@ NO_REASONING_FORMAT = {
 
 # `llama3` is the end of the cascade -- the answer when nothing matched.
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
-NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM", "LlamaGGUFForCausalLM"}
+NO_DEDICATED_TOOL_FORMAT = {
+    "LlamaForCausalLM",
+    "LlamaGGUFForCausalLM",
+    # Hy4-flash's suffixed <tool_call:opensource> arg-key/value grammar has no
+    # dedicated function-call parser yet; reasoning still parses ("hy4").
+    "HYV4FlashForCausalLM",
+    "HYV4FlashForConditionalGeneration",
+}
 
 
 class _Config:

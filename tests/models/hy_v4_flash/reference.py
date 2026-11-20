@@ -32,8 +32,9 @@ def unweighted_rms_inv(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    # GLM interleaved: adjacent (even, odd) pairs, matching the PR's rotate_half
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
@@ -48,7 +49,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.T
 
 
 def partial_rope_trailing(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int):
-    """Rotate the TRAILING rope_dim channels (indexer convention), NeoX half-split."""
+    """Rotate the TRAILING rope_dim channels (indexer convention), GLM interleaved."""
     passthrough, rotary = torch.split(x, [x.shape[-1] - rope_dim, rope_dim], dim=-1)
     if ROPE_FP32:
         cos = cos.unsqueeze(-2).float()
@@ -66,7 +67,8 @@ class RopeTable:
     def __init__(self, rope_dim: int, theta: float, max_pos: int, device):
         inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float, device=device) / rope_dim))
         freqs = torch.arange(max_pos, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
-        emb = torch.cat((freqs, freqs), dim=-1)
+        # interleaved layout: each frequency repeated for its (even, odd) pair
+        emb = freqs.repeat_interleave(2, dim=-1)
         self.cos = emb.cos()
         self.sin = emb.sin()
 
@@ -150,7 +152,7 @@ class Reference:
                 lookup=lookup,
                 table_size=lookup.numel(),
                 pad_compressed=int(lookup[text["engram_pad_id"]].item()),
-                multipliers=draw_multipliers(text["engram_seed"], L + 1, self.max_ngram, lookup.numel()).to(device),
+                multipliers=draw_multipliers(text["engram_seed"], L + 1, self.max_ngram, int(lookup.max().item()) + 1).to(device),
                 moduli=torch.tensor(sizes, dtype=torch.int64, device=device),
                 offsets=torch.tensor([0] + sizes[:-1], dtype=torch.int64, device=device).cumsum(0),
                 n_heads=n_heads,
