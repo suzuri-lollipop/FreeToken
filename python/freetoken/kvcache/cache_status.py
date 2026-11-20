@@ -194,6 +194,13 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)
     meta["swa_full_tokens_ratio"] = float(cfg.swa_full_tokens_ratio) if has_swa_ratio else 0.0
+    # The effective running-request cap (the engine clamps the requested one at load to fit
+    # its decode graphs). The frontend's /slots grid sizes itself from this, not from the
+    # requested config value. 0 when unknown (fake engines in tests).
+    try:
+        meta["max_running_req"] = max(0, int(cfg.max_running_req)) if cfg is not None else 0
+    except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
+        meta["max_running_req"] = 0
     # Exact total cache VRAM budget (all pools) the engine honors: memory_ratio of the
     # post-weights baseline minus weights — the same figure the rebuild fit-check uses, with
     # fixed=0 so it's the whole-cache ceiling (KV + MoE + Mamba + SWA), not the KV+MoE remainder.
