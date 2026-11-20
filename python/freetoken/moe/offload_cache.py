@@ -213,6 +213,19 @@ class OffloadMoeCache:
     # staging; the engine sets this when on-demand staging covers every chunk, so a
     # batch whose routes fit one plan overlaps safely and a larger one stays serial.
     decode_single_plan: bool = False
+    # Piped prefill: give the prefill staging buffers DEDICATED memory outside the LRU
+    # slot space instead of borrowing the first pools' slots. Borrowing assumes no
+    # concurrent decode during a chunk (inline prefill blocks decode; begin_prefill
+    # fences the copy stream behind enqueued decode work). A piped chunk runs
+    # concurrently with decode replays for its whole duration, so a borrowed slot that
+    # decode admits mid-chunk -- evict-first under per-layer pools sized <= num_experts,
+    # or a deprio stamp aged out over a long chunk -- races the chunk's staging gather
+    # and invalidation bookkeeping: torn expert rows and garbage logits (broken text,
+    # early EOS). Dedicated staging shifts the pools past the staging region so no slot
+    # is ever borrowed (_pool_stable_from collapses to 0, _inval to empty), removing the
+    # aliasing while keeping the full chunk/decode overlap. Costs 2 * stage_bytes per
+    # bank of extra VRAM; the engine reserves it in the cache budget.
+    dedicated_staging: bool = False
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
@@ -527,10 +540,16 @@ class OffloadMoeCache:
         return cache[offset : offset + nrows * row].view(dtype).view(nrows, *shape)
 
     def _bank_bytes(self, k: int, pool_sizes: list[int]) -> int:
-        """Bytes of raw bank ``k``: each pool's slots and pad, plus the largest pad, so two staging buffers fit wherever two layers of slots do."""
+        """Bytes of raw bank ``k``: each pool's slots and pad, plus the largest pad, so two staging buffers fit wherever two layers of slots do.
+
+        With dedicated staging the two buffers no longer borrow the first slots: they
+        keep the bank base and the pools are placed after them (the pool offsets shift
+        past the staging region in _slice_pools), so the bank grows by 2 * stage_bytes.
+        """
         layouts = [self._pool_layout(p) for p in range(len(pool_sizes))]
         slots = sum(s * self._row_bytes[g][k] + self._pad_bytes[g][k] for g, s in zip(layouts, pool_sizes))
-        return slots + max(pads[k] for pads in self._pad_bytes)
+        base = slots + max(pads[k] for pads in self._pad_bytes)
+        return base + 2 * self._stage_bytes[k] if self.dedicated_staging else base
 
     def _stage_fits(self, buffers: int) -> bool:
         return all(c.numel() * c.element_size() >= buffers * s for (_, c), s in zip(self.banks, self._stage_bytes))
@@ -560,6 +579,13 @@ class OffloadMoeCache:
             offsets.append([0])
             for s, r, d in zip(self.pool_sizes[:-1], row, pad):
                 offsets[-1].append(offsets[-1][-1] + s * r + d)
+        if self.dedicated_staging and self._stage_bytes:
+            # pools sit AFTER the two dedicated staging buffers (which stay at the bank
+            # base): no pool slot overlaps staging, so _pool_stable_from below collapses
+            # to 0 and the _inval masks to empty -- invalidation becomes a no-op and
+            # decode can never admit a slot the chunk stages into. (Skipped on the
+            # __post_init__ abstract pass, which has no banks and slot-unit offsets.)
+            offsets = [[o + 2 * self._stage_bytes[k] for o in bank] for k, bank in enumerate(offsets)]
         self._pool_offsets = offsets
         # local slots below this index overlap the prefill staging area in some bank; a pool's zero-byte rows (a role its kernel does not read) overlap nothing
         self._pool_stable_from = [
@@ -804,7 +830,9 @@ class OffloadMoeCache:
                 self.bank_caches[name] = torch.zeros(self._bank_bytes(k, self.pool_sizes), dtype=torch.uint8, device=self.device)
             else:
                 dtype, shape = self.layouts[0][k]
-                self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
+                # dedicated staging appends 2 * num_experts rows past the slot pools
+                rows = self.cache_size + (2 * self.num_experts if self.dedicated_staging else 0)
+                self.bank_caches[name] = torch.zeros((rows, *shape), dtype=dtype, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
 
     def _build_hot_row_of(self, hot) -> list:

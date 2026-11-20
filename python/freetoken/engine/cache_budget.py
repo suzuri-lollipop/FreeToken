@@ -35,6 +35,20 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     return -(-sum(per_layer) // len(per_layer))
 
 
+def dedicated_staging_bytes(sources: dict[str, "list[torch.Tensor]"], num_experts: int) -> int:
+    """Extra VRAM the piped dedicated prefill staging reserves (2 buffers per bank).
+
+    Mirrors OffloadMoeCache._stage_bytes: per bank, num_experts rows of the widest
+    layer layout, two buffers. The <=16-byte per-row pad term is omitted (negligible
+    against the row bytes); the reservation is therefore a hair under the allocation,
+    absorbed by the allocator's 16-byte rounding and the graph headroom.
+    """
+    widest = 0
+    for per_layer in sources.values():
+        widest += max(t[0].numel() * t.element_size() for t in per_layer)
+    return 2 * num_experts * widest
+
+
 def slot_cache_expert_cap(
     num_layers: int,
     num_experts: int,
