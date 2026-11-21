@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from freetoken.core import get_global_ctx
+
 from .dsa import DSAMetadata
 from .dsa_indexer_kpool import Glm5NextDSABackend
 
@@ -100,14 +102,151 @@ class Hy4DSABackend(Glm5NextDSABackend):
 
     def mla_forward(self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_inputs=None, sinks=None):
         self._current_sinks = sinks
+        md = batch.attn_metadata
+        # multi-row verify extend (DFly): graph-capturable device-side path
+        if getattr(md, "verify_rows_per_req", 1) > 1 and not md.is_decode:
+            self.kvcache.store_kv(c_kv, k_rope, batch.out_loc, layer_id)
+            if self.dsa_enabled and indexer_inputs is not None:
+                self._store_index(indexer_inputs, batch, layer_id)
+            return self._verify(md, layer_id, q_nope, q_pe, indexer_inputs)
         return super().mla_forward(q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_inputs=indexer_inputs)
+
+    # ----- multi-row verify (CUDA-graph capturable, DFly) -------------------------------------
+    def prepare_metadata(self, batch) -> None:
+        super().prepare_metadata(batch)
+        if getattr(batch, "phase", None) == "verify":
+            reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
+            batch.attn_metadata.verify_rows_per_req = reqs[0].extend_len if reqs else 1
+
+    def init_capture_graph(self, max_seq_len: int, bs_list, rows_per_req: int = 1) -> None:
+        if rows_per_req == 1:
+            super().init_capture_graph(max_seq_len, bs_list, rows_per_req)
+            self._verify_rows_per_req = 1
+            return
+        # multi-row verify: static buffers shaped [bs, m, ...] (qsa_sparse pattern)
+        self.max_seq_len = max_seq_len
+        self.capture_bs = sorted(bs_list)
+        self._verify_rows_per_req = rows_per_req
+        max_bs = max(bs_list)
+        width = get_global_ctx().page_table.shape[1]
+        m = rows_per_req
+        self._v_rows_buf = torch.full((max_bs, m, width), -1, dtype=torch.int32, device=self.device)
+        self._v_kvlen_buf = torch.zeros(max_bs, m, dtype=torch.int32, device=self.device)
+        self._v_pos_buf = torch.zeros(max_bs, m, dtype=torch.int32, device=self.device)
+        self._v_max_pools = max_seq_len // self.kpool
+
+    def _stage_verify(self, batch, bs: int) -> None:
+        try:
+            self._stage_verify_inner(batch, bs)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _stage_verify_inner(self, batch, bs: int) -> None:
+        md = batch.attn_metadata
+        m = self._verify_rows_per_req
+        reqs = batch.padded_reqs
+        page_table = get_global_ctx().page_table
+        rows = torch.stack([page_table[r.table_idx] for r in reqs])[:bs]      # [bs, W]
+        kvlen = md.kv_len_cpu.to(self.device, non_blocking=True)[:bs]         # [bs]
+        pos = getattr(batch, "positions", None)
+        if pos is None:  # dummy capture batch: replays restage live positions
+            pos = torch.zeros(bs * m, dtype=torch.int32, device=self.device)
+        pos = pos.view(bs, m)
+        self._v_rows_buf[:bs].copy_(rows.unsqueeze(1).expand(bs, m, -1))
+        self._v_kvlen_buf[:bs].copy_(kvlen.unsqueeze(1).expand(bs, m))
+        self._v_pos_buf[:bs].copy_(pos)
+        md.rows = self._v_rows_buf[:bs]
+        md.kvlen = self._v_kvlen_buf[:bs]
+        md.positions = self._v_pos_buf[:bs]
+
+    def prepare_for_capture(self, batch) -> None:
+        if getattr(self, "_verify_rows_per_req", 1) > 1:
+            self.prepare_metadata(batch)
+            self._stage_verify(batch, batch.size)
+        else:
+            super().prepare_for_capture(batch)
+
+    def prepare_for_replay(self, batch) -> None:
+        if getattr(self, "_verify_rows_per_req", 1) > 1:
+            self._stage_verify(batch, batch.padded_size)
+        else:
+            super().prepare_for_replay(batch)
+
+    def reset_capture(self) -> None:
+        super().reset_capture()
+        self._v_rows_buf = self._v_kvlen_buf = self._v_pos_buf = None
+        self._verify_rows_per_req = 1
+
+    def _verify(self, md, layer_id, q_nope, q_pe, inputs):
+        try:
+            return self._verify_inner(md, layer_id, q_nope, q_pe, inputs)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _verify_inner(self, md, layer_id, q_nope, q_pe, inputs):
+        """Device-side batched multi-row verify attention (m = k+1 rows/request)."""
+        rows, kvlen, positions = md.rows, md.kvlen, md.positions   # [bs, m, W], [bs, m], [bs, m]
+        bs, m = positions.shape
+        heads = self._heads(layer_id)
+        if self._hy4.swa_layers[layer_id]:
+            sel, cnt = self._window_select(rows, positions, kvlen)
+        elif not self.dsa_enabled or inputs is None:
+            sel = rows
+            cnt = (positions + 1).clamp_max(rows.shape[-1]).to(torch.int32)
+        else:
+            q_idx = inputs.q.view(bs, m, self._hy4.index_n_heads, self._hy4.index_head_dim)
+            w = inputs.w.view(bs, m, self._hy4.index_n_heads)
+            # per-request page-table rows [bs, W] (identical across the m query rows)
+            sel, cnt, pos = self._select_verify_indexed(
+                self._idx_slot[layer_id], q_idx, w, rows[:, 0, :], positions, kvlen[:, 0], self._v_max_pools
+            )
+            md.sel[layer_id] = (sel, cnt)
+            md.sel_pos[layer_id] = pos      # token positions for the DFly draft reuse snapshot
+        if q_pe.shape[-1] == 0:
+            q_cat = q_nope.view(bs, m, heads, self.kv_lora_rank)
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, m, heads, self.latent_dim)
+        o = self._attend(q_cat, layer_id, sel, cnt, sinks=self._current_sinks)
+        return o.view(bs * m, heads, self.kv_lora_rank)
+
+    # ----- DFly draft: attend over the paired TARGET layer's KV ------------------------------
+    def dfly_mla_forward(self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, sinks=None):
+        """Draft layer ``layer_id`` writes its query-block latent rows into the paired
+        target layer's pool and attends over that pool with the reused selection
+        (``md.dfly_sel[layer_id]``, built by the DFly proposer from the target
+        indexer snapshot + the draft query block). No private draft KV chain."""
+        from freetoken.models.hy_v4_flash.dfly import DFLY_TARGET_LAYERS
+
+        md = batch.attn_metadata
+        assert isinstance(md, DSAMetadata)
+        target_layer = DFLY_TARGET_LAYERS[layer_id]
+        self._current_sinks = sinks
+        self.kvcache.store_kv(c_kv, k_rope, batch.out_loc, target_layer)
+        sel, cnt = md.dfly_sel[layer_id]
+        # the paired target layers are all indexed (sparse): the draft's indexed head
+        # count matches them; _heads(target_layer) would index the draft's 5-layer swa table
+        from freetoken.distributed import get_tp_info
+
+        heads = self._hy4.n_heads // get_tp_info().size
+        bs, m = sel.shape[0], sel.shape[1]
+        if q_pe.shape[-1] == 0:
+            q_cat = q_nope.view(bs, m, heads, self.kv_lora_rank)
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, m, heads, self.latent_dim)
+        o = self._attend(q_cat, target_layer, sel, cnt, sinks=sinks)
+        return o.view(bs * m, heads, self.kv_lora_rank)
 
     # ----- selection helpers ---------------------------------------------------------------
     def _expand_groups(self, picks, rows, q_pos, kvlen):
         """Picked complete groups + the query's own group tokens (up to kpool),
         sentinels compacted to the tail. ``picks [B, m, select_k]`` (-1 sentinel),
         ``q_pos [B, m]`` query positions, ``kvlen [B, m]`` live lengths ->
-        (sel [B, m, kpool + select_k*kpool], cnt [B, m])."""
+        (sel [B, m, kpool + select_k*kpool] physical rows, cnt [B, m],
+        pos [B, m, width] token positions -- the DFly snapshot reuses positions)."""
         kp = self.kpool
         b, m, k_sel = picks.shape
         device = picks.device
@@ -130,7 +269,7 @@ class Hy4DSABackend(Glm5NextDSABackend):
         sel = rows_b.gather(-1, pos.clamp_min(0).long()).to(torch.int32)
         sel = torch.where(pos < 0, sel.new_full((), -1), sel)
         cnt = valid.sum(dim=-1).to(torch.int32)
-        return sel, cnt
+        return sel, cnt, pos.to(torch.int32)
 
     def _window_select(self, rows, q_pos, kvlen):
         """Last ``sliding_window`` positions per query; rows [B, W] or [B, m, W]."""
@@ -164,7 +303,7 @@ class Hy4DSABackend(Glm5NextDSABackend):
             picks = self.indexer_select_decode(
                 s.view(bs, 1, -1), valid=g_q, topk=k_sel, offset=0
             )[:, 0]  # [bs, k_sel]
-            sel, cnt = self._expand_groups(
+            sel, cnt, _ = self._expand_groups(
                 picks.unsqueeze(1), rows.unsqueeze(1), (kvlen - 1).view(bs, 1), kvlen.view(bs, 1)
             )
             sel, cnt = sel.view(bs, 1, -1), cnt.view(bs, 1)
@@ -188,7 +327,8 @@ class Hy4DSABackend(Glm5NextDSABackend):
         width = kp + k_sel * kp
         if n_pools == 0:
             picks = torch.full((1, m, k_sel), -1, dtype=torch.int32, device=self.device)
-            return self._expand_groups(picks, rows.view(1, -1), positions.view(1, -1), (positions + 1).view(1, -1))
+            sel, cnt, _ = self._expand_groups(picks, rows.view(1, -1), positions.view(1, -1), (positions + 1).view(1, -1))
+            return sel, cnt
         pool_rows = rows[kp - 1 :: kp] // kp
         k_pool = self.kvcache.index_k_cache(slot).index_select(0, pool_rows.long())
         sel = torch.empty(m, width, dtype=torch.int32, device=self.device)
@@ -203,12 +343,38 @@ class Hy4DSABackend(Glm5NextDSABackend):
             scores = scores + torch.where(cols >= live.unsqueeze(1), float("-inf"), 0.0)
             picks = scores.topk(min(k_sel, n_pools), dim=-1)[1]
             picks = torch.where(picks >= live.unsqueeze(1), -1, picks)
-            sel_c, cnt_c = self._expand_groups(
+            sel_c, cnt_c, _ = self._expand_groups(
                 picks.unsqueeze(0), rows.view(1, -1), p.view(1, -1), (p + 1).view(1, -1)
             )
             sel[s0:s1] = sel_c[0]
             cnt[s0:s1] = cnt_c[0]
         return sel.view(1, m, width), cnt.view(1, m)
+
+    def _select_verify_indexed(self, slot, q_idx, w, rows, positions, kv_len, max_pools):
+        """Device-side, static-shape causal pool top-k for a verify/extend block
+        (``m`` query rows per request). Batched generalization of
+        ``_select_prefill_indexed`` with no per-request host loop, so it captures
+        into a multi-row verify graph (``max_pools`` is the capture-time constant
+        ``max_seq_len // kpool``). ``q_idx [bs, m, H, D]``, ``w [bs, m, H]``,
+        ``rows [bs, W]`` position-ordered physical rows, ``positions [bs, m]``,
+        ``kv_len [bs]``. Returns ``(sel [bs, m, width], cnt [bs, m])``."""
+        from freetoken.attention.dfly_reuse import verify_select_pools
+        from freetoken.kernel.triton.dsv4.indexer import indexer_logits
+
+        kp = self.kpool
+        bs, m = positions.shape
+        device = rows.device
+        pool_rows_full = rows[:, kp - 1 :: kp] // kp           # [bs, <=max_pools]
+        pr = torch.zeros(bs, max_pools, dtype=torch.int64, device=device)
+        n = min(pool_rows_full.shape[1], max_pools)
+        pr[:, :n] = pool_rows_full[:, :n].to(torch.int64)
+        k_pool = self.kvcache.index_k_cache(slot).index_select(0, pr.view(-1)).view(bs, max_pools, -1)
+        scores = indexer_logits(q_idx, k_pool, (w * self.index_scale).to(torch.float32))  # [bs, m, max_pools]
+        n_pools = (kv_len // kp).to(torch.int64)
+        pool_idx = torch.arange(max_pools, device=device)
+        scores = scores + torch.where(pool_idx[None, None, :] >= n_pools[:, None, None], float("-inf"), 0.0)
+        picks = verify_select_pools(scores, positions, kp, self.select_k)   # [bs, m, select_k]
+        return self._expand_groups(picks, rows, positions, kv_len[:, None].expand(bs, m))
 
     def _prefill(self, md, layer_id, q_nope, q_pe, batch, inputs):
         t = q_nope.shape[0]

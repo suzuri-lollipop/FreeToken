@@ -94,6 +94,14 @@ class DSAMetadata(BaseAttnMetadata):
     kvlen:          torch.Tensor | None = None
     # group leader layer -> (sel_rows, counts); only the LIVE leader is retained
     sel:            dict = field(default_factory=dict)
+    # DFly draft layer -> (sel_rows, counts) reused from the paired target layer's
+    # selection plus the draft query block (built by the DFly proposer)
+    dfly_sel:       dict = field(default_factory=dict)
+    # indexed layer -> selected token POSITIONS [bs, m, width] (DFly snapshot reuses
+    # positions, mapped to physical rows by the proposer; md.sel holds physical rows)
+    sel_pos:        dict = field(default_factory=dict)
+    # multi-row verify extend (DFly): query rows per request (k+1); 1 for decode/prefill
+    verify_rows_per_req: int = 1
     # glm5_next kpool decode: per-request tail-ring slots (Req.table_idx). Under CUDA
     # graphs this is a view of the backend's STATIC buffer (restaged per replay by
     # _stage_decode, QSA ring_slots precedent); eager decode reads active_table_idx.

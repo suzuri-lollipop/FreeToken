@@ -259,6 +259,19 @@ class EngramHost:
             runs = [(torch.tensor(hist, dtype=torch.int64), tokens[i : i + 1]) for i, hist in enumerate(histories)]
             self.fill(runs, graph=use_graph)
             return
+        if getattr(batch, "phase", None) == "verify":
+            # multi-row verify (DFly): m query rows per request, each with its n-gram
+            # context; stage bs*m rows to match the engram lookup's num_tokens=bs*m.
+            reqs = list(batch.padded_reqs)
+            runs = []
+            for r in reqs:
+                m = r.extend_len
+                cached = r.device_len - m
+                for j in range(m):
+                    pos = cached + j
+                    runs.append((_context(r.input_ids, pos, width), r.input_ids[pos : pos + 1]))
+            self.fill(runs, graph=use_graph)
+            return
         # prefill: this chunk's per-request ranges off the DSA metadata (no segments field)
         md = batch.attn_metadata
         qo = md.qo_indptr_cpu.tolist()

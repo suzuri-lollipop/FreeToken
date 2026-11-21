@@ -17,6 +17,17 @@ logger = init_logger(__name__)
 # Bump when the row key or the measurements change: rows of another version are not comparable.
 PROFILE_VERSION = 6
 
+# Engine ``expert_quant`` (models/config.py) -> benchbw format key. Only offload-family
+# formats with a CPU MoE weight path resolve to hybrid; anything unmapped finds no
+# profile entry (-> None -> offload), the safe default.
+_QUANT_TO_BENCH_FORMAT = {
+    "nvfp4": "nvfp4",
+    "ds_fp4": "ds_fp4",
+    "mxfp4": "mxfp4_triton",
+    "bf16": "bf16",
+    "fp8_block": "fp8_block",
+}
+
 
 def _cache_dir() -> str:
     cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")

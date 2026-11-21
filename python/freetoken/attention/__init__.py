@@ -134,6 +134,10 @@ def create_dsv41_sparse_backend(config: ModelConfig):
         # models/glm5_next/weight.py), so TP does not shard heads here.
         supports_tp=True,
         kv_formats=ROW_SCALE_FORMATS,
+        # DFly spec decode: the hy4 verify path plans multi-row selection on the host
+        # before each replay (_select_verify_indexed is device-side; the per-request
+        # pool gather is host-planned), like fi.
+        uniform_extend_graph="host_plan",
     ),
 )
 def create_dsa_backend(config: ModelConfig):

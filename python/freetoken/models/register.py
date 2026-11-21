@@ -334,12 +334,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "HyV4FlashForCausalLM",
         tp_supported=True,
         checkpoint_roots=(("model", "language_model.model.model"), ("lm_head", "language_model.model.lm_head")),
+        spec_drafts=(("dfly", "freetoken.models.hy_v4_flash.dfly:Hy4DFlyDraft"),),
     ),
     "HYV4FlashForConditionalGeneration": ModelSpec(
         "freetoken.models.hy_v4_flash",
         "HyV4FlashForCausalLM",
         tp_supported=True,
         checkpoint_roots=(("model", "language_model.model.model"), ("lm_head", "language_model.model.lm_head")),
+        spec_drafts=(("dfly", "freetoken.models.hy_v4_flash.dfly:Hy4DFlyDraft"),),
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",

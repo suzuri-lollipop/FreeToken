@@ -149,7 +149,10 @@ class HyV4FlashForCausalLM(BaseLLMModel):
         from .engram_table import EngramDiskTable, EngramHost, engram_row_source
 
         folder = download_hf_weight(engine_config.model_path)
-        graph_rows = max(engine_config.max_running_req, engine_config.cuda_graph_max_bs or 0, 1)
+        # spec decode (DFly): every decode step is a verify of decode_rows_per_req
+        # rows/request, so the engram graph buffers must hold bs * rows_per_req rows.
+        rows_per_req = getattr(engine_config, "decode_rows_per_req", 1) or 1
+        graph_rows = max(engine_config.max_running_req, engine_config.cuda_graph_max_bs or 0, 1) * rows_per_req
         tables, hashes = [], []
         for layer in layers:
             hashes.append(layer.init_hash(self._args))
