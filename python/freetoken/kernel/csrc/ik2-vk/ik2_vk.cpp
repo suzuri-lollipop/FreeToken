@@ -86,14 +86,17 @@ struct Buf {
 };
 
 static constexpr int kRing = 4;
+static constexpr int kMaxGraphOps = 256;
 
 struct State {
     VkInstance inst = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    VkQueue graph_queue = VK_NULL_HANDLE;
     uint32_t qfam = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPool graph_pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd[kRing] = {};
     VkFence fence[kRing] = {};
     bool fence_pending[kRing] = {};
@@ -120,6 +123,16 @@ struct State {
     cudaExternalSemaphore_t c_v2c = nullptr;
 #endif
 
+    bool graph_mode = false;
+    int graph_sem_idx = 0;
+    int graph_cmd_count = 0;
+    VkSemaphore v_g_c2v[kMaxGraphOps] = {};
+    VkSemaphore v_g_v2c[kMaxGraphOps] = {};
+    cudaExternalSemaphore_t c_g_c2v[kMaxGraphOps] = {};
+    cudaExternalSemaphore_t c_g_v2c[kMaxGraphOps] = {};
+    VkCommandBuffer graph_cmd[kMaxGraphOps] = {};
+    VkFence graph_fence = VK_NULL_HANDLE;
+    bool graph_fence_pending = false;
     bool resident_banks = false;
     std::mutex mu;
     bool ready = false;
@@ -252,6 +265,9 @@ void free_buf(Buf & bf) {
 
 void ensure_buf(Buf & bf, size_t need, bool host, bool export_cuda = false) {
     if (bf.size >= need) return;
+#ifdef FREETOKEN_VK_CUDA
+    if (st().graph_mode) throw std::runtime_error("ik2_vk: buffer growth during graph capture");
+#endif
     wait_all_idle();
 #ifdef FREETOKEN_VK_CUDA
     if (export_cuda && st().has_cuda_interop) {
@@ -342,7 +358,7 @@ void init(int device_override = -1) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = s.qfam;
-    qci.queueCount = 1;
+    qci.queueCount = 2;
     qci.pQueuePriorities = &prio;
 
     std::vector<const char *> exts;
@@ -374,11 +390,13 @@ void init(int device_override = -1) {
     dci.ppEnabledExtensionNames = exts.empty() ? nullptr : exts.data();
     VK_CHECK(vkCreateDevice(s.phys, &dci, nullptr, &s.dev));
     vkGetDeviceQueue(s.dev, s.qfam, 0, &s.queue);
+    vkGetDeviceQueue(s.dev, s.qfam, 1, &s.graph_queue);
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.queueFamilyIndex = s.qfam;
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VK_CHECK(vkCreateCommandPool(s.dev, &pci, nullptr, &s.pool));
+    VK_CHECK(vkCreateCommandPool(s.dev, &pci, nullptr, &s.graph_pool));
 
     VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbi.commandPool = s.pool;
@@ -388,6 +406,7 @@ void init(int device_override = -1) {
 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (int i = 0; i < kRing; i++) VK_CHECK(vkCreateFence(s.dev, &fci, nullptr, &s.fence[i]));
+    VK_CHECK(vkCreateFence(s.dev, &fci, nullptr, &s.graph_fence));
 
     // Empty descriptor set layout + 128-byte push constants (BDA pointers + dims)
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
@@ -424,6 +443,15 @@ void init(int device_override = -1) {
         };
         make_sem(s.v_c2v, s.c_c2v);
         make_sem(s.v_v2c, s.c_v2c);
+        for (int i = 0; i < kMaxGraphOps; i++) {
+            make_sem(s.v_g_c2v[i], s.c_g_c2v[i]);
+            make_sem(s.v_g_v2c[i], s.c_g_v2c[i]);
+        }
+        VkCommandBufferAllocateInfo gcbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        gcbi.commandPool = s.graph_pool;
+        gcbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        gcbi.commandBufferCount = kMaxGraphOps;
+        VK_CHECK(vkAllocateCommandBuffers(s.dev, &gcbi, s.graph_cmd));
         s.io = make_buf(64 * 1024 * 1024, false, true);
     }
 #endif
@@ -555,6 +583,18 @@ uint64_t cached_weight_bda(TensorView w) {
 // Acquire next command buffer slot in the ring (waits only if that slot is still in flight)
 VkCommandBuffer acquire_cmd(int & slot_out) {
     auto & s = st();
+#ifdef FREETOKEN_VK_CUDA
+    if (s.graph_mode) {
+        int idx = s.graph_sem_idx;
+        if (idx >= kMaxGraphOps) throw std::runtime_error("ik2_vk: graph op limit exceeded");
+        slot_out = idx;
+        VkCommandBuffer cb = s.graph_cmd[idx];
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+        return cb;
+    }
+#endif
     int slot = s.ring_idx;
     s.ring_idx = (s.ring_idx + 1) % kRing;
     if (s.fence_pending[slot]) {
@@ -589,6 +629,25 @@ void cmd_dispatch(VkCommandBuffer cb, VkPipeline pipe, const T & pc, uint32_t gx
 // Submit command buffer: async external-semaphore handoff for CUDA, fence wait for CPU.
 void submit_cmd(int slot, bool use_cuda, DLDevice dev) {
     auto & s = st();
+#ifdef FREETOKEN_VK_CUDA
+    if (s.graph_mode && use_cuda && s.has_cuda_interop) {
+        VK_CHECK(vkEndCommandBuffer(s.graph_cmd[slot]));
+        s.graph_cmd_count = std::max(s.graph_cmd_count, slot + 1);
+        cudaStream_t stream = cu_stream(dev);
+        cudaExternalSemaphoreSignalParams sp{};
+        CU_CHECK(cudaSignalExternalSemaphoresAsync(&s.c_g_c2v[slot], &sp, 1, stream));
+        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s.v_g_c2v[slot]; si.pWaitDstStageMask = &ws;
+        si.commandBufferCount = 1; si.pCommandBuffers = &s.graph_cmd[slot];
+        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s.v_g_v2c[slot];
+        VK_CHECK(vkQueueSubmit(s.graph_queue, 1, &si, VK_NULL_HANDLE));
+        cudaExternalSemaphoreWaitParams wp{};
+        CU_CHECK(cudaWaitExternalSemaphoresAsync(&s.c_g_v2c[slot], &wp, 1, stream));
+        s.graph_sem_idx++;
+        return;
+    }
+#endif
     VK_CHECK(vkEndCommandBuffer(s.cmd[slot]));
 #ifdef FREETOKEN_VK_CUDA
     if (use_cuda && s.has_cuda_interop) {
@@ -1068,6 +1127,31 @@ void op_dequantize(TensorView w, int64_t ty, int64_t K, TensorView out) {
     }
 }
 
+void op_begin_graph() {
+    auto & s = st();
+    std::lock_guard<std::mutex> lock(s.mu);
+    s.graph_mode = true; s.graph_sem_idx = 0; s.graph_cmd_count = 0;
+}
+void op_end_graph() {
+    auto & s = st();
+    std::lock_guard<std::mutex> lock(s.mu);
+    s.graph_mode = false;
+}
+void op_pre_submit_graph() {
+    auto & s = st();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (s.graph_cmd_count == 0) return;
+    std::vector<VkSubmitInfo> submits(s.graph_cmd_count);
+    std::vector<VkPipelineStageFlags> stages(s.graph_cmd_count, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+    for (int i = 0; i < s.graph_cmd_count; i++) {
+        submits[i] = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submits[i].waitSemaphoreCount = 1; submits[i].pWaitSemaphores = &s.v_g_c2v[i]; submits[i].pWaitDstStageMask = &stages[i];
+        submits[i].commandBufferCount = 1; submits[i].pCommandBuffers = &s.graph_cmd[i];
+        submits[i].signalSemaphoreCount = 1; submits[i].pSignalSemaphores = &s.v_g_v2c[i];
+    }
+    VK_CHECK(vkQueueSubmit(s.graph_queue, uint32_t(submits.size()), submits.data(), VK_NULL_HANDLE));
+}
+
 }  // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_init, op_init);
@@ -1079,3 +1163,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_mul_mat_id, op_mul_mat_id);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_wsum, op_wsum);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_get_rows, op_get_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_dequantize, op_dequantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_begin_graph, op_begin_graph);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_end_graph, op_end_graph);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ik2_vk_pre_submit_graph, op_pre_submit_graph);

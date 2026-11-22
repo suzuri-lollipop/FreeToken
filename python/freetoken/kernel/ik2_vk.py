@@ -80,6 +80,18 @@ def set_bank_mode(resident: bool) -> None:
     _module().ik2_vk_set_bank_mode(resident)
 
 
+def begin_graph() -> None:
+    _module().ik2_vk_begin_graph()
+
+
+def end_graph() -> None:
+    _module().ik2_vk_end_graph()
+
+
+def pre_submit_graph() -> None:
+    _module().ik2_vk_pre_submit_graph()
+
+
 def mul_mat(w, ggml_type: int, x, *, out=None):
     import torch
 
