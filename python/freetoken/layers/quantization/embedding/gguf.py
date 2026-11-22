@@ -26,7 +26,17 @@ class GgmlEmbeddingKernel(EmbeddingKernel):
 
         cfg = layer.quant_method.cfg
         (ggml_type,) = gguf_types(cfg.scheme)
-        rows = ggml.get_rows(layer.weight, ggml_type, cfg.embedding_dim, ids.reshape(-1).to(torch.int32), cfg.dtype)
+        flat = ids.reshape(-1)
+        if cfg.tp_size > 1:
+            # TP: only local-vocab ids are valid rows; mask the rest to row 0 and zero output
+            start = layer.vocab_range[0]
+            local = flat - start
+            mask = (local >= 0) & (local < cfg.num_embeddings)
+            local = local.clamp(0, cfg.num_embeddings - 1)
+            rows = ggml.get_rows(layer.weight, ggml_type, cfg.embedding_dim, local.to(torch.int32), cfg.dtype)
+            rows = rows * mask.unsqueeze(-1).to(rows.dtype)
+        else:
+            rows = ggml.get_rows(layer.weight, ggml_type, cfg.embedding_dim, flat.to(torch.int32), cfg.dtype)
         return rows.view(*ids.shape, cfg.embedding_dim)
 
     def logits(self, layer: Any, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
