@@ -81,6 +81,7 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜ calls>",
     "<｜DSML｜ invoke",
     "<atem:function_calls>",
+    "<|content_invoke_tool_json|>",
 ]
 
 
@@ -1003,6 +1004,37 @@ class Qwen25Detector(BaseFormatDetector):
         residual = super().finish_streaming()
         held, self._normal_text_buffer = self._normal_text_buffer, ""
         return held + residual
+
+
+class Inkling2Detector(Qwen25Detector):
+    """Inkling-2 tool calls: ``<|content_invoke_tool_json|>{"name":..., "args":{...}}<|end_message|>``.
+    Same JSON shape as Qwen2.5 but the arguments key is ``args`` and the closer is the
+    shared channel terminator (the reasoning parser leaves the block verbatim)."""
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<|content_invoke_tool_json|>"
+        self.eot_token = "<|end_message|>"
+        self.tool_call_separator = ""
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        result = super().detect_and_parse(text, tools)
+        # the template renders the function name just before the JSON channel; it is
+        # part of the call, not visible content
+        names = {c.name for c in result.calls}
+        normal = result.normal_text.strip()
+        if normal in names:
+            normal = ""
+        return StreamingParseResult(normal_text=normal, calls=result.calls)
+
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+        if isinstance(action, dict):
+            action = [action]
+        action = [{**a, "arguments": a.get("args", a.get("arguments", {}))} for a in action if isinstance(a, dict)]
+        return super().parse_base_json(action, tools)
 
 
 class RippleDetector(Qwen25Detector):
@@ -3586,6 +3618,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,
         "glm47": Glm47Detector,
+        "inkling2": Inkling2Detector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,

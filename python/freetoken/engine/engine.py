@@ -3466,6 +3466,11 @@ def _ensure_banks_sidecar(config: EngineConfig, method, *, device, required: boo
 
     if config.use_dummy_weight:
         return config.model_path
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(config.model_path) is not None:
+        # a GGUF file is its own bank source; the HF sidecar repack does not apply
+        return None
     local = download_hf_weight(config.model_path)
     if is_ftw_checkpoint(local):
         return local
@@ -3761,6 +3766,31 @@ def _adjust_config(config: EngineConfig):
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
+
+    if has_swa_attention and has_linear_attention:
+        # No radix cache serves both SWA window slots and linear-state snapshots yet
+        # (swa_radix and hybrid_radix are separate mechanisms); the naive cache drives
+        # both lifecycles -- the inkling2_loop combination runs without prefix reuse.
+        if getattr(config, "cache_type", "radix") != "naive":
+            logger.warning_rank0(
+                f"{getattr(model_config, 'model_type', 'model')}: SWA + linear state runs on the naive "
+                "prefix cache (no cross-request reuse); forcing cache_type=naive"
+            )
+        override("cache_type", "naive")
+
+    if getattr(model_config, "inkling2_args", None) is not None:
+        # The loop revisits the core MoE layers (visit order 0..17, 6..17, 6..17, 18..23);
+        # the overlap prefetch stages layer_id+1, which is not the next visit after the
+        # core's last layer -- the double buffer then serves the wrong experts. Disable
+        # the overlap until the prefetch learns the visit schedule.
+        if config.moe_prefill_overlap or config.decode_fetch_overlap:
+            logger.warning_rank0(
+                "inkling2_loop: disabling MoE fetch overlap (the loop revisits expert layers; "
+                "the prefetch assumes sequential layer order)"
+            )
+        override("moe_prefill_overlap", False)
+        override("decode_fetch_overlap", False)
+
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

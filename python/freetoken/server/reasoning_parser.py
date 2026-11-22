@@ -1058,6 +1058,127 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
         )
 
 
+class Inkling2ReasoningParser(BaseReasoningParser):
+    """Inkling-2's content channels: ``<|content_thinking|>...<|end_message|>`` is
+    reasoning, ``<|content_text|>`` is content. The generation prompt ends at
+    ``<|message_model|>`` and the model opens every channel itself, so nothing is forced.
+    The tool-call channel (``<|content_invoke_tool_json|>``) passes through verbatim for
+    the function-call detector; channel markers and closers never reach the client."""
+
+    OPEN_THINK = "<|content_thinking|>"
+    OPEN_TEXT = "<|content_text|>"
+    OPEN_TOOL = "<|content_invoke_tool_json|>"
+    CLOSE = "<|end_message|>"
+    OPEN_PREFIX = "<|content_"
+    # the turn header; the prompt ends with it, but the model sometimes re-emits it
+    MODEL_HEADER = "<|message_model|>"
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token=self.OPEN_THINK,
+            think_end_token=self.CLOSE,
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+        self._channel: str | None = None  # think | text | tool | other; None: seeking an opener
+
+    def _kind(self, opener: str) -> str:
+        if opener == self.OPEN_THINK:
+            return "think"
+        if opener == self.OPEN_TEXT:
+            return "text"
+        if opener == self.OPEN_TOOL:
+            return "tool"
+        return "other"
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        text = text.replace(self.MODEL_HEADER, "")
+        reasoning, normal = [], []
+        rest = text
+        while rest:
+            idx = rest.find(self.OPEN_PREFIX)
+            if idx < 0:
+                normal.append(rest)
+                break
+            normal.append(rest[:idx])
+            rest = rest[idx:]
+            end = rest.find("|>")
+            if end < 0:  # truncated opener
+                normal.append(rest)
+                break
+            opener, rest = rest[: end + 2], rest[end + 2 :]
+            kind = self._kind(opener)
+            close = rest.find(self.CLOSE)
+            body = rest if close < 0 else rest[:close]
+            rest = "" if close < 0 else rest[close + len(self.CLOSE) :]
+            if kind == "think":
+                reasoning.append(body)
+            elif kind == "tool":
+                normal.append(opener + body + (self.CLOSE if close >= 0 else ""))
+            else:
+                normal.append(body)
+        return ReasoningParseResult(reasoning_text="".join(reasoning), normal_text="".join(normal))
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        reasoning, normal = "", ""
+        while self._buffer:
+            buf = self._buffer
+            if self._channel is None:
+                if buf.startswith(self.MODEL_HEADER):
+                    self._buffer = buf[len(self.MODEL_HEADER) :]
+                    continue
+                if self.MODEL_HEADER.startswith(buf):
+                    break  # partial turn header; wait for the rest
+                idx = buf.find(self.OPEN_PREFIX)
+                if idx < 0:
+                    # hold back a partial opener prefix; the rest is stray content
+                    hold = _partial_suffix(buf, self.OPEN_PREFIX)
+                    normal += buf[: len(buf) - hold]
+                    self._buffer = buf[len(buf) - hold :]
+                    break
+                normal += buf[:idx]
+                rest = buf[idx:]
+                end = rest.find("|>")
+                if end < 0:
+                    self._buffer = rest
+                    break
+                opener = rest[: end + 2]
+                self._channel = self._kind(opener)
+                if self._channel == "tool":
+                    normal += opener
+                self._buffer = rest[end + 2 :]
+                continue
+            close = buf.find(self.CLOSE)
+            if close >= 0:
+                kind = self._channel
+                body, self._buffer, self._channel = buf[:close], buf[close + len(self.CLOSE) :], None
+                if kind == "think":
+                    reasoning += body
+                elif kind == "tool":
+                    normal += body + self.CLOSE
+                else:
+                    normal += body
+                continue
+            if not self.stream_reasoning and self._channel == "think":
+                break
+            hold = _partial_suffix(buf, self.CLOSE)
+            body, self._buffer = buf[: len(buf) - hold], buf[len(buf) - hold :]
+            if self._channel == "think":
+                reasoning += body
+            else:
+                normal += body
+            break
+        return ReasoningParseResult(reasoning_text=reasoning, normal_text=normal)
+
+    def flush(self) -> ReasoningParseResult:
+        buf, self._buffer = self._buffer, ""
+        channel, self._channel = self._channel, None
+        if channel == "think":
+            return ReasoningParseResult(reasoning_text=buf)
+        return ReasoningParseResult(normal_text=buf)
+
+
 class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
@@ -1072,6 +1193,7 @@ class ReasoningParser:
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
+        "inkling2": Inkling2ReasoningParser,
     }
 
     def __init__(

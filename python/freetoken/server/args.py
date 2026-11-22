@@ -229,6 +229,8 @@ def parse_args(
         # off the checkpoint only: the HF org name ricursiveAI would match other models' paths
         if "ricursive" in " ".join(candidates[1:]).lower():
             return "ricursive"
+        if "inkling" in marker:
+            return "inkling2"
         if "flint" in marker:
             return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -284,6 +286,8 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "ricursive" in " ".join(candidates[1:]).lower():
             return "ricursive"
+        if "inkling" in marker:
+            return "inkling2"
         if "flint" in marker:
             return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -720,6 +724,7 @@ def parse_args(
             "muse_glimmer",
             "gpt_oss",
             "gpt-oss",
+            "inkling2",
         ],
         help="Tool-call parser format for OpenAI-compatible tool responses.",
     )
@@ -730,7 +735,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive", "inkling2",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "

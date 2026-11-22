@@ -399,6 +399,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         arch_aliases=("RicursiveGGUFForCausalLM",),
     ),
     AotModel(
+        name="thinkingmachines/Inkling-2-Mini",
+        architecture="Inkling2LoopForConditionalGeneration",
+        hidden_size=2304,
+        kv_groups=((8, 128),),  # SWA and full visits share the geometry; each visit owns its KV
+        top_k=8,
+        moe_intermediate_size=1152,
+        # NVFP4 experts (layers 0-19) + MXFP8 served dequantized bf16 (20-23); GGUF banks
+        expert_formats=("nvfp4", "bf16", "gguf_scaled"),
+        arch_aliases=("Inkling2LoopForCausalLM", "Inkling2LoopGGUFForCausalLM"),
+    ),
+    AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,

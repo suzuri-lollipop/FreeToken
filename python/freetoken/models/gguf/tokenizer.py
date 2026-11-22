@@ -41,7 +41,13 @@ _FLINT_SPLITS = (
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
 
-_CUSTOM_SPLITS = {"joyai-llm": _JOYAI_LLM_SPLITS, "flint": _FLINT_SPLITS}
+# Inkling-2 (llama.cpp pre type "inkling2" = GPT4O, clean_spaces off): the single
+# GPT-4o split of the checkpoint's tokenizer.json, before the byte-level fallback.
+_INKLING2_SPLITS = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+_CUSTOM_SPLITS = {"joyai-llm": _JOYAI_LLM_SPLITS, "flint": _FLINT_SPLITS, "inkling2": _INKLING2_SPLITS}
 
 
 def _add_bos(meta: dict) -> bool:
@@ -125,12 +131,16 @@ def load_gguf_tokenizer(model_path: str):
     if pre in _IGNORE_MERGES_PRE:
         fast.model.ignore_merges = True
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template
-    return PreTrainedTokenizerFast(
+    tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=fast,
         **_known_specials(special, fast),
         add_bos_token=_add_bos(meta),
         add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
+    from freetoken.utils.hf import ensure_tml_generation_prompt
+
+    ensure_tml_generation_prompt(tokenizer)
+    return tokenizer
 
 
 def gguf_eos_token_ids(model_path: str) -> set[int]:

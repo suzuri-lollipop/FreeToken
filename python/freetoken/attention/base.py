@@ -44,6 +44,10 @@ class AttentionSpec:
     sliding_window: int | None = None
     sm_scale: float | None = None
     sinks: torch.Tensor | None = None
+    # per-query-row relative bias table [num_query_rows, num_q_heads, extent+1] fp32: the
+    # kernel adds table[row, head, clamp(q_pos - k_pos, 0, extent)] to each logit; the last
+    # column holds the bias of keys beyond the extent (inkling2: zero). None: no bias.
+    rel_table: torch.Tensor | None = None
     # rows of a multimodal span (batch.mm_block_ends) also attend to the span's later keys
     bidirectional_mm_blocks: bool = False
 
