@@ -210,7 +210,7 @@ class Inkling2Attention(BaseOP):
         out = out.reshape(tokens, self.nh * self.hd)
         out = (out.float() * torch.sigmoid(gate.float())).to(out.dtype)
         out = self.o_proj.forward(out.reshape(tokens, self.nh * self.hd))
-        out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim))
+        out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * self.nk * self.hd))
         if _IK2_PROF:
             torch.cuda.synchronize()
             _a4 = _time.perf_counter()

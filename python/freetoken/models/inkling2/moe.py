@@ -58,12 +58,11 @@ class Inkling2MoE(BaseOP):
             logits, self.gate_bias, self.top_k, True, routed_scale=self.route_scale
         )
         if self.tp_size > 1:
-            # EP: remap global expert ids to local; non-local routes become -1 (inactive)
+            # EP: remap global expert ids to local; non-local routes read expert 0 with weight 0
             local_ids = topk_ids - self.expert_offset
-            local_ids = torch.where(
-                (local_ids >= 0) & (local_ids < self.local_experts), local_ids, -1
-            )
-            topk_ids = local_ids
+            is_local = (local_ids >= 0) & (local_ids < self.local_experts)
+            topk_ids = local_ids.clamp(0, self.local_experts - 1)
+            topk_weights = topk_weights * is_local.to(topk_weights.dtype)
         return self.experts.routed_forward(x, topk_weights, topk_ids)
 
 
