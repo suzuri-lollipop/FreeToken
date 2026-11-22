@@ -167,7 +167,7 @@ class Inkling2DecoderLayer(BaseOP):
             _t2 = _time.perf_counter()
             _prof.add("moe_phase", _t2 - _t1)
 
-        h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim + args.hidden_size))
+        h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * (args.kv_dim // get_tp_info().size) + args.hidden_size))
         out = (residual + h.float()).to(x.dtype)
         if _IK2_PROF:
             torch.cuda.synchronize()
@@ -260,8 +260,7 @@ class Inkling2TextModel(BaseOP):
 
 class Inkling2LoopForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
-        if get_tp_info().size > 1:
-            raise NotImplementedError("inkling2_loop supports TP=1 only")
+        # TP>=2: attention heads split column/row parallel, experts EP-sharded
         args: Inkling2Args = config.inkling2_args
         self.model = Inkling2TextModel(config)
         self.lm_head = ParallelLMHead(

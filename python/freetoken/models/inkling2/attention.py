@@ -21,7 +21,9 @@ import torch
 import torch.nn.functional as F
 from freetoken.attention import AttentionSpec
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
+from freetoken.layers import BaseOP, LinearReplicated, LinearRowParallel, RMSNorm
+from freetoken.layers.linear import LinearColParallelMerged
+from freetoken.distributed import get_tp_info
 from freetoken.models.config import ModelConfig
 from freetoken.utils import nvtx_annotate
 
@@ -49,19 +51,22 @@ class Inkling2Attention(BaseOP):
         self.args = args
         self.phys_layer = phys_layer
         self.swa = phys_layer in args.swa_physical
-        self.nh, self.nk, self.hd = args.num_qo_heads, args.num_kv_heads, args.head_dim
+        tp = get_tp_info().size
+        self.nh, self.nk, self.hd = args.num_qo_heads // tp, args.num_kv_heads // tp, args.head_dim
         self.d_rel = args.d_rel
         H = config.hidden_size
-        lin = lambda out_dim, name: LinearReplicated(
-            H, out_dim, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.{name}"
+        local_q = self.nh * self.hd
+        local_kv = self.nk * self.hd
+        col = lambda out_dim, name: LinearColParallelMerged(
+            H, [out_dim], has_bias=False, quant_config=config.quant, prefix=f"{prefix}.{name}"
         )
-        self.q_proj = lin(args.q_dim, "q_proj")
-        self.k_proj = lin(args.kv_dim, "k_proj")
-        self.v_proj = lin(args.kv_dim, "v_proj")
-        self.r_proj = lin(self.nh * self.d_rel, "r_proj")
-        self.gate_proj = lin(args.q_dim, "gate_proj")
-        self.sink_proj = lin(self.nh, "sink_proj")
-        self.o_proj = LinearReplicated(
+        self.q_proj = col(args.q_dim, "q_proj")
+        self.k_proj = col(args.kv_dim, "k_proj")
+        self.v_proj = col(args.kv_dim, "v_proj")
+        self.r_proj = col(args.num_qo_heads * self.d_rel, "r_proj")
+        self.gate_proj = col(args.q_dim, "gate_proj")
+        self.sink_proj = col(args.num_qo_heads, "sink_proj")
+        self.o_proj = LinearRowParallel(
             args.q_dim, H, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj"
         )
         self.q_clip_scale = torch.empty(self.nh, self.hd)
@@ -70,14 +75,14 @@ class Inkling2Attention(BaseOP):
         self.rel_bias = torch.empty(self.d_rel, extent)
         if self.swa:
             self.input_layernorm = RMSNorm(H, config.rms_norm_eps)
-            self.k_conv = Inkling2Conv(config, args.kv_dim, prefix=f"{prefix}.k_sconv")
-            self.v_conv = Inkling2Conv(config, args.kv_dim, prefix=f"{prefix}.v_sconv")
+            self.k_conv = Inkling2Conv(config, local_kv, prefix=f"{prefix}.k_sconv")
+            self.v_conv = Inkling2Conv(config, local_kv, prefix=f"{prefix}.v_sconv")
         else:
             self.q_input_norm = RMSNorm(H, config.rms_norm_eps)
             self.k_input_norm = RMSNorm(H, config.rms_norm_eps)
             self.v_input_norm = RMSNorm(H, config.rms_norm_eps)
-            self.k_conv = Inkling2Conv(config, args.kv_dim, num_heads=self.nk, prefix=f"{prefix}.k_sconv")
-            self.v_conv = Inkling2Conv(config, args.kv_dim, num_heads=self.nk, prefix=f"{prefix}.v_sconv")
+            self.k_conv = Inkling2Conv(config, local_kv, num_heads=self.nk, prefix=f"{prefix}.k_sconv")
+            self.v_conv = Inkling2Conv(config, local_kv, num_heads=self.nk, prefix=f"{prefix}.v_sconv")
         self.attn_post_conv = Inkling2Conv(config, H, prefix=f"{prefix}.attn_sconv")
         self.attn_spec = AttentionSpec(
             sliding_window=args.sliding_window if self.swa else None,
@@ -147,19 +152,19 @@ class Inkling2Attention(BaseOP):
                     k_raw = self.k_proj.forward(xk)
                     v_raw = self.v_proj.forward(xv)
                 sinks = self.sink_proj.forward(xq)
-                k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
-                v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+                k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
+                v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None)
             else:
                 q = self.q_proj.forward(xq)
-                k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
-                v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+                k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
+                v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None)
                 r = self.r_proj.forward(xq)
                 gate = self.gate_proj.forward(xq)
                 sinks = self.sink_proj.forward(xq)
         else:
             q = self.q_proj.forward(xq)
-            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
-            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
+            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None)
             r = self.r_proj.forward(xq)
             gate = self.gate_proj.forward(xq)
             sinks = self.sink_proj.forward(xq)
@@ -202,9 +207,9 @@ class Inkling2Attention(BaseOP):
             torch.cuda.synchronize()
             _a3 = _time.perf_counter()
             _prof.add("attn_triton", _a3 - _a2)
-        out = out.reshape(tokens, args.q_dim)
+        out = out.reshape(tokens, self.nh * self.hd)
         out = (out.float() * torch.sigmoid(gate.float())).to(out.dtype)
-        out = self.o_proj.forward(out.reshape(tokens, args.q_dim))
+        out = self.o_proj.forward(out.reshape(tokens, self.nh * self.hd))
         out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim))
         if _IK2_PROF:
             torch.cuda.synchronize()

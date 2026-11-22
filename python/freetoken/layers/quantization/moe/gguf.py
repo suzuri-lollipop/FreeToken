@@ -82,7 +82,7 @@ class GgmlMoEKernel(MoEKernel):
                 return f"float GGUF experts run on the bf16 fused MoE: {reason}"
         if cfg.has_bias and cfg.decode_target != "gpu":
             return "gpt-oss per-expert biases have no CPU executor format; decode must run on the GPU"
-        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False, bias_ok=True)
+        return self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False, bias_ok=True)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)

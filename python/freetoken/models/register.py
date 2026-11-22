@@ -609,6 +609,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         quant_overrides=(("with_input_scale", False),),
         mm_processor=_INKLING2_PROCESSOR,
         encoders=_INKLING2_ENCODERS,
+        tp_supported=True,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "Inkling2LoopForCausalLM": ModelSpec(
@@ -618,6 +619,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_segments=_INKLING2_SEGMENTS,
         unquantized_modules=_INKLING2_UNQUANTIZED,
         quant_overrides=(("with_input_scale", False),),
+        tp_supported=True,
     ),
     # mainline llama.cpp inkling2_loop GGUF (unsloth Mainline_Support UD-Q4_K_XL / UD-Q8_K_XL):
     # the same model classes with every tensor in its packed ggml type; an inkling2v mmproj
@@ -631,6 +633,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_EXPERTS_PACKED,
         mm_processor=_INKLING2_PROCESSOR,
         encoders=_INKLING2_ENCODERS,
+        tp_supported=True,
     ),
 }
 

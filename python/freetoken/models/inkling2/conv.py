@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers.linear import LinearColParallelMerged
+from freetoken.distributed import get_tp_info
 from freetoken.models.config import ModelConfig
 
 from .args import CONV_STATE, Inkling2Args
@@ -97,8 +99,9 @@ class Inkling2Conv(BaseOP):
         self.weight = torch.empty(channels, self.kernel, dtype=torch.float32)
         self.out_scale = 1.0 / math.sqrt((2 if num_heads else 1) * self.kernel + 1)
         if num_heads:
-            self.conv_proj = LinearReplicated(
-                config.hidden_size, num_heads * self.kernel,
+            tp = get_tp_info().size
+            self.conv_proj = LinearColParallelMerged(
+                config.hidden_size, [num_heads * tp * self.kernel],
                 has_bias=False, quant_config=config.quant, prefix=f"{prefix}.conv_proj",
             )
 

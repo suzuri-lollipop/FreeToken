@@ -250,8 +250,11 @@ def iter_gguf_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     if not include_non_moe:
         return
+    from freetoken.distributed import info as _di
+    from freetoken.models.loader import shard_tensor
     from freetoken.utils import cached_load_hf_config
 
+    tp = _di._TP_INFO if _di._TP_INFO is not None else _di.DistributedInfo(rank=0, size=1)
     hf = _hf_config(cached_load_hf_config(model_path))
     vision = include_vision and hf.vision_config is not None
     log_mmproj(model_path, vision)
@@ -260,12 +263,50 @@ def iter_gguf_weights(
     core_start = hf.loop_config["core_start"]
     core_end = hf.loop_config["core_end"]
 
+    def tp_shard(name: str, t: torch.Tensor) -> torch.Tensor:
+        if tp.size == 1:
+            return t
+        # standard projections: shard_tensor handles q/k/v/gate/o/embed/lm_head
+        if any(sub in name for sub in (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".o_proj", "lm_head", "embed_tokens")):
+            sh = shard_tensor(name, t, rank=tp.rank, world_size=tp.size, num_kv_heads=hf.num_key_value_heads)
+            if "lm_head" in name or "embed_tokens" in name:
+                want = (t.shape[0] + tp.size - 1) // tp.size
+                if sh.shape[0] < want:
+                    sh = torch.cat([sh, sh.new_zeros(want - sh.shape[0], *sh.shape[1:])])
+            elif t.dtype == torch.uint8:
+                # file carries ggml pad rows; equalize to the largest partition
+                want = (t.shape[0] + tp.size - 1) // tp.size
+                if sh.shape[0] < want:
+                    sh = torch.cat([sh, sh.new_zeros(want - sh.shape[0], *sh.shape[1:])])
+            return sh
+        # r_proj, sink_proj: split output dim (per q-head)
+        if any(sub in name for sub in (".r_proj", ".sink_proj")):
+            sh = t.chunk(tp.size, dim=0)[tp.rank].clone()
+            if t.dtype == torch.uint8:
+                want = (t.shape[0] + tp.size - 1) // tp.size
+                if sh.shape[0] < want:
+                    sh = torch.cat([sh, sh.new_zeros(want - sh.shape[0], *sh.shape[1:])])
+            return sh
+        # per-head clip scales: [nh, hd] or [nh, d_rel]
+        if "clip_scale" in name:
+            return t.chunk(tp.size, dim=0)[tp.rank].clone()
+        # k/v conv weights and conv_proj: split channel dim
+        if any(sub in name for sub in (".k_conv.weight", ".v_conv.weight", ".k_conv.conv_proj", ".v_conv.conv_proj")):
+            sh = t.chunk(tp.size, dim=0)[tp.rank].clone()
+            if t.dtype == torch.uint8:
+                want = (t.shape[0] + tp.size - 1) // tp.size
+                if sh.shape[0] < want:
+                    sh = torch.cat([sh, sh.new_zeros(want - sh.shape[0], *sh.shape[1:])])
+            return sh
+        return t
+
     def t(name: str) -> GgufTensorInfo:
         return index[name if name in index else f"{name}.weight"]
 
     def linear(module: str, gguf_name: str, k: int):
         info = t(gguf_name)
-        yield from fused(module, [info], [matrix(info)], k)
+        for name, tensor in fused(module, [info], [matrix(info)], k):
+            yield name, tp_shard(name, tensor)
 
     yield from linear("model.embed_tokens", "token_embd", hidden)
     if "output.weight" in index:
@@ -281,11 +322,11 @@ def iter_gguf_weights(
         for leaf in ("q_proj", "k_proj", "v_proj", "o_proj", "r_proj", "gate_proj", "sink_proj"):
             info = t(f"{blk}.{_LAYER_LEAVES[f'self_attn.{leaf}']}")
             yield from linear(f"{sa}.{leaf}", info.name.removesuffix(".weight"), int(info.ne[0]))
-        yield f"{sa}.q_clip_scale", float_tensor(t(f"{blk}.attn_q_clip"))
-        yield f"{sa}.rel_clip_scale", float_tensor(t(f"{blk}.attn_rel_clip"))
+        yield f"{sa}.q_clip_scale", tp_shard(f"{sa}.q_clip_scale", float_tensor(t(f"{blk}.attn_q_clip")))
+        yield f"{sa}.rel_clip_scale", tp_shard(f"{sa}.rel_clip_scale", float_tensor(t(f"{blk}.attn_rel_clip")))
         yield f"{sa}.rel_bias", float_tensor(t(f"{blk}.attn_rel_bias")).transpose(0, 1).contiguous()
-        yield f"{sa}.k_conv.weight", _conv_lag(t(f"{blk}.attn_k_conv"))
-        yield f"{sa}.v_conv.weight", _conv_lag(t(f"{blk}.attn_v_conv"))
+        yield f"{sa}.k_conv.weight", tp_shard(f"{sa}.k_conv.weight", _conv_lag(t(f"{blk}.attn_k_conv")))
+        yield f"{sa}.v_conv.weight", tp_shard(f"{sa}.v_conv.weight", _conv_lag(t(f"{blk}.attn_v_conv")))
         yield f"{sa}.attn_post_conv.weight", _conv_lag(t(f"{blk}.attn_post_conv"))
         yield f"{pre}.ffn_post_conv.weight", _conv_lag(t(f"{blk}.ffn_post_conv"))
         if swa:

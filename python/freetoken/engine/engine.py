@@ -1097,23 +1097,30 @@ class Engine:
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
         from freetoken.kernel import ggml
 
-        # the Vulkan wrapper reads the banks itself: keep them in pinned host RAM (its
-        # resident device copies live in Vulkan memory, a CUDA copy would double the VRAM)
         vulkan = ggml.backend_name() == "vulkan"
+        tp = config.tp_info
+        # EP: each rank loads only its local experts; TP>=2 always VRAM-resident (no host RAM)
+        expert_slice = None
+        if tp.size > 1:
+            ne = config.model_config.num_experts
+            local = ne // tp.size
+            expert_slice = (tp.rank * local, local)
+        # TP>=2: VRAM-resident (fits with EP sharding); TP1 Vulkan: host banks (ik2-vk uploads)
+        device = self.device if (tp.size > 1 or not vulkan) else None
         with _weight_load_context():
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
                 method=layers[0].quant_method,
-                device=None if vulkan else self.device,
+                device=device,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
                 layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
+                expert_slice=expert_slice,
             )
-        if vulkan:
-            # the per-expert scales stay on the GPU: the MoE apply indexes them with
-            # device route ids (the packed weight banks themselves stay in host RAM)
+        if vulkan and device is None:
+            # TP1 host banks: scales to GPU, warn if VRAM is tight for the Vulkan uploads
             for role, per_layer in banks.sources.items():
                 if role == "global":
                     banks.sources[role] = [t.to(self.device) for t in per_layer]
