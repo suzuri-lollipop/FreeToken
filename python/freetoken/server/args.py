@@ -1170,7 +1170,8 @@ def parse_args(
         default=ServerArgs.speculative_algorithm,
         help=(
             "Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers; dflash: a DFlash 2 draft "
-            "checkpoint from --speculative-draft-model-path). Off by default."
+            "checkpoint from --speculative-draft-model-path; dspark: Inkling-2-Mini's official mtp.safetensors drafter, "
+            "from the target folder or --speculative-draft-model-path). Off by default."
         ),
     )
 

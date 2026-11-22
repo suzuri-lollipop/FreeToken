@@ -34,6 +34,8 @@ class ConvMeta:
     seq_lens   host per-request token counts
     fresh      [B] bool device or None -- request starts a new sequence (zero history)
     is_decode  one token per request
+    is_verify / rows_per_req -- a speculative verify batch: B requests x rows_per_req causal
+               rows; the convs read the live state and stash every row's window for the commit
     track_dst / track_boundary_row -- hybrid-radix snapshot target (None on the naive cache)
     """
 
@@ -44,9 +46,13 @@ class ConvMeta:
     is_decode: bool
     track_dst: torch.Tensor | None = None
     track_boundary_row: torch.Tensor | None = None
+    is_verify: bool = False
+    rows_per_req: int = 1
 
 
 def build_conv_meta(batch, device: torch.device) -> ConvMeta:
+    verify = getattr(batch, "phase", None) == "verify"
+    rows = getattr(batch, "rows_per_req", None) or 1
     fla = getattr(batch, "fla_metadata", None)
     if fla is not None:
         slots = fla.cache_indices.long()
@@ -68,6 +74,8 @@ def build_conv_meta(batch, device: torch.device) -> ConvMeta:
             is_decode=False,
             track_dst=fla.track_dst,
             track_boundary_row=fla.track_boundary_row,
+            is_verify=verify,
+            rows_per_req=rows,
         )
     # direct-op callers (tests) with no scheduler metadata
     reqs = batch.padded_reqs
@@ -76,7 +84,8 @@ def build_conv_meta(batch, device: torch.device) -> ConvMeta:
     cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
     slots = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
     fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
-    return ConvMeta(slots=slots, cu_seqlens=cu, seq_lens=tuple(lens), fresh=fresh, is_decode=batch.is_decode)
+    return ConvMeta(slots=slots, cu_seqlens=cu, seq_lens=tuple(lens), fresh=fresh, is_decode=batch.is_decode,
+                    is_verify=verify, rows_per_req=rows)
 
 
 def conv_state_slab(visit: int, channels: int, offset: int) -> torch.Tensor:
@@ -114,13 +123,35 @@ class Inkling2Conv(BaseOP):
         dyn = dyn.unsqueeze(2).expand(-1, -1, self.head_dim, -1).reshape(tokens, self.channels, self.kernel)
         return w + dyn
 
-    def forward(self, x: torch.Tensor, meta: ConvMeta, states: torch.Tensor, dyn_input: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, meta: ConvMeta, states: torch.Tensor, dyn_input: torch.Tensor | None = None,
+                *, verify_key: tuple[int, int] | None = None) -> torch.Tensor:
         dyn = self.conv_proj.forward(dyn_input).float() if self.num_heads else None
-        if meta.is_decode:
+        if meta.is_verify:
+            assert verify_key is not None, "a verify conv needs its (visit, channel offset) slab key"
+            out = self._verify(x, meta, states, dyn, verify_key)
+        elif meta.is_decode:
             out = self._decode(x, meta, states, dyn)
         else:
             out = self._prefill(x, meta, states, dyn)
         return ((out + x.float()) * self.out_scale).to(x.dtype)
+
+    def _verify(self, x: torch.Tensor, meta: ConvMeta, states: torch.Tensor, dyn: torch.Tensor | None,
+                verify_key: tuple[int, int]) -> torch.Tensor:
+        """Every verify row's causal window over [live history | the block's inputs], the live
+        state read-only; the stash lets the commit roll the history to the accepted rows only.
+        Device ops only, so a verify graph captures it (the PLE conv verify pattern)."""
+        visit, offset = verify_key
+        bs, rows = meta.slots.numel(), meta.rows_per_req
+        handler = get_global_ctx().linear_state_pool.verify_handler(CONV_STATE)
+        history = handler.history[visit][:bs, offset : offset + self.channels]
+        history[..., : self.kernel - 1].copy_(self._read_state(meta, states))
+        history[..., self.kernel - 1 :].copy_(x.view(bs, rows, self.channels).transpose(1, 2))
+        # window[r, lag] = packed column (K-1) + r - lag: lag 0 the row itself, lag K-1 the oldest
+        cols = (self.kernel - 1) + torch.arange(rows, device=x.device).unsqueeze(1) - torch.arange(self.kernel, device=x.device)
+        packed = history.gather(2, cols.reshape(1, 1, -1).expand(bs, self.channels, -1))
+        windows = packed.view(bs, self.channels, rows, self.kernel).permute(0, 2, 1, 3).reshape(bs * rows, self.channels, self.kernel)
+        taps = self._taps(dyn, x.shape[0])
+        return (windows * taps).sum(-1)
 
     def _read_state(self, meta: ConvMeta, states: torch.Tensor) -> torch.Tensor:
         state = states.index_select(0, meta.slots)
@@ -242,4 +273,31 @@ def short_conv_reference(
     return out.to(input_dtype), torch.stack(new_states, dim=0)
 
 
-__all__ = ["ConvMeta", "Inkling2Conv", "build_conv_meta", "conv_state_slab", "short_conv_reference"]
+class Inkling2ConvVerify:
+    """``SlotVerify`` of the conv history: per visit and verify row, the live history then
+    every verify conv input (the PLEConvVerify pattern; the four convs of a visit share the
+    slab, each stashing its own channels)."""
+
+    def __init__(self, spec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.name = spec.name
+        width, self.state_len = spec.shape
+        self.history = {
+            layer_id: torch.zeros(max_bs, width, self.state_len + rows_per_req, dtype=dtype, device=device)
+            for layer_id in spec.layer_ids
+        }
+
+    @staticmethod
+    def nbytes(spec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
+        width, state_len = spec.shape
+        return len(spec.layer_ids) * max_bs * width * (state_len + rows_per_req) * dtype.itemsize
+
+    def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
+        # after n accepted rows the history is columns n .. n + state_len - 1
+        cols = (counts.unsqueeze(1) + torch.arange(self.state_len, device=counts.device)).unsqueeze(1)
+        for layer_id, history in self.history.items():
+            states = pool.slot_state(self.name, layer_id)
+            window = history[: slots.numel()].gather(2, cols.expand(-1, history.shape[1], -1))
+            states.index_copy_(0, slots, window.to(states.dtype))
+
+
+__all__ = ["ConvMeta", "Inkling2Conv", "Inkling2ConvVerify", "build_conv_meta", "conv_state_slab", "short_conv_reference"]

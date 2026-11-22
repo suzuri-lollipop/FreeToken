@@ -36,6 +36,7 @@ from freetoken.models.config import (
 )
 
 from .args import CONV_STATE, Inkling2Args, build_args
+from .conv import Inkling2ConvVerify
 
 # the chat template's image placeholder <|unused_200054|>
 IMAGE_TOKEN_ID = 200054
@@ -201,6 +202,7 @@ def parse_config(hf: Any) -> ModelConfig:
                 shape=(args.conv_channels, args.conv_state_len),
                 layer_ids=tuple(range(args.num_visits)),
                 dtype=torch.float32,
+                verify=Inkling2ConvVerify,
             ),
         ),
         inkling2_args=args,

@@ -153,8 +153,8 @@ class Inkling2Attention(BaseOP):
                     k_raw = self.k_proj.forward(xk)
                     v_raw = self.v_proj.forward(xv)
                 sinks = self.sink_proj.forward(xq)
-                k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
-                v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None)
+                k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None, verify_key=(visit, 0))
+                v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None, verify_key=(visit, self.nk * self.hd))
             else:
                 q = self.q_proj.forward(xq)
                 k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
@@ -164,8 +164,8 @@ class Inkling2Attention(BaseOP):
                 sinks = self.sink_proj.forward(xq)
         else:
             q = self.q_proj.forward(xq)
-            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None)
-            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None)
+            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None, verify_key=(visit, 0))
+            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None, verify_key=(visit, self.nk * self.hd))
             r = self.r_proj.forward(xq)
             gate = self.gate_proj.forward(xq)
             sinks = self.sink_proj.forward(xq)
@@ -211,7 +211,7 @@ class Inkling2Attention(BaseOP):
         out = out.reshape(tokens, self.nh * self.hd)
         out = (out.float() * torch.sigmoid(gate.float())).to(out.dtype)
         out = self.o_proj.forward(out.reshape(tokens, self.nh * self.hd))
-        out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * self.nk * self.hd))
+        out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * self.nk * self.hd), verify_key=(visit, 2 * self.nk * self.hd))
         if _IK2_PROF:
             torch.cuda.synchronize()
             _a4 = _time.perf_counter()

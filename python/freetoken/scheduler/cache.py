@@ -46,7 +46,8 @@ _ANCHOR_BORROW_MARGIN = 4
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 radix_lookahead: bool = False, mamba_host_cache_mb: int = 2048):
+                 radix_lookahead: bool = False, mamba_host_cache_mb: int = 2048,
+                 spec_decode: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -79,6 +80,9 @@ class CacheManager:
         # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
         assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
         self.radix_lookahead = radix_lookahead
+        # a verify step runs k+1 rows and rejection rolls the committed length back, so the
+        # out-of-window frontier must be the COMMITTED length, not the optimistic device_len
+        self.spec_decode = spec_decode
         # Host tier for evicted GDN snapshots (hybrid + CUDA + a positive budget): snapshots
         # evict_mamba would LOSE are stashed in pinned host RAM and stay resumable. None
         # otherwise; every host_* call below is guarded by `self.host_cache is not None`.
@@ -265,7 +269,11 @@ class CacheManager:
             if req.decode_batch_idx < 1:
                 continue                       # overlap guard: extend forward may still be running
             floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
-            threshold = (req.device_len - 1) - window - self.page_size
+            # spec: the block's first row reads back to cached_len - window + 1 and a rejection
+            # rolls device_len back, so free only below the COMMITTED frontier minus the margin;
+            # the device_len frontier would free rows the next verify still reads (k > page_size)
+            frontier = req.cached_len if self.spec_decode else req.device_len - 1
+            threshold = frontier - window - self.page_size
             if req.toolcall_anchor_len is not None:
                 # Keep the window ending at the anchor resumable: a client-side rewrite of the
                 # echoed tool call forks after the anchor, and a resume there needs
@@ -363,14 +371,17 @@ class CacheManager:
 
         The page-table entries still point at them; the caller must re-charge the span
         (which overwrites the entries) before the freed slots are handed out again -- the
-        next spec verify step does exactly that. SWA-mapped pools are not supported (the
-        spec gate excludes them).
+        next spec verify step does exactly that. On a SWA-mapped pool the backing swa slots
+        go with them (the span is the request's own rejected tail, above the committed
+        frontier the eviction driver frees below).
         """
-        assert not self.swa_paged, "release_paged: swa pools need their slot mapping undone"
         for table_idx, first_page, last_page in allocation_info:
             lo = first_page * self.page_size
             hi = last_page * self.page_size
-            self._free(self.page_table[table_idx, lo:hi])
+            indices = self.page_table[table_idx, lo:hi]
+            if self.swa_paged:
+                self._free_swa(indices)
+            self._free(indices)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
@@ -778,9 +789,14 @@ class CacheManager:
         """
         start = div_ceil(keep_len, self.page_size) * self.page_size
         end = div_ceil(drop_len, self.page_size) * self.page_size
-        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
         if end > start:
-            self._free(self.page_table[req.table_idx, start:end])
+            indices = self.page_table[req.table_idx, start:end]
+            # the rejected tail is the request's own, above the committed length: its swa
+            # slots go back too (the eviction driver only frees below the committed frontier,
+            # and the next verify re-charges exactly this span)
+            if self.swa_paged:
+                self._free_swa(indices)
+            self._free(indices)
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

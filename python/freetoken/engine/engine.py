@@ -3899,7 +3899,11 @@ def _adjust_config(config: EngineConfig):
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
-        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+        # inkling2's SWA eviction frees below the COMMITTED frontier under spec (cache.py), so a
+        # verify's reads stay live at any draft width; other SWA families keep the ban until their
+        # eviction is audited the same way, and the DSV4 window tiers stay banned outright
+        swa_spec_ok = getattr(model_config, "inkling2_args", None) is not None
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or (has_swa_attention and not swa_spec_ok))
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

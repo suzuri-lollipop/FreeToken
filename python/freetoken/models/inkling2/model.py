@@ -167,7 +167,8 @@ class Inkling2DecoderLayer(BaseOP):
             _t2 = _time.perf_counter()
             _prof.add("moe_phase", _t2 - _t1)
 
-        h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * (args.kv_dim // get_tp_info().size) + args.hidden_size))
+        _ffn_off = 2 * (args.kv_dim // get_tp_info().size) + args.hidden_size
+        h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, _ffn_off), verify_key=(visit, _ffn_off))
         out = (residual + h.float()).to(x.dtype)
         if _IK2_PROF:
             torch.cuda.synchronize()
@@ -232,9 +233,17 @@ class Inkling2TextModel(BaseOP):
         positions = ctx.batch.get_attn_positions()
         layers = self.layers.op_list
         blocks: List[torch.Tensor] = []
+        # the DSpark drafter's taps: the stream at the start of a tap visit (sequential visit
+        # id, not the slot id) and the final normed hidden; the sink copies into its own buffers
+        features = ctx.batch.features
+        wanted = features.wanted_layers if features is not None else ()
+        vis = 0
 
         for il in range(args.core_start):
+            if vis in wanted:
+                features.layer_output(vis, x)
             x = layers[il].forward(x, blocks, il, conv_meta, positions)
+            vis += 1
 
         prelude = x
         prelude_blocks = list(blocks)
@@ -251,13 +260,21 @@ class Inkling2TextModel(BaseOP):
                 messages = None
                 if p > 0:
                     messages = mix(bank, bank_out, layers[ip].loop_msg_query)
+                if vis in wanted:
+                    features.layer_output(vis, x)
                 x = layers[ip].forward(x, blocks, il, conv_meta, positions, messages)
+                vis += 1
 
         for il in range(args.core_end, args.num_phys_layers):
+            if vis in wanted:
+                features.layer_output(vis, x)
             x = layers[il].forward(x, blocks, il, conv_meta, positions)
+            vis += 1
 
         x = mix(blocks, x, self.output_res_query)[:, 0]
         out = self.norm.forward(x.to(self.norm.weight.dtype))
+        if features is not None:
+            features.final_hidden(out)
         if _IK2_PROF:
             torch.cuda.synchronize()
             _prof.add("total_forward", _time.perf_counter() - _prof.total_t0)

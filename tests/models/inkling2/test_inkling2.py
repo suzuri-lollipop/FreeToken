@@ -10,6 +10,7 @@ triton kernels that serve them in production are diffed in tests/kernels.
 from __future__ import annotations
 
 import math
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -527,3 +528,319 @@ def _ref_decode_step(sd, ids, convs, backend):
     x = _rms(mix(blocks, x, sd["model.output_res_query"])[:, 0], sd["model.norm.weight"]).to(_RDTYPE)
     logits = SOFTCAP * torch.tanh((x @ sd["lm_head.weight"].T).float() / SOFTCAP)
     return logits[:, :UNPADDED]
+
+
+# ---------------------------------------------------------------- DSpark drafter (mtp.safetensors)
+# The reference below transcribes maya-ik2's drafter kernels (src/ik2/ik2_draft.cu, v1.1.73)
+# independently of the serving module: BF16 gemm inputs with F32 sums and F32 outputs,
+# F32 norms / rope / attention / GRU gates, the silu and rnn-input BF16 roundings, and the
+# FP16 folded Markov bias. A change to the draft math (mix order, rope half, gate order,
+# window bounds) turns these red.
+
+def _draft_sd(C=64, R=16, V=32, NH=4, NK=2, F=32, n_layers=3, taps=4, seed=7):
+    g = torch.Generator().manual_seed(seed)
+    bf = lambda *s: (torch.randn(*s, generator=g) * 0.1).to(torch.bfloat16)
+    sd = {
+        "fuse_weight": bf(n_layers + 1, taps),
+        "norm.weight": bf(C),
+        "mask_embed": bf(C),
+        "markov_head.dflare_norm.weight": bf(C),
+        "markov_head.markov_w1.weight": bf(V, R),
+        "markov_head.rnn_proj.weight": bf(3 * R, 2 * R + 2 * C),
+        "markov_head.rnn_proj.bias": bf(3 * R),
+        "markov_head.hidden_out.weight": bf(C, R),
+        "markov_head.hidden_out.bias": bf(C),
+    }
+    for i in range(n_layers):
+        b, a = f"layers.{i}.", f"layers.{i}.self_attn."
+        sd.update({
+            b + "input_layernorm.weight": bf(C),
+            b + "post_attention_layernorm.weight": bf(C),
+            b + "dflare_norm.weight": bf(C),
+            a + "q_norm.weight": bf(128),
+            a + "k_norm.weight": bf(128),
+            a + "k_norm_ctx.weight": bf(128),
+            a + "q_proj.weight": bf(NH * 128, C),
+            a + "k_proj.weight": bf(NK * 128, C),
+            a + "v_proj.weight": bf(NK * 128, C),
+            a + "o_proj.weight": bf(C, NH * 128),
+            a + "k_proj_ctx.weight": bf(NK * 128, C),
+            a + "v_proj_ctx.weight": bf(NK * 128, C),
+            b + "mlp.gate_proj.weight": bf(F, C),
+            b + "mlp.up_proj.weight": bf(F, C),
+            b + "mlp.down_proj.weight": bf(C, F),
+        })
+    return sd
+
+
+def _ref_dspark(sd, taps, anchor, anchor_h, P, head_logits, n_vocab, k=7, full_cap=8192):
+    """Maya's drafter in fp32: returns (draft tokens, block hidden, base logits)."""
+    import math as _m
+
+    C = sd["norm.weight"].shape[0]
+    n_layers = sum(1 for key in sd if key.endswith(".input_layernorm.weight") and key.startswith("layers."))
+    n_taps = sd["fuse_weight"].shape[1]
+    R = sd["markov_head.markov_w1.weight"].shape[1]
+    NH = sd["layers.0.self_attn.q_proj.weight"].shape[0] // 128
+    NK = sd["layers.0.self_attn.k_proj.weight"].shape[0] // 128
+    F = sd["layers.0.mlp.gate_proj.weight"].shape[0]
+    local = (lambda i: i != 1) if n_layers == 3 else (lambda i: i in (0, 1, 3, 4))
+    alpha = torch.softmax(sd["fuse_weight"].float(), dim=-1)
+    bf = lambda t: t.to(torch.bfloat16).float()  # Maya's to_bf16: round, then F32 sums
+    gemm = lambda x, w: bf(x) @ w.float().T
+
+    def rms(x, w):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w.float()
+
+    def rope(x, pos):
+        i = torch.arange(64, dtype=torch.float32)
+        ang = pos.float().unsqueeze(-1) * (1e6 ** (-2.0 * i / 128))
+        sn, cs = ang.sin(), ang.cos()
+        while sn.dim() < x.dim():
+            sn, cs = sn.unsqueeze(-2), cs.unsqueeze(-2)
+        a, b = x[..., :64], x[..., 64:]
+        return torch.cat([a * cs - b * sn, b * cs + a * sn], dim=-1)
+
+    m = taps.shape[0]
+    ctx = []
+    for li in range(n_layers):
+        b, a = f"layers.{li}.", f"layers.{li}.self_attn."
+        mixed = rms(torch.einsum("mtc,t->mc", taps.float(), alpha[li]), sd[b + "dflare_norm.weight"])
+        K = gemm(mixed, sd[a + "k_proj_ctx.weight"]).view(m, NK, 128)
+        V = gemm(mixed, sd[a + "v_proj_ctx.weight"]).view(m, NK, 128)
+        K = rope(rms(K, sd[a + "k_norm_ctx.weight"]), torch.arange(m))
+        ctx.append((K.reshape(m, NK * 128), V.reshape(m, NK * 128)))
+    f_rnn = rms(torch.einsum("tc,t->c", taps[-1].float(), alpha[n_layers]), sd["markov_head.dflare_norm.weight"])
+
+    res = torch.stack([anchor_h.float()] + [sd["mask_embed"].float()] * 7)
+    pos = torch.arange(P, P + 8)
+    x = res
+    for li in range(n_layers):
+        b, a = f"layers.{li}.", f"layers.{li}.self_attn."
+        if li > 0:
+            res = x + res
+        h = rms(res, sd[b + "input_layernorm.weight"])
+        q = rope(rms(gemm(h, sd[a + "q_proj.weight"]).view(8, NH, 128), sd[a + "q_norm.weight"]), pos)
+        kk = rope(rms(gemm(h, sd[a + "k_proj.weight"]).view(8, NK, 128), sd[a + "k_norm.weight"]), pos)
+        vv = gemm(h, sd[a + "v_proj.weight"]).view(8, NK, 128)
+        win = 1023 if local(li) else full_cap
+        lo = max(0, P - win)
+        keys = torch.cat([ctx[li][0][lo:], kk.reshape(8, NK * 128)]).view(-1, NK, 128).repeat_interleave(NH // NK, 1)
+        vals = torch.cat([ctx[li][1][lo:], vv.reshape(8, NK * 128)]).view(-1, NK, 128).repeat_interleave(NH // NK, 1)
+        scores = torch.einsum("qhd,khd->hqk", q, keys) / _m.sqrt(128)
+        o = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vals).reshape(8, NH * 128)
+        x = gemm(o, sd[a + "o_proj.weight"])
+        res = x + res
+        h = rms(res, sd[b + "post_attention_layernorm.weight"])
+        gu = gemm(h, torch.cat([sd[b + "mlp.gate_proj.weight"], sd[b + "mlp.up_proj.weight"]]))
+        g, u = gu[:, :F], gu[:, F:]
+        act = bf(g / (1.0 + torch.exp(-g)) * u)
+        x = gemm(act, sd[b + "mlp.down_proj.weight"])
+    res = x + res
+    hidden = rms(res, sd["norm.weight"])
+    base = head_logits(hidden[1 : k + 1]).float()
+
+    hout_w = sd["markov_head.hidden_out.weight"]
+    hout_b = sd["markov_head.hidden_out.bias"]
+    fw = head_logits(hout_w.t().to(torch.bfloat16)).float().t().to(torch.float16)
+    fb = head_logits(hout_b.unsqueeze(0).to(torch.bfloat16)).float()[0].to(torch.float16)
+    state = torch.zeros(R)
+    toks = [anchor]
+    for t in range(k):
+        rnn_in = bf(torch.cat([state, sd["markov_head.markov_w1.weight"][toks[t]].float(), hidden[t + 1], f_rnn]))
+        proj = gemm(rnn_in.unsqueeze(0), sd["markov_head.rnn_proj.weight"])[0] + sd["markov_head.rnn_proj.bias"].float()
+        gr, cr, orw = proj[:R], proj[R : 2 * R], proj[2 * R :]
+        gate = torch.sigmoid(gr)
+        state = gate * state + (1.0 - gate) * torch.tanh(cr)
+        latent = torch.tanh(orw)
+        bias = fw.float() @ latent + fb.float()  # Maya: FP16 weights, F32 latent, F32 sums
+        scores = base[t] + bias
+        toks.append(int(scores[:n_vocab].argmax()))
+    return torch.tensor(toks[1:]), hidden, base
+
+
+def _head_fn(head_w):
+    return lambda x: (x.to(torch.bfloat16).float() @ head_w.float().T)
+
+
+def _draft_case(sd, n_vocab, m=24, seed=3):
+    g = torch.Generator().manual_seed(seed)
+    C = sd["norm.weight"].shape[0]
+    taps = torch.randn(m, sd["fuse_weight"].shape[1], C, generator=g)
+    anchor = int(torch.randint(0, n_vocab, (1,), generator=g))
+    anchor_h = torch.randn(C, generator=g)
+    head_w = (torch.randn(sd["markov_head.markov_w1.weight"].shape[0], C, generator=g) * 0.1).to(torch.bfloat16)
+    return taps, anchor, anchor_h, m, head_w
+
+
+@pytest.mark.parametrize("n_layers,taps", [(3, 4), (5, 8)])
+def test_dspark_draft_matches_maya_reference(tmp_path, n_layers, taps):
+    import safetensors.torch
+
+    from freetoken.models.inkling2.draft import DSparkDraft
+
+    sd = _draft_sd(n_layers=n_layers, taps=taps)
+    path = tmp_path / "mtp.safetensors"
+    safetensors.torch.save_file(sd, str(path))
+    draft = DSparkDraft.load(str(path), torch.device("cpu"), n_vocab=30)
+    t, anchor, anchor_h, P, head_w = _draft_case(sd, 30)
+    head = _head_fn(head_w)
+    ref_toks, ref_hidden, ref_base = _ref_dspark(sd, t, anchor, anchor_h, P, head, 30)
+    # the proposer's rings: windowed layers keep the last 1023 rows, the full layer everything
+    ctx_k, ctx_v = [], []
+    for li in range(n_layers):
+        mixed = draft.mix_taps(t, li)
+        K, V = draft.context_rows(mixed, li, torch.arange(P))
+        ctx_k.append(K)
+        ctx_v.append(V)
+    f_rnn = draft.f_rnn(t[-1])
+    fold_w, fold_b = draft.fold(head)
+    toks = draft.propose(anchor, anchor_h, P, ctx_k, ctx_v, f_rnn, head, fold_w, fold_b)
+    hidden = draft.block_hidden(anchor_h, P, ctx_k, ctx_v)
+    assert torch.equal(toks, ref_toks), f"draft tokens diverged: {toks.tolist()} vs {ref_toks.tolist()}"
+    # the module's bf16 gemm rounds its outputs once more than Maya's F32 pipeline
+    assert torch.allclose(hidden, ref_hidden, rtol=2e-2, atol=2e-2)
+    base = head(hidden[1:8]).float()
+    assert torch.allclose(base, ref_base, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.needs_weights
+@pytest.mark.skipif(not os.environ.get("FREETOKEN_IK2_DRAFT"), reason="set FREETOKEN_IK2_DRAFT to the official mtp.safetensors (or its folder)")
+def test_dspark_official_drafter_matches_reference():
+    from freetoken.models.inkling2.draft import DSparkDraft
+
+    path = os.environ["FREETOKEN_IK2_DRAFT"]
+    draft = DSparkDraft.load(path, torch.device("cpu"), n_vocab=200058)
+    assert draft.C == 2304 and len(draft.layers) == 3 and draft.R == 256
+    import safetensors.torch
+
+    sd = safetensors.torch.load_file(path if path.endswith(".safetensors") else os.path.join(path, "mtp.safetensors"))
+    t, anchor, anchor_h, P, head_w = _draft_case(sd, 200058, m=24)
+    head = _head_fn(head_w)
+    ref_toks, ref_hidden, _ = _ref_dspark(sd, t, anchor, anchor_h, P, head, 200058)
+    ctx_k, ctx_v = [], []
+    for li in range(3):
+        K, V = draft.context_rows(draft.mix_taps(t, li), li, torch.arange(P))
+        ctx_k.append(K)
+        ctx_v.append(V)
+    fold_w, fold_b = draft.fold(head)
+    toks = draft.propose(anchor, anchor_h, P, ctx_k, ctx_v, draft.f_rnn(t[-1]), head, fold_w, fold_b)
+    assert torch.equal(toks, ref_toks), f"official drafter tokens diverged: {toks.tolist()} vs {ref_toks.tolist()}"
+
+
+def test_dspark_check_source_rejects_non_drafter(tmp_path):
+    import safetensors.torch
+
+    from freetoken.models.inkling2.draft import DSparkDraft
+
+    with pytest.raises(ValueError, match="mtp.safetensors"):
+        DSparkDraft.check_source(str(tmp_path))
+    p = tmp_path / "mtp.safetensors"
+    safetensors.torch.save_file({"norm.weight": torch.zeros(4)}, str(p))
+    with pytest.raises(ValueError, match="not an Inkling-2 DSpark drafter"):
+        DSparkDraft.check_source(str(p))
+
+
+# ---------------------------------------------------------------- conv verify (speculative)
+
+def test_conv_verify_stash_and_commit(monkeypatch):
+    """The verify convs read the live history, leave it untouched, and the commit rolls it
+    to the accepted rows -- against the per-request conv oracle, static and dynamic taps."""
+    from freetoken.distributed import info
+    from freetoken.models.inkling2.conv import CONV_STATE, ConvMeta, Inkling2Conv, Inkling2ConvVerify, short_conv_reference
+    from freetoken.models.inkling2.config import parse_config
+
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=1))
+    config = parse_config(SimpleNamespace(**_hf_dict()))
+    rows, bs = 3, 2
+    spec = next(s for s in config.slot_states if s.name == CONV_STATE)
+    handler = Inkling2ConvVerify(spec, bs, rows, torch.device("cpu"), torch.float32)
+    state = torch.zeros(len(VISITS), bs + 1, CONV_CH, KERNEL - 1, dtype=torch.float32)
+    torch.manual_seed(5)
+    state.normal_(0, 0.3)
+    live_before = state.clone()
+
+    class Pool:
+        def slot_state(self, name, layer_id=None):
+            return state[layer_id]
+
+        def verify_handler(self, name):
+            return handler
+
+    ctx = SimpleNamespace(linear_state_pool=Pool())
+    monkeypatch.setattr("freetoken.models.inkling2.conv.get_global_ctx", lambda: ctx)
+    slots = torch.tensor([1, 2], dtype=torch.int64)
+    meta = ConvMeta(slots=slots, cu_seqlens=torch.arange(bs + 1) * rows, seq_lens=(rows,) * bs,
+                    fresh=None, is_decode=False, is_verify=True, rows_per_req=rows)
+    torch.manual_seed(6)
+    for visit in (0, 3):
+        for channels, heads, off in ((KV_DIM, NK, 0), (H, 0, 2 * KV_DIM)):
+            conv = Inkling2Conv(config, channels, num_heads=heads)
+            conv.weight = (torch.randn(channels, KERNEL) * 0.2).float()
+            if heads:
+                conv.conv_proj.weight = (torch.randn(heads * KERNEL, H) * 0.1).to(_RDTYPE)
+            x = (torch.randn(bs * rows, channels) * 0.5).to(_RDTYPE)
+            dyn_input = (torch.randn(bs * rows, H) * 0.5).to(_RDTYPE) if heads else None
+            slab = state[visit, :, off : off + channels, :]
+            out = conv.forward(x, meta, slab, dyn_input, verify_key=(visit, off))
+            dyn = (dyn_input @ conv.conv_proj.weight.T).float() if heads else None
+            ref_out, _ = short_conv_reference(x, (rows,) * bs, state[visit, slots, off : off + channels, :],
+                                              conv.weight, KERNEL, dyn, heads)
+            assert torch.allclose(out, ref_out, rtol=1e-5, atol=1e-5), f"visit {visit} heads {heads}"
+            assert torch.equal(state, live_before), "the verify forward wrote the live conv state"
+            # commit n accepted rows per request: the oracle's state after n rows
+            counts = torch.tensor([1, 3], dtype=torch.int64)
+            handler.commit(Pool(), slots, counts)
+            for i, n in enumerate(counts.tolist()):
+                s0 = int(slots[i])
+                _, ref_state = short_conv_reference(x[i * rows : i * rows + n], (n,),
+                                                    live_before[visit, s0 : s0 + 1, off : off + channels, :],
+                                                    conv.weight, KERNEL,
+                                                    dyn[i * rows : i * rows + n] if heads else None, heads)
+                assert torch.allclose(state[visit, slots[i], off : off + channels, :], ref_state, rtol=1e-6, atol=1e-6)
+            state.copy_(live_before)
+            handler.history[visit].zero_()
+
+
+def test_dspark_ring_write_and_window_read(tmp_path):
+    """The proposer's rings: positions key by pos % cap (a long prompt wraps the local rings),
+    and a proposal reads exactly the window rows Maya's k_lo bounds select."""
+    import safetensors.torch
+
+    from freetoken.models.inkling2.draft import RING, WINDOW, DSparkDraft
+    from freetoken.spec.dspark.proposer import CTX_FULL, CTX_LOCAL, FRNN, DSparkProposer
+
+    sd = _draft_sd()
+    path = tmp_path / "mtp.safetensors"
+    safetensors.torch.save_file(sd, str(path))
+    draft = DSparkDraft.load(str(path), torch.device("cpu"), n_vocab=30)
+    prop = DSparkProposer.__new__(DSparkProposer)
+    prop.draft = draft
+    prop.config = SimpleNamespace(max_seq_len=16384)
+    cap = 8192
+    prop.ctx = SimpleNamespace(slot_states={
+        CTX_LOCAL: torch.zeros(2, 3, 2, RING, 256, dtype=torch.float32),
+        CTX_FULL: torch.zeros(1, 3, 2, cap, 256, dtype=torch.float16),
+        FRNN: torch.zeros(1, 3, 64, dtype=torch.float32),
+    })
+    torch.manual_seed(11)
+    m = 3000  # past the local rings' 2048 rows: the early positions are overwritten
+    taps = torch.randn(m, 4, 64)
+    prop._write_context(1, taps, 0, m)
+    # the write touched slot 1 only: slot 0's rings stay zero (the slot axis, not the K/V axis)
+    assert not prop.ctx.slot_states[CTX_LOCAL][:, 0].any()
+    assert not prop.ctx.slot_states[CTX_FULL][:, 0].any()
+    prop.ctx.slot_states[FRNN][0][1] = draft.f_rnn(taps[-1])
+    assert torch.equal(prop.ctx.slot_states[FRNN][0][1], draft.f_rnn(taps[-1]))
+    ks, vs = prop._read_context(1, m)
+    for li in range(3):
+        win = WINDOW - 1 if draft.layers[li].local else cap
+        pos = torch.arange(max(0, m - win), m)
+        K, V = draft.context_rows(draft.mix_taps(taps[pos], li), li, pos)
+        ring, _ = prop._rings(li)
+        # the gathered window rows must be the fresh context of exactly those positions
+        assert torch.allclose(ks[li], K.to(ring.dtype).float(), rtol=1e-3, atol=1e-3)
+        assert torch.allclose(vs[li], V.to(ring.dtype).float(), rtol=1e-3, atol=1e-3)
+    # a short history reads from position 0, not a negative window
+    ks0, _ = prop._read_context(2, 5)
+    assert ks0[0].shape[0] == 5

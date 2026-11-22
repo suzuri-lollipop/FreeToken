@@ -8,7 +8,8 @@ weights are upcast to fp32 and flipped into lag order, the router weight to fp32
 
 The dense pass renames ``model.llm.*`` / ``model.visual.*`` onto the module tree; the
 expert banks are filled through ``iter_expert_pieces`` (the offload family's hook), never
-through this pass. The MTP drafter (mtp.safetensors) is not served.
+through this pass. The MTP drafter (mtp.safetensors) is not a target weight;
+``--speculative-algorithm dspark`` loads it on its own (freetoken.models.inkling2.draft).
 """
 
 from __future__ import annotations
