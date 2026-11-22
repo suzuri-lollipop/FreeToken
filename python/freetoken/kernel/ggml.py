@@ -7,6 +7,7 @@ Activations are fp32, bf16 or fp16 and are quantized to q8_1 first; results come
 from __future__ import annotations
 
 import functools
+import os
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,12 @@ def load_module(build_directory: str | None = None) -> Module:
 
 @functools.cache
 def _module() -> Module:
+    # FREETOKEN_GGML_BACKEND=vulkan runs the packed-weight ops on the vendored ggml-vulkan
+    # backend instead of ggml-cuda; the op surface and dtype contracts are identical.
+    if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
+        from .ggml_vk import load_module as load_vk_module
+
+        return load_vk_module()
     return load_module()
 
 

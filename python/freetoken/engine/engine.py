@@ -3791,6 +3791,24 @@ def _adjust_config(config: EngineConfig):
         override("moe_prefill_overlap", False)
         override("decode_fetch_overlap", False)
 
+    if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
+        # the Vulkan ggml ops stage activations through the host and submit Vulkan work
+        # outside the CUDA stream; a decode CUDA graph cannot capture that
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0 or config.cuda_graph_bs:
+            logger.warning_rank0(
+                "FREETOKEN_GGML_BACKEND=vulkan: disabling decode CUDA graphs "
+                "(host-staged Vulkan ops are not capturable)"
+            )
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        # the KV pool would otherwise take nearly all free VRAM; the Vulkan backend
+        # needs device memory of its own for the resident embedding cache and the
+        # per-call staging buffers
+        if config.memory_ratio is None or config.memory_ratio > 0.8:
+            logger.warning_rank0(
+                "FREETOKEN_GGML_BACKEND=vulkan: clamping memory_ratio to 0.8 to leave VRAM for the Vulkan backend"
+            )
+            override("memory_ratio", 0.8)
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

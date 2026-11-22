@@ -178,3 +178,91 @@ def test_nvfp4_dequantize_and_rows(dtype):
     rows = ggml.get_rows(w, int(QType.NVFP4), 320, ids, dtype)
     torch.testing.assert_close(rows.cpu(), ref[ids.cpu().long()].to(dtype), atol=0, rtol=0)
 
+
+
+# ---------------------------------------------------------------- Vulkan backend
+# The vendored ggml-vulkan module exposes the same op surface; route the ggml API at it
+# and reuse the CPU references above. Skipped where glslc / a Vulkan device is absent.
+
+
+@pytest.fixture
+def vk_ggml(monkeypatch):
+    from freetoken.kernel import ggml, ggml_vk
+
+    try:
+        module = ggml_vk.load_module()
+    except Exception as exc:
+        pytest.skip(f"Vulkan ggml module unavailable: {exc}")
+    monkeypatch.setattr(ggml, "_module", lambda: module)
+    return ggml
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vk_q4_dequantize_and_rows(vk_ggml, dtype):
+    w, ref = _q4_weights((64, 256))
+    actual = vk_ggml.dequantize(w, int(QType.Q4_0), 256, dtype)
+    torch.testing.assert_close(actual.cpu(), ref.to(dtype), atol=0, rtol=0)
+    ids = torch.tensor([63, 0, 17, 17], dtype=torch.int32, device="cuda")
+    rows = vk_ggml.get_rows(w, int(QType.Q4_0), 256, ids, dtype)
+    torch.testing.assert_close(rows.cpu(), ref[ids.cpu().long()].to(dtype), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batch", [1, 17])
+def test_vk_q4_matrix_matches_cpu(vk_ggml, dtype, batch):
+    w, ref = _q4_weights((64, 256))
+    x = _activation((batch, 256), dtype)
+    actual = vk_ggml.mul_mat(w, int(QType.Q4_0), x)
+    expected = F.linear(x.cpu().float(), ref).to(dtype)
+    # the Vulkan pipeline quantizes activations to q8_1 with its own fp16 scale rounding,
+    # so even the CUDA-exact inputs carry quantization noise here (unlike the CUDA module)
+    torch.testing.assert_close(actual.cpu(), expected, atol=5e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("per_route_x", [False, True])
+@pytest.mark.parametrize("inactive", [False, True])
+def test_vk_q4_moe_routes_match_cpu(vk_ggml, dtype, per_route_x, inactive):
+    batch = 5
+    w, ref = _q4_weights((4, 64, 256))
+    x = _activation((batch, 2, 256) if per_route_x else (batch, 256), dtype)
+    ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
+    if inactive:
+        ids[::2, 0] = -1
+    actual = vk_ggml.mul_mat_id(w, int(QType.Q4_0), x, ids, inactive=inactive)
+    xs = x.cpu().float() if per_route_x else x.cpu().float().unsqueeze(1).expand(-1, 2, -1)
+    expected = torch.einsum("tjk, tjok -> tjo", xs, ref[ids.cpu().long().clamp_min(0)])
+    expected[ids.cpu() < 0] = 0
+    torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=2e-4, rtol=1e-3)
+
+
+def test_vk_nvfp4_moe_scale_matches_cpu(vk_ggml):
+    w, ref = _nvfp4_weights((4, 256))
+    w = w.unsqueeze(1)  # [E, N=1, row_bytes]
+    scale = torch.tensor([0.25, 0.5, 1.0, 2.0], dtype=torch.float32, device="cuda")
+    x = _activation((3, 256), torch.float32)
+    ids = torch.tensor([[0, 1], [2, 3], [3, 0]], dtype=torch.int32, device="cuda")
+    actual = vk_ggml.mul_mat_id(w, int(QType.NVFP4), x, ids, scale=scale)
+    expected = torch.einsum("tk,tjk->tj", x.cpu(), ref[ids.cpu().long()])
+    expected = expected * scale.cpu()[ids.cpu().long()]
+    torch.testing.assert_close(actual.cpu().squeeze(-1), expected, atol=2e-4, rtol=1e-3)
+
+
+def test_vk_swiglu_glu_matches_cpu(vk_ggml):
+    w, ref = _q4_weights((4, 128, 256))  # gate rows then up rows
+    x = _activation((3, 256), torch.float32)
+    ids = torch.tensor([[0, 1], [2, 3], [1, 0]], dtype=torch.int32, device="cuda")
+    actual = vk_ggml.mul_mat_id_glu(w, int(QType.Q4_0), x, ids, "swiglu")
+    h = torch.einsum("tk,tjok->tjo", x.cpu(), ref[ids.cpu().long()])
+    gate, up = h.chunk(2, dim=-1)
+    expected = F.silu(gate) * up
+    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+
+
+def test_vk_weighted_sum_matches_cpu(vk_ggml):
+    y = torch.randn(3, 2, 64, dtype=torch.bfloat16, device="cuda")
+    weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [1.0, 0.0]], dtype=torch.float32, device="cuda")
+    actual = vk_ggml.moe_weighted_sum(y, weights)
+    expected = (y.cpu().float() * weights.cpu().unsqueeze(-1)).sum(dim=1)
+    # bf16 output rounding dominates at these magnitudes
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=8e-3, rtol=4e-3)
