@@ -350,8 +350,6 @@ def _ik2_ref(wgu, ref_gu, wdn, ref_dn, x, ids, weights, sc, gcap=4.0, ucap=25.0)
             g = g * sc[e, 0].item()
             u = u * sc[e, 1].item()
             situ = (gcap * torch.tanh(g / gcap)) * torch.sigmoid(g) * (ucap * torch.tanh(u / ucap))
-            # the shaders store h rounded to FP16 (maya ik2_exact's convention)
-            situ = situ.half().float()
             expected[ti] += weights[ti, j].item() * ((situ @ ref_dn[e].T) * sc[e, 2].item())
     return expected
 

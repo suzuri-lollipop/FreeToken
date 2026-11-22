@@ -1,0 +1,78 @@
+#version 450
+#include "vk_common.glsl"
+
+// Fast BDA get_rows / dequantize for NVFP4, Q8_0, BF16, F32, Q4_0, Q6_K.
+// Grid: (ceil(K / 256), M, 1); local_size = (256, 1, 1).
+// When ids_addr == 0, source row is m (dequantize); else ids[m] (get_rows).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t ids_addr;
+    uint64_t out_addr;
+    int K;
+    int M;
+    int ty;
+    int out_dt;
+} p;
+
+void main() {
+    uint v = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.y;
+    if (v >= uint(p.K) || m >= uint(p.M)) return;
+
+    uint row = (p.ids_addr != 0ul) ? uint(I32Buf(p.ids_addr).v[m]) : m;
+    float outv = 0.0;
+    if (p.ty == 40) {
+        U32Buf W = U32Buf(p.w_addr);
+        uint n_blk = uint(p.K) >> 6u;
+        uint blk = v >> 6u;
+        uint i = v & 63u, sb = i >> 4u, j = i & 15u;
+        uint bu = (row * n_blk + blk) * 9u;
+        uint sw = W.v[bu];
+        uint qw = sb * 2u + ((j & 7u) >> 2u);
+        uint qbits = W.v[bu + 1u + qw];
+        uint byte_v = (qbits >> ((j & 3u) * 8u)) & 0xFFu;
+        uint nib = j < 8u ? (byte_v & 0xFu) : (byte_v >> 4u);
+        outv = kv_e2m1(nib) * e4m3_half((sw >> (sb * 8u)) & 0xFFu);
+    } else if (p.ty == 8) {
+        U16Buf W = U16Buf(p.w_addr);
+        uint n_blk = uint(p.K) >> 5u;
+        uint blk = v >> 5u, j = v & 31u;
+        uint bu = (row * n_blk + blk) * 17u;
+        float d = unpackHalf2x16(uint(W.v[bu])).x;
+        uint q_byte = getb16(W, (bu + 1u) * 2u + j);
+        int q = int(q_byte); if (q >= 128) q -= 256;
+        outv = d * float(q);
+    } else if (p.ty == 30) {
+        U16Buf W = U16Buf(p.w_addr);
+        outv = uintBitsToFloat(uint(W.v[row * uint(p.K) + v]) << 16u);
+    } else if (p.ty == 0) {
+        outv = F32Buf(p.w_addr).v[row * uint(p.K) + v];
+    } else if (p.ty == 2) {
+        U16Buf W = U16Buf(p.w_addr);
+        uint n_blk = uint(p.K) >> 5u;
+        uint blk = v >> 5u, j = v & 31u;
+        uint bu = (row * n_blk + blk) * 9u;
+        float d = unpackHalf2x16(uint(W.v[bu])).x;
+        uint b_off = (bu + 1u) * 2u + (j & 15u);
+        uint byte_v = getb16(W, b_off);
+        int q = int(j < 16u ? (byte_v & 0xFu) : (byte_v >> 4u)) - 8;
+        outv = d * float(q);
+    } else {  // Q6_K (14)
+        U16Buf W = U16Buf(p.w_addr);
+        uint n_blk = uint(p.K) >> 8u;
+        uint blk = v >> 8u, i = v & 255u;
+        uint bb = (row * n_blk + blk) * 210u;
+        uint nn = i >> 7u, lq = i & 127u, qd = lq >> 5u, l = lq & 31u;
+        uint lo = getb16(W, bb + nn * 64u + l + ((qd & 1u) != 0u ? 32u : 0u));
+        uint nib = qd >= 2u ? (lo >> 4u) : (lo & 0xFu);
+        uint qh = (getb16(W, bb + 128u + nn * 32u + l) >> (2u * qd)) & 3u;
+        int q = int(nib | (qh << 4u)) - 32;
+        int sc = int(getb16(W, bb + 192u + nn * 8u + (l >> 4u) + 2u * qd));
+        if (sc >= 128) sc -= 256;
+        float d = unpackHalf2x16(uint(W.v[(bb + 208u) >> 1u])).x;
+        outv = d * float(sc * q);
+    }
+    write_val(p.out_addr, p.out_dt, m * uint(p.K) + v, outv);
+}

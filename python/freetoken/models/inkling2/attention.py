@@ -99,19 +99,76 @@ class Inkling2Attention(BaseOP):
             self.v_input_norm.forward(inputs[2]),
         ]
 
+    @staticmethod
+    def _vk_ggml_single(proj: LinearBase):
+        """Return (weight_slice, ggml_type) if `proj` is a single-segment quantized ggml linear supported by ik2_vk."""
+        segs = getattr(proj, "_ggml_segments", None)
+        if not segs or len(segs) != 1 or proj.bias is not None or getattr(proj, "ggml_scale", None) is not None:
+            return None
+        from freetoken.kernel import ik2_vk
+        from freetoken.layers.quantization.ggml_types import is_quantized, segment_param
+
+        s = segs[0]
+        if not is_quantized(s.ggml_type) or not ik2_vk.supports_type(s.ggml_type):
+            return None
+        return getattr(proj, segment_param(0))[: s.rows], s.ggml_type
+
     @nvtx_annotate("MHA")
     def forward(self, inputs: list[torch.Tensor], visit: int, conv_meta: ConvMeta, positions: torch.Tensor) -> torch.Tensor:
         args = self.args
         ctx = get_global_ctx()
         xq, xk, xv = inputs
-        q = self.q_proj.forward(xq)
-        k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
-        v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
-        r = self.r_proj.forward(xq)
-        gate = self.gate_proj.forward(xq)
-        sinks = self.sink_proj.forward(xq)
+        from freetoken.kernel import ggml
+        from .model import _IK2_PROF, _prof
+        import time as _time
+
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _a0 = _time.perf_counter()
+
+        if ggml.backend_name() == "vulkan":
+            # Batch projections sharing xq into ONE Vulkan command buffer & ONE handoff.
+            shared_projs = [self.q_proj, self.r_proj, self.gate_proj]
+            if xk is xq and xv is xq:
+                shared_projs.extend((self.k_proj, self.v_proj))
+            vk_specs = [self._vk_ggml_single(p) for p in shared_projs]
+            if all(sp is not None for sp in vk_specs):
+                from freetoken.kernel import ik2_vk
+
+                m = xq.shape[0]
+                ws = [sp[0] for sp in vk_specs]
+                tys = [sp[1] for sp in vk_specs]
+                outs = [torch.empty(m, w.shape[0], dtype=xq.dtype, device=xq.device) for w in ws]
+                ik2_vk.mul_mat_batch(xq, ws, tys, outs)
+                q, r, gate = outs[0], outs[1], outs[2]
+                if xk is xq and xv is xq:
+                    k_raw, v_raw = outs[3], outs[4]
+                else:
+                    k_raw = self.k_proj.forward(xk)
+                    v_raw = self.v_proj.forward(xv)
+                sinks = self.sink_proj.forward(xq)
+                k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
+                v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+            else:
+                q = self.q_proj.forward(xq)
+                k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
+                v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+                r = self.r_proj.forward(xq)
+                gate = self.gate_proj.forward(xq)
+                sinks = self.sink_proj.forward(xq)
+        else:
+            q = self.q_proj.forward(xq)
+            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, args.kv_dim, 0), dyn_input=xk if not self.swa else None)
+            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, args.kv_dim, args.kv_dim), dyn_input=xv if not self.swa else None)
+            r = self.r_proj.forward(xq)
+            gate = self.gate_proj.forward(xq)
+            sinks = self.sink_proj.forward(xq)
 
         tokens = q.shape[0]
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _a1 = _time.perf_counter()
+            _prof.add("attn_projs", _a1 - _a0)
         q = l2_clip(q.view(tokens, self.nh, self.hd), args.qk_clip, self.q_clip_scale)
         k = l2_clip(k.view(tokens, self.nk, self.hd), args.qk_clip)
         v = unweighted_rms_norm(v.view(tokens, self.nk, self.hd), args.rms_norm_eps)
@@ -127,6 +184,10 @@ class Inkling2Attention(BaseOP):
         # project r on the bias table, then the kernel gathers by distance; the padded
         # last column holds the zero bias of keys beyond the extent (bf16 matmul as HF)
         rel_table = F.pad(r @ self.rel_bias, (0, 1)).float().contiguous()
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _a2 = _time.perf_counter()
+            _prof.add("attn_clips_rel", _a2 - _a1)
         spec = AttentionSpec(
             sliding_window=self.attn_spec.sliding_window,
             sm_scale=self.attn_spec.sm_scale,
@@ -137,10 +198,19 @@ class Inkling2Attention(BaseOP):
             q.view(tokens, self.nh, self.hd), k.view(tokens, self.nk * self.hd), v.view(tokens, self.nk * self.hd),
             visit, ctx.batch, attn_spec=spec,
         )
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _a3 = _time.perf_counter()
+            _prof.add("attn_triton", _a3 - _a2)
         out = out.reshape(tokens, args.q_dim)
         out = (out.float() * torch.sigmoid(gate.float())).to(out.dtype)
         out = self.o_proj.forward(out.reshape(tokens, args.q_dim))
-        return self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim))
+        out = self.attn_post_conv.forward(out, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim))
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _a4 = _time.perf_counter()
+            _prof.add("attn_gate_o_conv", _a4 - _a3)
+        return out
 
 
 __all__ = ["Inkling2Attention", "l2_clip", "unweighted_rms_norm"]

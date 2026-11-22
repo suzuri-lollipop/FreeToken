@@ -28,6 +28,39 @@ from freetoken.models.config import ModelConfig
 from freetoken.utils import nvtx_annotate
 
 from .args import Inkling2Args
+
+import os as _os
+import time as _time
+
+_IK2_PROF = _os.environ.get("FREETOKEN_IK2_PROFILE") is not None
+
+
+class _Prof:
+    def __init__(self):
+        self.t: dict[str, float] = {}
+        self.n: dict[str, int] = {}
+        self.total_t0 = 0.0
+        self.total_n = 0
+
+    def add(self, name, dt):
+        self.t[name] = self.t.get(name, 0.0) + dt
+        self.n[name] = self.n.get(name, 0) + 1
+
+    def report(self):
+        if self.total_n == 0:
+            return
+        import sys
+        n = self.total_n
+        lines = [f"inkling2 profile ({n} tokens):"]
+        for k in sorted(self.t, key=lambda k: -self.t[k]):
+            lines.append(f"  {k:24s} {self.t[k]/n*1e3:8.2f} ms/tok  ({self.n[k]//n:3d} calls, {self.t[k]/max(1,self.n[k])*1e3:.3f} ms/call)")
+        print("\n".join(lines), file=sys.stderr, flush=True)
+        self.t.clear()
+        self.n.clear()
+        self.total_n = 0
+
+
+_prof = _Prof()
 from .attention import Inkling2Attention, unweighted_rms_norm
 from .conv import ConvMeta, Inkling2Conv, build_conv_meta, conv_state_slab
 from .moe import Inkling2MoE
@@ -95,6 +128,9 @@ class Inkling2DecoderLayer(BaseOP):
         messages: torch.Tensor | None = None,
     ) -> torch.Tensor:
         args = self.args
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _t0 = _time.perf_counter()
         inpSA = x
         if self._phys_layer > 0:
             mixed = mix(blocks, x, self.attn_res_query)
@@ -115,13 +151,29 @@ class Inkling2DecoderLayer(BaseOP):
         else:
             residual = inpSA.float() + attn_out.float()
 
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _t1 = _time.perf_counter()
+            _prof.add("attn_phase", _t1 - _t0)
+
         ffn_in = mix(blocks, residual, self.ffn_res_query)[:, 0]
         if messages is not None:
             ffn_in = self.controllers.op_list[3].forward(ffn_in, messages[:, 3])
         h = self.mlp_norm.forward(ffn_in.to(x.dtype))
         h = self.mlp.forward(h)
+
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _t2 = _time.perf_counter()
+            _prof.add("moe_phase", _t2 - _t1)
+
         h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, 2 * args.kv_dim + args.hidden_size))
-        return (residual + h.float()).to(x.dtype)
+        out = (residual + h.float()).to(x.dtype)
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _t3 = _time.perf_counter()
+            _prof.add("post_conv_res", _t3 - _t2)
+        return out
 
 
 class _NormedEmbedding:
@@ -164,6 +216,9 @@ class Inkling2TextModel(BaseOP):
     def forward_embeds(self, x: torch.Tensor) -> torch.Tensor:
         args = self.args
         ctx = get_global_ctx()
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _prof.total_t0 = _time.perf_counter()
         conv_meta = build_conv_meta(ctx.batch, x.device)
         positions = ctx.batch.get_attn_positions()
         layers = self.layers.op_list
@@ -193,7 +248,14 @@ class Inkling2TextModel(BaseOP):
             x = layers[il].forward(x, blocks, il, conv_meta, positions)
 
         x = mix(blocks, x, self.output_res_query)[:, 0]
-        return self.norm.forward(x.to(self.norm.weight.dtype))
+        out = self.norm.forward(x.to(self.norm.weight.dtype))
+        if _IK2_PROF:
+            torch.cuda.synchronize()
+            _prof.add("total_forward", _time.perf_counter() - _prof.total_t0)
+            _prof.total_n += int(x.shape[0])
+            if _prof.total_n >= 10:
+                _prof.report()
+        return out
 
 
 class Inkling2LoopForCausalLM(BaseLLMModel):

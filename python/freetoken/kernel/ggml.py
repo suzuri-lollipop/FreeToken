@@ -63,7 +63,17 @@ def set_bank_mode(resident: bool) -> None:
     serving), so it uploads each bank to the device once and reads per-expert views;
     offload slot pools keep the default per-call gather because their contents change."""
     if backend_name() == "vulkan":
-        _module().set_bank_mode(resident)
+        from . import ik2_vk
+
+        ik2_vk.set_bank_mode(resident)
+
+
+def _use_fast_vk(ggml_type: int) -> bool:
+    if backend_name() != "vulkan":
+        return False
+    from . import ik2_vk
+
+    return ik2_vk.supports_type(ggml_type)
 
 
 def moe_ffn_situ(
@@ -113,6 +123,10 @@ def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tens
     m, k = x.shape
     if out is None:
         out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
+    if _use_fast_vk(ggml_type):
+        from . import ik2_vk
+
+        return ik2_vk.mul_mat(w, ggml_type, x, out=out)
     if not uses_mmvq(ggml_type, m):
         _check_mmq_tail(w, ggml_type, k)
     _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
@@ -135,6 +149,9 @@ def _q8_1_row_bytes(k: int) -> int:
 @functools.cache
 def uses_mmvq(ggml_type: int, m: int) -> bool:
     """Whether ``mul_mat`` of ``m`` rows on this GPU runs the vector kernel, the one that reads ``xq``."""
+    if backend_name() == "vulkan":
+        # Vulkan shaders read F32/BF16 activations directly (no shared q8_1 quantize step).
+        return False
     return _module().uses_mmvq(ggml_type, m)
 
 
@@ -146,6 +163,10 @@ def mul_mat_id(
     ``scale`` is an fp32 ``[E]`` view (strided is fine) that multiplies each NVFP4 expert's rows; it needs ``T <= mmvq_max_tokens``.
     ``inactive`` says ``ids`` may hold -1 (hybrid decode's CPU routes): those rows come back zero. Above ``mmvq_max_tokens`` it costs a memset and a zeroing pass, so pass it only then.
     """
+    if _use_fast_vk(ggml_type):
+        from . import ik2_vk
+
+        return ik2_vk.mul_mat_id(w, ggml_type, x, ids, scale=scale)
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
@@ -177,6 +198,10 @@ def mul_mat_id_glu(
 
 def moe_weighted_sum(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """``sum_j weights[t, j] * y[t, j, :]`` over ``y[T, k, N]``, accumulated in fp32 and returned in ``y``'s dtype."""
+    if backend_name() == "vulkan":
+        from . import ik2_vk
+
+        return ik2_vk.moe_weighted_sum(y, weights)
     out = torch.empty(y.shape[0], y.shape[2], dtype=y.dtype, device=y.device)
     _module().moe_weighted_sum(y.contiguous(), weights.float().contiguous(), out)
     return out
@@ -185,16 +210,26 @@ def moe_weighted_sum(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 @functools.cache
 def mmvq_max_tokens(ggml_type: int) -> int:
     """Largest token count the small-batch MoE kernels take on this GPU."""
+    if backend_name() == "vulkan":
+        return 1 << 20
     return _module().mmvq_max_tokens(ggml_type)
 
 
 def dequantize(w: torch.Tensor, ggml_type: int, k: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    if _use_fast_vk(ggml_type):
+        from . import ik2_vk
+
+        return ik2_vk.dequantize(w, ggml_type, k, dtype)
     out = torch.empty(w.numel() // w.shape[-1], k, dtype=dtype, device=w.device)
     _module().dequantize(w, ggml_type, k, out)
     return out
 
 
 def get_rows(w: torch.Tensor, ggml_type: int, k: int, ids: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    if _use_fast_vk(ggml_type):
+        from . import ik2_vk
+
+        return ik2_vk.get_rows(w, ggml_type, k, ids, dtype)
     out = torch.empty(ids.shape[0], k, dtype=dtype, device=ids.device)
     _module().get_rows(w, ggml_type, k, ids, out)
     return out
