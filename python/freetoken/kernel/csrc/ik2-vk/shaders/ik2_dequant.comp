@@ -1,0 +1,73 @@
+#version 450
+// ik2-vk weight decode: one invocation per value, packed blocks -> F32 rows.
+// Embarrassingly parallel; the GEMV then runs pure FMAs over the decoded rows.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer EIDS { int eids[]; };
+layout(std430, binding = 3) writeonly buffer WF { float wf[]; };
+
+layout(push_constant) uniform PC {
+    int K; int N; int ty; int row0; int x0; int y0; int te; int e; int half_n; int dim2;
+    float gcap; float ucap;
+} p;
+
+uint getb(uint byte) { return (w[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+
+float h2f(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u) return uintBitsToFloat(sign) + float(m) * 5.9604644775390625e-8;
+    if (e == 31u) return uintBitsToFloat(sign | 0x7f800000u | (m << 13));
+    return uintBitsToFloat(sign | ((e + 112u) << 23) | (m << 13));
+}
+
+float e4m3(uint v) {
+    if (v == 0x7Fu || v == 0u) return 0.0;
+    uint e = (v >> 3) & 0xFu, m = v & 7u;
+    if (e == 0u) return float(m) * 9.765625e-4;
+    return uintBitsToFloat(((e + 119u) << 23) | (m << 20));
+}
+
+float kv_val(uint c) {
+    uint m = c & 7u;
+    float v = m < 4u ? float(m) : (m < 6u ? float(2u * m - 4u) : float(4u * m - 16u));
+    return (c & 8u) != 0u ? -v : v;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    // p.N rows per expert, p.e experts in the chunk; p.row0 indexes the chunk's
+    // actual expert ids in EIDS (the routed ids are sparse in the bank)
+    uint per = uint(p.N) * uint(p.K);
+    if (id >= uint(p.e) * per) return;
+    int el = int(id / per);
+    int n = int((id % per) / uint(p.K)), v = int(id % uint(p.K));
+    int actual = eids[p.row0 + el];
+    uint row = uint(actual * p.N + n) * (p.ty == 40 ? uint(p.K) / 64u * 36u : p.ty == 8 ? uint(p.K) / 32u * 34u : uint(p.K) / 256u * 210u);
+    float outv;
+    if (p.ty == 40) {
+        uint b = row + uint(v / 64) * 36u;
+        int i = v % 64, sb = i / 16, j = i % 16;
+        uint byte = getb(b + 4u + uint(sb) * 8u + uint(j & 7));
+        outv = kv_val(j < 8 ? (byte & 0xFu) : (byte >> 4)) * e4m3(getb(b + uint(sb)));
+    } else if (p.ty == 8) {
+        uint b = row + uint(v / 32) * 34u;
+        float d = h2f(getb(b) | (getb(b + 1u) << 8));
+        int q = int(getb(b + 2u + uint(v % 32)));
+        if (q >= 128) q -= 256;
+        outv = d * float(q);
+    } else {
+        uint b = row + uint(v / 256) * 210u;
+        int i = v % 256, nn = i / 128, lq = i % 128, qd = lq / 32, l = lq % 32;
+        uint lo = getb(b + uint(nn) * 64u + uint(l + ((qd & 1) != 0 ? 32 : 0)));
+        int nib = qd >= 2 ? int(lo >> 4) : int(lo & 0xFu);
+        int qh = int((getb(b + 128u + uint(nn) * 32u + uint(l)) >> (2 * uint(qd))) & 3u);
+        int q = (nib | (qh << 4)) - 32;
+        int sc = int(getb(b + 192u + uint(nn) * 8u + uint(l / 16 + 2 * qd)));
+        if (sc >= 128) sc -= 256;
+        float d = h2f(getb(b + 208u) | (getb(b + 209u) << 8));
+        outv = d * float(sc) * float(q);
+    }
+    wf[id] = outv;
+}

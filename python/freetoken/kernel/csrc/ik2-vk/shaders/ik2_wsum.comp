@@ -1,0 +1,27 @@
+#version 450
+// ik2-vk routed weighted sum: out[t][h] = sum_j weights[t][j] * Y[pos[t][j]][h],
+// inactive routes (pos < 0) skipped, fixed j order.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 5) readonly buffer Y { float y[]; };
+layout(std430, binding = 6) readonly buffer POS { int pos[]; };
+layout(std430, binding = 7) readonly buffer WT { float wt[]; };
+layout(std430, binding = 9) writeonly buffer OUT { float outv[]; };
+
+layout(push_constant) uniform PC {
+    int K; int N; int ty; int row0; int x0; int y0; int te; int e; int half_n; int dim2;
+    float gcap; float ucap;
+} p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    int H = p.dim2, k = p.e;
+    if (id >= uint(p.te) * uint(H)) return;
+    int t = int(id) / H, h = int(id) % H;
+    precise float acc = 0.0;
+    for (int j = 0; j < k; ++j) {
+        int r = pos[uint(t) * uint(k) + uint(j)];
+        if (r >= 0) acc += wt[uint(t) * uint(k) + uint(j)] * y[uint(r) * uint(H) + uint(h)];
+    }
+    outv[uint(t) * uint(H) + uint(h)] = acc;
+}

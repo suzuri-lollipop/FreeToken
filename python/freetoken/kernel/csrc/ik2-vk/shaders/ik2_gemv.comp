@@ -1,0 +1,32 @@
+#version 450
+// ik2-vk GEMV over decoded F32 rows, all routed experts of a chunk in one dispatch:
+// invocation = route * N + n; EIDX[route] picks the expert's decoded row block,
+// SCG[route] its scales. y[route][n] = dot(WF[e][n], X[route]) * scale.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer WF { float wf[]; };
+layout(std430, binding = 1) readonly buffer EIDX { int eidx[]; };
+layout(std430, binding = 2) readonly buffer X { float x[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(std430, binding = 8) readonly buffer SCG { float scg[]; };
+
+layout(push_constant) uniform PC {
+    int K; int N; int ty; int row0; int x0; int y0; int te; int e; int half_n; int dim2;
+    float gcap; float ucap;
+} p;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(p.te) * uint(p.N)) return;
+    int r = int(id) / p.N, n = int(id) % p.N;
+    int el = eidx[uint(p.y0 + r)] - p.row0;  // expert within the chunk
+    uint wr = (uint(el) * uint(p.N) + uint(n)) * uint(p.K);
+    uint xr = uint(p.x0 + p.y0 + r) * uint(p.K);
+    precise float acc = 0.0;
+    for (int v = 0; v < p.K; ++v) {
+        acc = fma(x[xr + uint(v)], wf[wr + uint(v)], acc);
+    }
+    // half_n < 0: no scale (the gate/up scales ride the SITU shader); 0: down (col 2)
+    float sc = p.half_n < 0 ? 1.0 : scg[uint(p.y0 + r) * 4u + 2u];
+    y[uint(p.y0 + r) * uint(p.N) + uint(n)] = acc * sc;
+}

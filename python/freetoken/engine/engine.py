@@ -1095,19 +1095,39 @@ class Engine:
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
+        from freetoken.kernel import ggml
+
+        # the Vulkan wrapper reads the banks itself: keep them in pinned host RAM (its
+        # resident device copies live in Vulkan memory, a CUDA copy would double the VRAM)
+        vulkan = ggml.backend_name() == "vulkan"
         with _weight_load_context():
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
                 method=layers[0].quant_method,
-                device=self.device,
+                device=None if vulkan else self.device,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
                 layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
             )
+        if vulkan:
+            # the per-expert scales stay on the GPU: the MoE apply indexes them with
+            # device route ids (the packed weight banks themselves stay in host RAM)
+            for role, per_layer in banks.sources.items():
+                if role == "global":
+                    banks.sources[role] = [t.to(self.device) for t in per_layer]
+            bank_bytes = sum(t.numel() * t.element_size() for per_layer in banks.sources.values() for t in per_layer)
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            if bank_bytes + (2 << 30) > free_bytes:
+                logger.warning_rank0(
+                    f"vulkan resident banks need {bank_bytes / 2**30:.1f} GiB of VRAM but only "
+                    f"{free_bytes / 2**30:.1f} GiB is free; reduce --num-tokens or the KV cache dtype "
+                    "or the Vulkan uploads will run out of device memory"
+                )
         attach_resident_banks(layers, banks)
-
+        if vulkan:
+            ggml.set_bank_mode(True)
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
         for item in self.mm_processor.dummy_items(self.dtype, self.device):

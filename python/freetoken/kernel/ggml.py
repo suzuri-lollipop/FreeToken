@@ -47,11 +47,47 @@ def load_module(build_directory: str | None = None) -> Module:
 def _module() -> Module:
     # FREETOKEN_GGML_BACKEND=vulkan runs the packed-weight ops on the vendored ggml-vulkan
     # backend instead of ggml-cuda; the op surface and dtype contracts are identical.
-    if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
+    if backend_name() == "vulkan":
         from .ggml_vk import load_module as load_vk_module
 
         return load_vk_module()
     return load_module()
+
+
+def backend_name() -> str:
+    return "vulkan" if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan" else "cuda"
+
+
+def set_bank_mode(resident: bool) -> None:
+    """Vulkan only: resident=True tells the wrapper the expert banks are static (fused
+    serving), so it uploads each bank to the device once and reads per-expert views;
+    offload slot pools keep the default per-call gather because their contents change."""
+    if backend_name() == "vulkan":
+        _module().set_bank_mode(resident)
+
+
+def moe_ffn_situ(
+    wgu: torch.Tensor,
+    gu_type: int,
+    wdn: torch.Tensor,
+    dn_type: int,
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    global_scales: torch.Tensor | None = None,
+    alpha: float = 4.0,
+    limit: float = 25.0,
+) -> torch.Tensor:
+    """Vulkan only: gate_up GEMM -> SITU -> down GEMM -> weighted sum in one graph per
+    call, so the looped decoder pays one submit instead of two plus a host round trip
+    for the activation. ``global_scales`` is the NVFP4 ``[E, 4]`` bank (gate, up, down, 1)."""
+    t = ids.shape[0]
+    out = torch.empty(t, wdn.shape[1], dtype=x.dtype, device=x.device)
+    _module().moe_ffn_situ(
+        wgu, gu_type, wdn, dn_type, x.contiguous(), ids, weights.float().contiguous(), out, global_scales, alpha, limit
+    )
+    return out
 
 
 @functools.cache

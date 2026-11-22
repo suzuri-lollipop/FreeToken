@@ -1,0 +1,82 @@
+#version 450
+// ik2-vk softcapped SwiGLU (SITU): h = gcap*tanh(g/gcap) * sigmoid(g) * ucap*tanh(u/ucap),
+// rounded to FP16 as maya's ik2_exact.h stores it; exp/tanh are its IEEE-only polynomials.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 3) readonly buffer GU { float gu[]; };
+layout(std430, binding = 4) writeonly buffer INTER { float inter[]; };
+layout(std430, binding = 8) readonly buffer SCG { float scg[]; };
+
+layout(push_constant) uniform PC {
+    int K; int N; int ty; int row0; int x0; int y0; int te; int e; int half_n; int dim2;
+    float gcap; float ucap;
+} p;
+
+float ik_exp(float xx) {
+    xx = xx < -87.0 ? -87.0 : (xx > 88.0 ? 88.0 : xx);
+    float n = roundEven(xx * 1.44269502162933349609375);
+    float r = fma(-n, 0.693145751953125, xx);
+    r = fma(-n, 1.428606765330187045e-06, r);
+    float q = 1.98412698412698412526e-4;
+    q = fma(q, r, 1.38888888888888894189e-3);
+    q = fma(q, r, 8.33333333333333321769e-3);
+    q = fma(q, r, 4.16666666666666643537e-2);
+    q = fma(q, r, 1.66666666666666657415e-1);
+    q = fma(q, r, 0.5);
+    q = fma(q, r, 1.0);
+    q = fma(q, r, 1.0);
+    return q * uintBitsToFloat(uint(int(n) + 127) << 23);
+}
+
+float ik_tanh(float yv) {
+    float a = uintBitsToFloat(floatBitsToUint(yv) & 0x7fffffffu);
+    if (a < 0.0625) {
+        float y2 = yv * yv;
+        float q = -5.3968253968253968e-2;
+        q = fma(q, y2, 1.3333333333333333e-1);
+        q = fma(q, y2, -3.3333333333333333e-1);
+        return fma(q * y2, yv, yv);
+    }
+    float t = 1.0 - 2.0 / (ik_exp(2.0 * a) + 1.0);
+    return uintBitsToFloat(floatBitsToUint(t) | (floatBitsToUint(yv) & 0x80000000u));
+}
+
+uint f2h(float f) {
+    uint xx = floatBitsToUint(f), sign = (xx >> 16) & 0x8000u, ax = xx & 0x7fffffffu;
+    if (ax >= 0x7f800000u) return sign | (ax > 0x7f800000u ? 0x7e00u : 0x7c00u);
+    if (ax >= 0x477ff000u) return sign | 0x7c00u;
+    if (ax < 0x38800000u) {
+        if (ax < 0x33000000u) return sign;
+        uint e = ax >> 23, m = (ax & 0x7fffffu) | 0x800000u;
+        uint sh = 126u - e, hf = 1u << (sh - 1u), rem = m & ((1u << sh) - 1u);
+        uint q = m >> sh;
+        if (rem > hf || (rem == hf && (q & 1u) != 0u)) ++q;
+        return sign | q;
+    }
+    uint h = (ax - 0x38000000u) >> 13;
+    uint rem = ax & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    return sign | h;
+}
+
+float h2f(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u) return uintBitsToFloat(sign) + float(m) * 5.9604644775390625e-8;
+    if (e == 31u) return uintBitsToFloat(sign | 0x7f800000u | (m << 13));
+    return uintBitsToFloat(sign | ((e + 112u) << 23) | (m << 13));
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    int I = p.dim2;
+    if (id >= uint(p.te) * uint(I)) return;
+    int t = int(id) / I, i = int(id) % I;
+    uint base = uint(p.y0 + t) * uint(2 * I) + uint(i);
+    float g = gu[base] * scg[uint(p.y0 + t) * 4u + 0u];
+    float u = gu[base + uint(I)] * scg[uint(p.y0 + t) * 4u + 1u];
+    float a = p.gcap * ik_tanh(g / p.gcap);
+    float b = a * (1.0 / (1.0 + ik_exp(-g))) * p.ucap;
+    float h = b * ik_tanh(u / p.ucap);
+    inter[uint(p.y0 + t) * uint(I) + uint(i)] = h2f(f2h(h));
+}
