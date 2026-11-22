@@ -254,7 +254,8 @@ def iter_gguf_weights(
     from freetoken.models.loader import shard_tensor
     from freetoken.utils import cached_load_hf_config
 
-    tp = _di._TP_INFO if _di._TP_INFO is not None else _di.DistributedInfo(rank=0, size=1)
+    import os as _os
+    tp = _di.DistributedInfo(rank=0, size=1) if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" else (_di._TP_INFO if _di._TP_INFO is not None else _di.DistributedInfo(rank=0, size=1))
     hf = _hf_config(cached_load_hf_config(model_path))
     vision = include_vision and hf.vision_config is not None
     log_mmproj(model_path, vision)

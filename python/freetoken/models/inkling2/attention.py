@@ -51,7 +51,8 @@ class Inkling2Attention(BaseOP):
         self.args = args
         self.phys_layer = phys_layer
         self.swa = phys_layer in args.swa_physical
-        tp = get_tp_info().size
+        import os as _os
+        tp = 1 if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" else get_tp_info().size
         self.nh, self.nk, self.hd = args.num_qo_heads // tp, args.num_kv_heads // tp, args.head_dim
         self.d_rel = args.d_rel
         H = config.hidden_size

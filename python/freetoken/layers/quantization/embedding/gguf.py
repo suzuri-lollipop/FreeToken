@@ -27,7 +27,8 @@ class GgmlEmbeddingKernel(EmbeddingKernel):
         cfg = layer.quant_method.cfg
         (ggml_type,) = gguf_types(cfg.scheme)
         flat = ids.reshape(-1)
-        if cfg.tp_size > 1:
+        import os as _os
+        if cfg.tp_size > 1 and _os.environ.get("FREETOKEN_LAYER_SPLIT") != "1":
             # TP: only local-vocab ids are valid rows; mask the rest to row 0 and zero output
             start = layer.vocab_range[0]
             local = flat - start

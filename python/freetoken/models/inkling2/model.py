@@ -195,6 +195,11 @@ class Inkling2TextModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         args: Inkling2Args = config.inkling2_args
         self.args = args
+        # Split mode: build the model as TP1 (full-width layers, replicated weights)
+        from freetoken.distributed import info as _di
+        _saved_tp = _di._TP_INFO
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1":
+            _di._TP_INFO = _di.DistributedInfo(rank=0, size=1)
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=args.padded_vocab_size,
             embedding_dim=config.hidden_size,
@@ -208,9 +213,13 @@ class Inkling2TextModel(BaseOP):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.output_res_query = torch.empty(1, config.hidden_size, dtype=torch.float32)
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1":
+            _di._TP_INFO = _saved_tp
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self._normed_embedding, input_ids, get_global_ctx().batch)
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and get_tp_info().size > 1:
+            return self.forward_split(x)
         return self.forward_embeds(x)
 
     def forward_embeds(self, x: torch.Tensor) -> torch.Tensor:
@@ -258,11 +267,130 @@ class Inkling2TextModel(BaseOP):
         return out
 
 
+
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Layer-split forward: each rank runs its local layers, transfers at the boundary.
+
+        Enabled by FREETOKEN_LAYER_SPLIT=1 with tp_size=2. Rank 0 owns layers 0..split-1,
+        rank 1 owns layers split..N-1. Weights are replicated (both ranks hold all layers);
+        only the COMPUTE is split. No allreduce — just point-to-point at the boundary.
+        """
+        import torch.distributed as dist
+        args = self.args
+        ctx = get_global_ctx()
+        tp = get_tp_info()
+        split = args.num_phys_layers // tp.size  # 12 for 24 layers / 2
+        rank = tp.rank
+        device = f"cuda:{rank}"
+        # Use gloo (CPU) for P2P: messages are tiny (decode: 4.6KB), avoids NCCL init deadlock
+        grp = None  # default gloo group
+        conv_meta = build_conv_meta(ctx.batch, device)
+        positions = ctx.batch.get_attn_positions()
+        layers = self.layers.op_list
+        blocks: List[torch.Tensor] = []
+        H = args.hidden_size
+        T = x.shape[0] if rank == 0 else int(ctx.batch.input_ids.shape[0])
+
+        def send_x(t):
+            dist.send(t.contiguous(), dst=1 - rank, group=grp)
+
+        def recv_x():
+            buf = torch.empty(T, H, dtype=x.dtype, device=x.device)
+            dist.recv(buf, src=1 - rank, group=grp)
+            return buf
+
+        def send_blocks(bl):
+            n = len(bl)
+            dist.send(torch.tensor([n], dtype=torch.int32, device=device), dst=1 - rank, group=grp)
+            for b in bl:
+                dist.send(b.contiguous(), dst=1 - rank, group=grp)
+
+        def recv_blocks():
+            n_t = torch.empty(1, dtype=torch.int32, device=x.device)
+            dist.recv(n_t, src=1 - rank, group=grp)
+            n = int(n_t.item())
+            bl = []
+            for _ in range(n):
+                b = torch.empty(T, H, dtype=torch.float32, device=x.device)
+                dist.recv(b, src=1 - rank, group=grp)
+                bl.append(b)
+            return bl
+
+        # --- Prelude (layers 0..core_start-1): all on rank 0 ---
+        if rank == 0:
+            for il in range(args.core_start):
+                x = layers[il].forward(x, blocks, il, conv_meta, positions)
+            prelude = x.clone()
+            prelude_blocks = list(blocks)
+            # send prelude output + blocks to rank 1 for core
+            send_x(x)
+            send_blocks(blocks)
+        else:
+            x = recv_x()
+            blocks = recv_blocks()
+            prelude = x.clone()
+            prelude_blocks = list(blocks)
+
+        # --- Core passes ---
+        core = args.core_end - args.core_start
+        for p in range(args.num_passes):
+            if p > 0:
+                bank = blocks[len(prelude_blocks) + 1:]
+                bank_out = x
+                x = prelude.clone()
+                blocks = list(prelude_blocks)
+
+            # First half (core_start..split-1): rank 0
+            if rank == 0:
+                for ip in range(args.core_start, split):
+                    il = ip if p == 0 else args.num_phys_layers + (p - 1) * core + (ip - args.core_start)
+                    messages = None
+                    if p > 0:
+                        messages = mix(bank, bank_out, layers[ip].loop_msg_query)
+                    x = layers[ip].forward(x, blocks, il, conv_meta, positions, messages)
+                send_x(x)
+                send_blocks(blocks)
+            else:
+                x = recv_x()
+                blocks = recv_blocks()
+
+            # Second half (split..core_end-1): rank 1
+            if rank == 1:
+                for ip in range(split, args.core_end):
+                    il = ip if p == 0 else args.num_phys_layers + (p - 1) * core + (ip - args.core_start)
+                    messages = None
+                    if p > 0:
+                        messages = mix(bank, bank_out, layers[ip].loop_msg_query)
+                    x = layers[ip].forward(x, blocks, il, conv_meta, positions, messages)
+                # send back for next pass (or coda)
+                send_x(x)
+                send_blocks(blocks)
+            else:
+                x = recv_x()
+                blocks = recv_blocks()
+
+        # --- Coda (core_end..N-1): rank 1 ---
+        if rank == 1:
+            for il in range(args.core_end, args.num_phys_layers):
+                x = layers[il].forward(x, blocks, il, conv_meta, positions)
+            x = mix(blocks, x, self.output_res_query)[:, 0]
+            out = self.norm.forward(x.to(self.norm.weight.dtype))
+            send_x(out)
+        else:
+            out = recv_x()
+
+        return out
+
+
 class Inkling2LoopForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         # TP>=2: attention heads split column/row parallel, experts EP-sharded
         args: Inkling2Args = config.inkling2_args
         self.model = Inkling2TextModel(config)
+        from freetoken.distributed import info as _di2
+        _saved_tp2 = _di2._TP_INFO
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1":
+            _di2._TP_INFO = _di2.DistributedInfo(rank=0, size=1)
         self.lm_head = ParallelLMHead(
             num_embeddings=args.padded_vocab_size,
             embedding_dim=config.hidden_size,
@@ -270,12 +398,27 @@ class Inkling2LoopForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1":
+            _di2._TP_INFO = _saved_tp2
         self._softcap = args.final_logit_softcapping
         self._unpadded = args.unpadded_vocab_size
         super().__init__()
 
     def forward(self) -> torch.Tensor:
+        split = _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and get_tp_info().size > 1
+        rank = get_tp_info().rank
+        if split and rank == 1:
+            # rank 1: skip embedding, run split layers, send hidden to rank 0, return dummy
+            hidden = self.model.forward_split(torch.empty(0, device=f"cuda:{rank}"))
+            # forward_split sends the normed hidden to rank 0; return zeros for the sampler
+            return torch.zeros(1, self._unpadded, device=f"cuda:{rank}")
         hidden = self.model.forward(get_global_ctx().batch.input_ids)
+        if split:
+            # rank 0: hidden came from rank 1 via forward_split; no broadcast needed
+            logits = self.lm_head.forward(hidden).float()
+            if self._softcap:
+                logits = torch.tanh(logits / self._softcap) * self._softcap
+            return logits[:, : self._unpadded].contiguous()
         logits = self.lm_head.forward(hidden).float()
         if self._softcap:
             logits = torch.tanh(logits / self._softcap) * self._softcap

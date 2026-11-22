@@ -61,8 +61,9 @@ class Inkling2Args:
     @property
     def conv_channels(self) -> int:
         # K and V convs (local under TP), then the attention-output and FFN-output convs (full H)
+        import os as _os
         from freetoken.distributed import info as _di
-        tp = _di._TP_INFO.size if _di._TP_INFO is not None else 1
+        tp = 1 if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" else (_di._TP_INFO.size if _di._TP_INFO is not None else 1)
         return 2 * (self.kv_dim // tp) + 2 * self.hidden_size
 
     @property

@@ -925,6 +925,15 @@ class Engine:
             available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
+        # Split mode: KV uses full heads (model is TP1-width, layers split across GPUs)
+        _split_kv = os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1
+        if _split_kv:
+            from freetoken.distributed import DistributedInfo as _DI
+            from freetoken.distributed import info as _dinfo
+            _saved_cfg_tp = config.tp_info
+            _saved_global_tp = _dinfo._TP_INFO
+            object.__setattr__(config, "tp_info", _DI(rank=0, size=1))
+            _dinfo._TP_INFO = _DI(rank=0, size=1)
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             # A quantized pool stores below the model dtype; it takes its dtype from the
             # config so the allocation and the reported capacity can never disagree.
@@ -934,6 +943,9 @@ class Engine:
             dtype=getattr(config, "kv_dtype", self.dtype),
         )
 
+        if _split_kv:
+            object.__setattr__(config, "tp_info", _saved_cfg_tp)
+            _dinfo._TP_INFO = _saved_global_tp
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
@@ -1100,8 +1112,9 @@ class Engine:
         vulkan = ggml.backend_name() == "vulkan"
         tp = config.tp_info
         # EP: each rank loads only its local experts; TP>=2 always VRAM-resident (no host RAM)
+        # Split mode: replicated experts (each rank holds all, runs only its layers)
         expert_slice = None
-        if tp.size > 1:
+        if tp.size > 1 and os.environ.get("FREETOKEN_LAYER_SPLIT") != "1":
             ne = config.model_config.num_experts
             local = ne // tp.size
             expert_slice = (tp.rank * local, local)
@@ -3817,6 +3830,11 @@ def _adjust_config(config: EngineConfig):
             )
         override("moe_prefill_overlap", False)
         override("decode_fetch_overlap", False)
+
+    if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1:
+        # split-layer forward uses dist.send/recv which cannot be CUDA-graph captured
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
 
     if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
         # the Vulkan ggml ops stage activations through the host and submit Vulkan work

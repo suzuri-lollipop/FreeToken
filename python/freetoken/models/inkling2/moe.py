@@ -25,9 +25,11 @@ class Inkling2MoE(BaseOP):
         args: Inkling2Args = config.inkling2_args
         self.top_k = config.num_experts_per_tok
         self.route_scale = args.route_scale
+        import os as _os
         tp = get_tp_info()
-        self.tp_size = tp.size
-        self.tp_rank = tp.rank
+        _split = _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1"
+        self.tp_size = 1 if _split else tp.size
+        self.tp_rank = 0 if _split else tp.rank
         self.num_experts = config.num_experts
         self.local_experts = config.num_experts // tp.size
         self.expert_offset = self.tp_rank * self.local_experts
