@@ -185,7 +185,8 @@ class DSparkDraft:
     def _tensors(self):
         yield from (self.alpha, self.norm, self.mask, self.mk_dflare, self.w1, self.rnn_w, self.rnn_b, self.hout_w, self.hout_b)
         for l in self.layers:
-            yield from vars(l).values()
+            # vars() also carries the `local` flag; only the weights move and count
+            yield from (t for t in vars(l).values() if isinstance(t, torch.Tensor))
 
     def weight_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self._tensors())

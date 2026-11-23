@@ -163,7 +163,8 @@ class DSparkProposer(Proposer):
             head = self.target.lm_head
             self.head_logits = lambda x: head.gather_logits(head.logits(x))
             self.fold_w, self.fold_b = self.draft.fold(self.head_logits)
-            self.embed = self.target.model._normed_embedding
+            # _NormedEmbedding is a plain op (no __call__); the proposer invokes it directly
+            self.embed = self.target.model._normed_embedding.forward
             logger.info_rank0(
                 f"dspark: the official drafter loaded ({self.draft.weight_bytes() / 2**20:.0f} MiB), "
                 f"full-context layer keeps {_full_cap(self.config)} positions"
@@ -237,7 +238,7 @@ class DSparkProposer(Proposer):
         sink, self._prefill_sink = self._prefill_sink, None
         taps = sink.buffer
         offset = 0
-        frnn = self.ctx.slot_states[FRNN][0]
+        frnn = self.ctx.slot_states[FRNN]
         for i, (req, (s, e)) in enumerate(zip(batch.reqs, sink.spans)):
             m = e - s
             rows = taps[offset : offset + m]
@@ -248,7 +249,7 @@ class DSparkProposer(Proposer):
 
     def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         drafts = []
-        frnn = self.ctx.slot_states[FRNN][0]
+        frnn = self.ctx.slot_states[FRNN]
         for i, req in enumerate(reqs):
             P = req.cached_len
             slot = gdn_slot(req)
@@ -263,7 +264,7 @@ class DSparkProposer(Proposer):
         came from the verify forward; write their context and set f_rnn at the last kept row."""
         k1 = self.k + 1
         counts = (emitted[: batch.size] + 1).tolist()
-        frnn = self.ctx.slot_states[FRNN][0]
+        frnn = self.ctx.slot_states[FRNN]
         for i, req in enumerate(batch.reqs):
             n = counts[i]
             taps = self.verify_taps[i * k1 : i * k1 + n]

@@ -821,7 +821,7 @@ def test_dspark_ring_write_and_window_read(tmp_path):
     prop.ctx = SimpleNamespace(slot_states={
         CTX_LOCAL: torch.zeros(2, 3, 2, RING, 256, dtype=torch.float32),
         CTX_FULL: torch.zeros(1, 3, 2, cap, 256, dtype=torch.float16),
-        FRNN: torch.zeros(1, 3, 64, dtype=torch.float32),
+        FRNN: torch.zeros(3, 64, dtype=torch.float32),
     })
     torch.manual_seed(11)
     m = 3000  # past the local rings' 2048 rows: the early positions are overwritten
@@ -830,8 +830,8 @@ def test_dspark_ring_write_and_window_read(tmp_path):
     # the write touched slot 1 only: slot 0's rings stay zero (the slot axis, not the K/V axis)
     assert not prop.ctx.slot_states[CTX_LOCAL][:, 0].any()
     assert not prop.ctx.slot_states[CTX_FULL][:, 0].any()
-    prop.ctx.slot_states[FRNN][0][1] = draft.f_rnn(taps[-1])
-    assert torch.equal(prop.ctx.slot_states[FRNN][0][1], draft.f_rnn(taps[-1]))
+    prop.ctx.slot_states[FRNN][1] = draft.f_rnn(taps[-1])
+    assert torch.equal(prop.ctx.slot_states[FRNN][1], draft.f_rnn(taps[-1]))
     ks, vs = prop._read_context(1, m)
     for li in range(3):
         win = WINDOW - 1 if draft.layers[li].local else cap
