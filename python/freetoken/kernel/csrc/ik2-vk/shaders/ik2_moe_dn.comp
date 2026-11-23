@@ -1,0 +1,50 @@
+#version 450
+#include "vk_common.glsl"
+
+// MoE Down GEMV (also reusable for general mul_mat_id):
+// y[t, j, h] = dot(W[e, h], X[t, j (or 0), :]) * scale[e]
+// Grid: (ceil(H / 4), top_k, T); local_size = (32, 4, 1).
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t x_addr;
+    uint64_t ids_addr;
+    uint64_t sc_addr;    // [E, sc_stride] fp32, or 0
+    uint64_t y_addr;     // [T, top_k, H]
+    int K;
+    int H;
+    int top_k;
+    int T;
+    int ty;
+    int x_dt;
+    int y_dt;
+    int x_per_route;     // 1: x is [T, top_k, K]; 0: x is [T, K]
+    int sc_stride;       // 4 for global [E,4] (col 2), 1 for 1D scale [E] (col 0)
+    int sc_col;
+} p;
+
+void main() {
+    uint h = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    uint j = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    if (h >= uint(p.H) || j >= uint(p.top_k) || t >= uint(p.T)) return;
+
+    uint route = t * uint(p.top_k) + j;
+    int e = I32Buf(p.ids_addr).v[route];
+    if (e < 0) {
+        if (gl_LocalInvocationID.x == 0u) {
+            write_val(p.y_addr, p.y_dt, route * uint(p.H) + h, 0.0);
+        }
+        return;
+    }
+
+    uint x_base = (p.x_per_route != 0 ? route : t) * uint(p.K);
+    float dot = warp_dot_row(p.w_addr, p.ty, uint(e) * uint(p.H) + h, p.K, p.x_addr, p.x_dt, x_base);
+    if (gl_LocalInvocationID.x == 0u) {
+        if (p.sc_addr != 0ul) {
+            dot *= F32Buf(p.sc_addr).v[uint(e) * uint(p.sc_stride) + uint(p.sc_col)];
+        }
+        write_val(p.y_addr, p.y_dt, route * uint(p.H) + h, dot);
+    }
+}

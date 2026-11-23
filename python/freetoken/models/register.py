@@ -37,6 +37,10 @@ class ModelSpec:
     packed_modules_mapping: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # checkpoint-name globs the family serves in bf16 although the quantization_config covers them
     unquantized_modules: tuple[str, ...] = ()
+    # key/value overrides applied to the checkpoint's quantization_config before the dialect reads it,
+    # for releases whose config.json under-declares (inkling2: NVFP4 experts with dynamic activation
+    # quant, i.e. no static input_scale -> with_input_scale false selects the W4A16 kernels)
+    quant_overrides: tuple[tuple[str, Any], ...] = ()
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
@@ -119,6 +123,27 @@ _RICURSIVE_PACKED = (("qk_proj", ("q_proj", "k_proj")), ("gate_up_proj", ("gate_
 # language model's rather than under a section of their own.
 _DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
 _DSV4_ENCODERS = (EncoderSpec("vision", "vision_n_layers", ("image",)),)
+# Inkling-2-Mini (inkling2_loop): the text tower lives under model.llm., the CLIP-style
+# tower under model.visual.; only the routed experts are quantized (NVFP4 layers 0-19,
+# MXFP8 layers 20-23 served dequantized), everything else stays bf16 despite the global
+# ModelOpt NVFP4 algo.
+_INKLING2_ROOTS = (("model", "model.llm"), ("visual", "model.visual"), ("lm_head", "model.llm.unembed"))
+_INKLING2_SEGMENTS = (("self_attn", "attn"),)
+_INKLING2_UNQUANTIZED = (
+    "model.llm.layers.*.attn*",
+    "model.llm.layers.*norm*",
+    "model.llm.layers.*sconv*",
+    "model.llm.layers.*.mlp.gate*",
+    "model.llm.layers.*.controllers*",
+    "model.llm.embed*",
+    "model.llm.norm*",
+    "model.llm.unembed*",
+    "model.llm.attn_res*",
+    "model.visual*",
+    "model.llm.layers.2[0-3].mlp.experts*",
+)
+_INKLING2_PROCESSOR = "freetoken.mm.processors.inkling2:Inkling2MMProcessor"
+_INKLING2_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "FlintGGUFForCausalLM": ModelSpec(
@@ -569,6 +594,46 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
         # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
         unquantized_modules=("*.self_attn.kv_b_proj",),
+    ),
+    # Inkling-2-Mini (model_type inkling2_loop): 24 physical decoder layers run as 48 visits
+    # (the middle 12 loop three times with cross-pass messages); NoPE GQA with a learned
+    # relative-position bias, per-query sinks and L2-clipped q/k, short convs on K/V and the
+    # sublayer outputs, 128-expert top-8 SITU MoE; the CLIP-style vision tower serves images.
+    "Inkling2LoopForConditionalGeneration": ModelSpec(
+        "freetoken.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+        checkpoint_roots=_INKLING2_ROOTS,
+        checkpoint_segments=_INKLING2_SEGMENTS,
+        unquantized_modules=_INKLING2_UNQUANTIZED,
+        # the release quantizes activations per token at runtime; no static input_scale is stored
+        quant_overrides=(("with_input_scale", False),),
+        mm_processor=_INKLING2_PROCESSOR,
+        encoders=_INKLING2_ENCODERS,
+        tp_supported=True,
+    ),
+    # Text-only sibling (the text_config's own architectures entry).
+    "Inkling2LoopForCausalLM": ModelSpec(
+        "freetoken.models.inkling2",
+        "Inkling2LoopForCausalLM",
+        checkpoint_roots=_INKLING2_ROOTS,
+        checkpoint_segments=_INKLING2_SEGMENTS,
+        unquantized_modules=_INKLING2_UNQUANTIZED,
+        quant_overrides=(("with_input_scale", False),),
+        tp_supported=True,
+    ),
+    # mainline llama.cpp inkling2_loop GGUF (unsloth Mainline_Support UD-Q4_K_XL / UD-Q8_K_XL):
+    # the same model classes with every tensor in its packed ggml type; an inkling2v mmproj
+    # adds the vision tower. The converter already deinterleaved the expert gate|up rows.
+    # No checkpoint_roots: to_gguf maps the module names straight to the ggml tensor table.
+    "Inkling2LoopGGUFForCausalLM": ModelSpec(
+        "freetoken.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_EXPERTS_PACKED,
+        mm_processor=_INKLING2_PROCESSOR,
+        encoders=_INKLING2_ENCODERS,
+        tp_supported=True,
     ),
 }
 

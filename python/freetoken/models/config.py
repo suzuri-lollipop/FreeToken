@@ -380,6 +380,13 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Inkling-2-Mini (inkling2_loop) payload (Inkling2Args): loop geometry, relative-bias
+    # attention dims, short-conv channel layout and the cross-pass controllers. Opaque to
+    # model-agnostic engine code; None for every other model.
+    inkling2_args: Any | None = None
+    # Explicit MoE weight-set count for models whose layer visits outnumber their stored
+    # layers (inkling2_loop: 48 visits, 24 expert banks); None keeps num_layers - first_k_dense_replace.
+    moe_layer_count: int | None = None
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None
@@ -400,7 +407,10 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+        Looped models (``moe_layer_count``) store fewer expert banks than layer visits.
         """
+        if self.moe_layer_count is not None:
+            return self.moe_layer_count
         return self.num_layers - self.first_k_dense_replace
 
     @property

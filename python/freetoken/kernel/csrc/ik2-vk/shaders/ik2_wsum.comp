@@ -1,0 +1,33 @@
+#version 450
+#include "vk_common.glsl"
+
+// Weighted sum across routes: out[t, h] = sum_j (ids[t, j] >= 0 ? wt[t, j] * y[t, j, h] : 0)
+// Grid: (ceil(H / 256), T, 1); local_size = (256, 1, 1).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t y_addr;
+    uint64_t ids_addr;  // optional (0 = all routes active)
+    uint64_t wt_addr;   // [T, top_k] fp32
+    uint64_t out_addr;  // [T, H]
+    int H;
+    int top_k;
+    int T;
+    int y_dt;
+    int out_dt;
+} p;
+
+void main() {
+    uint h = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y;
+    if (h >= uint(p.H) || t >= uint(p.T)) return;
+
+    float acc = 0.0;
+    F32Buf W = F32Buf(p.wt_addr);
+    for (uint j = 0u; j < uint(p.top_k); ++j) {
+        uint route = t * uint(p.top_k) + j;
+        if (p.ids_addr != 0ul && I32Buf(p.ids_addr).v[route] < 0) continue;
+        acc = fma(W.v[route], read_val(p.y_addr, p.y_dt, route * uint(p.H) + h), acc);
+    }
+    write_val(p.out_addr, p.out_dt, t * uint(p.H) + h, acc);
+}

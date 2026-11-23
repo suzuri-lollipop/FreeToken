@@ -564,6 +564,7 @@ def load_expert_banks(
     banks_path: str | None = None,
     hot_experts: dict[int, list[int]] | None = None,
     layer_methods: list | None = None,
+    expert_slice: tuple[int, int] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -662,7 +663,7 @@ def load_expert_banks(
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
-            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
+            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None, expert_slice=expert_slice)
         if method is None:
             raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)

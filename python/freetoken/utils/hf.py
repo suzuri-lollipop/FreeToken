@@ -28,6 +28,22 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def ensure_tml_generation_prompt(tokenizer: Any) -> None:
+    """Thinking Machines' inkling templates mark the assistant span with a ``generation``
+    block but carry no ``add_generation_prompt`` branch -- the TML renderer appends the
+    assistant header itself. HF's apply_chat_template would otherwise end the prompt at
+    the last user message and the model never sees that it is its turn."""
+    template = getattr(tokenizer, "chat_template", None)
+    if not template or "add_generation_prompt" in template:
+        return
+    # the marker test needs the vocab; a tokenizer that does not expose it cannot be the
+    # TML inkling template, so leave it untouched rather than crash on get_vocab()
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if get_vocab is None or "<|message_model|>" not in get_vocab():
+        return
+    tokenizer.chat_template = template + "{%- if add_generation_prompt -%}<|message_model|>{%- endif -%}"
+
+
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     from freetoken.models.gguf.reader import gguf_config_source
 
@@ -44,6 +60,7 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
                 tokenizer.chat_template = json.load(f)["chat_template"]
         except Exception:
             pass
+    ensure_tml_generation_prompt(tokenizer)
     return tokenizer
 
 

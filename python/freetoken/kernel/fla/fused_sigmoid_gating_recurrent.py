@@ -496,8 +496,8 @@ def gdn_state_replay(
     _, rows, steps, H, _ = stash_k.shape
     R = meta.shape[1]
     assert state.is_contiguous() and meta.dtype == torch.int32 and meta.is_contiguous()
-    if R == 0:
-        return
+    if R == 0 or L == 0:
+        return  # L == 0: a conv-only slot-state model (inkling2_loop) has no recurrent state to replay
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     # rows and layers x heads on separate grid axes, as SGLang's ReplaySSM fold lays them out: one axis holds at most 65535 programs
     gdn_state_replay_kernel[(triton.cdiv(V, BV), R, L * HV)](

@@ -297,9 +297,19 @@ def test_explicit_non_sharding_backend_is_rejected_under_tp(monkeypatch):
 
 
 def test_no_sharding_backend_available_reports_tp(monkeypatch):
+    import dataclasses
+
+    from freetoken.engine import engine
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch, major=10, flashinfer=False)
+    # triton shards FULL heads too (the inkling2 TP backend), so it would otherwise be the
+    # fallback here; drop its TP flag to leave genuinely no sharding backend for the gate
+    real_info = engine.attention_backend_info
+    monkeypatch.setattr(
+        engine, "attention_backend_info",
+        lambda name: dataclasses.replace(real_info(name), supports_tp=False) if name == "triton" else real_info(name),
+    )
     config = _config(tp=2, attention_backend="auto")
     with pytest.raises(RuntimeError, match="tensor parallelism over 2 ranks"):
         _adjust_config(config)

@@ -371,3 +371,14 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+def test_inkling2_parser_reads_args_key_and_strips_name_prefix():
+    from freetoken.server.function_call_parser import FunctionCallParser
+
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+    parser = FunctionCallParser(tools, "inkling2")
+    text = 'get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Tokyo"}}<|end_message|>'
+    result = parser.parse_non_stream(text)
+    assert [(c.name, c.parameters) for c in result.calls] == [("get_weather", '{"city": "Tokyo"}')]
+    assert result.normal_text == ""

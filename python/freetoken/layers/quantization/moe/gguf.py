@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -81,7 +82,7 @@ class GgmlMoEKernel(MoEKernel):
                 return f"float GGUF experts run on the bf16 fused MoE: {reason}"
         if cfg.has_bias and cfg.decode_target != "gpu":
             return "gpt-oss per-expert biases have no CPU executor format; decode must run on the GPU"
-        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False, bias_ok=True)
+        return self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False, bias_ok=True)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
@@ -140,6 +141,28 @@ class GgmlMoEKernel(MoEKernel):
         # the view indexes them by slot id on the decode path and by expert id on prefill / resident
         gate_up_bias = view.tensors.get("gate_up_bias")
         down_bias = view.tensors.get("down_bias")
+        if ggml.backend_name() == "vulkan" and layer.activation == "situ" and gate_up_bias is None and down_bias is None:
+            if gate_up.device.type == "cpu":
+                # fused host banks: the dedicated ik2-vk shaders run the whole expert FFN
+                # in one command buffer (maya-ik2 style), weights resident on the device
+                from freetoken.kernel import ik2_vk
+
+                sc = view.tensors.get("global")
+                if sc is None:
+                    sc = torch.ones(gate_up.shape[0], 4, dtype=torch.float32, device=x.device)
+                return ik2_vk.moe(
+                    gate_up, gate_up_type, view.tensors["down"], down_type,
+                    x, topk_ids.to(torch.int32), topk_weights, sc,
+                    gcap=float(layer.alpha), ucap=limit_or_inf(layer),
+                )
+            if os.environ.get("FREETOKEN_VK_FUSED_SITU") == "1":
+                # offload slot views: one ggml graph for the whole expert FFN
+                return ggml.moe_ffn_situ(
+                    gate_up, gate_up_type, view.tensors["down"], down_type,
+                    x, topk_ids.to(torch.int32), topk_weights,
+                    global_scales=view.tensors.get("global"),
+                    alpha=float(layer.alpha), limit=limit_or_inf(layer),
+                )
         glu = fused_glu(layer)
         small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
         if glu is not None and small and is_quantized(gate_up_type) and gate_up_bias is None:

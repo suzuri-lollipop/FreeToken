@@ -770,6 +770,13 @@ class Engine:
             if enable_pipe_distributed(config.tp_info, self.tp_cpu_group,
                                        config.distributed_timeout):
                 logger.info_rank0("piped prefill: dedicated torch NCCL group ready")
+        if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1:
+            from freetoken.distributed import split_p2p_group
+
+            if split_p2p_group() is None:
+                # gloo host-staged P2P cannot be captured; keep split decode eager
+                object.__setattr__(config, "cuda_graph_bs", [])
+                object.__setattr__(config, "cuda_graph_max_bs", 0)
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._init_free_memory = init_free_memory  # reused by the GDN-pool budget settle
@@ -925,6 +932,15 @@ class Engine:
             available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
+        # Split mode: KV uses full heads (model is TP1-width, layers split across GPUs)
+        _split_kv = os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1
+        if _split_kv:
+            from freetoken.distributed import DistributedInfo as _DI
+            from freetoken.distributed import info as _dinfo
+            _saved_cfg_tp = config.tp_info
+            _saved_global_tp = _dinfo._TP_INFO
+            object.__setattr__(config, "tp_info", _DI(rank=0, size=1))
+            _dinfo._TP_INFO = _DI(rank=0, size=1)
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             # A quantized pool stores below the model dtype; it takes its dtype from the
             # config so the allocation and the reported capacity can never disagree.
@@ -934,6 +950,9 @@ class Engine:
             dtype=getattr(config, "kv_dtype", self.dtype),
         )
 
+        if _split_kv:
+            object.__setattr__(config, "tp_info", _saved_cfg_tp)
+            _dinfo._TP_INFO = _saved_global_tp
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
@@ -1043,6 +1062,10 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+        if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size == 2:
+            from freetoken.distributed import enable_split_p2p
+
+            enable_split_p2p(config.tp_info, tp_cpu_group)
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
@@ -1095,19 +1118,47 @@ class Engine:
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
+        from freetoken.kernel import ggml
+
+        vulkan = ggml.backend_name() == "vulkan"
+        tp = config.tp_info
+        # EP: each rank loads only its local experts; TP>=2 always VRAM-resident (no host RAM)
+        # Split mode: replicated experts (each rank holds all, runs only its layers)
+        expert_slice = None
+        if tp.size > 1 and os.environ.get("FREETOKEN_LAYER_SPLIT") != "1":
+            ne = config.model_config.num_experts
+            local = ne // tp.size
+            expert_slice = (tp.rank * local, local)
+        # TP>=2: VRAM-resident (fits with EP sharding); TP1 Vulkan: host banks (ik2-vk uploads)
+        device = self.device if (tp.size > 1 or not vulkan) else None
         with _weight_load_context():
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
                 method=layers[0].quant_method,
-                device=self.device,
+                device=device,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
                 layer_methods=[layer.quant_method for layer in sorted(layers, key=lambda layer: layer.layer_id)],
+                expert_slice=expert_slice,
             )
+        if vulkan and device is None:
+            # TP1 host banks: scales to GPU, warn if VRAM is tight for the Vulkan uploads
+            for role, per_layer in banks.sources.items():
+                if role == "global":
+                    banks.sources[role] = [t.to(self.device) for t in per_layer]
+            bank_bytes = sum(t.numel() * t.element_size() for per_layer in banks.sources.values() for t in per_layer)
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            if bank_bytes + (2 << 30) > free_bytes:
+                logger.warning_rank0(
+                    f"vulkan resident banks need {bank_bytes / 2**30:.1f} GiB of VRAM but only "
+                    f"{free_bytes / 2**30:.1f} GiB is free; reduce --num-tokens or the KV cache dtype "
+                    "or the Vulkan uploads will run out of device memory"
+                )
         attach_resident_banks(layers, banks)
-
+        if vulkan:
+            ggml.set_bank_mode(True)
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
         for item in self.mm_processor.dummy_items(self.dtype, self.device):
@@ -3466,6 +3517,11 @@ def _ensure_banks_sidecar(config: EngineConfig, method, *, device, required: boo
 
     if config.use_dummy_weight:
         return config.model_path
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(config.model_path) is not None:
+        # a GGUF file is its own bank source; the HF sidecar repack does not apply
+        return None
     local = download_hf_weight(config.model_path)
     if is_ftw_checkpoint(local):
         return local
@@ -3762,6 +3818,52 @@ def _adjust_config(config: EngineConfig):
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
 
+    if has_swa_attention and has_linear_attention:
+        # No radix cache serves both SWA window slots and linear-state snapshots yet
+        # (swa_radix and hybrid_radix are separate mechanisms); the naive cache drives
+        # both lifecycles -- the inkling2_loop combination runs without prefix reuse.
+        if getattr(config, "cache_type", "radix") != "naive":
+            logger.warning_rank0(
+                f"{getattr(model_config, 'model_type', 'model')}: SWA + linear state runs on the naive "
+                "prefix cache (no cross-request reuse); forcing cache_type=naive"
+            )
+        override("cache_type", "naive")
+
+    if getattr(model_config, "inkling2_args", None) is not None:
+        # The loop revisits the core MoE layers (visit order 0..17, 6..17, 6..17, 18..23);
+        # the overlap prefetch stages layer_id+1, which is not the next visit after the
+        # core's last layer -- the double buffer then serves the wrong experts. Disable
+        # the overlap until the prefetch learns the visit schedule.
+        if config.moe_prefill_overlap or config.decode_fetch_overlap:
+            logger.warning_rank0(
+                "inkling2_loop: disabling MoE fetch overlap (the loop revisits expert layers; "
+                "the prefetch assumes sequential layer order)"
+            )
+        override("moe_prefill_overlap", False)
+        override("decode_fetch_overlap", False)
+
+    # layer-split P2P over NCCL is CUDA-graph capturable; the gloo fallback is not, and
+    # is gated after _init_communication builds (or declines) the split P2P group
+
+    if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
+        # the Vulkan ggml ops stage activations through the host and submit Vulkan work
+        # outside the CUDA stream; a decode CUDA graph cannot capture that
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0 or config.cuda_graph_bs:
+            logger.warning_rank0(
+                "FREETOKEN_GGML_BACKEND=vulkan: disabling decode CUDA graphs "
+                "(host-staged Vulkan ops are not capturable)"
+            )
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        # the KV pool would otherwise take nearly all free VRAM; the Vulkan backend
+        # needs device memory of its own for the resident embedding cache and the
+        # per-call staging buffers
+        if config.memory_ratio is None or config.memory_ratio > 0.8:
+            logger.warning_rank0(
+                "FREETOKEN_GGML_BACKEND=vulkan: clamping memory_ratio to 0.8 to leave VRAM for the Vulkan backend"
+            )
+            override("memory_ratio", 0.8)
+
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every
     # comma part must serve every required type, with packages/arch available.
@@ -3806,7 +3908,11 @@ def _adjust_config(config: EngineConfig):
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
-        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+        # inkling2's SWA eviction frees below the COMMITTED frontier under spec (cache.py), so a
+        # verify's reads stay live at any draft width; other SWA families keep the ban until their
+        # eviction is audited the same way, and the DSV4 window tiers stay banned outright
+        swa_spec_ok = getattr(model_config, "inkling2_args", None) is not None
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or (has_swa_attention and not swa_spec_ok))
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
