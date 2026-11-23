@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import List
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
@@ -167,7 +168,10 @@ class Inkling2DecoderLayer(BaseOP):
             _t2 = _time.perf_counter()
             _prof.add("moe_phase", _t2 - _t1)
 
-        _ffn_off = 2 * (args.kv_dim // get_tp_info().size) + args.hidden_size
+        # split mode builds the conv slab at TP1 width (args.conv_channels); the offset
+        # must match it, not the real TP size, or the FFN conv overwrites the K/V history
+        _tp = 1 if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" else get_tp_info().size
+        _ffn_off = 2 * (args.kv_dim // _tp) + args.hidden_size
         h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, _ffn_off), verify_key=(visit, _ffn_off))
         out = (residual + h.float()).to(x.dtype)
         if _IK2_PROF:
@@ -190,6 +194,20 @@ class _NormedEmbedding:
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_norm.forward(self.embed_tokens.forward(input_ids))
+
+
+def _split_send(t: torch.Tensor, dst: int) -> None:
+    # gloo's TCP transport writev()s the buffer pointer directly: a CUDA address is
+    # EFAULT ("Bad address"), so every layer-split message stages through host memory.
+    host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    host.copy_(t)
+    dist.send(host, dst=dst)
+
+
+def _split_recv(shape, dtype, device, src: int) -> torch.Tensor:
+    host = torch.empty(shape, dtype=dtype, pin_memory=True)
+    dist.recv(host, src=src)
+    return host.to(device)
 
 
 class Inkling2TextModel(BaseOP):
@@ -292,15 +310,16 @@ class Inkling2TextModel(BaseOP):
         rank 1 owns layers split..N-1. Weights are replicated (both ranks hold all layers);
         only the COMPUTE is split. No allreduce — just point-to-point at the boundary.
         """
-        import torch.distributed as dist
         args = self.args
         ctx = get_global_ctx()
         tp = get_tp_info()
         split = args.num_phys_layers // tp.size  # 12 for 24 layers / 2
         rank = tp.rank
-        device = f"cuda:{rank}"
-        # Use gloo (CPU) for P2P: messages are tiny (decode: 4.6KB), avoids NCCL init deadlock
-        grp = None  # default gloo group
+        peer = 1 - rank
+        device = x.device
+        # every message is the model dtype: rank 1 enters with an empty x, so the recv
+        # buffers take it from the weights (blocks ride the residual stream's dtype too)
+        dtype = self.norm.weight.dtype
         conv_meta = build_conv_meta(ctx.batch, device)
         positions = ctx.batch.get_attn_positions()
         layers = self.layers.op_list
@@ -309,29 +328,19 @@ class Inkling2TextModel(BaseOP):
         T = x.shape[0] if rank == 0 else int(ctx.batch.input_ids.shape[0])
 
         def send_x(t):
-            dist.send(t.contiguous(), dst=1 - rank, group=grp)
+            _split_send(t.to(dtype), peer)
 
         def recv_x():
-            buf = torch.empty(T, H, dtype=x.dtype, device=x.device)
-            dist.recv(buf, src=1 - rank, group=grp)
-            return buf
+            return _split_recv((T, H), dtype, device, peer)
 
         def send_blocks(bl):
-            n = len(bl)
-            dist.send(torch.tensor([n], dtype=torch.int32, device=device), dst=1 - rank, group=grp)
+            _split_send(torch.tensor([len(bl)], dtype=torch.int32), peer)
             for b in bl:
-                dist.send(b.contiguous(), dst=1 - rank, group=grp)
+                _split_send(b.to(dtype), peer)
 
         def recv_blocks():
-            n_t = torch.empty(1, dtype=torch.int32, device=x.device)
-            dist.recv(n_t, src=1 - rank, group=grp)
-            n = int(n_t.item())
-            bl = []
-            for _ in range(n):
-                b = torch.empty(T, H, dtype=torch.float32, device=x.device)
-                dist.recv(b, src=1 - rank, group=grp)
-                bl.append(b)
-            return bl
+            n = int(_split_recv((1,), torch.int32, device, peer).item())
+            return [_split_recv((T, H), dtype, device, peer) for _ in range(n)]
 
         # --- Prelude (layers 0..core_start-1): all on rank 0 ---
         if rank == 0:
@@ -422,25 +431,32 @@ class Inkling2LoopForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        split = _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and get_tp_info().size > 1
-        rank = get_tp_info().rank
-        if split and rank == 1:
-            # rank 1: skip embedding, run split layers, send hidden to rank 0, return dummy
-            hidden = self.model.forward_split(torch.empty(0, device=f"cuda:{rank}"))
-            # forward_split sends the normed hidden to rank 0; return zeros for the sampler
-            return torch.zeros(1, self._unpadded, device=f"cuda:{rank}")
+        if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and get_tp_info().size > 1:
+            return self._forward_split()
         hidden = self.model.forward(get_global_ctx().batch.input_ids)
-        if split:
-            # rank 0: hidden came from rank 1 via forward_split; no broadcast needed
-            logits = self.lm_head.forward(hidden).float()
-            if self._softcap:
-                logits = torch.tanh(logits / self._softcap) * self._softcap
-            return logits[:, : self._unpadded].contiguous()
         logits = self.lm_head.forward(hidden).float()
         if self._softcap:
             logits = torch.tanh(logits / self._softcap) * self._softcap
         # contiguous: the padded-vocab slice is a view, and the sampler rejects strided logits
         return logits[:, : self._unpadded].contiguous()
+
+    def _forward_split(self) -> torch.Tensor:
+        tp = get_tp_info()
+        device = f"cuda:{tp.rank}"
+        if tp.rank == 1:
+            # rank 1 runs its layers inside forward_split, which sends the normed hidden
+            # to rank 0; the head lives there, so receive the sampled logits back: both
+            # ranks must sample the SAME logits or their schedulers diverge (eos, batches)
+            self.model.forward_split(torch.empty(0, dtype=self.model.norm.weight.dtype, device=device))
+            bs = get_global_ctx().batch.size
+            return _split_recv((bs, self._unpadded), torch.float32, device, src=0)
+        hidden = self.model.forward(get_global_ctx().batch.input_ids)
+        logits = self.lm_head.forward(hidden).float()
+        if self._softcap:
+            logits = torch.tanh(logits / self._softcap) * self._softcap
+        logits = logits[:, : self._unpadded].contiguous()
+        _split_send(logits, dst=1)
+        return logits
 
 
 class Inkling2LoopForConditionalGeneration(Inkling2LoopForCausalLM):

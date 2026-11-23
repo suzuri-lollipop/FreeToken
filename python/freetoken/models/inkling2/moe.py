@@ -31,7 +31,9 @@ class Inkling2MoE(BaseOP):
         self.tp_size = 1 if _split else tp.size
         self.tp_rank = 0 if _split else tp.rank
         self.num_experts = config.num_experts
-        self.local_experts = config.num_experts // tp.size
+        # split mode replicates the experts (each rank runs only its layers, but every
+        # expert id routes locally); EP sharding would leave ids >= local out of range
+        self.local_experts = config.num_experts if _split else config.num_experts // tp.size
         self.expert_offset = self.tp_rank * self.local_experts
         # the reference keeps the router fp32: the bias sits on the top-8 selection boundary
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
