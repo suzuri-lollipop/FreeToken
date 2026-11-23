@@ -69,13 +69,14 @@ from .moe import Inkling2MoE
 
 def mix(blocks: List[torch.Tensor], cur: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
     """Attention over the depth streams: ``[T, Q, H]`` fp32 (the BlockAttentionResidual)."""
-    # stack bf16 then cast once: identical values, one cast kernel instead of one per stream
-    states = torch.stack(blocks + [cur], dim=1).float()
-    states = unweighted_rms_norm(states, 1e-6)
-    hidden = states.shape[-1]
-    scores = torch.einsum("tsh,qh->tsq", states, query.float()) * hidden**-0.5
-    probs = torch.softmax(scores, dim=1)
-    return torch.einsum("tsq,tsh->tqh", probs, states)
+    states = torch.stack(blocks + [cur], dim=1)
+    if states.is_cuda:
+        from freetoken.kernel.triton.ik2_mix import mix_fused
+
+        return mix_fused(states, query)
+    from freetoken.kernel.triton.ik2_mix import mix_ref
+
+    return mix_ref(blocks, cur, query)
 
 
 class LoopController(BaseOP):
