@@ -130,6 +130,17 @@ class Inkling2Conv(BaseOP):
             assert verify_key is not None, "a verify conv needs its (visit, channel offset) slab key"
             out = self._verify(x, meta, states, dyn, verify_key)
         elif meta.is_decode:
+            if x.is_cuda:
+                from freetoken.kernel.triton.ik2_conv import conv_decode_fused
+
+                # the dynamic taps are head-shared: expand [T, heads*K] to [T, C, K] as _taps does
+                dyn_e = None
+                if dyn is not None:
+                    t = x.shape[0]
+                    dyn_e = dyn.view(t, self.num_heads, self.kernel).unsqueeze(2).expand(
+                        -1, -1, self.head_dim, -1).reshape(t, self.channels, self.kernel)
+                # one kernel: window . taps, history shift, residual + out_scale
+                return conv_decode_fused(x, states, meta.slots, self.weight, dyn_e, meta.fresh, self.out_scale)
             out = self._decode(x, meta, states, dyn)
         else:
             out = self._prefill(x, meta, states, dyn)
