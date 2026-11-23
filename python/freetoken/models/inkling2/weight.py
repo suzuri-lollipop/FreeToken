@@ -168,6 +168,23 @@ def iter_weights(
     yield from _loop_query_pieces(folder, weight_map, device, _core_start(model_path))
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it (the FTW encoder-only reader)."""
+    folder = download_hf_weight(model_path)
+    weight_map = safetensors_weight_map(folder)
+    by_file: dict[str, list[str]] = {}
+    for name, shard in weight_map.items():
+        if name.startswith("model.visual."):
+            by_file.setdefault(shard, []).append(name)
+    for shard in sorted(by_file):
+        path = os.path.join(folder, shard)
+        with safetensors.safe_open(path, framework="pt", device=str(device)) as f:
+            for name in by_file[shard]:
+                renamed = _dense_rename(name, f.get_tensor(name))
+                if renamed is not None:
+                    yield renamed
+
+
 def _core_start(model_path: str) -> int:
     from freetoken.utils import cached_load_hf_config
 
