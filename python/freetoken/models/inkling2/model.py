@@ -69,7 +69,8 @@ from .moe import Inkling2MoE
 
 def mix(blocks: List[torch.Tensor], cur: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
     """Attention over the depth streams: ``[T, Q, H]`` fp32 (the BlockAttentionResidual)."""
-    states = torch.stack([b.float() for b in blocks] + [cur.float()], dim=1)
+    # stack bf16 then cast once: identical values, one cast kernel instead of one per stream
+    states = torch.stack(blocks + [cur], dim=1).float()
     states = unweighted_rms_norm(states, 1e-6)
     hidden = states.shape[-1]
     scores = torch.einsum("tsh,qh->tsq", states, query.float()) * hidden**-0.5

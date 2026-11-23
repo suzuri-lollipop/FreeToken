@@ -33,16 +33,15 @@ from .conv import ConvMeta, Inkling2Conv, conv_state_slab
 
 def l2_clip(x: torch.Tensor, threshold: float, scale: torch.Tensor | None = None) -> torch.Tensor:
     """Per-head L2 cap in fp32 (the reference's Inkling2L2Clip / ScaledL2Clip)."""
-    xf = x.float()
-    if scale is not None:
-        xf = xf * scale.float()
-    norm = torch.linalg.vector_norm(xf, dim=-1, keepdim=True)
-    return (xf * (threshold / (norm + 1e-6)).clamp(max=1.0)).to(x.dtype)
+    from freetoken.kernel.triton.ik2_norm import l2_clip as _fused
+
+    return _fused(x, threshold, scale)
 
 
 def unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
-    xf = x.float()
-    return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(x.dtype)
+    from freetoken.kernel.triton.ik2_norm import rms_noweight
+
+    return rms_noweight(x, eps)
 
 
 class Inkling2Attention(BaseOP):
