@@ -770,6 +770,13 @@ class Engine:
             if enable_pipe_distributed(config.tp_info, self.tp_cpu_group,
                                        config.distributed_timeout):
                 logger.info_rank0("piped prefill: dedicated torch NCCL group ready")
+        if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1:
+            from freetoken.distributed import split_p2p_group
+
+            if split_p2p_group() is None:
+                # gloo host-staged P2P cannot be captured; keep split decode eager
+                object.__setattr__(config, "cuda_graph_bs", [])
+                object.__setattr__(config, "cuda_graph_max_bs", 0)
         free_min, free_max = self._sync_get_memory()
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._init_free_memory = init_free_memory  # reused by the GDN-pool budget settle
@@ -1055,6 +1062,10 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+        if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size == 2:
+            from freetoken.distributed import enable_split_p2p
+
+            enable_split_p2p(config.tp_info, tp_cpu_group)
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
@@ -3831,10 +3842,8 @@ def _adjust_config(config: EngineConfig):
         override("moe_prefill_overlap", False)
         override("decode_fetch_overlap", False)
 
-    if os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" and config.tp_info.size > 1:
-        # split-layer forward uses dist.send/recv which cannot be CUDA-graph captured
-        override("cuda_graph_bs", [])
-        override("cuda_graph_max_bs", 0)
+    # layer-split P2P over NCCL is CUDA-graph capturable; the gloo fallback is not, and
+    # is gated after _init_communication builds (or declines) the split P2P group
 
     if os.environ.get("FREETOKEN_GGML_BACKEND", "").strip().lower() == "vulkan":
         # the Vulkan ggml ops stage activations through the host and submit Vulkan work

@@ -216,6 +216,7 @@ def dual_ar_available() -> bool:
 
 _PIPE_IMPL: "DistributedImpl | None" = None
 _PIPE_THREADS: set = set()
+_SPLIT_P2P_GROUP: "torch.distributed.ProcessGroup | None" = None
 
 
 def enable_pipe_distributed(
@@ -277,13 +278,55 @@ def _pipe_impl() -> "DistributedImpl | None":
     return _PIPE_IMPL if threading.get_ident() in _PIPE_THREADS else None
 
 
+def enable_split_p2p(tp_info: DistributedInfo, tp_cpu_group: "torch.distributed.ProcessGroup") -> bool:
+    """Build a dedicated torch NCCL group for layer-split point-to-point transfers.
+
+    The split forward hands activations between ranks at each layer boundary; gloo TCP
+    stages them through host memory (cudaHostAlloc + writev per message), which dominates
+    decode. A NCCL group moves them GPU-direct. Built and warmed at engine init (the
+    ncclCommInitRank rendezvous is blocking and symmetric), with a verdict reduce on the
+    CPU group so a one-sided failure cannot strand a peer. tp2 only (the split forward
+    pairs rank 0 with rank 1).
+    """
+    global _SPLIT_P2P_GROUP
+    if tp_info.size != 2 or _SPLIT_P2P_GROUP is not None:
+        return False
+    verdict = torch.ones(1, dtype=torch.int32)
+    group = None
+    try:
+        group = dist.new_group(backend="nccl")
+        probe = torch.zeros(1, device=f"cuda:{torch.cuda.current_device()}")
+        peer = 1 - tp_info.rank
+        # rank 0 sends first, rank 1 recvs first: the two send/recv pairs match without deadlock
+        if tp_info.rank == 0:
+            dist.send(probe, dst=peer, group=group)
+            dist.recv(probe, src=peer, group=group)
+        else:
+            dist.recv(probe, src=peer, group=group)
+            dist.send(probe, dst=peer, group=group)
+    except Exception as exc:  # noqa: BLE001 -- degrade to gloo staging, never kill boot
+        logger.warning(f"layer-split NCCL P2P unavailable ({exc}); keeping host-staged gloo")
+        verdict[0] = 0
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN, group=tp_cpu_group)
+    if int(verdict[0]) != 1 or group is None:
+        return False
+    _SPLIT_P2P_GROUP = group
+    return True
+
+
+def split_p2p_group() -> "torch.distributed.ProcessGroup | None":
+    """The layer-split NCCL P2P group, or None to fall back to host-staged gloo."""
+    return _SPLIT_P2P_GROUP
+
+
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    global _DUAL_IMPL, _AR_INSTANCE, _PIPE_IMPL
+    global _DUAL_IMPL, _AR_INSTANCE, _PIPE_IMPL, _SPLIT_P2P_GROUP
     _DUAL_IMPL = None
     _AR_INSTANCE = 0
     _PIPE_IMPL = None
+    _SPLIT_P2P_GROUP = None
     _PIPE_THREADS.clear()
     DistributedCommunicator.plugins = []

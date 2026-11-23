@@ -198,14 +198,27 @@ class _NormedEmbedding:
 
 
 def _split_send(t: torch.Tensor, dst: int) -> None:
-    # gloo's TCP transport writev()s the buffer pointer directly: a CUDA address is
-    # EFAULT ("Bad address"), so every layer-split message stages through host memory.
+    from freetoken.distributed import split_p2p_group
+
+    grp = split_p2p_group()
+    if grp is not None:
+        dist.send(t.contiguous(), dst=dst, group=grp)  # NCCL: GPU-direct, no host staging
+        return
+    # gloo fallback: its TCP transport writev()s the buffer pointer, so a CUDA address is
+    # EFAULT ("Bad address"); stage through host memory.
     host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
     host.copy_(t)
     dist.send(host, dst=dst)
 
 
 def _split_recv(shape, dtype, device, src: int) -> torch.Tensor:
+    from freetoken.distributed import split_p2p_group
+
+    grp = split_p2p_group()
+    if grp is not None:
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        dist.recv(buf, src=src, group=grp)
+        return buf
     host = torch.empty(shape, dtype=dtype, pin_memory=True)
     dist.recv(host, src=src)
     return host.to(device)
@@ -327,6 +340,13 @@ class Inkling2TextModel(BaseOP):
         blocks: List[torch.Tensor] = []
         H = args.hidden_size
         T = x.shape[0] if rank == 0 else int(ctx.batch.input_ids.shape[0])
+        # block counts at each transfer are fixed by the loop geometry (a boundary layer
+        # appends its input); static counts keep the forward CUDA-graph capturable (no
+        # data-dependent recv loop, no device->host sync)
+        bsz = args.block_size
+        n_prelude = sum(1 for il in range(args.core_start) if il % bsz == 0)
+        n_first = n_prelude + sum(1 for ip in range(args.core_start, split) if ip % bsz == 0)
+        n_second = n_first + sum(1 for ip in range(split, args.core_end) if ip % bsz == 0)
 
         def send_x(t):
             _split_send(t.to(dtype), peer)
@@ -335,12 +355,10 @@ class Inkling2TextModel(BaseOP):
             return _split_recv((T, H), dtype, device, peer)
 
         def send_blocks(bl):
-            _split_send(torch.tensor([len(bl)], dtype=torch.int32), peer)
             for b in bl:
                 _split_send(b.to(dtype), peer)
 
-        def recv_blocks():
-            n = int(_split_recv((1,), torch.int32, device, peer).item())
+        def recv_blocks(n):
             return [_split_recv((T, H), dtype, device, peer) for _ in range(n)]
 
         # --- Prelude (layers 0..core_start-1): all on rank 0 ---
@@ -354,7 +372,7 @@ class Inkling2TextModel(BaseOP):
             send_blocks(blocks)
         else:
             x = recv_x()
-            blocks = recv_blocks()
+            blocks = recv_blocks(n_prelude)
             prelude = x.clone()
             prelude_blocks = list(blocks)
 
@@ -379,7 +397,7 @@ class Inkling2TextModel(BaseOP):
                 send_blocks(blocks)
             else:
                 x = recv_x()
-                blocks = recv_blocks()
+                blocks = recv_blocks(n_first)
 
             # Second half (split..core_end-1): rank 1
             if rank == 1:
@@ -394,7 +412,7 @@ class Inkling2TextModel(BaseOP):
                 send_blocks(blocks)
             else:
                 x = recv_x()
-                blocks = recv_blocks()
+                blocks = recv_blocks(n_second)
 
         # --- Coda (core_end..N-1): rank 1 ---
         if rank == 1:
