@@ -118,6 +118,57 @@ class Inkling2Attention(BaseOP):
             return None
         return getattr(proj, segment_param(0))[: s.rows], s.ggml_type
 
+    def _q8_plan(self):
+        """(packed weight, ggml type) per projection for the shared-q8_1 GEMV path, cached
+        after load; None where a projection is not a single quantized segment (e.g. bf16 sink)."""
+        plan = getattr(self, "_q8_plan_cache", None)
+        if plan is not None:
+            return plan
+        from freetoken.layers.quantization.ggml_types import is_quantized, segment_param
+
+        def spec(proj):
+            segs = getattr(proj, "_ggml_segments", None)
+            if not segs or len(segs) != 1 or proj.bias is not None or getattr(proj, "ggml_scale", None) is not None:
+                return None
+            s = segs[0]
+            if not is_quantized(s.ggml_type):
+                return None
+            return getattr(proj, segment_param(0))[: s.rows], s.ggml_type
+
+        plan = {n: spec(getattr(self, n)) for n in ("q_proj", "k_proj", "v_proj", "r_proj", "gate_proj")}
+        self._q8_plan_cache = plan
+        return plan
+
+    def _projs_q8(self, xq, xk, xv):
+        """q/k/v/r/gate projections sharing one q8_1 quantize per distinct input tensor.
+
+        The Q8_0 MMVQ GEMV reads a q8_1 activation; the separate projection modules would
+        each quantize their input again. SWA layers feed xq=xk=xv (one object), so keying the
+        quantize on input identity collapses five quantizes into one; full layers share xq
+        across q/r/gate. Bit-identical to the per-module forward; non-Q8_0 / non-MMVQ
+        projections fall back to it.
+        """
+        from freetoken.kernel import ggml
+
+        plan = self._q8_plan()
+        q8_cache: dict[int, torch.Tensor] = {}
+
+        def gemv(name, x):
+            sp = plan[name]
+            x2 = x.reshape(-1, x.shape[-1])
+            if sp is None or not ggml.uses_mmvq(sp[1], x2.shape[0]):
+                return getattr(self, name).forward(x)
+            w, ty = sp
+            key = id(x)
+            q8 = q8_cache.get(key)
+            if q8 is None:
+                q8 = ggml.quantize_q8_1(x2)
+                q8_cache[key] = q8
+            y = ggml.mul_mat(w, ty, x2, xq=q8)
+            return y.reshape(*x.shape[:-1], y.shape[-1])
+
+        return gemv("q_proj", xq), gemv("k_proj", xk), gemv("v_proj", xv), gemv("r_proj", xq), gemv("gate_proj", xq)
+
     @nvtx_annotate("MHA")
     def forward(self, inputs: list[torch.Tensor], visit: int, conv_meta: ConvMeta, positions: torch.Tensor) -> torch.Tensor:
         args = self.args
@@ -162,11 +213,9 @@ class Inkling2Attention(BaseOP):
                 gate = self.gate_proj.forward(xq)
                 sinks = self.sink_proj.forward(xq)
         else:
-            q = self.q_proj.forward(xq)
-            k = self.k_conv.forward(self.k_proj.forward(xk), conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None, verify_key=(visit, 0))
-            v = self.v_conv.forward(self.v_proj.forward(xv), conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None, verify_key=(visit, self.nk * self.hd))
-            r = self.r_proj.forward(xq)
-            gate = self.gate_proj.forward(xq)
+            q, k_raw, v_raw, r, gate = self._projs_q8(xq, xk, xv)
+            k = self.k_conv.forward(k_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, 0), dyn_input=xk if not self.swa else None, verify_key=(visit, 0))
+            v = self.v_conv.forward(v_raw, conv_meta, conv_state_slab(visit, self.nk * self.hd, self.nk * self.hd), dyn_input=xv if not self.swa else None, verify_key=(visit, self.nk * self.hd))
             sinks = self.sink_proj.forward(xq)
 
         tokens = q.shape[0]
