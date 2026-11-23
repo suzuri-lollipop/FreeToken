@@ -36,8 +36,12 @@ def ensure_tml_generation_prompt(tokenizer: Any) -> None:
     template = getattr(tokenizer, "chat_template", None)
     if not template or "add_generation_prompt" in template:
         return
-    if "<|message_model|>" in tokenizer.get_vocab():
-        tokenizer.chat_template = template + "{%- if add_generation_prompt -%}<|message_model|>{%- endif -%}"
+    # the marker test needs the vocab; a tokenizer that does not expose it cannot be the
+    # TML inkling template, so leave it untouched rather than crash on get_vocab()
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if get_vocab is None or "<|message_model|>" not in get_vocab():
+        return
+    tokenizer.chat_template = template + "{%- if add_generation_prompt -%}<|message_model|>{%- endif -%}"
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
