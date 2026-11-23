@@ -151,4 +151,46 @@ def l2_clip(x: torch.Tensor, threshold: float, scale: torch.Tensor | None = None
     return out
 
 
-__all__ = ["l2_clip", "rms_noweight"]
+@triton.jit
+def _rel_table_kernel(
+    OUT, R, BIAS,
+    D: tl.constexpr, E: tl.constexpr,
+    D_PAD: tl.constexpr, BLOCK_E: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, D_PAD)
+    dm = d < D
+    r = tl.load(R + row * D + d, mask=dm, other=0.0).to(tl.float32)
+    e = tl.arange(0, BLOCK_E)
+    for e0 in range(0, E, BLOCK_E):
+        ee = e0 + e
+        em = ee < E
+        bias = tl.load(BIAS + d[:, None] * E + ee[None, :], mask=dm[:, None] & em[None, :], other=0.0).to(tl.float32)
+        acc = tl.sum(r[:, None] * bias, axis=0)
+        # the reference runs a bf16 matmul (fp32 accumulate, bf16 output) then casts to fp32
+        acc = acc.to(tl.bfloat16).to(tl.float32)
+        tl.store(OUT + row * (E + 1) + ee, acc, mask=em)
+    tl.store(OUT + row * (E + 1) + E, 0.0)  # the padded zero bias column
+
+
+def rel_table_fused(r: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """``r [T, nh, d_rel]`` bf16, ``bias [d_rel, extent]`` bf16 -> ``[T, nh, extent+1]`` fp32.
+
+    Fuses the bf16 rel-bias matmul, the zero pad column and the fp32 cast (the reference's
+    ``F.pad(r @ bias, (0, 1)).float().contiguous()``) into one kernel.
+    """
+    T, nh, D = r.shape
+    E = bias.shape[1]
+    out = torch.empty(T * nh, E + 1, dtype=torch.float32, device=r.device)
+    if T * nh == 0:
+        return out.view(T, nh, E + 1)
+    r2 = r.reshape(T * nh, D)
+    BLOCK_E = 256 if E >= 256 else triton.next_power_of_2(E)
+    _rel_table_kernel[(T * nh,)](
+        out, r2, bias, D, E, D_PAD=triton.next_power_of_2(D), BLOCK_E=BLOCK_E,
+        num_warps=4, num_stages=1,
+    )
+    return out.view(T, nh, E + 1)
+
+
+__all__ = ["l2_clip", "rms_noweight", "rel_table_fused"]

@@ -237,7 +237,12 @@ class Inkling2Attention(BaseOP):
 
         # project r on the bias table, then the kernel gathers by distance; the padded
         # last column holds the zero bias of keys beyond the extent (bf16 matmul as HF)
-        rel_table = F.pad(r @ self.rel_bias, (0, 1)).float().contiguous()
+        if r.is_cuda:
+            from freetoken.kernel.triton.ik2_norm import rel_table_fused
+
+            rel_table = rel_table_fused(r, self.rel_bias)
+        else:
+            rel_table = F.pad(r @ self.rel_bias, (0, 1)).float().contiguous()
         if _IK2_PROF:
             torch.cuda.synchronize()
             _a2 = _time.perf_counter()
