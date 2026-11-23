@@ -1,0 +1,111 @@
+#version 450
+#include "vk_common.glsl"
+
+// Fused MoE Gate+Up GEMV + per-expert global scales + SITU activation.
+// Grid: (ceil(I / 4), top_k, T); local_size = (32, 4, 1).
+// Reads expert id e = ids[t * top_k + j] directly on GPU (zero CPU route grouping).
+// For NVFP4/Q8_0/BF16, computes gate_row = e*2I + i and up_row = e*2I + I + i in the
+// same warp so X[t] is reused in registers, applies SITU right in registers, and writes
+// inter[(t * top_k + j) * I + i] in F32.
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t x_addr;
+    uint64_t ids_addr;
+    uint64_t sc_addr;     // [E, 4] fp32 global scales, or 0 for unscaled
+    uint64_t inter_addr;  // [T, top_k, I] fp32
+    int K;
+    int I;
+    int top_k;
+    int T;
+    int ty;
+    int x_dt;
+    float gcap;
+    float ucap;
+} p;
+
+void main() {
+    uint i = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    uint j = gl_WorkGroupID.y;
+    uint t = gl_WorkGroupID.z;
+    if (i >= uint(p.I) || j >= uint(p.top_k) || t >= uint(p.T)) return;
+
+    uint route = t * uint(p.top_k) + j;
+    int e = I32Buf(p.ids_addr).v[route];
+    if (e < 0) return;
+
+    uint base_row = uint(e) * uint(2 * p.I);
+    uint x_base = t * uint(p.K);
+    float g = 0.0;
+    float u = 0.0;
+
+    if (p.ty == 40) {
+        // Specialized NVFP4 path: load X once per block, dot BOTH gate and up rows!
+        U32Buf W = U32Buf(p.w_addr);
+        uint lane = gl_LocalInvocationID.x;
+        uint n_blk = uint(p.K) >> 6u;
+        uint g_row_u32 = (base_row + i) * n_blk * 9u;
+        uint u_row_u32 = (base_row + uint(p.I) + i) * n_blk * 9u;
+        uint b_off = lane >> 3u;
+        uint qw = lane & 7u;
+        uint sb = qw >> 1u;
+        uint hw = qw & 1u;
+        float acc_g = 0.0, acc_u = 0.0;
+        for (uint blk = b_off; blk < n_blk; blk += 4u) {
+            uint bk = x_base + blk * 64u + sb * 16u + hw * 4u;
+            float x0 = read_val(p.x_addr, p.x_dt, bk + 0u);
+            float x1 = read_val(p.x_addr, p.x_dt, bk + 1u);
+            float x2 = read_val(p.x_addr, p.x_dt, bk + 2u);
+            float x3 = read_val(p.x_addr, p.x_dt, bk + 3u);
+            float x8 = read_val(p.x_addr, p.x_dt, bk + 8u);
+            float x9 = read_val(p.x_addr, p.x_dt, bk + 9u);
+            float x10 = read_val(p.x_addr, p.x_dt, bk + 10u);
+            float x11 = read_val(p.x_addr, p.x_dt, bk + 11u);
+
+            uint bgu = g_row_u32 + blk * 9u;
+            uint swg = W.v[bgu];
+            uint qg = W.v[bgu + 1u + qw];
+            float scg = e4m3_half((swg >> (sb * 8u)) & 0xFFu);
+            float sg = 0.0;
+            sg = fma(kv_e2m1(qg & 0xFu), x0, sg);
+            sg = fma(kv_e2m1((qg >> 8u) & 0xFu), x1, sg);
+            sg = fma(kv_e2m1((qg >> 16u) & 0xFu), x2, sg);
+            sg = fma(kv_e2m1((qg >> 24u) & 0xFu), x3, sg);
+            sg = fma(kv_e2m1((qg >> 4u) & 0xFu), x8, sg);
+            sg = fma(kv_e2m1((qg >> 12u) & 0xFu), x9, sg);
+            sg = fma(kv_e2m1((qg >> 20u) & 0xFu), x10, sg);
+            sg = fma(kv_e2m1(qg >> 28u), x11, sg);
+            acc_g = fma(sg, scg, acc_g);
+
+            uint buu = u_row_u32 + blk * 9u;
+            uint swu = W.v[buu];
+            uint qu = W.v[buu + 1u + qw];
+            float scu = e4m3_half((swu >> (sb * 8u)) & 0xFFu);
+            float su = 0.0;
+            su = fma(kv_e2m1(qu & 0xFu), x0, su);
+            su = fma(kv_e2m1((qu >> 8u) & 0xFu), x1, su);
+            su = fma(kv_e2m1((qu >> 16u) & 0xFu), x2, su);
+            su = fma(kv_e2m1((qu >> 24u) & 0xFu), x3, su);
+            su = fma(kv_e2m1((qu >> 4u) & 0xFu), x8, su);
+            su = fma(kv_e2m1((qu >> 12u) & 0xFu), x9, su);
+            su = fma(kv_e2m1((qu >> 20u) & 0xFu), x10, su);
+            su = fma(kv_e2m1(qu >> 28u), x11, su);
+            acc_u = fma(su, scu, acc_u);
+        }
+        g = subgroupAdd(acc_g);
+        u = subgroupAdd(acc_u);
+    } else {
+        g = warp_dot_row(p.w_addr, p.ty, base_row + i, p.K, p.x_addr, p.x_dt, x_base);
+        u = warp_dot_row(p.w_addr, p.ty, base_row + uint(p.I) + i, p.K, p.x_addr, p.x_dt, x_base);
+    }
+
+    if (gl_LocalInvocationID.x == 0u) {
+        if (p.sc_addr != 0ul) {
+            F32Buf S = F32Buf(p.sc_addr);
+            g *= S.v[uint(e) * 4u + 0u];
+            u *= S.v[uint(e) * 4u + 1u];
+        }
+        F32Out(p.inter_addr).v[route * uint(p.I) + i] = situ_act(g, u, p.gcap, p.ucap);
+    }
+}

@@ -85,7 +85,12 @@ inline void gated_rows(const MoeParams& p, int i0, int i1, float w_in, bf16_t* g
     // gate = row i, up = row I+i
     float gate = dot(i) * w_in;
     float up = dot(p.I + i) * w_in;
-    if (clamped) {
+    if (p.act == ACT_SITU) {
+      // (alpha*tanh(gate/alpha)) * sigmoid(gate) * (lim*tanh(up/lim)); the
+      // sigmoid reads the raw gate, not the softcapped one
+      const float glu = (alpha * std::tanh(gate / alpha)) / (1.0f + std::exp(-gate));
+      g[i] = f32_to_bf16(glu * (lim * std::tanh(up / lim)));
+    } else if (clamped) {
       // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
       // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
       // (GLM-5.3) does not. lim == +inf: no clamp.

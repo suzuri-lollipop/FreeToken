@@ -4,6 +4,7 @@ from .activation import (
     gelu_and_mul,
     gelu_tanh_and_mul,
     silu_and_mul,
+    situ_and_mul,
     swiglu_clamp_and_mul,
     swigluoai_and_mul,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "gelu_tanh_and_mul",
     "swigluoai_and_mul",
     "swiglu_clamp_and_mul",
+    "situ_and_mul",
     "gated_act_and_mul",
     "GATED_ACTIVATIONS",
     "BaseOP",

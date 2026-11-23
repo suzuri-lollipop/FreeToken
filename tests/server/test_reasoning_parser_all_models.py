@@ -176,3 +176,42 @@ def test_build_reasoning_parser_builds_named_parser():
     assert parser is not None
     reasoning, content = parser.parse_non_stream(ANALYSIS_FINAL)
     assert reasoning == "The user says hi. Greet back."
+
+
+# --------------------------------------------------------------------- inkling2
+INKLING_TURN = (
+    "<|content_thinking|>Capital of France is Paris.<|end_message|>"
+    "<|content_text|>Paris<|end_message|>"
+)
+
+
+def test_inkling_channels_split_reasoning_and_content():
+    parser = ReasoningParser("inkling2", force_reasoning=False)
+    assert parser.parse_non_stream(INKLING_TURN) == ("Capital of France is Paris.", "Paris")
+
+
+def test_inkling_strips_reemitted_turn_header():
+    parser = ReasoningParser("inkling2", force_reasoning=False)
+    text = "<|message_model|>" + INKLING_TURN
+    assert parser.parse_non_stream(text) == ("Capital of France is Paris.", "Paris")
+
+
+def test_inkling_streaming_matches_one_shot_across_chunk_sizes():
+    for size in (1, 3, 7, 13, len(INKLING_TURN)):
+        parser = ReasoningParser("inkling2", force_reasoning=False)
+        chunks = [INKLING_TURN[i : i + size] for i in range(0, len(INKLING_TURN), size)]
+        assert _stream(parser, chunks) == ("Capital of France is Paris.", "Paris")
+
+
+def test_inkling_tool_channel_passes_through_verbatim():
+    parser = ReasoningParser("inkling2", force_reasoning=False)
+    block = '<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Tokyo"}}<|end_message|>'
+    text = "<|content_thinking|>Call the tool.<|end_message|>get_weather" + block
+    reasoning, content = parser.parse_non_stream(text)
+    assert reasoning == "Call the tool."
+    assert content == "get_weather" + block
+
+
+def test_inkling_text_only_turn_is_all_content():
+    parser = ReasoningParser("inkling2", force_reasoning=False)
+    assert parser.parse_non_stream("<|content_text|>Hello!<|end_message|>") == ("", "Hello!")

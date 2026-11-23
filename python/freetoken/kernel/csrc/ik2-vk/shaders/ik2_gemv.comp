@@ -1,0 +1,29 @@
+#version 450
+#include "vk_common.glsl"
+
+// Warp-coalesced dense GEMV/GEMM: Y[m, n] = dot(W[n], X[m]).
+// Grid: (ceil(N / 4), M, 1); local_size = (32, 4, 1) -> 4 warps = 4 output rows/workgroup.
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t x_addr;
+    uint64_t y_addr;
+    int K;
+    int N;
+    int M;
+    int ty;
+    int x_dt;
+    int y_dt;
+    int y_stride;  // row stride of Y in elements (>= N; allows direct slice writes)
+} p;
+
+void main() {
+    uint n = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.y;
+    uint m = gl_WorkGroupID.y;
+    if (n >= uint(p.N) || m >= uint(p.M)) return;
+    float dot = warp_dot_row(p.w_addr, p.ty, n, p.K, p.x_addr, p.x_dt, m * uint(p.K));
+    if (gl_LocalInvocationID.x == 0u) {
+        write_val(p.y_addr, p.y_dt, m * uint(p.y_stride) + n, dot);
+    }
+}

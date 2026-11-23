@@ -10,9 +10,31 @@ FreeToken runs GGUF weights on kernels copied from [llama.cpp](https://github.co
 | `kernel/csrc/ggml/ggml-cpu/` | `ggml/src/ggml-cpu/` | CPU MoE row kernels, built by `setup.py` |
 | `kernel/csrc/ggml/src/` | `ggml/src/` | shared headers and `ggml-quants.c` |
 | `kernel/csrc/ggml/include/` | `ggml/include/` | shared headers |
+| `kernel/csrc/ggml-vk/` | `ggml/src/` + `ggml/src/ggml-vulkan/` | self-contained ggml core + Vulkan backend (own pin), built by `kernel/ggml_vk.py` |
 | `third_party/gguf/` | `gguf-py/gguf/` | GGUF file reader |
 
-Only the files FreeToken compiles or imports are here. `kernel/csrc/ggml/freetoken/` is our own code: the GPU ops (`ggml_ops.cu`), the host symbols the kernels need (`ggml_shim.cu`), and the CPU entry points.
+Only the files FreeToken compiles or imports are here. `kernel/csrc/ggml/freetoken/` is our own code: the GPU ops (`ggml_ops.cu`), the host symbols the kernels need (`ggml_shim.cu`), and the CPU entry points. `kernel/csrc/ggml-vk/freetoken/ggml_vk_ops.cpp` is the Vulkan op wrapper: it runs one-op ggml graphs on the Vulkan backend and keeps the packed weights in resident device buffers.
+
+## Vulkan backend
+
+`FREETOKEN_GGML_BACKEND=vulkan` routes the packed-weight ops (`mul_mat`, `mul_mat_id`, `mul_mat_id_glu`, `dequantize`, `get_rows`, `moe_weighted_sum`) through `ggml-vk` instead of `ggml-cuda`; the op surface and dtype contracts are the same, so GGUF models serve unchanged. Activations stage through the host as fp32 (the NVIDIA Vulkan driver exposes no bf16 storage), and the internal q8_1 activation quantization rounds its fp16 scales differently from CUDA, so parity is at quantization-noise level, not bit-exact. The rest of the engine (attention, convs, activations) still runs on its CUDA/Triton kernels.
+
+`mul_mat_id` / `mul_mat_id_glu` never feed the vendored `mul_mat_id` shader: on the NVIDIA Blackwell driver it miscomputes leading tokens (token 0 for tiny batches, the first six tokens from T=9) and `-1` routes corrupt their neighbors. Instead the wrapper groups the routes by expert and runs one `ggml_mul_mat` per expert in a single graph. Up to 8 tokens per expert (the DMMV `mul_mat_vec_max_cols` bound) ride the vec path, which dot-products fp32 activations against in-shader dequantized weights; larger groups dequantize the routed rows with ggml-quants on the host (parallel over rows) and run an fp32 GEMM, because the MMQ path's internal q8_1 activation rounding differs from CUDA's and the looped decoder amplifies that noise into incoherent text. The gated activation runs on the host. With this split, greedy output is token-identical to the CUDA backend. Only the routed rows cross the host per call and nothing is weight-cached, because an offload slot pool's contents change under the same pointer.
+
+Serving notes: decode CUDA graphs are disabled (the host staging is not capturable), `memory_ratio` is clamped to 0.8 so the KV pool leaves the Vulkan backend device memory, and a raw GGUF file skips the HF banks sidecar. Decode runs at a few tokens/s on an RTX PRO 4000 (offload, fp32 staging); resident Vulkan weight buffers and a capture-safe design are the next step.
+
+## ik2-vk: Inkling-2's expert FFN on dedicated shaders
+
+`kernel/csrc/ik2-vk/` is a separate, self-contained Vulkan module for Inkling-2's routed experts, in the style of maya-ik2 (arithmetic of its `ik2_exact.h`, which follows transformers' `modeling_inkling2`): no ggml graph, one command buffer per MoE call, one submit and one fence, intermediates stay on the device. `kernel/ik2_vk.py` compiles the GLSL shaders with glslc and builds the orchestrator through tvm-ffi.
+
+- `ik2_dequant.comp` decodes the routed experts' packed rows (NVFP4 / Q8_0 / Q6_K) to F32, one invocation per value, in chunks of 8 experts; a per-chunk table carries the sparse expert ids.
+- `ik2_gemv.comp` runs the row dot products over the decoded rows (pure FMA, all routes of a chunk in one dispatch), `ik2_situ.comp` the softcapped SwiGLU (maya's IEEE-only exp/tanh polynomials, h rounded to FP16), `ik2_wsum.comp` the routed weighted sum.
+- The gate/up scales ride the SITU shader, the down scale the GEMV; the NVFP4 scale convention is doubled E2M1 codes times half the E4M3 scale (the ggml NVFP4 reading), the bank global amax/2688.
+- Fused serving (`--moe-strategy fused` + `FREETOKEN_GGML_BACKEND=vulkan`) keeps the expert banks in pinned host RAM; the module uploads each bank once into a resident device buffer, keyed by pointer plus content samples (a freed pointer can be reused). Offload slot views keep the ggml-vk path.
+
+Measured on an RTX PRO 4000 (Q4_K_XL, int8 KV, 8192 tokens): ~1.5 tok/s decode greedy, output token-identical to the CUDA backend on the reference prompts; the ggml-vk offload path it replaces ran ~0.3 tok/s. The remaining gap to CUDA (~19 tok/s) is the per-call submit/fence and the decode-through-F32 round trip; a fused decode+dot shader and a whole-token command buffer are the next steps.
+
+Build dependencies: `glslc` (shaderc), Vulkan headers + SPIRV-Headers, and `libvulkan`. Discovery: `FREETOKEN_GLSLC_EXECUTABLE` / `glslc` on PATH / `~/.local/vulkan-deps/prefix/bin/glslc`; headers from `FREETOKEN_VULKAN_INCLUDE` / the system / `~/.local/vulkan-deps/Vulkan-Headers-*/include`. Shaders compile on first use into `~/.cache/freetoken/ggml-vk` (override: `FREETOKEN_GGML_VK_BUILD_DIR`); the C/C++ module then builds through tvm-ffi like the other kernel modules. shaderc 2025.2 is the verified glslc; 2026.4 miscompiles the coopmat per-element overloads.
 
 ## Changing a kernel
 

@@ -90,7 +90,7 @@ def segment_param(index: int) -> str:
 NVFP4 = int(gguf.GGMLQuantizationType.NVFP4)
 
 # per-expert fp32 weight scales llama.cpp reads next to separate gate / up / down expert tensors (llama-model.cpp ffn_*_exps_s)
-_EXPERT_SCALE_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down)_exps\.scale$")
+_EXPERT_SCALE_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.scale$")
 
 
 def scale_name(tensor: str) -> str:
@@ -105,11 +105,10 @@ def has_weight_scale(tensor_types: dict[str, int], tensor: str) -> bool:
 
 
 def has_expert_scales(tensor_types: dict[str, int]) -> bool:
-    """Whether any NVFP4 expert tensor of the file carries per-expert scales, which then take a scale bank in every MoE layer."""
-    merged = [n for n in tensor_types if n.endswith("ffn_gate_up_exps.scale") and tensor_types.get(n.replace(".scale", ".weight")) == NVFP4]
-    if merged:
-        # llama.cpp scales only separate gate / up expert tensors and would drop this one
-        raise NotImplementedError(f"per-expert scales of merged gate_up NVFP4 experts are not supported (e.g. {merged[0]})")
+    """Whether any NVFP4 expert tensor of the file carries per-expert scales, which then take a scale bank in every MoE layer.
+
+    A merged ffn_gate_up_exps.scale (inkling2's converter writes one amax scale per expert
+    for both halves) applies to the gate and up rows alike, as the bank loader reads it."""
     return any(_EXPERT_SCALE_RE.match(n) and has_weight_scale(tensor_types, n.removesuffix(".scale")) for n in tensor_types)
 
 

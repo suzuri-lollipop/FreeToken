@@ -256,6 +256,12 @@ class EngineConfig:
             if key not in built and getattr(hf_config, key, None) is not None:
                 setattr(hf_config, key, None)
         spec = self.model_spec
+        if spec.quant_overrides:
+            from freetoken.layers.quantization.configs.base import quantization_config_of
+
+            q = quantization_config_of(hf_config)
+            if q is not None:
+                setattr(hf_config, "quantization_config", {**q, **dict(spec.quant_overrides)})
         quant = checkpoint_quant_config(
             self.model_path, hf_config, spec, online=self.online_quant, online_modules=self.online_quant_modules
         )

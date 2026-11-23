@@ -72,7 +72,7 @@ def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts:
     return out
 
 
-def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None):
+def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int = 0, dummy: bool = False, device: torch.device | None = None, expert_slice: tuple[int, int] | None = None):
     """``ExpertBanks`` with one bank per (layer, role): pinned host banks for the offload cache, filled from the file and pinned while later layers load, or resident banks on ``device``."""
     from freetoken.moe.expert_banks import ExpertBanks
     from freetoken.moe.host_banks import HostBank, PinPipeline
@@ -110,8 +110,12 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             pure_float = float_dtype(gate.ggml_type) is not None and float_dtype(down.ggml_type) is not None
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
+            if expert_slice is not None:
+                e0, en = expert_slice
+                rows = [r[e0:e0+en] for r in rows]
+                d = d[e0:e0+en]
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
-            experts = rows[0].shape[0]
+            experts = rows[0].shape[0]  # local count when expert_slice is set
             gu_dtype, down_dtype = (torch.bfloat16, torch.bfloat16) if pure_float else (rows[0].dtype, d.dtype)
             if device is None:
                 host = {"gate_up": HostBank(gate_up_shape, gu_dtype), "down": HostBank(tuple(d.shape), down_dtype)}
@@ -126,7 +130,11 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 if scaled:
                     banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)
             if scaled:
-                banks["global"].copy_(_expert_scales(parts, down, experts))
+                full_experts = parts[0].ne[2]  # ne = [K, rows, E]
+                sc = _expert_scales(parts, down, full_experts)
+                if expert_slice is not None:
+                    sc = sc[expert_slice[0]:expert_slice[0]+expert_slice[1]]
+                banks["global"].copy_(sc)
             if biased:
                 missing = [f"{blk}.ffn_{p}_exps.bias" for p in ("gate", "up", "down") if f"{blk}.ffn_{p}_exps.bias" not in index]
                 if missing:

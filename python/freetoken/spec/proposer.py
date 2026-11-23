@@ -37,7 +37,8 @@ class DraftContext(NamedTuple):
     stream: torch.cuda.Stream
     # the engine's padding request: its table row points at the dummy page
     dummy_req: Req
-    # the tensors of the proposer's slot_states, ``[num_slots, *shape]`` each, on the target's GDN slots
+    # the proposer's slot_states on the target's GDN slots: a per-layer spec keeps its layer
+    # axis (``[n_layers, num_slots, *shape]``), a non-layer spec is ``[num_slots, *shape]``
     slot_states: dict[str, torch.Tensor]
 
 

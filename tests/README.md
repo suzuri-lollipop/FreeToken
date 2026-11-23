@@ -98,7 +98,8 @@ checkpoint is set:
 | `FREETOKEN_MINIMAX_M3_MODEL` | `tokenizer/test_mm_tokenize.py` — local MiniMax-M3 checkpoint (start/end expansion, token budget) |
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
-| `FREETOKEN_TEST_SPEC_ALGORITHM` | `e2e/test_aime.py` — speculative decoding method (`mtp`, `dflash`); prints the accept len of each sample (tokens committed per verify step, the bonus token included) |
+| `FREETOKEN_IK2_DRAFT`          | `models/inkling2/test_inkling2.py` — the official Inkling-2-Mini `mtp.safetensors` (or its folder); the DSpark drafter's token parity against the Maya reference, CPU-only |
+| `FREETOKEN_TEST_SPEC_ALGORITHM` | `e2e/test_aime.py` — speculative decoding method (`mtp`, `dflash`, `dspark`); prints the accept len of each sample (tokens committed per verify step, the bonus token included) |
 | `FREETOKEN_TEST_SPEC_DRAFT_PATH` | `e2e/test_aime.py` — the draft checkpoint (`--speculative-draft-model-path`) |
 | `FREETOKEN_TEST_SPEC_NUM_STEPS` | `e2e/test_aime.py` — draft tokens per step (default `0`, the method's own) |
 | `FREETOKEN_TEST_SPEC_MIN_ACCEPT` | `e2e/test_aime.py` — accept len every sample must reach (default `0`, no floor) |

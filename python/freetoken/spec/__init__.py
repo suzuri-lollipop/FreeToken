@@ -6,5 +6,6 @@ from freetoken.utils import Registry
 PROPOSERS = Registry[str]("Speculative proposer")
 PROPOSERS.register("mtp")("freetoken.spec.mtp.proposer:MTPProposer")
 PROPOSERS.register("dflash")("freetoken.spec.dflash.proposer:DFlashProposer")
+PROPOSERS.register("dspark")("freetoken.spec.dspark.proposer:DSparkProposer")
 
 __all__ = ["PROPOSERS"]

@@ -428,7 +428,10 @@ def _swa_per_req_swa_floor(config) -> int:
     window = next(g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa)
     ps = config.page_size
     locked = ((window + _SWA_RETAIN_GAP + ps - 1) // ps) * ps
-    floor = locked + window + _SWA_EVICTION_INTERVAL + 2 * ps
+    # spec: each verify advances the committed frontier up to k+1 rows and keeps the k+1
+    # in-flight rows live, so the interval growth and the tail both scale by the block width
+    rows = getattr(config, "decode_rows_per_req", 1) if getattr(config, "speculative_algorithm", None) else 1
+    floor = locked + window + rows * _SWA_EVICTION_INTERVAL + 2 * ps + (rows - 1)
     if getattr(config, "special_token_ckpt", False):
         floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL
     return floor

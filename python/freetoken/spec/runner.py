@@ -70,7 +70,12 @@ class SpecRunner:
         self.engine = engine
         self._host = torch.zeros(self.config.max_running_req + 1, self.k + 2, dtype=torch.int64, pin_memory=True)
         pool = engine.linear_state_pool
-        states = {s.name: pool.slot_state(s.name) for s in self.config.spec_slot_states} if pool is not None else {}
+        states = {}
+        if pool is not None:
+            for s in self.config.spec_slot_states:
+                # per-layer specs keep the layer axis (the proposer indexes it, dspark's
+                # rings); non-layer specs arrive squeezed to [num_slots, *shape] (dflash)
+                states[s.name] = pool.slot_states[s.name] if s.layer_ids else pool.slot_state(s.name)
         self.proposer.attach(DraftContext(
             page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
             stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states,

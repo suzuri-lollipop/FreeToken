@@ -28,6 +28,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
     "glm5-next": "Glm5NextGGUFForCausalLM",
     "glm5next": "Glm5NextGGUFForCausalLM",
+    "inkling2_loop": "Inkling2LoopGGUFForCausalLM",
     "llama": "LlamaGGUFForCausalLM",
     "minimax-m2": "MiniMaxM2GGUFForCausalLM",
     "minimax-m3": "MiniMaxM3GGUFForCausalLM",

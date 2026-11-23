@@ -247,3 +247,39 @@ def test_ratio_and_override_never_dip_below_the_floor():
     # A pinned window (the rebuild path only validates num_swa_pages > 0) is clamped up.
     pinned = _cfg(128, max_running_req=4, override=1)
     assert _swa_paged_num_tokens(pinned, num_full_pages=1024) == _swa_pool_floor(pinned) + 1
+
+
+# --------------------------------------------------------------- spec: the committed frontier
+
+def _spec_req(cached: int, k: int):
+    return SimpleNamespace(
+        cache_handle=SimpleNamespace(cached_len=0), cached_len=cached, device_len=cached + k + 1,
+        swa_evicted_seqlen=0, decode_batch_idx=5, table_idx=1, toolcall_anchor_len=None,
+    )
+
+
+def test_spec_eviction_frees_below_the_committed_frontier():
+    """A verify block's first row reads back to cached_len - window + 1 and a rejection rolls
+    device_len back, so the spec frontier must be the committed length: the optimistic
+    device_len frontier frees rows the next verify still reads once k > page_size."""
+    window, k = 128, 7
+    interval = cache_mod._SWA_EVICTION_INTERVAL
+    cm, _, _ = _managers(window, num_swa_tokens=4096)
+    cm.spec_decode = True
+    req = _spec_req(1000, k)
+    cm.maybe_free_swa_out_of_window([req], forward_iter=interval)
+    oldest_read = req.cached_len - window + 1
+    assert req.swa_evicted_seqlen < oldest_read
+    # the non-spec frontier frees INTO the verify window at this width (the old ban's reason)
+    cm2, _, _ = _managers(window, num_swa_tokens=4096)
+    req2 = _spec_req(1000, k)
+    cm2.maybe_free_swa_out_of_window([req2], forward_iter=interval)
+    assert req2.swa_evicted_seqlen >= oldest_read
+
+
+def test_spec_pool_floor_scales_with_the_block_width():
+    cfg = _cfg(128)
+    base = _swa_per_req_swa_floor(cfg)
+    cfg.speculative_algorithm = "dspark"
+    cfg.decode_rows_per_req = 8
+    assert _swa_per_req_swa_floor(cfg) == base + 7 * cache_mod._SWA_EVICTION_INTERVAL + 7

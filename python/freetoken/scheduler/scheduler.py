@@ -183,6 +183,7 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
+            spec_decode=self.spec is not None,
         )
         token_headroom = config.decode_rows_per_req - 1
         self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)

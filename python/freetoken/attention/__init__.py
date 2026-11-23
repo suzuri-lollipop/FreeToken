@@ -97,6 +97,7 @@ def create_fa_backend(config: ModelConfig):
         consumes_attn_spec=True,
         uniform_extend_graph="device",
         kv_formats=ROW_SCALE_FORMATS,
+        supports_tp=True,
     ),
 )
 def create_triton_backend(config: ModelConfig):
