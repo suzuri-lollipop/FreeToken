@@ -91,6 +91,14 @@ class LoopController(BaseOP):
         dtype = self.down_weight.dtype
         cur = cur.to(dtype)
         msg = msg.to(dtype)
+        if cur.is_cuda:
+            from freetoken.kernel.triton.ik2_ctrl import ctrl_gate_out, ctrl_rms_cat
+
+            gate = ctrl_rms_cat(cur, msg)
+            h = F.linear(gate, self.down_weight)
+            gain_raw = F.linear(h, self.gain_weight)
+            forget_raw = F.linear(h, self.forget_weight)
+            return ctrl_gate_out(gain_raw, forget_raw, cur, msg)
         gate = torch.cat([unweighted_rms_norm(cur, 1e-6), unweighted_rms_norm(msg, 1e-6)], dim=-1)
         h = F.linear(gate, self.down_weight)
         gain = torch.tanh(F.linear(h, self.gain_weight))
