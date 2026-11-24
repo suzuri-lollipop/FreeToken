@@ -225,6 +225,58 @@ def test_pinned_uva_zeroes_out_of_range_ids():
     assert torch.equal(rows[0], bank.tensor[0].cuda().to(torch.bfloat16))
 
 
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_load_host_tables_gpu_backend_keeps_table_in_vram(tmp_path, dtype):
+    """--ple-backend gpu: the loader attaches a VRAM-resident table, reports zero pinned
+    host bytes, and its lookups equal the checkpoint rows dequantized."""
+    from safetensors.torch import save_file
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    from freetoken.utils.torch_utils import torch_dtype
+
+    config = _config()
+    args = config.qwen4_args
+    multipliers, sizes, offsets = hash_constants(args)
+    rows = int(offsets[-1] + sizes[-1])
+    gen = torch.Generator().manual_seed(13)
+    if dtype is torch.float8_e4m3fn:
+        stored = torch.randint(0, 256, (rows, args.ngram_head_dim), dtype=torch.uint8,
+                               generator=gen).view(torch.float8_e4m3fn)
+        scale = 0.03125
+    else:
+        stored = (torch.randn(rows, args.ngram_head_dim, generator=gen) * 0.4).to(dtype)
+        scale = 1.0
+    prefix = "model.layers.2.ple.ple_embedding.ngram_embedding"
+    per = rows // args.split_ngram_parts
+    tensors = {f"{prefix}.shard_{i}.weight": stored[i * per:(i + 1) * per].clone()
+               for i in range(args.split_ngram_parts)}
+    if dtype is torch.float8_e4m3fn:
+        tensors[f"{prefix}.weight_scale"] = torch.tensor(scale, dtype=torch.bfloat16)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    with torch.device("cuda"), torch_dtype(torch.bfloat16):
+        model = Qwen4ExpForCausalLM(config)
+    for ple in model.model.ple_layers:
+        emb = ple.ple_embedding
+        emb.layer_multipliers.copy_(multipliers)
+        emb.ngram_heads_vocab_sizes.copy_(sizes)
+        emb.ngram_heads_offsets.copy_(offsets)
+    engine_config = SimpleNamespace(ple_backend="gpu", model_path=str(tmp_path),
+                                    use_dummy_weight=False)
+    assert model.load_host_tables(engine_config) == 0   # the host copy is dropped, no pin quota
+    want = stored.cuda().to(torch.bfloat16) * scale
+    ids = torch.randint(0, rows, (19, args.num_ngram_heads), device="cuda")
+    for ple in model.model.ple_layers:
+        table = ple.ple_embedding.table
+        assert isinstance(table, GpuResidentTable)
+        assert table.weight.device.type == "cuda"
+        assert table.weight.dtype is dtype
+        got = table.lookup(ids)
+        ref = want[ids.reshape(-1)].view(*ids.shape[:-1], -1)
+        # random fp8 bytes include NaN encodings, and NaN != NaN under torch.equal
+        assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
+
+
 @pytest.mark.skipif(
     not os.environ.get("FREETOKEN_QWEN4EXP_MODEL"), reason="needs FREETOKEN_QWEN4EXP_MODEL"
 )

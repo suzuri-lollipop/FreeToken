@@ -143,7 +143,7 @@ _INKLING2_UNQUANTIZED = (
     "model.llm.layers.2[0-3].mlp.experts*",
 )
 _INKLING2_PROCESSOR = "freetoken.mm.processors.inkling2:Inkling2MMProcessor"
-_INKLING2_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_INKLING2_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), tp_sharded=True),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "FlintGGUFForCausalLM": ModelSpec(

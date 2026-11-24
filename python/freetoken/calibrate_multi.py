@@ -48,13 +48,15 @@ decode is neutral, sharing the link with short chunks costs the interleaved regi
 calibration whose staggered wall had shown +17.7% tok/s). The spec and MoE dimensions
 carry the same score and guards.
 
-A second dimension compares speculative backends (--spec, default auto = mtp + dflash;
-dflash needs a draft checkpoint). Each spec arm runs with prefill off and wins on the
-same mean regime tok/s (>= SPEC_MIN_GAIN) without worsening the worst stall by more than
-SPEC_STALL_TOL. The winner is then stacked on the prefill winner in a combo arm: under
-piped the engine refuses speculation (spec verify shares the PLE/plan staging with the
-pipe's chunk -- Strata lifts this with STRATA_PIPED_MTP, this port has not yet), so the
-combo verifies that empirically and the report records why the two cannot stack.
+A second dimension compares speculative backends (--spec, default auto = the target's
+backends: mtp + dflash, or dspark on Inkling-2-Mini; dflash needs a draft checkpoint,
+dspark reads the checkpoint's bundled mtp.safetensors and runs at tp 1 only). Each spec
+arm runs with prefill off and wins on the same mean regime tok/s (>= SPEC_MIN_GAIN)
+without worsening the worst stall by more than SPEC_STALL_TOL. The winner is then
+stacked on the prefill winner in a combo arm: under piped the engine refuses speculation
+(spec verify shares the PLE/plan staging with the pipe's chunk -- Strata lifts this with
+STRATA_PIPED_MTP, this port has not yet), so the combo verifies that empirically and the
+report records why the two cannot stack.
 
 A third dimension compares MoE serving strategies (--moe, default auto = offload +
 hybrid). The profile's own --moe-strategy is stripped so every arm starts from the same
@@ -154,8 +156,9 @@ TIE_S = 0.15
 STALL_EVENT_S = 0.5  # the launcher bench's stall threshold; keep the two in step
 
 # Speculative-decoding dimension. Only backends this engine actually registers are
-# offered (spec.PROPOSERS: mtp, dflash); "lookup" is not a live backend in this fork.
-SPEC_ALGOS = ("mtp", "dflash")
+# offered (spec.PROPOSERS: mtp, dflash, dspark); "lookup" is not a live backend in this
+# fork. dspark is Inkling-2-Mini's (inkling2_loop) official DSpark drafter, tp 1 only.
+SPEC_ALGOS = ("mtp", "dflash", "dspark")
 SPEC_MIN_GAIN = 0.03   # a spec arm must add >=3% aggregate tok/s over the no-spec arm
 SPEC_STALL_TOL = 0.1   # ...while worsening the worst stall by at most this many seconds
 SPEC_COMBO_TPS_TOL = 0.02  # a prefill+spec combo keeps the spec win within this fraction
@@ -242,26 +245,35 @@ def strip_spec_args(argv) -> list[str]:
 def spec_argv(algo: str, draft_path: str | None = None,
               num_steps: int | None = None) -> list[str]:
     """The server flags that arm one speculative backend (mtp drafts from the target;
-    dflash needs its own draft checkpoint)."""
+    dflash needs its own draft checkpoint; dspark reads the target's bundled
+    mtp.safetensors unless a draft path overrides it)."""
     if algo == "none":
         return []
     out = ["--speculative-algorithm", algo]
-    if algo == "dflash":
-        if not draft_path:
-            raise ValueError("dflash needs --spec-draft-path (a DFlash 2 draft checkpoint)")
+    if algo == "dflash" and not draft_path:
+        raise ValueError("dflash needs --spec-draft-path (a DFlash 2 draft checkpoint)")
+    if algo in ("dflash", "dspark") and draft_path:
         out += ["--speculative-draft-model-path", str(draft_path)]
     if num_steps:
         out += ["--speculative-num-steps", str(int(num_steps))]
     return out
 
 
-def spec_backends_for(requested: str, draft_path: str | None) -> list[tuple[str, str]]:
-    """Resolve --spec into (algo, skip_reason) pairs. 'auto' offers every registered
-    backend; dflash is skipped without a draft checkpoint rather than failing the run."""
+def spec_backends_for(requested: str, draft_path: str | None, *,
+                      model_type: str | None = None, tp: int = 1) -> list[tuple[str, str]]:
+    """Resolve --spec into (algo, skip_reason) pairs. 'auto' offers the backends the
+    target can serve: Inkling-2-Mini (model_type inkling2_loop, HF config or GGUF
+    architecture) drafts with dspark, other checkpoints get mtp + dflash; an
+    unreadable model type keeps mtp + dflash and leaves dspark to an explicit
+    --spec. dflash is skipped without a draft checkpoint, dspark outside
+    inkling2_loop or above tp 1, rather than failing the run."""
     if requested.strip().lower() in ("none", "off", ""):
         return []
     if requested.strip().lower() == "auto":
-        algos = list(SPEC_ALGOS)
+        if model_type == "inkling2_loop":
+            algos = ["dspark", "mtp", "dflash"]
+        else:
+            algos = ["mtp", "dflash"]
     else:
         algos = [a.strip().lower() for a in requested.split(",") if a.strip()]
         for a in algos:
@@ -271,6 +283,14 @@ def spec_backends_for(requested: str, draft_path: str | None) -> list[tuple[str,
     for a in algos:
         if a == "dflash" and not draft_path:
             out.append((a, "no DFlash 2 draft checkpoint (--spec-draft-path)"))
+        elif a == "dspark" and model_type not in (None, "inkling2_loop"):
+            out.append((a, "dspark drafts Inkling-2-Mini (inkling2_loop) only"))
+        elif a == "dspark" and tp > 1:
+            out.append((a, "dspark requires --tp-size 1"))
+        elif a == "mtp" and model_type == "inkling2_loop":
+            out.append((a, "mtp drafts the Qwen3.5 / 3.6 / 3.8 families; Inkling-2-Mini uses dspark"))
+        elif a == "dflash" and model_type == "inkling2_loop":
+            out.append((a, "DFlash 2 drafts the Qwen families, not Inkling-2-Mini"))
         else:
             out.append((a, ""))
     return out
@@ -519,16 +539,22 @@ def run_concurrent_probe(server: Server, model: str, items: list[dict],
     prefix names the report keys."""
     t_start = time.perf_counter()
     results: list[dict | None] = [None] * len(items)
+    errors: list[str] = []
 
     def one(i: int, item: dict) -> None:
-        results[i] = _stream_chat(server, model, item["prompt"], item["max_tokens"],
-                                  t_start, item["at"], temperature=temperature)
+        try:
+            results[i] = _stream_chat(server, model, item["prompt"], item["max_tokens"],
+                                      t_start, item["at"], temperature=temperature)
+        except Exception as e:  # noqa: BLE001 -- a dead request invalidates the arm, not the tool
+            errors.append(f"request {i}: {e}")
 
     threads = [threading.Thread(target=one, args=(i, it)) for i, it in enumerate(items)]
     for th in threads:
         th.start()
     for th in threads:
         th.join()
+    if errors or any(r is None for r in results):
+        raise ServerError(f"{prefix} probe failed: {'; '.join(errors) or 'a request returned no result'}")
     wall = max(r["end"] for r in results) - t_start
     tokens = sum(r["usage_tokens"] or r["tokens"] for r in results)
     worst = 0.0
@@ -892,6 +918,47 @@ def concurrency_from_spec(spec: dict, default: int = 4) -> int:
     return max(1, mrr)
 
 
+def target_model_type(argv) -> str | None:
+    """The target's model type for the spec dimension's auto gate: config.json's
+    model_type for an HF dir, general.architecture for a GGUF file (both name
+    inkling2_loop). Unreadable -> None: auto keeps mtp + dflash and leaves dspark
+    to an explicit --spec."""
+    mp = _arg_value(list(argv), "--model-path") or _arg_value(list(argv), "--model")
+    if not mp:
+        return None
+    p = Path(mp).expanduser()
+    if str(p).endswith(".gguf") and p.is_file():
+        try:
+            from freetoken.models.gguf.reader import gguf_architecture
+            return gguf_architecture(str(p)) or None
+        except Exception:  # noqa: BLE001 -- an unreadable target must not kill the run
+            return None
+    try:
+        cfg = json.loads((p / "config.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    return str(cfg.get("model_type") or "") or None
+
+
+def tp_from_spec(argv) -> int:
+    raw = (_arg_value(list(argv), "--tp-size")
+           or _arg_value(list(argv), "--tensor-parallel-size"))
+    try:
+        return max(1, int(raw)) if raw else 1
+    except ValueError:
+        return 1
+
+
+def smoke_backends(backends: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """--smoke measures one spec arm: a runnable mtp if there is one, else the first
+    runnable backend (dspark on Inkling-2-Mini, where mtp is pre-skipped), else the
+    first entry so its skip reason still lands in the report."""
+    return ([b for b in backends if b[0] == "mtp" and not b[1]]
+            or [b for b in backends if not b[1]][:1] or backends[:1])
+
+
 def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     out_dir = Path(a.out_dir).expanduser().resolve()
     log_dir = out_dir / "logs"
@@ -908,6 +975,9 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
                   or _arg_value(list(spec.get("argv") or []), "--speculative-draft-model-path")
                   or _arg_value(list(spec.get("argv") or []), "--spec-draft-model"))
     num_steps = getattr(a, "spec_num_steps", 0) or None
+    # the auto gate reads the target's own config / tp before the flags are stripped
+    model_type = target_model_type(spec.get("argv") or [])
+    tp = tp_from_spec(spec.get("argv") or [])
     spec = {**spec,
             "argv": strip_moe_args(strip_spec_args(ensure_distributed_timeout(spec["argv"]))),
             "env": {k: v for k, v in (spec.get("env") or {}).items() if k not in MULTI_KEYS}}
@@ -947,10 +1017,11 @@ def calibrate_multi(spec: dict, a: argparse.Namespace) -> dict:
     by = {s.label: s for s in scores}
     base = by["none"]
 
-    # --- speculative dimension (prefill off): mtp / dflash compared on the same workload ---
-    backends = spec_backends_for(getattr(a, "spec", "auto"), draft_path)
+    # --- speculative dimension (prefill off): the target's backends on the same workload ---
+    backends = spec_backends_for(getattr(a, "spec", "auto"), draft_path,
+                                 model_type=model_type, tp=tp)
     if a.smoke:
-        backends = [b for b in backends if b[0] == "mtp"] or backends[:1]
+        backends = smoke_backends(backends)
     spec_scores: list[MultiScore] = []
     for algo, skip in backends:
         slabel = f"spec-{algo}"
@@ -1124,10 +1195,11 @@ def main(argv: list[str] | None = None) -> int:
                          "production defaults (generation_config + the high-temp guard) "
                          "apply. 0.0 = deterministic greedy arms")
     ap.add_argument("--spec", default="auto",
-                    help="speculative backends to compare: 'auto' (mtp + dflash), 'none', "
-                         "or a comma list of mtp,dflash. dflash is skipped without a draft "
-                         "checkpoint. Each is measured beside the prefill winner when the "
-                         "engine allows it")
+                    help="speculative backends to compare: 'auto' (the target's backends: "
+                         "mtp + dflash, or dspark on Inkling-2-Mini), 'none', or a comma "
+                         "list of mtp,dflash,dspark. dflash is skipped without a draft "
+                         "checkpoint; dspark needs inkling2_loop and tp 1. Each is measured "
+                         "beside the prefill winner when the engine allows it")
     ap.add_argument("--spec-draft-path", default="",
                     help="DFlash 2 draft checkpoint for the dflash arm (else taken from the "
                          "profile's --speculative-draft-model-path)")

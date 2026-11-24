@@ -129,8 +129,9 @@ ft serve --model Qwen/Qwen3.8-27B-FP8 --tp-size 2 --gpu 0,1   # 27 GB of weights
 What is TP-sharded today:
 
 * Readers of `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `minimax_m2`, `mistral`, `gpt_oss`, the
-  dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B) with its vision tower, and `Qwen4Exp`
-  (Qwen3.8-Flash-Next) with its dense projections and its vision tower. Anything else reports
+  dense `Qwen3_5ForConditionalGeneration` family (Qwen3.6/3.8-27B) with its vision tower, `Qwen4Exp`
+  (Qwen3.8-Flash-Next) with its dense projections and its vision tower, and `inkling2_loop`
+  (Inkling-2-Mini) with its vision tower (HF checkpoint or GGUF mmproj). Anything else reports
   `does not shard its checkpoint for tensor parallelism yet` at startup, before any rank is spawned.
 * A tower whose reader still emits full-width weights (`Glm5NextForConditionalGeneration`) is
   refused under TP with `the vision encoder's weights are not tensor-parallel sharded yet`: pass

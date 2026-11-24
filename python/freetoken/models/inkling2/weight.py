@@ -22,10 +22,14 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.layers.quantization import QuantKind
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import drop_page_cache, safetensors_weight_map
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.hf import optional_hf_file
 from tqdm import tqdm
+
+from .config import parse_vision_config
+from .vision import vision_module_leaf, vision_tp_shard
 
 _EXPERT_LAYER = re.compile(r"^model\.llm\.layers\.(\d+)\.mlp\.experts\.")
 _ATTN_LEAVES = {
@@ -145,6 +149,8 @@ def iter_weights(
     )
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
+    vc = parse_vision_config(cached_load_hf_config(model_path))
+    vshard = vision_tp_shard(vc) if include_vision and vc is not None else None
     loop_queries = {
         "model.llm.middle_cycle_cross_pass_queries",
         "model.llm.middle_cycle_cross_pass_kv_queries",
@@ -163,7 +169,10 @@ def iter_weights(
             for name in by_file[shard]:
                 renamed = _dense_rename(name, f.get_tensor(name))
                 if renamed is not None:
-                    yield renamed
+                    out, tensor = renamed
+                    if vshard is not None and out.startswith(VISION_KEY_PREFIXES):
+                        tensor = vshard.tensor(vision_module_leaf(out), tensor)
+                    yield out, tensor
         drop_page_cache(path)
     yield from _loop_query_pieces(folder, weight_map, device, _core_start(model_path))
 

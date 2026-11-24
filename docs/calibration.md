@@ -278,12 +278,18 @@ the same way lookup does.
 ### Speculative backends in the same run (`--spec`)
 
 The multi tool now owns a second dimension: it compares speculative backends on the same
-staggered workload, not just the prefill knobs. `--spec auto` (the default) measures `mtp`
-and `dflash`; `--spec none` disables the dimension; `--spec mtp,dflash` picks a subset. Only
-backends this engine registers are offered (`mtp`, `dflash`); `dflash` is skipped with a
+staggered workload, not just the prefill knobs. `--spec auto` (the default) measures the
+backends the target can serve: `mtp` and `dflash` on the Qwen families, `dspark` on
+Inkling-2-Mini (the checkpoint's `model_type: inkling2_loop` is the judge -- read from
+config.json for an HF dir, from `general.architecture` for a GGUF file; an unreadable
+target keeps mtp + dflash and an explicit `--spec dspark` still runs). `--spec none`
+disables the dimension; `--spec mtp,dflash,dspark` picks a subset. Only backends this engine registers are offered; `dflash` is skipped with a
 reason unless a DFlash 2 draft checkpoint is given (`--spec-draft-path`, or the profile's
-`--speculative-draft-model-path`). `--spec-num-steps` overrides the draft width. The tool
-strips the profile's own `--speculative-*` flags so every arm starts from the same base.
+`--speculative-draft-model-path`), `dspark` outside inkling2_loop or above tp 1 (its
+drafter reads the target's bundled `mtp.safetensors` unless a draft path overrides it;
+a GGUF or FTW target needs that flag). `--spec-num-steps` overrides the draft width. The
+tool strips the profile's own `--speculative-*` flags so every arm starts from the same
+base.
 
 Each spec arm runs with prefill off and is judged on aggregate throughput: it wins only when
 it adds at least 3% tok/s over the no-spec arm **and** does not worsen the worst inter-token

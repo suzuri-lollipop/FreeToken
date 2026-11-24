@@ -360,7 +360,13 @@ def iter_gguf_weights(
                     yield f"{pre}.controllers.{idx}.{w}_weight", float_tensor(t(f"{blk}.loop_{kind}_ctrl_{w}"))
 
     if vision:
-        yield from iter_mmproj_weights(find_mmproj(model_path))
+        from .config import parse_vision_config
+        from .vision import vision_module_leaf, vision_tp_shard_for
+
+        # the same TP view the text closure uses (layer-split keeps every tensor full width)
+        vshard = vision_tp_shard_for(parse_vision_config(hf), tp.rank, tp.size)
+        for name, tensor in iter_mmproj_weights(find_mmproj(model_path)):
+            yield name, tensor if vshard is None else vshard.tensor(vision_module_leaf(name), tensor)
 
 
 __all__ = ["gguf_mm_config", "iter_gguf_weights", "iter_mmproj_weights", "parse_gguf_config", "to_gguf"]
