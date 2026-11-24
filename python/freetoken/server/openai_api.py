@@ -796,7 +796,7 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
     served = effective_efforts(profile)
     if not served:
         return None, None
-    ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
+    ordered = sorted(served, key=lambda name: (-EFFORT_SCALE.get(name, 0.0), name))
     return ordered, profile.default
 
 

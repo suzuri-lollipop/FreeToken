@@ -295,6 +295,10 @@ def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
+    # OpenAI's developer role is a system prompt; chat templates only know
+    # system/user/assistant/tool (the Responses adapter folds it the same way).
+    if m.get("role") == "developer":
+        m["role"] = "system"
     content = m.get("content")
     if isinstance(content, list):
         m["content"] = _flatten_text_parts(content)
