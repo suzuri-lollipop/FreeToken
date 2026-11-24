@@ -382,3 +382,21 @@ def test_inkling2_parser_reads_args_key_and_strips_name_prefix():
     result = parser.parse_non_stream(text)
     assert [(c.name, c.parameters) for c in result.calls] == [("get_weather", '{"city": "Tokyo"}')]
     assert result.normal_text == ""
+
+    # Streaming must agree with one-shot: the "args" key completes the call mid-stream
+    # (otherwise the serving layer closes it with "{}" and re-emits the real call from
+    # recovery, fabricating an empty-argument duplicate every turn), and the name the
+    # template renders before the channel never leaks into content.
+    for step in (1, 5, 7, 64):
+        streamed = FunctionCallParser(tools, "inkling2")
+        texts, frags = _feed(streamed, [text[i : i + step] for i in range(0, len(text), step)])
+        texts.append(streamed.finish_stream())
+        assert "".join(texts) == ""
+        by_index: dict = {}
+        for f in frags:
+            slot = by_index.setdefault(f.tool_index, {"name": None, "params": ""})
+            if f.name is not None:
+                slot["name"] = f.name
+            slot["params"] += f.parameters
+        assembled = [(s["name"], s["params"]) for _, s in sorted(by_index.items())]
+        assert assembled == [("get_weather", '{"city": "Tokyo"}')]

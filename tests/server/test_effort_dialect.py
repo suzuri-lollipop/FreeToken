@@ -76,13 +76,26 @@ def chat_request(**overrides) -> ChatCompletionRequest:
 # --------------------------------------------------------------------------- #
 # effort_toggle_kwargs: the DeepSeek thinking toggle folds into template kwargs.
 # --------------------------------------------------------------------------- #
-OFF = {"enable_thinking": False, "thinking_mode": "disabled"}
+# The disable broadcast carries reasoning_effort "none" too: effort-grading
+# templates (Inkling-2) have no enable_thinking knob, and templates that don't
+# support "none" quantize it away at render time.
+OFF = {"enable_thinking": False, "thinking_mode": "disabled", "reasoning_effort": "none"}
 ON = {"enable_thinking": True, "thinking_mode": "enabled"}
 
 
 def test_thinking_disabled_wins_over_an_effort():
     ctk = effort_toggle_kwargs("high", {}, thinking_type="disabled")
     assert ctk == OFF
+
+
+def test_disable_broadcasts_the_none_effort_gear():
+    # Regression: Inkling-2's off gear is reasoning_effort "none" (renders effort
+    # 0); the enable_thinking/thinking_mode toggles alone are ignored by its
+    # template and left it at the default 0.9.
+    for effort in ("none", "off", None):
+        ctk = effort_toggle_kwargs(effort, {}, thinking_type="disabled" if effort is None else None)
+        assert ctk["reasoning_effort"] == "none"
+        assert ctk["enable_thinking"] is False
 
 
 def test_thinking_enabled_forwards_the_effort():

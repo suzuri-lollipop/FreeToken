@@ -1003,7 +1003,8 @@ def test_convert_reasoning_field_enables_thinking():
          "chat_template_kwargs": {"custom_var": 1}}
     )
     assert RP.convert_responses_to_genspec(req3, {}).chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1,
+        "enable_thinking": False, "thinking_mode": "disabled",
+        "reasoning_effort": "none", "custom_var": 1,
     }
 
     # absent reasoning -> no kwargs
@@ -1017,7 +1018,7 @@ def test_convert_reasoning_effort_none_disables_thinking():
         {"model": "m", "input": "hi", "reasoning": {"effort": "none"}}
     )
     assert RP.convert_responses_to_genspec(req, {}).chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled"
+        "enable_thinking": False, "thinking_mode": "disabled", "reasoning_effort": "none"
     }
 
 
@@ -1037,7 +1038,7 @@ def test_convert_reasoning_toggle_broadcasts_every_spelling():
         assert spec.chat_template_kwargs == on, parser
         spec = RP.convert_responses_to_genspec(off, {}, reasoning_parser=parser)
         assert spec.chat_template_kwargs == {
-            "enable_thinking": False, "thinking_mode": "disabled"
+            "enable_thinking": False, "thinking_mode": "disabled", "reasoning_effort": "none"
         }, parser
 
 

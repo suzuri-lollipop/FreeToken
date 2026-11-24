@@ -328,6 +328,13 @@ class BaseFormatDetector(ABC):
 
         return results
 
+    def _normalize_stream_obj(self, obj: Any) -> Any:
+        """Hook: normalize a partial call object parsed from the wire JSON before
+        the streaming state machine reads it. Detectors whose format names the
+        arguments key differently (Inkling-2: ``args``) override this so the
+        streaming path agrees with ``parse_base_json``; the default is identity."""
+        return obj
+
     @abstractmethod
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -548,6 +555,8 @@ class BaseFormatDetector(ABC):
 
             if not current_tool_call:
                 return StreamingParseResult()
+
+            current_tool_call = self._normalize_stream_obj(current_tool_call)
 
             # Case 1: Handle tool name streaming
             # This happens when we encounter a tool but haven't sent its name yet
@@ -1016,6 +1025,7 @@ class Inkling2Detector(Qwen25Detector):
         self.bot_token = "<|content_invoke_tool_json|>"
         self.eot_token = "<|end_message|>"
         self.tool_call_separator = ""
+        self._name_hold = ""
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -1035,6 +1045,62 @@ class Inkling2Detector(Qwen25Detector):
             action = [action]
         action = [{**a, "arguments": a.get("args", a.get("arguments", {}))} for a in action if isinstance(a, dict)]
         return super().parse_base_json(action, tools)
+
+    def _normalize_stream_obj(self, obj: Any) -> Any:
+        # the wire JSON carries the arguments under "args"; the streaming state
+        # machine reads "arguments", so map it here as parse_base_json does one-shot.
+        # Without this the call never completes mid-stream: the serving layer closes
+        # it with "{}" and recover_truncated_call re-emits the real call, so every
+        # turn fabricates an empty-argument duplicate (and can lose the real one).
+        if isinstance(obj, dict) and "args" in obj and "arguments" not in obj:
+            obj = {**obj, "arguments": obj["args"]}
+        return obj
+
+    def _strip_rendered_name(self, result: StreamingParseResult, tools: List[Tool]) -> StreamingParseResult:
+        # the template renders the function name immediately before the JSON channel;
+        # it is part of the call, not content (detect_and_parse strips it one-shot).
+        # Hold back released text that could still grow into that name, drop it once
+        # the channel opens, and release it as content when it proves to be prose.
+        names = set(self._get_tool_indices(tools))
+        text = self._name_hold + result.normal_text
+        self._name_hold = ""
+        if result.calls or self.current_tool_name_sent or self._buffer.startswith(self.bot_token):
+            for n in names:
+                if text.endswith(n):
+                    text = text[: -len(n)]
+                    break
+        hold = 0
+        for n in names:
+            for i in range(1, min(len(text), len(n)) + 1):
+                if n.startswith(text[-i:]):
+                    hold = max(hold, i)
+        if hold:
+            self._name_hold = text[-hold:]
+            text = text[:-hold]
+        result.normal_text = text
+        return result
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        result = self._strip_rendered_name(super().parse_streaming_increment(new_text, tools), tools)
+        # dropping a rendered name can empty a prefix-release increment; if a channel
+        # is now at the buffer head, parse it in this same increment so the serving
+        # drain loop still sees progress (otherwise it stops before the next call).
+        for _ in range(16):
+            if result.calls or result.normal_text or not self._buffer.startswith(self.bot_token):
+                break
+            more = self._strip_rendered_name(super().parse_streaming_increment("", tools), tools)
+            result.normal_text += more.normal_text
+            result.calls = list(result.calls or []) + list(more.calls or [])
+            if more.calls or more.normal_text:
+                break
+        return result
+
+    def finish_streaming(self) -> str:
+        held, self._name_hold = self._name_hold, ""
+        names = set(getattr(self, "_tool_indices", {}) or {})
+        if held.strip() in names and self.prev_tool_call_arr:
+            held = ""
+        return held + super().finish_streaming()
 
 
 class RippleDetector(Qwen25Detector):

@@ -152,6 +152,13 @@ def quantize_effort(value: Any, profile: EffortProfile) -> str | int | None:
     return None
 
 
+#: An out-of-vocabulary effort name. A template that rejects it validates its
+#: vocabulary, so the probed ``supported`` set is authoritative even when it
+#: accepts every known name (Inkling-2's effort_map is exactly this scale). A
+#: template that interpolates anything renders the sentinel verbatim, never
+#: raising, and stays classified as a non-validating grader.
+_PROBE_INVALID_EFFORT = "freetoken-probe-invalid"
+
 #: One tool flips tool-conditional paths (the DSV4 encoder grades effort only
 #: in thinking mode, which tools force).
 _PROBE_TOOLS = [
@@ -182,13 +189,16 @@ def probe_effort_profile(
 
     ``render(chat_template_kwargs, tools)`` returns a comparable rendering and
     raises on rejection. A round whose no-effort baseline raises is skipped:
-    the template rejected the probe conversation shape, not the effort.
+    the template rejected the probe conversation shape, not the effort. Each
+    round also renders an out-of-vocabulary sentinel: a rejection there marks
+    the template validating even if it accepted every known name.
     """
     rejected: set[str] = set()
     diverged: set[str] = set()
     matches_baseline: dict[str, bool] = {name: True for name in KNOWN_REASONING_EFFORTS}
     ran_rounds = 0
     integer_range = None
+    validates_observed = False
 
     for base_kwargs, tools in _PROBE_ROUNDS:
         try:
@@ -206,6 +216,12 @@ def probe_effort_profile(
             if _renderings_differ(rendering, baseline):
                 diverged.add(name)
                 matches_baseline[name] = False
+        # A rejection of an out-of-vocabulary name proves the template validates,
+        # even when every known name was accepted (no ``rejected`` entries).
+        try:
+            render({**base_kwargs, "reasoning_effort": _PROBE_INVALID_EFFORT}, tools)
+        except Exception:  # noqa: BLE001 -- rejects unknown effort -> a real vocabulary
+            validates_observed = True
         # Only a validated budget range is a numeric capability; arbitrary Jinja
         # interpolation must not advertise support for numeric reasoning effort.
         if _accepts_integer_budget(render, base_kwargs, tools):
@@ -236,7 +252,7 @@ def probe_effort_profile(
         supported=supported,
         default=default,
         consumes_effort=consumes,
-        validates=bool(rejected),
+        validates=bool(rejected) or validates_observed,
         strength_dialect=strength_dialect,
         integer_range=integer_range,
     )
