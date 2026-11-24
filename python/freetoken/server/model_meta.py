@@ -57,7 +57,9 @@ def derive_think_gears(
         # non-validating grader gets the graded ladder (incl. xhigh -- muse's
         # model card recommends it for agentic use) rather than the OpenAI triple.
         names = [n for n in effective_efforts(efforts) if n in EFFORT_SCALE]
-        for name in sorted(names, key=lambda n: EFFORT_SCALE[n]):
+        # name tiebreak: xhigh and max share 0.99, and frozenset order is hash-seed
+        # dependent, so the gear list must not vary across processes
+        for name in sorted(names, key=lambda n: (EFFORT_SCALE[n], n)):
             gears.append(name)
             gear_kwargs = dict(THINKING_ON_KWARGS) if profile.toggleable else {}
             gear_kwargs["reasoning_effort"] = name
@@ -97,9 +99,11 @@ def effort_toggle_kwargs(
 ) -> dict:
     """Fold a protocol-level reasoning-effort request into the template kwargs.
     An explicit thinking-related key wins wholesale; unrelated extras ride along.
-    Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
-    effort enables it, forwarded for templates that grade it (quantized against
-    the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
+    Effort "none"/"off" (case-insensitive) disables thinking, broadcasting both
+    the toggle kwargs and reasoning_effort "none" (the off gear of effort-grading
+    templates); any other or absent effort enables it, forwarded for templates
+    that grade it (quantized against the checkpoint's probed vocabulary at render
+    time). ``thinking_type`` is the
     DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides
     the on/off direction outright, "disabled" winning over any effort."""
     ctk = dict(chat_template_kwargs or {})
@@ -113,6 +117,11 @@ def effort_toggle_kwargs(
     elif thinking_type == "enabled":
         disabled = False
     mapped = thinking_toggle_kwargs(not disabled)
+    if disabled:
+        # Effort-grading templates (Inkling-2) have no enable_thinking knob: their
+        # off gear is reasoning_effort "none". Templates that don't support "none"
+        # quantize it away at render time, so the broadcast stays safe for them.
+        mapped.setdefault("reasoning_effort", "none")
     if effort and not disabled and effort not in _DISABLE_EFFORTS:
         mapped.setdefault("reasoning_effort", effort)
     mapped.update(ctk)

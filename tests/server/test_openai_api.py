@@ -165,6 +165,22 @@ def test_chat_request_reasoning_replay_field_aliases():
         assert asst["thinking"] == "prior thought", field
 
 
+def test_chat_request_developer_role_folds_to_system():
+    # Regression: pi (and OpenAI SDKs) send the system prompt as a "developer"
+    # role for reasoning models; templates that only know system/user/assistant/
+    # tool (Inkling-2) raised "Unknown message role: developer" -> 400.
+    req = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {"role": "developer", "content": "be helpful"},
+            {"role": "user", "content": "hi"},
+        ],
+    )
+    msgs = chat_request_to_genspec(req, {}).messages
+    assert msgs[0]["role"] == "system"
+    assert msgs[0]["content"] == "be helpful"
+
+
 def test_chat_reasoning_effort_enables_thinking():
     spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
     assert spec.chat_template_kwargs == {
@@ -182,7 +198,8 @@ def test_chat_reasoning_effort_enables_thinking():
         chat_request(reasoning_effort="none", chat_template_kwargs={"custom_var": 1}), {}
     )
     assert spec.chat_template_kwargs == {
-        "enable_thinking": False, "thinking_mode": "disabled", "custom_var": 1
+        "enable_thinking": False, "thinking_mode": "disabled",
+        "reasoning_effort": "none", "custom_var": 1
     }
 
     # absent effort -> kwargs pass through untouched
@@ -190,15 +207,19 @@ def test_chat_reasoning_effort_enables_thinking():
 
 
 def test_chat_reasoning_effort_none_disables_thinking():
-    # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking.
+    # vLLM-compatible semantics: an explicit effort "none" DISABLES thinking. The
+    # disable also broadcasts reasoning_effort "none" for effort-grading templates
+    # (Inkling-2) whose off gear is that name, not enable_thinking.
     spec = chat_request_to_genspec(chat_request(reasoning_effort="none"), {})
-    assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled", "reasoning_effort": "none"
+    }
 
 
 def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
     """The toggle is broadcast in every spelling templates read (enable_thinking
-    bool + M3's thinking_mode); each template picks the knob it knows and Jinja
-    ignores the rest, so no per-family routing exists."""
+    bool + M3's thinking_mode + the "none" effort gear); each template picks the
+    knob it knows and Jinja ignores the rest, so no per-family routing exists."""
     on = chat_request(reasoning_effort="high")
     spec = chat_request_to_genspec(on, {})
     assert spec.chat_template_kwargs == {
@@ -207,7 +228,9 @@ def test_chat_reasoning_effort_broadcasts_every_toggle_spelling():
 
     off = chat_request(reasoning_effort="none")
     spec = chat_request_to_genspec(off, {})
-    assert spec.chat_template_kwargs == {"enable_thinking": False, "thinking_mode": "disabled"}
+    assert spec.chat_template_kwargs == {
+        "enable_thinking": False, "thinking_mode": "disabled", "reasoning_effort": "none"
+    }
 
 
 

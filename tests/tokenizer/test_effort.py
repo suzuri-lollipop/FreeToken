@@ -7,6 +7,7 @@ from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
     EffortProfile,
     KNOWN_REASONING_EFFORTS,
+    effective_efforts,
     probe_effort_profile,
     quantize_effort,
 )
@@ -122,6 +123,35 @@ def test_probe_marks_an_interpolating_template_as_not_validating():
     profile = probe_effort_profile(lambda kwargs, tools: f"p|{kwargs.get('reasoning_effort')}")
     assert profile.consumes_effort
     assert not profile.validates
+
+
+def _inkling_render(kwargs, tools):
+    # Inkling-2's effort_map accepts exactly the full known scale (default 0.9 =
+    # high) and rejects any other name -- a validating template that happens to
+    # reject none of the known names.
+    eff = kwargs.get("reasoning_effort", "high")
+    if isinstance(eff, str):
+        if eff not in EFFORT_SCALE:
+            raise ValueError(f"Unknown reasoning_effort: {eff}")
+        num = EFFORT_SCALE[eff]
+    else:
+        num = float(eff)
+    return f"inkling|{num}"
+
+
+def test_probe_learns_a_full_vocabulary_validating_template():
+    # Regression: with no known-name rejection observable, only the out-of-vocab
+    # sentinel marks Inkling-2 validating. Without it effective_efforts caps the
+    # served gears to the OpenAI triple, hiding none/minimal/xhigh/max and dropping
+    # the "none" off gear to the template default.
+    profile = probe_effort_profile(_inkling_render)
+    assert profile.supported == frozenset(KNOWN_REASONING_EFFORTS)
+    assert profile.validates
+    assert profile.consumes_effort
+    assert profile.default == "high"
+    assert effective_efforts(profile) == frozenset(KNOWN_REASONING_EFFORTS)
+    assert quantize_effort("none", profile) == "none"
+    assert quantize_effort("minimal", profile) == "minimal"
 
 
 def test_probe_skips_rounds_whose_baseline_fails():
