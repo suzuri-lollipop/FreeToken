@@ -37,7 +37,7 @@ class EngineConfig:
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
+    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM, "gpu" keeps it resident in VRAM.
     ple_backend: str = "disk"
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
@@ -368,13 +368,19 @@ def tp_shard_error(model_config, tp_size: int) -> str | None:
     # The tower hands each of these widths to div_even, and its reader cuts the same axis.
     vision = getattr(model_config, "vision_config", None)
     if vision is not None:
-        merged = vision.hidden_size * vision.spatial_merge_size**2
-        for what, total in (
+        # towers name the merge differently: qwen spatial_merge_size, inkling2 merge_size
+        merge = getattr(vision, "spatial_merge_size", None) or getattr(vision, "merge_size", 1)
+        merged = vision.hidden_size * merge**2
+        widths = [
             ("heads", vision.num_heads),
             ("hidden size", vision.hidden_size),
             ("MLP intermediate size", vision.intermediate_size),
             ("merged width", merged),
-        ):
+        ]
+        proj = getattr(vision, "projection_hidden_size", None)
+        if proj is not None:
+            widths.append(("projector width", proj))
+        for what, total in widths:
             if total % tp_size:
                 problems.append(f"vision {what} ({total}) does not divide into {tp_size} ranks")
     return "; ".join(problems) or None

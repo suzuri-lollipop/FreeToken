@@ -180,6 +180,7 @@ here (126.9 GiB RAM), pinning through `HostBank` itself in 1 GiB steps:
 | same through `cudaHostAlloc` instead of `mmap`+register | 62 GiB too, so the backing is irrelevant |
 | Qwen3.8-Flash-Next NVFP4 expert banks | **63.5 GiB** |
 | PLE n-gram table when `--ple-backend pinned` | **47.7 GiB more** |
+| PLE n-gram table when `--ple-backend gpu` | 0 host (47.7 GiB of VRAM per rank instead) |
 | PLE with the default `disk` backend | 0 (it pins ~22 MiB of staging; the 512 MiB row LRU is ordinary RAM) |
 
 `_pin_budget_bytes` therefore caps Windows too (45% of RAM -> 57.1 GiB here, beside the 40%

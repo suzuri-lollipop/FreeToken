@@ -22,6 +22,7 @@ for them; other checkpoints of the same architectures work too.
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 | Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
 | Ripple-65B Preview | [ricursiveAI/Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview), [ricursiveAI/Ripple-65B-Preview-NVFP4](https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4), [AtomicChat/Ripple-65B-Preview-GGUF](https://huggingface.co/AtomicChat/Ripple-65B-Preview-GGUF) |
+| Inkling-2-Mini | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (Mainline_Support) |
 
 ### GGUF
 
@@ -45,6 +46,7 @@ These llama.cpp architectures (`general.architecture`) are served:
 | `gpt-oss` | gpt-oss |
 | `flint` | Flint |
 | `ricursive` | Ripple-65B Preview |
+| `inkling2_loop` | Inkling-2-Mini (unsloth Mainline_Support) |
 
 ### Image input
 
@@ -61,6 +63,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | Muse-Glimmer-30B (windowed ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, aspect ratio kept under a token cap; checkpoint default 4096 tokens | the maximum is the cap (`max_image_tokens`); the minimum has no effect | `{"max_image_tokens": 1024}` |
 | MiniMax-M3 (`minimax_m3`: CLIP-style ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 4 to 576 tokens | `{"size": {"longest_edge": 1048576}}` |
 | DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
+| Inkling-2-Mini (`inkling2_loop`: CLIP-style ViT tower) | one token per 40x40 pixels at native resolution, no resize (40..4096px recommended); the image is padded to a whole number of token patches | not read | not read |
 
 A GGUF model takes image input from a separate llama.cpp mmproj file, found in the model file's own folder or passed with `--mmproj` (see the
 [CLI reference](cli.md#image-input)). A GGUF file that carries the vision tensors itself (the Ollama layout) serves text only. The tower runs in bf16
@@ -219,7 +222,25 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Inkling-2-Mini (`inkling2_loop`) runs its 24 physical decoder layers as 48 visits (the
+  middle 12 loop three times). Attention is NoPE with a learned relative-position bias:
+  there is no rope to scale, and the context ceiling is the checkpoint's 1M
+  (`model_max_length`). The SWA + short-conv state combination runs on the naive prefix
+  cache (no radix reuse). Only the routed experts are quantized (layers 0-19 NVFP4,
+  layers 20-23 MXFP8 served dequantized to bf16); every projection, the router, the
+  controllers and the vision tower are bf16. `--tp-size 2+` shards the NVFP4 expert
+  banks with expert parallelism, and the vision tower shards its heads, FFN and projector,
+  so image input is served at TP=2+ (a GGUF + mmproj needs `--moe-strategy fused`: its ggml
+  expert banks do not shard for offload). `--speculative-algorithm dspark` drafts with the
+  official `mtp.safetensors` shipped in the checkpoint (or
+  `--speculative-draft-model-path`), at `--tp-size 1` only; the drafter's full-context
+  ring is `FREETOKEN_IK2_DRAFT_CTX` positions (default 8192, capped at the context).
+  The root unsloth GGUFs (arch `inkling2`, Unsloth's own looped layout) are not served:
+  use the Mainline_Support files (rename `.gguf_file` -> `.gguf`); an `inkling2v` mmproj
+  beside the text file adds image input.
+- Qwen3.8-Flash-Next has a 47.7 GiB PLE n-gram table: `--ple-backend disk` (default) reads
+  rows from the checkpoint files, `pinned` keeps the whole table in page-locked host RAM,
+  `gpu` keeps it resident in VRAM (every rank holds a full copy; lookups never leave the device).
 - With the default KV cache (bf16, sized from free VRAM) a 2x24 GB rig holds only ~8k
   tokens of context, and an over-long prompt is a clean 400 `context_length_exceeded`.
   Long-context serving needs `--kv-cache-dtype fp8` and/or `--num-tokens` (the shipped

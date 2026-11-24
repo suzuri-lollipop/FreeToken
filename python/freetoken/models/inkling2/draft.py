@@ -263,7 +263,9 @@ class DSparkDraft:
         """k draft tokens after the anchor at position P; head_logits reads the target's head
         (fp32 [rows, V] over its padded rows), fold_w [V, R] / fold_b [V] the folded Markov bias."""
         hidden = self.block_hidden(anchor_h, P, ctx_k, ctx_v)
-        base = head_logits(hidden[1 : k + 1]).float()[:, : self.V]
+        # Maya's to_bf16 before the head pass: an fp32 activation would upcast / dequantize
+        # the whole head weight per step (a full-vocab transient, OOM on a 24 GiB rank)
+        base = head_logits(hidden[1 : k + 1].to(torch.bfloat16)).float()[:, : self.V]
         state = torch.zeros(self.R, device=hidden.device, dtype=torch.float32)
         # the token chain stays on the device: one proposal is one launch sequence, no host sync
         toks = torch.empty(k + 1, dtype=torch.int64, device=hidden.device)
@@ -284,7 +286,11 @@ class DSparkDraft:
     def fold(self, head_logits: Callable[[torch.Tensor], torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """(fold_w [V, R] fp16, fold_b [V] fp16): the Markov bias through the target's head,
         computed on the head's own (possibly quantized) projection, Maya's chunked F32 fold."""
-        w = head_logits(self.hout_w.t().to(torch.bfloat16)).float()  # [R, V]
+        # row chunks keep the pass inside the W8A16 head's fused decode window (M <= 32):
+        # one R-row call dequantizes the whole head (a full-vocab fp32 transient, OOM on
+        # a 24 GiB rank). The projection is row-independent, so the fold is unchanged.
+        w = torch.cat([head_logits(c).float()
+                       for c in self.hout_w.t().to(torch.bfloat16).split(32)], dim=0)  # [R, V]
         b = head_logits(self.hout_b.unsqueeze(0).to(torch.bfloat16)).float()[0]  # [V]
         return w.t().to(torch.float16).contiguous(), b.to(torch.float16)
 
