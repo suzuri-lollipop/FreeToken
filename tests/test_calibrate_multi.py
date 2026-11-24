@@ -26,11 +26,15 @@ from freetoken.calibrate_multi import (
     moe_argv,
     moe_strategies_for,
     render_script_multi,
+    run_concurrent_probe,
     score_window,
+    smoke_backends,
     spec_argv,
     spec_backends_for,
     strip_moe_args,
     strip_spec_args,
+    target_model_type,
+    tp_from_spec,
     victims_from_spec,
     winner_env,
     workload,
@@ -329,6 +333,12 @@ def test_spec_argv_arms_each_backend_and_dflash_needs_a_draft():
                                              "--speculative-draft-model-path", "/draft"]
     with pytest.raises(ValueError):
         spec_argv("dflash")
+    # dspark reads the target's bundled mtp.safetensors; a draft path overrides it
+    assert spec_argv("dspark") == ["--speculative-algorithm", "dspark"]
+    assert spec_argv("dspark", "/mtp.safetensors", num_steps=5) == [
+        "--speculative-algorithm", "dspark",
+        "--speculative-draft-model-path", "/mtp.safetensors",
+        "--speculative-num-steps", "5"]
 
 
 def test_spec_backends_for_auto_skips_dflash_without_a_draft():
@@ -340,6 +350,88 @@ def test_spec_backends_for_auto_skips_dflash_without_a_draft():
     assert [a for a, _ in spec_backends_for("mtp", None)] == ["mtp"]
     with pytest.raises(ValueError):
         spec_backends_for("lookup", None)  # not a live backend in this fork
+
+
+def test_spec_backends_for_auto_offers_dspark_on_inkling():
+    # Inkling-2-Mini: dspark is the runnable draft, the Qwen backends are pre-skipped
+    ink = spec_backends_for("auto", None, model_type="inkling2_loop")
+    assert [a for a, _ in ink] == ["dspark", "mtp", "dflash"]
+    assert ink[0][1] == ""
+    assert "dspark" in ink[1][1] and "DFlash" in ink[2][1]
+    assert spec_backends_for("dspark", None, model_type="inkling2_loop") == [("dspark", "")]
+    # dspark is tp 1 only (the drafter's rings are rank-local)
+    skip = spec_backends_for("dspark", None, model_type="inkling2_loop", tp=2)
+    assert skip[0][0] == "dspark" and "tp" in skip[0][1]
+    # other checkpoints: auto keeps mtp + dflash, an explicit dspark is pre-skipped
+    assert [a for a, _ in spec_backends_for("auto", None, model_type="qwen4_exp")] == [
+        "mtp", "dflash"]
+    skip = spec_backends_for("dspark", None, model_type="qwen4_exp")
+    assert "inkling2_loop" in skip[0][1]
+    # unreadable model_type (GGUF target): an explicit dspark runs, the engine judges
+    assert spec_backends_for("dspark", None) == [("dspark", "")]
+
+
+def test_target_model_type_and_tp_read_the_profile_argv(tmp_path):
+    mp = tmp_path / "model"
+    mp.mkdir()
+    (mp / "config.json").write_text('{"model_type": "inkling2_loop"}', "utf-8")
+    argv = ["-m", "freetoken", "--model-path", str(mp), "--tp-size", "2"]
+    assert target_model_type(argv) == "inkling2_loop"
+    assert tp_from_spec(argv) == 2
+    assert tp_from_spec(["--tensor-parallel-size=4"]) == 4
+    assert tp_from_spec([]) == 1
+    # a broken / missing config -> None (auto keeps mtp + dflash)
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0")
+    assert target_model_type(["--model", str(gguf)]) is None
+    assert target_model_type([]) is None
+    (mp / "config.json").write_text("{broken", "utf-8")
+    assert target_model_type(argv) is None
+
+
+def test_concurrent_probe_dead_request_is_a_server_error(monkeypatch):
+    # a failed probe request (503 during a rebuild, a timeout) must invalidate the
+    # arm through the retry/exclude path, not crash the tool on a None result
+    from freetoken.calibrate_multi import ServerError
+
+    def chat(server, model, prompt, max_tokens, t_start, delay, temperature=None):
+        if prompt == "bad":
+            raise OSError("503 Service Unavailable")
+        return {"end": t_start + 1.0, "arrivals": [t_start + 0.5, t_start + 1.0],
+                "tokens": 2, "usage_tokens": 2}
+    monkeypatch.setattr("freetoken.calibrate_multi._stream_chat", chat)
+    items = [{"prompt": "ok", "max_tokens": 4, "at": 0.0},
+             {"prompt": "bad", "max_tokens": 4, "at": 0.0}]
+    with pytest.raises(ServerError, match="decode probe failed"):
+        run_concurrent_probe(object(), "m", items, "decode")
+
+
+def test_smoke_backends_prefers_runnable_mtp_then_dspark():
+    # a pre-skipped mtp (Inkling) must not shadow the runnable dspark arm
+    assert smoke_backends([("mtp", ""), ("dflash", "no draft")]) == [("mtp", "")]
+    assert smoke_backends([("dspark", ""), ("mtp", "skip"), ("dflash", "skip")]) == [
+        ("dspark", "")]
+    assert smoke_backends([("mtp", "skip")]) == [("mtp", "skip")]
+    assert smoke_backends([]) == []
+
+
+def test_target_model_type_reads_gguf_architecture(tmp_path):
+    # a GGUF target carries its config in the file's KV section: auto must see
+    # inkling2_loop there too, or the dspark arm would never be offered
+    import struct
+    p = tmp_path / "inkling.gguf"
+    out = bytearray(b"GGUF")
+    out.extend(struct.pack("<I", 3))      # version
+    out.extend(struct.pack("<Q", 0))      # tensor_count
+    out.extend(struct.pack("<Q", 1))      # metadata_kv_count
+    key, val = b"general.architecture", b"inkling2_loop"
+    out.extend(struct.pack("<Q", len(key)) + key)
+    out.extend(struct.pack("<I", 8))      # GGUF_TYPE_STRING
+    out.extend(struct.pack("<Q", len(val)) + val)
+    p.write_bytes(bytes(out))
+    assert target_model_type(["--model-path", str(p)]) == "inkling2_loop"
+    assert spec_backends_for("auto", None,
+                             model_type=target_model_type(["--model-path", str(p)]))[0] == ("dspark", "")
 
 
 def test_argv_with_timings_adds_the_gate_once():

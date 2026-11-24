@@ -22,7 +22,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, mem_GB, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .config import PLE_NGRAM_STATE
@@ -35,6 +35,9 @@ from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMix
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+
+logger = init_logger(__name__)
 
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
@@ -275,11 +278,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
-        """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        """Attach the PLE n-gram table (disk rows, pinned host bank, VRAM copy, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
         ple_layers = self.model.ple_layers
         if not ple_layers:
             return 0
-        from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
+        from .ple import GpuResidentTable, PinnedUVATable, ZeroTable, derive_ngram_hash_constants
 
         if getattr(engine_config, "use_dummy_weight", False):
             # Dummy fill leaves the int64 hash buffers garbage (a zero vocab size divides by
@@ -332,6 +335,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
 
         from .weight import load_ple_table
+
+        if engine_config.ple_backend == "gpu":
+            # Pageable read -> VRAM copy -> drop the host pages: lookups gather
+            # device-side, so the table spends no pin quota (full copy per rank).
+            table = load_ple_table(engine_config.model_path, self._config.qwen4_args, pin=False)
+            weight = table.bank.tensor.to(torch.device("cuda", torch.cuda.current_device()))
+            gpu_table = GpuResidentTable(weight, float(table.weight_scale))
+            table.bank.release()
+            self._ple_table = gpu_table  # owns the VRAM copy; keep it alive
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(gpu_table)
+            logger.info_rank0(f"PLE table resident in VRAM (--ple-backend gpu): {mem_GB(weight.nbytes)}")
+            return 0
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive

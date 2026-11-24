@@ -704,6 +704,29 @@ def test_dspark_draft_matches_maya_reference(tmp_path, n_layers, taps):
     assert torch.allclose(base, ref_base, rtol=2e-2, atol=2e-2)
 
 
+def test_dspark_fold_chunks_inside_the_w8a16_decode_window(tmp_path):
+    # one R-row head pass dequantizes the whole W8A16 head (a full-vocab fp32
+    # transient, OOM on a 24 GiB rank); the fold stays within the kernel's M <= 32
+    import safetensors.torch
+
+    from freetoken.models.inkling2.draft import DSparkDraft
+
+    sd = _draft_sd(R=64)
+    path = tmp_path / "mtp.safetensors"
+    safetensors.torch.save_file(sd, str(path))
+    draft = DSparkDraft.load(str(path), torch.device("cpu"), n_vocab=30)
+    head_w = (torch.randn(32, 64, generator=torch.Generator().manual_seed(1)) * 0.1).to(torch.bfloat16)
+    seen = []
+
+    def head(x):
+        seen.append(x.shape[0])
+        return x.to(torch.bfloat16).float() @ head_w.float().T
+
+    fold_w, fold_b = draft.fold(head)
+    assert seen and max(seen) <= 32
+    assert fold_w.shape == (32, 64) and fold_b.shape == (32,)
+
+
 @pytest.mark.needs_weights
 @pytest.mark.skipif(not os.environ.get("FREETOKEN_IK2_DRAFT"), reason="set FREETOKEN_IK2_DRAFT to the official mtp.safetensors (or its folder)")
 def test_dspark_official_drafter_matches_reference():

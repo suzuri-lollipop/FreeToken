@@ -83,7 +83,10 @@ def _reference(sd, pixel_values):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vision tower kernels")
-def test_vision_tower_matches_the_reference():
+def test_vision_tower_matches_the_reference(monkeypatch):
+    from freetoken.distributed import info
+
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=1))
     prev_dtype, prev_device = torch.get_default_dtype(), torch.get_default_device()
     torch.set_default_dtype(torch.float32)
     torch.set_default_device("cuda")
@@ -104,6 +107,61 @@ def test_vision_tower_matches_the_reference():
         torch.set_default_dtype(prev_dtype)
         torch.set_default_device(prev_device)
     assert (got - want).abs().max() < 2e-3, ((got - want).abs().max().item(), want.std().item())
+
+
+# ------------------------------------------------------------------ tensor-parallel tower
+def _tp_forward(rank: int, world: int, port: int):
+    """One rank of a real gloo group: slice the full-width weights, encode, diff the reference.
+
+    The collectives are the production ones (TorchDistributedImpl over the default group), so
+    a misplaced all-reduce, a double-counted row-parallel bias or a wrong head slice shows up
+    as a number that disagrees with the single-process transcription.
+    """
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from freetoken.distributed import info
+    from freetoken.models.inkling2.vision import vision_module_leaf, vision_tp_shard_for
+
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.set_default_dtype(torch.float32)
+        info._TP_INFO = info.DistributedInfo(rank=0, size=1)
+        torch.manual_seed(0)
+        full = Inkling2VisionModel(VC)
+        sd = {k: torch.randn(v.shape) * 0.1 for k, v in full.state_dict().items()}
+        for name in sd:
+            if name.endswith(("ln_1.weight", "ln_2.weight", "ln_pre.weight")):
+                sd[name] = sd[name].abs() + 0.5
+            if name.endswith("gamma"):
+                sd[name] = sd[name].abs() * 0.1
+        pixel_values = torch.randn(ROWS * COLS, VC.token_patch_size, VC.token_patch_size, 3)
+        want = _reference(sd, pixel_values)
+
+        info._TP_INFO = info.DistributedInfo(rank=rank, size=world)
+        tower = Inkling2VisionModel(VC)
+        shard = vision_tp_shard_for(VC, rank, world)
+        cut = {k: shard.tensor(vision_module_leaf("visual." + k), v) for k, v in sd.items()}
+        tower.load_state_dict(cut)
+        got = tower.forward(pixel_values, [1, ROWS, COLS])
+        assert (got - want).abs().max() < 2e-3, ((got - want).abs().max().item(), want.std().item())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_tp_tower_matches_the_reference(world):
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    mp.spawn(_tp_forward, args=(world, port), nprocs=world, join=True)
 
 
 def test_processor_patches_and_grid():

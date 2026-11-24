@@ -779,10 +779,12 @@ def parse_args(
     parser.add_argument(
         "--ple-backend",
         default=ServerArgs.ple_backend,
-        choices=["pinned", "disk"],
+        choices=["pinned", "disk", "gpu"],
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
-            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+            "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM; "
+            "'gpu' keeps the whole table resident in VRAM (no host copy, lookups never leave "
+            "the device; needs the table's bytes free in VRAM on every rank)."
         ),
     )
 

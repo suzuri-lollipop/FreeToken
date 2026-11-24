@@ -13,8 +13,12 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-from freetoken.layers import BaseOP, LayerNorm, LinearReplicated, OPList
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, LayerNorm, LinearColParallelMerged, LinearReplicated, LinearRowParallel, OPList
+from freetoken.models.qwen3_vl.vision import vision_module_leaf
+from freetoken.models.tp_shard import COLS, ROWS, TpShard
 from freetoken.models.weight_stream import BlockWeightStreamer
+from freetoken.utils import div_even
 
 from .config import VisionConfig
 
@@ -34,8 +38,8 @@ class _Embeddings(BaseOP):
 
 class _VisionMLP(BaseOP):
     def __init__(self, vc: VisionConfig, prefix: str):
-        self.c_fc = LinearReplicated(vc.hidden_size, vc.intermediate_size, has_bias=True, prefix=f"{prefix}.c_fc")
-        self.c_proj = LinearReplicated(vc.intermediate_size, vc.hidden_size, has_bias=True, prefix=f"{prefix}.c_proj")
+        self.c_fc = LinearColParallelMerged(vc.hidden_size, [vc.intermediate_size], has_bias=True, prefix=f"{prefix}.c_fc")
+        self.c_proj = LinearRowParallel(vc.intermediate_size, vc.hidden_size, has_bias=True, prefix=f"{prefix}.c_proj")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.c_proj.forward(F.gelu(self.c_fc.forward(x), approximate="none"))
@@ -43,13 +47,12 @@ class _VisionMLP(BaseOP):
 
 class _VisionAttention(BaseOP):
     def __init__(self, vc: VisionConfig, prefix: str):
-        self.num_heads = vc.num_heads
+        self.num_heads = div_even(vc.num_heads, get_tp_info().size)
         self.head_dim = vc.head_dim
-        lin = lambda name: LinearReplicated(vc.hidden_size, vc.hidden_size, has_bias=True, prefix=f"{prefix}.{name}")
-        self.q_proj = lin("q_proj")
-        self.k_proj = lin("k_proj")
-        self.v_proj = lin("v_proj")
-        self.out_proj = lin("out_proj")
+        self.q_proj = LinearColParallelMerged(vc.hidden_size, [vc.hidden_size], has_bias=True, prefix=f"{prefix}.q_proj")
+        self.k_proj = LinearColParallelMerged(vc.hidden_size, [vc.hidden_size], has_bias=True, prefix=f"{prefix}.k_proj")
+        self.v_proj = LinearColParallelMerged(vc.hidden_size, [vc.hidden_size], has_bias=True, prefix=f"{prefix}.v_proj")
+        self.out_proj = LinearRowParallel(vc.hidden_size, vc.hidden_size, has_bias=True, prefix=f"{prefix}.out_proj")
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         seq = x.shape[0]
@@ -148,11 +151,11 @@ class Inkling2VisionModel(BaseOP):
     def __init__(self, vc: VisionConfig):
         self._vc = vc
         self.backbone = _Backbone(vc)
-        self.proj_in = LinearReplicated(
-            vc.merge_size**2 * vc.hidden_size, vc.projection_hidden_size,
+        self.proj_in = LinearColParallelMerged(
+            vc.merge_size**2 * vc.hidden_size, [vc.projection_hidden_size],
             has_bias=vc.projector_bias, prefix="visual.proj_in",
         )
-        self.proj_out = LinearReplicated(
+        self.proj_out = LinearRowParallel(
             vc.projection_hidden_size, vc.text_hidden_size,
             has_bias=vc.projector_bias, prefix="visual.proj_out",
         )
@@ -210,4 +213,45 @@ class Inkling2VisionModel(BaseOP):
         return self.proj_out.forward(F.gelu(self.proj_in.forward(merged), approximate="none"))
 
 
-__all__ = ["Inkling2VisionModel"]
+# The tower's rank split, keyed by the module that owns each leaf: the projector cuts by its
+# own hidden width, not the block's. Kept next to the Linear classes above because it has to
+# agree with them. Embeddings, norms and LayerScale stay replicated; the row-parallel
+# all-reduce hands every rank the full-width hidden state they multiply.
+_TP_LEAF_AXIS = {
+    "self_attn.q_proj": ROWS,
+    "self_attn.k_proj": ROWS,
+    "self_attn.v_proj": ROWS,
+    "self_attn.out_proj": COLS,
+    "mlp.c_fc": ROWS,
+    "mlp.c_proj": COLS,
+    "visual.proj_in": ROWS,
+    "visual.proj_out": COLS,
+}
+
+
+def _tp_leaf_units(vc: VisionConfig) -> dict[str, int]:
+    """Global units along each sharded leaf's split axis."""
+    return {
+        "self_attn.q_proj": vc.hidden_size,
+        "self_attn.k_proj": vc.hidden_size,
+        "self_attn.v_proj": vc.hidden_size,
+        "self_attn.out_proj": vc.hidden_size,
+        "mlp.c_fc": vc.intermediate_size,
+        "mlp.c_proj": vc.intermediate_size,
+        "visual.proj_in": vc.projection_hidden_size,
+        "visual.proj_out": vc.projection_hidden_size,
+    }
+
+
+def vision_tp_shard_for(vc: VisionConfig, rank: int, world: int) -> TpShard | None:
+    """The tower's slicer for an explicit rank, so a reader with its own TP view can use it."""
+    return None if world == 1 else TpShard(rank, world, _TP_LEAF_AXIS, _tp_leaf_units(vc))
+
+
+def vision_tp_shard(vc: VisionConfig) -> TpShard | None:
+    """This rank's slicer for the tower's own keys, or None when running single-process."""
+    tp = get_tp_info()
+    return vision_tp_shard_for(vc, tp.rank, tp.size)
+
+
+__all__ = ["Inkling2VisionModel", "vision_module_leaf", "vision_tp_shard", "vision_tp_shard_for"]
