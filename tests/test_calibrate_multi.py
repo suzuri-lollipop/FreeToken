@@ -371,6 +371,15 @@ def test_spec_backends_for_auto_offers_dspark_on_inkling():
     assert spec_backends_for("dspark", None) == [("dspark", "")]
 
 
+def test_spec_backends_for_auto_offers_nothing_on_ernie():
+    # ERNIE 5.5 refuses speculation at config time (window-tier KV; DSpark head unserved):
+    # auto offers no arm, an explicit request is pre-skipped with the reason
+    assert spec_backends_for("auto", None, model_type="ernie5_5_moe") == []
+    skip = spec_backends_for("mtp", None, model_type="ernie5_5_moe")
+    assert skip[0][0] == "mtp" and "config time" in skip[0][1]
+    assert spec_backends_for("none", None, model_type="ernie5_5_moe") == []
+
+
 def test_target_model_type_and_tp_read_the_profile_argv(tmp_path):
     mp = tmp_path / "model"
     mp.mkdir()

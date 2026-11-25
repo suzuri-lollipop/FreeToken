@@ -55,16 +55,24 @@ def mhc_gates(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The coefficient predictor H(X): returns (pre_mix [T, n] fp32, post_mix [T, n, 1]
-    fp32, comb_mix [T, n, n] fp32) from one fp32 GEMM over the flattened streams."""
+    fp32, comb_mix [T, n, n] fp32) from one fp32 GEMM over the flattened streams.
+
+    ``rms_eps_outside`` selects the ERNIE 5.5 RMS factor ``1 / (sqrt(mean) + eps)``
+    (eps outside the sqrt); the default is the GLM/DSV4 ``rsqrt(mean + eps)``."""
     n, hidden = residual.shape[-2], residual.shape[-1]
     t = residual.shape[0]
 
     x = residual.reshape(t, n * hidden).to(torch.float32)
     mixes = x @ fn.t()
     # RMS over the FULL flattened n*hidden vector (not per stream).
-    mixes = mixes * torch.rsqrt(x.square().sum(-1, keepdim=True) / (n * hidden) + rms_eps)
+    mean_sq = x.square().sum(-1, keepdim=True) / (n * hidden)
+    if rms_eps_outside:
+        mixes = mixes / (mean_sq.sqrt() + rms_eps)
+    else:
+        mixes = mixes * torch.rsqrt(mean_sq + rms_eps)
 
     pre_mix = torch.sigmoid(mixes[:, :n] * hc_scale[0] + hc_base[:n]) + hc_eps
     post_mix = torch.sigmoid(mixes[:, n : 2 * n] * hc_scale[1] + hc_base[n : 2 * n])
@@ -95,10 +103,14 @@ def mhc_pre(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Multi-pass: gates from ``residual``, pre applied to it right away. Returns
     (post_mix [T, n, 1] fp32, comb_mix [T, n, n] fp32, layer_input [T, hidden] bf16)."""
-    pre_mix, post_mix, comb = mhc_gates(residual, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult, sinkhorn_repeat)
+    pre_mix, post_mix, comb = mhc_gates(
+        residual, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+        rms_eps_outside=rms_eps_outside,
+    )
     return post_mix, comb, mhc_mix_input(residual, pre_mix)
 
 
@@ -146,12 +158,14 @@ def mhc_fused_post_pre_torch(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decomposed reference: hc_post then hc_pre; the fused triton kernel
     replaces it on CUDA and is validated against this function."""
     residual_new = mhc_post(x, residual, post_mix, comb_mix)
     post_new, comb_new, layer_input = mhc_pre(
-        residual_new, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult, sinkhorn_repeat
+        residual_new, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+        rms_eps_outside=rms_eps_outside,
     )
     return residual_new, post_new, comb_new, layer_input
 
@@ -168,6 +182,7 @@ def mhc_fused_post_pre(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply the previous sublayer's hc_post, then this sublayer's hc_pre on the
     updated streams. The fused triton kernel serves every batch size on CUDA
@@ -178,10 +193,12 @@ def mhc_fused_post_pre(
         return mhc_fused_post_pre_triton(
             x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
             rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+            rms_eps_outside=rms_eps_outside,
         )
     return mhc_fused_post_pre_torch(
         x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
         rms_eps, hc_eps, post_mult, sinkhorn_repeat,
+        rms_eps_outside=rms_eps_outside,
     )
 
 

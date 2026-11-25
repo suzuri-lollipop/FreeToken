@@ -23,6 +23,14 @@ def proposer_class(config) -> type[Proposer]:
     from freetoken.models.register import _load_attr
     from freetoken.spec import PROPOSERS
 
+    # spec_drafts usually names a family DRAFT class the global proposer loads (mtp's
+    # Qwen3_5MTPDraft); a family whose whole proposer differs (ERNIE dspark) registers a
+    # Proposer subclass there instead, which overrides the global method registry.
+    for method, target in getattr(getattr(config, "model_spec", None), "spec_drafts", ()):
+        if method == config.speculative_algorithm:
+            cls = _load_attr(*target.split(":"))
+            if isinstance(cls, type) and issubclass(cls, Proposer):
+                return cls
     module, attr = PROPOSERS[config.speculative_algorithm].split(":")
     return _load_attr(module, attr)
 
@@ -111,7 +119,11 @@ class SpecRunner:
         bs, width = batch.size, self.k + 1
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
+        if batch.active_table_idx is None:
+            batch.active_table_idx = torch.tensor(
+                [r.table_idx for r in batch.reqs], dtype=torch.int64, device=batch.input_ids.device)
         batch.features = self.feature_sink(batch)
+        engine.attn_backend.prepare_metadata(batch)
         with record_function("spec_verify_forward"):
             logits = engine.forward_logits(batch)[: bs * width]
         proposal, self._proposal = self._proposal, None

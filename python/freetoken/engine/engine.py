@@ -300,7 +300,7 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KV
 
 
 _ATTENTION_BACKEND_NAMES = (
-    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse", "qsa_sparse",
+    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "ernie55_sparse", "m3_sparse", "qsa_sparse",
 )
 
 
@@ -329,6 +329,8 @@ def _resolve_auto_attention_backend(
     Tensor parallelism narrows that to the backends that read TP-local heads."""
     fp8_kv = kv_format.quantized
     candidates: list[tuple[str, bool]] = []
+    if AttnType.ERNIE55 in required:
+        candidates.append(("ernie55_sparse", True))
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
     if AttnType.DSV41 in required:
@@ -955,6 +957,16 @@ class Engine:
             _dinfo._TP_INFO = _saved_global_tp
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
+        if linear_group is None and config.slot_states:
+            # A draft (ERNIE DSpark) keeps per-request context state on these slots even
+            # though the target has no GDN tower; a zero-layer group carries just the
+            # slot_states (its conv/recurrent tensors are empty).
+            from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+            linear_group = LinearGatedDeltaGroupConfig(
+                name="spec_state", layer_ids=(), num_key_heads=1, num_value_heads=1,
+                key_head_dim=1, value_head_dim=1, conv_kernel_dim=2, output_gate="silu",
+            )
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
@@ -2605,10 +2617,21 @@ class Engine:
     def _prepare_verify_batch(self, batch: Batch) -> None:
         batch.features = self.spec.feature_sink(batch)
 
-    def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
+    def commit_verify(self, batch, counts, out: torch.Tensor) -> None:
         """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
+        reqs = batch.reqs
         if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
             self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
+        # roll the HCA compressor carry ring back to the committed frontier (the rejected
+        # draft rows' carry writes overwrote it during the verify forward); the compressor
+        # reads the verify batch's snapshot, so run inside its forward context
+        with self.ctx.forward_batch(batch):
+            batch.active_table_idx = torch.tensor(
+                [r.table_idx for r in batch.reqs], dtype=torch.int64, device=self.device)
+            self.attn_backend.prepare_metadata(batch)
+            for layer in self.model.model.layers.op_list:
+                if hasattr(layer.attn, "rollback_carry"):
+                    layer.attn.rollback_carry(counts)
         for req, n, tokens in zip(reqs, counts, out):
             if req.output_token_counts is not None:
                 req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
@@ -3153,6 +3176,39 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             override("cuda_graph_bs", kept)
 
 
+def _adjust_ernie55_config(config: EngineConfig, override) -> None:
+    """ERNIE 5.5 engine-config reconciliation: the DSV4 policy (its HCA layers ARE
+    DSV4 window+compressed attention), with the DSA slabs riding the same pool.
+    Syncs the runtime into the Ernie55Args payload, page_size = the window page P,
+    radix -> swa_radix, single-chunk prefill, graph bs <= max_running_req."""
+    model_config = config.model_config
+    args = model_config.dsv4_args
+    args.max_seq_len = config.max_seq_len
+    args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    P = args.window_size
+    override("page_size", P)
+    logger.info_rank0(f"ERNIE 5.5 KV pages are {P}-token window pages; page_size set to {P}")
+    if getattr(config, "cache_type", "radix") != "naive":
+        override("cache_type", "swa_radix")
+    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+        override("max_extend_tokens", config.max_seq_len)
+    mr = config.max_running_req
+    if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > mr:
+        logger.warning_rank0(
+            f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds ERNIE 5.5 max_running_req {mr}; "
+            "clamping to max_running_req (larger decode batches never occur)."
+        )
+        override("cuda_graph_max_bs", mr)
+    if config.cuda_graph_bs is not None:
+        kept = [bs for bs in config.cuda_graph_bs if bs <= mr]
+        if kept != list(config.cuda_graph_bs):
+            logger.warning_rank0(
+                f"dropping cuda_graph_bs entries {[bs for bs in config.cuda_graph_bs if bs > mr]} "
+                f"above ERNIE 5.5 max_running_req {mr} (larger decode batches never occur)."
+            )
+            override("cuda_graph_bs", kept)
+
+
 def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     """Parse ``--moe-cpu-layers``: an explicit MoE-layer id list (``"3,7,11"``), a count
     (``"8"`` -> 8 layers evenly strided across depth), or a fraction (``"0.5"``). Ids are
@@ -3210,7 +3266,7 @@ def _decode_target(config: EngineConfig) -> str:
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
+    "swiglu_clamp", "situ",
 )
 
 
@@ -3748,7 +3804,8 @@ def _adjust_config(config: EngineConfig):
     # Duck-typed test configs omit tp_info; absent means the single-rank view.
     tp_size = getattr(config, "tp_size", 1)
     single_stream_only = getattr(model_config, "single_stream_only", False)
-    is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    is_ernie55 = getattr(model_config, "model_type", None) == "ernie5_5_moe"
+    is_dsv4 = getattr(model_config, "dsv4_args", None) is not None and not is_ernie55
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
@@ -3793,6 +3850,8 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+    if is_ernie55:
+        _adjust_ernie55_config(config, override)
     if is_dsv41:
         _adjust_dsv41_config(config, override)
 
@@ -3910,8 +3969,11 @@ def _adjust_config(config: EngineConfig):
     if getattr(config, "speculative_algorithm", None) is not None:
         # inkling2's SWA eviction frees below the COMMITTED frontier under spec (cache.py), so a
         # verify's reads stay live at any draft width; other SWA families keep the ban until their
-        # eviction is audited the same way, and the DSV4 window tiers stay banned outright
-        swa_spec_ok = getattr(model_config, "inkling2_args", None) is not None
+        # eviction is audited the same way, and the DSV4 window tiers stay banned outright.
+        # ERNIE's HCA window tier is audited the same way: it is a WindowTierPagedPool (swa_paged),
+        # so the CacheManager's maybe_free_swa_out_of_window floors its frees at req.cached_len
+        # under spec (scheduler/cache.py), keeping every verify read live at any draft width.
+        swa_spec_ok = getattr(model_config, "inkling2_args", None) is not None or is_ernie55
         _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or (has_swa_attention and not swa_spec_ok))
 
     if config.moe_cache_rate is not None:
@@ -4115,10 +4177,11 @@ def _adjust_config(config: EngineConfig):
 
     # The rope cos/sin table covers rotary_config.table_positions, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.
-    # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
+    # DSV4 / ERNIE 5.5 are exempt: they size their own tables from the resolved max_seq_len
+    # (_adjust_dsv4_config / _adjust_ernie55_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
-    if seq_override is not None and rotary is not None and not (is_dsv4 or is_dsv41):
+    if seq_override is not None and rotary is not None and not (is_dsv4 or is_dsv41 or is_ernie55):
         if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "

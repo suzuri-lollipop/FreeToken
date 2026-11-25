@@ -1,10 +1,12 @@
 """`--tool-call-parser auto` / `--reasoning-parser auto`: architecture -> parser name.
 
-Three tables are maintained independently -- the model registry, the substring cascade in
-``server/args.py``, and the two parser factories -- and nothing links them. Add a model family and
-forget the cascade, and the model serves perfectly: it just stops emitting tool calls and stops
-separating out its thinking, because it silently fell through to the generic default. Every other
-parser test still passes, since they all start from a parser name that is already correct.
+Four tables are maintained independently -- the model registry, the substring cascade in
+``server/args.py``, the two parser factories, and the explicit CLI choices lists -- and nothing
+links them. Add a model family and forget the cascade, and the model serves perfectly: it just
+stops emitting tool calls and stops separating out its thinking, because it silently fell through
+to the generic default. Forget the choices lists, and ``auto`` works while an explicit selection
+is rejected by argparse. Every other parser test still passes, since they all start from a parser
+name that is already correct.
 
 So this drives the *live* registry rather than a list: a newly registered architecture is covered
 the moment it is added, and has to be dispositioned here to stay green.
@@ -67,6 +69,22 @@ def test_inferred_parser_names_are_names_the_factories_know(architecture):
     assert tool_call in FunctionCallParser.ToolCallParserEnum, tool_call
     if reasoning is not None:
         assert reasoning in ReasoningParser.ReasoningParserEnum, reasoning
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_inferred_parser_names_are_explicit_cli_choices(architecture):
+    """The choices lists are a fourth independent table: a name the cascade resolves and the
+    factories know is still rejected by argparse when selected explicitly, if the choices list
+    was not extended (ERNIE 5.5 shipped auto-only this way). Auto working proves nothing here."""
+    tool_call, reasoning = _inferred(architecture)
+
+    config = _Config({"architectures": [architecture], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _run_shell = parse_args(["--model", ANON_PATH, "--tool-call-parser", tool_call])
+        assert args.tool_call_parser == tool_call
+        if reasoning is not None:
+            args, _run_shell = parse_args(["--model", ANON_PATH, "--reasoning-parser", reasoning])
+            assert args.reasoning_parser == reasoning
 
 
 def test_only_the_families_without_a_thinking_format_get_no_reasoning_parser():

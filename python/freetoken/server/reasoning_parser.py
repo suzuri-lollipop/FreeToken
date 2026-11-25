@@ -600,6 +600,27 @@ class RippleReasoningParser(BaseReasoningParser):
         return ReasoningParseResult(normal_text=buf)
 
 
+class Ernie55ReasoningParser(BaseReasoningParser):
+    """ERNIE 5.5's ``<ernie:think>...</ernie:think>`` protocol. Thinking is ON by
+    default: the chat template ends the generation prompt with ``<ernie:think>``
+    (the model emits only the closing tag), so ``force_reasoning`` defaults True;
+    ``enable_thinking: false`` pre-closes the block and the completion carries no
+    reasoning. A malformed turn running straight into a tool block ends reasoning
+    at ``<ernie:tool_call>`` (dsv4 precedent)."""
+
+    THINK_START = "<ernie:think>"
+    THINK_END = "</ernie:think>"
+
+    def __init__(self, force_reasoning: bool = True, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token=self.THINK_START,
+            think_end_token=self.THINK_END,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<ernie:tool_call>",
+        )
+
+
 class MiniMaxM3ReasoningParser(BaseReasoningParser):
     """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
 
@@ -1191,6 +1212,7 @@ class ReasoningParser:
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,
+        "ernie55": Ernie55ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
         "inkling2": Inkling2ReasoningParser,

@@ -86,6 +86,7 @@ def _mhc_gates(
     SINKHORN: tl.constexpr,
     H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
     NS: tl.constexpr, BLK_NS: tl.constexpr,
+    RMS_OUTSIDE: tl.constexpr,
 ):
     """Reduce token ``t``'s split partials and run the tiny gate math (sigmoid gates,
     row-softmax + in-register 4x4 Sinkhorn); writes post / comb / pre for the next sublayer."""
@@ -99,7 +100,11 @@ def _mhc_gates(
         tl.load(mix_part_ptr + (t * NS + offs_s)[:, None] * BLK_MIX + offs_mix[None, :], mask=s_mask[:, None], other=0.0),
         axis=0,
     )
-    inv_rms = tl.math.rsqrt(sqsum / (N * H) + rms_eps)
+    if RMS_OUTSIDE:
+        # ERNIE 5.5: eps outside the sqrt, IEEE division (matches the torch reference).
+        inv_rms = 1.0 / (tl.sqrt(sqsum / (N * H)) + rms_eps)
+    else:
+        inv_rms = tl.math.rsqrt(sqsum / (N * H) + rms_eps)
     mixes = acc * inv_rms
     s0 = tl.load(scale_ptr + 0)
     s1 = tl.load(scale_ptr + 1)
@@ -151,11 +156,12 @@ def _mhc_stage2_kernel(
     SINKHORN: tl.constexpr,
     H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
     NS: tl.constexpr, BLK_NS: tl.constexpr,
+    RMS_OUTSIDE: tl.constexpr,
 ):
     """Gate math alone (the two-pass variant, whose stage 3 consumes these pre gates)."""
     _mhc_gates(
         tl.program_id(0).to(tl.int64), sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr, post_out_ptr, comb_out_ptr, pre_out_ptr,
-        rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS,
+        rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS, RMS_OUTSIDE,
     )
 
 
@@ -187,6 +193,7 @@ def _mhc_stage23_kernel(
     SINKHORN: tl.constexpr,
     H: tl.constexpr, N: tl.constexpr, MIX: tl.constexpr, BLK_MIX: tl.constexpr,
     NS: tl.constexpr, BLK_NS: tl.constexpr, BLOCK_H: tl.constexpr,
+    RMS_OUTSIDE: tl.constexpr,
 ):
     """Single-pass mHC: the layer input mixes with the PREVIOUS sublayer's pre gates, so the
     gate math for the next sublayer (stage 2) does not gate stage 3 -- one launch does both:
@@ -206,7 +213,7 @@ def _mhc_stage23_kernel(
     if hb == 0:
         _mhc_gates(
             t, sq_part_ptr, mix_part_ptr, scale_ptr, base_ptr, post_out_ptr, comb_out_ptr, pre_out_ptr,
-            rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS,
+            rms_eps, hc_eps, post_mult, SINKHORN, H, N, MIX, BLK_MIX, NS, BLK_NS, RMS_OUTSIDE,
         )
 
 
@@ -230,6 +237,7 @@ def _mhc_fused_launch(
     post_mult: float,
     sinkhorn_repeat: int,
     pre_mix_in: torch.Tensor | None,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The three stages behind both variants. ``pre_mix_in`` selects single-pass: the
     layer input is mixed with it instead of with the pre gates stage 2 just computed
@@ -274,6 +282,7 @@ def _mhc_fused_launch(
             rms_eps, hc_eps, post_mult,
             SINKHORN=sinkhorn_repeat,
             H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns, BLK_NS=triton.next_power_of_2(ns),
+            RMS_OUTSIDE=rms_eps_outside,
             num_warps=1,
         )
         _mhc_stage3_kernel[(t, triton.cdiv(h, block_h3))](
@@ -291,6 +300,7 @@ def _mhc_fused_launch(
             rms_eps, hc_eps, post_mult,
             SINKHORN=sinkhorn_repeat,
             H=h, N=n, MIX=mix, BLK_MIX=blk_mix, NS=ns, BLK_NS=triton.next_power_of_2(ns), BLOCK_H=block_h3,
+            RMS_OUTSIDE=rms_eps_outside,
             num_warps=4,
         )
     return res_out, post_out.view(t, n, 1), comb_out, pre_out, li_out
@@ -308,6 +318,7 @@ def mhc_fused_post_pre_triton(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused hc_post (skipped when ``post_mix is None``) + hc_pre. Three-stage
     split-K: the GEMV/sq-sum reduction fans out over NS hidden slices. Returns
@@ -316,6 +327,7 @@ def mhc_fused_post_pre_triton(
     res_out, post_out, comb_out, _pre_out, li_out = _mhc_fused_launch(
         x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
         rms_eps, hc_eps, post_mult, sinkhorn_repeat, pre_mix_in=None,
+        rms_eps_outside=rms_eps_outside,
     )
     return res_out, post_out, comb_out, li_out
 
@@ -333,6 +345,7 @@ def mhc_fused_post_pre_single_pass_triton(
     hc_eps: float,
     post_mult: float,
     sinkhorn_repeat: int,
+    rms_eps_outside: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-pass mHC (DeepSeek-V4.1): same fused stages, but the layer input is mixed
     with the PREVIOUS sublayer's ``pre_mix_in`` and this sublayer's pre gates come back
@@ -341,6 +354,7 @@ def mhc_fused_post_pre_single_pass_triton(
     return _mhc_fused_launch(
         x, residual, post_mix, comb_mix, fn, hc_scale, hc_base,
         rms_eps, hc_eps, post_mult, sinkhorn_repeat, pre_mix_in=pre_mix_in,
+        rms_eps_outside=rms_eps_outside,
     )
 
 
