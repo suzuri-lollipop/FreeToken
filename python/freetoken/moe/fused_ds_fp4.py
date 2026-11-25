@@ -43,12 +43,16 @@ def _grouped_decode(
     *,
     a_row_is_route: bool,
     mul_routed_weight: bool,
+    skip_w0: bool = False,
 ) -> torch.Tensor:
     """Grouped per-route GEMM ``c[t,r,:] = a[row] @ dequant(W[slot])^T``.
 
     Returns ``[T, top_k, N]``. Used for both gate_up (a_row=token) and down
     (a_row=route). FP4 weights are dequantized inline from the slot cache. A slot
     of ``-1`` is an inactive route: its output is zero and its storage is never read.
+    ``skip_w0`` (fetch-overlap decode) additionally zero-stores a zero-WEIGHTED route
+    without reading its slot, so the complementary pass's concurrent H2D copy is never
+    read mid-write; ``topk_weights`` must be supplied when it is set.
     """
     T, top_k = slots.shape
     N = packed_cache.shape[1]
@@ -57,6 +61,7 @@ def _grouped_decode(
     dtype = a.dtype
     out = torch.empty((T, top_k, N), dtype=dtype, device=a.device)
     if topk_weights is None:
+        assert not skip_w0, "skip_w0 needs the route weights to mask the other pass"
         topk_weights = out.new_empty((1, 1), dtype=torch.float32)
     scale_u8 = scale_cache.view(torch.uint8)
 
@@ -85,6 +90,7 @@ def _grouped_decode(
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        SKIP_W0=skip_w0,
         compute_type=_compute_type(dtype),
         num_warps=_NW,
     )
@@ -101,6 +107,8 @@ def routed_experts_fp4(
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
     act_block: int = 128,
+    situ_alpha: float | None = None,
+    skip_w0: bool = False,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
@@ -116,17 +124,25 @@ def routed_experts_fp4(
     I = two_I // 2
 
     x = act_quant_fp8_roundtrip(x, act_block)  # gate_up activation -> FP8 round-trip (no clone)
+    # gate_up carries the route weights only to SKIP zero-weighted routes under fetch
+    # overlap (it does not multiply them); the down pass applies them in its epilogue.
     gate_up = _grouped_decode(
-        x, gate_up_packed, gate_up_scale, slots, None,
-        a_row_is_route=False, mul_routed_weight=False,
+        x, gate_up_packed, gate_up_scale, slots, topk_weights if skip_w0 else None,
+        a_row_is_route=False, mul_routed_weight=False, skip_w0=skip_w0,
     )  # [T, top_k, 2I]
     # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
-    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(T * top_k, I)
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block, situ_alpha=situ_alpha).reshape(T * top_k, I)
     down = _grouped_decode(
         act, down_packed, down_scale, slots, topk_weights,
-        a_row_is_route=True, mul_routed_weight=True,
+        a_row_is_route=True, mul_routed_weight=True, skip_w0=skip_w0,
     )  # [T, top_k, H]
-    return down.sum(dim=1)  # [T, H]
+    # fp32-accumulated route sum (the NVFP4 decode's moe_sum_reduce_triton): keeps the
+    # fetch-overlap hit/miss merge as close to the serial single pass as bf16 allows.
+    from freetoken.kernel import moe_sum_reduce_triton
+
+    out = torch.empty((T, H), dtype=x.dtype, device=x.device)
+    moe_sum_reduce_triton(down, out)
+    return out  # [T, H]
 
 
 # Above this the grouped GEMM beats the per-route GEMV despite its padding;
@@ -189,6 +205,7 @@ def routed_experts_fp4_prefill(
     swiglu_limit: float,
     num_rows: int,
     act_block: int = 128,
+    situ_alpha: float | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM counterpart of :func:`routed_experts_fp4` for dense prefill
     chunks: one moe_align sort shared by both GEMMs, each expert's weights
@@ -200,6 +217,7 @@ def routed_experts_fp4_prefill(
         return routed_experts_fp4(
             x, slots, topk_weights,
             gate_up_packed, gate_up_scale, down_packed, down_scale, swiglu_limit, act_block=act_block,
+            situ_alpha=situ_alpha,
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
@@ -222,7 +240,7 @@ def routed_experts_fp4_prefill(
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
     )
     # [T, top_k, I] with the down activation's FP8 round-trip in the same pass
-    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block).reshape(routes, I)
+    act = fused_swiglu(gate_up, swiglu_limit, act_block=act_block, situ_alpha=situ_alpha).reshape(routes, I)
     down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(
         act, down_packed, down_scale, down, tw,

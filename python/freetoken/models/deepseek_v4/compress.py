@@ -36,6 +36,10 @@ class Compressor(BaseOP):
         raw = without_online(quant_config)
         self.wkv = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=raw, prefix=f"{prefix}.wkv")
         self.wgate = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=raw, prefix=f"{prefix}.wgate")
+        # decode_step reads these weights DIRECTLY via bf16_linear_fp32 (not the quant
+        # apply path), so the W8A16 decode replacement must not free the bf16 copy.
+        self.wkv.w8a16_decode_ok = False
+        self.wgate.w8a16_decode_ok = False
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         # Paged-KV binding (set on first forward). All addressing -- the compressed-KV pool view,
         # the per-window-page compress-state ring, the decode snapshot -- is reached through the
@@ -321,6 +325,10 @@ class Compressor(BaseOP):
         block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
             self.layer_id, self.tier, prev_window_slots, self.ring_size
         )
+        # A spec verify's rejected draft rows overwrite the shared per-page carry ring; save
+        # the pre-verify block so rollback_carry can restore it before replaying accepted rows.
+        if (get_global_ctx().batch.rows_per_req or 1) > 1:
+            self._verify_carry_block = (block.clone(), prev_window_slots.clone())
         ks = block[..., :item].clone()  # [B, ring_size, item]
         ss = block[..., item:].clone()
 

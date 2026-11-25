@@ -202,3 +202,35 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
     torch.cuda.synchronize()
     del ex
     assert_matches(cpu_out.float(), x, slots, torch.where(on_gpu, 0.0, w), clean, block)
+
+
+@pytest.mark.parametrize("block", [32, 128])
+def test_skip_w0_fetch_overlap_split_matches_serial(block):
+    """Fetch-overlap decode runs the GEMV twice with complementary zero-masked weights
+    (the hit routes while the misses stream in on a side stream, then the misses).
+    SKIP_W0 zero-stores a zero-weighted route WITHOUT reading its slot, so the hit pass
+    never reads a slot the concurrent copy is mid-write -- poisoned 0xFF (NaN e8m0 scale)
+    here. The merged hit+miss output matches the serial single pass to bf16 sum-order
+    noise (the same allowance the NVFP4 overlap backend tests use)."""
+    from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
+
+    gu_p, gu_s, dn_p, dn_s = (t.clone() for t in _banks("cuda"))
+    x, slots, w = _inputs(4, "cuda")
+    miss = torch.zeros_like(slots, dtype=torch.bool)
+    miss[:, ::2] = True
+    w_hits = torch.where(miss, 0.0, w)
+    w_miss = torch.where(miss, w, 0.0)
+    # poison the slots ONLY miss routes use (a slot a hit route also reads must stay clean)
+    hit_slots = set(slots[~miss].tolist())
+    poison = [e for e in set(slots[miss].tolist()) if e not in hit_slots]
+    poisoned = tuple(t.clone() for t in (gu_p, gu_s, dn_p, dn_s))
+    for t in poisoned:
+        t[poison] = 0xFF
+    out_hits = routed_experts_fp4(x, slots, w_hits, *poisoned, LIMIT, act_block=block, skip_w0=True)
+    assert torch.isfinite(out_hits).all()
+    out_hits_clean = routed_experts_fp4(x, slots, w_hits, gu_p, gu_s, dn_p, dn_s, LIMIT, act_block=block, skip_w0=True)
+    assert torch.equal(out_hits, out_hits_clean)  # the poisoned miss slots were never read
+    out_miss = routed_experts_fp4(x, slots, w_miss, gu_p, gu_s, dn_p, dn_s, LIMIT, act_block=block, skip_w0=True)
+    serial = routed_experts_fp4(x, slots, w, gu_p, gu_s, dn_p, dn_s, LIMIT, act_block=block)
+    merged = (out_hits + out_miss).float()
+    torch.testing.assert_close(merged, serial.float(), rtol=2e-2, atol=2e-2 * serial.float().abs().max().item())
