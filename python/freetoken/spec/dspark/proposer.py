@@ -163,6 +163,8 @@ class DSparkProposer(Proposer):
             head = self.target.lm_head
             self.head_logits = lambda x: head.gather_logits(head.logits(x))
             self.fold_w, self.fold_b = self.draft.fold(self.head_logits)
+            # the graphed block pads each layer's context to its ring capacity
+            self.draft.set_ctx_caps([WINDOW if l.local else _full_cap(self.config) for l in self.draft.layers])
             # _NormedEmbedding is a plain op (no __call__); the proposer invokes it directly
             self.embed = self.target.model._normed_embedding.forward
             logger.info_rank0(
@@ -179,6 +181,12 @@ class DSparkProposer(Proposer):
         self.prefill_taps = None
         self._prefill_sink = None
         super().detach(keep_kv=keep_kv)
+
+    def capture_graphs(self, bs_list, pool) -> None:
+        # the draft's block + Markov graphs capture here at startup, not mid-serve (a runtime
+        # capture on the engine stream drops the target's verify graph to eager)
+        if self.draft is not None:
+            self.draft.warm_graphs(self.device, self.fold_w, self.fold_b, self.k)
 
     # ------------------------------------------------------------------ context state
 
