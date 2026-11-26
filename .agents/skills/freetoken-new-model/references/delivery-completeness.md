@@ -26,6 +26,13 @@ exception to surface and solve with the owner, not a default.
    `auto_map` tokenizer needs `trust_remote_code` + a registered `PretrainedConfig`),
    the config gates pass, and it generates. Synthetic-only verification hides the
    serving-path gaps (config registration, the TP offload gate, the tokenizer).
+8. **Incremental streaming tool-call parser** - the detector streams a call with a
+   cursor that walks the buffer once (string values char-by-char as prefix-stable
+   JSON-escaped fragments, typed values buffered until they close), NOT the base
+   `partial_json_parser` path that re-parses the whole growing call JSON every token.
+   The base path is O(n^2): a 20 KB tool argument stalled the stream for minutes and
+   the engine's frozen-watchdog rebuilt the backend mid-turn. A reasoning-heavy family
+   served on long coding turns MUST use the incremental shape (see below).
 
 The deep mechanics live in the referenced files; this is the checklist that
 makes them required rather than skipped.
@@ -61,6 +68,40 @@ args, _ = parse_args(["--model", "/models/anon",
 assert args.tool_call_parser == "<family>"
 assert args.reasoning_parser == "<family>"
 ```
+
+### Streaming parser: incremental, not full-buffer re-parse
+
+Registering the detector class is not enough - HOW it streams is a delivery
+requirement. `BaseFormatDetector.parse_streaming_increment` re-parses the whole
+accumulated call JSON with `partial_json_parser` on EVERY token. That is O(n^2)
+in the argument length: a 20 KB `write` argument took ~160 s of frontend CPU,
+the stream went silent past the engine's 90 s frozen-watchdog (`server/supervisor.py`
+`FrozenEngine`), and the supervisor rebuilt the backend mid-turn - the coding
+benchmark lost the turn. The fix is an incremental state machine, the shape the
+invoke/parameter detectors already use (`InvokeParamStreamMixin`, `Glm47Detector`,
+`Inkling2Detector`):
+
+- A cursor (`_sp`) walks the buffer once; structural tokens (keys, colons, braces)
+  are consumed as they complete, never re-scanned from the start.
+- String-typed values stream char-by-char as JSON-escaped, prefix-stable fragments
+  (the wire is already JSON-escaped, so emit it verbatim; hold back a trailing
+  partial escape). Typed values (number/bool/object/array) buffer until they close,
+  then emit `json.dumps` of the native JSON value - do NOT schema-stringify a JSON
+  value, the wire type is authoritative.
+- Keep the call buffer whole until the call completes so `recover_truncated_call`
+  can re-parse it; on truncation complete the partial arguments ledger once in
+  `finalize_streaming` (`partial_json_parser` with `Allow.ALL`) so the content
+  streamed so far is not lost.
+- A drain re-feed of `""` with an unchanged buffer must make NO progress and return
+  immediately - never loop re-parsing waiting for progress that cannot come (the
+  Inkling-2 regression was a 16-iteration re-feed spin on every empty mid-argument
+  increment, ~21x the work).
+
+Verify against the one-shot `detect_and_parse` as the oracle: feed the same call at
+chunk widths 1/3/7/64 and assert the assembled arguments equal the input for string,
+typed, nested, escaped, unicode, empty and multi-call cases, plus a large (~20 KB)
+argument completing in well under a second. `tests/server/test_function_call_parser.py`
+guards the re-parse count so a reintroduced spin turns it red.
 
 ## 2. Tensor parallelism (TP >= 2) - REQUIRED
 

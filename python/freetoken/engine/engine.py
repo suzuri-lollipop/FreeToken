@@ -2630,8 +2630,10 @@ class Engine:
                 [r.table_idx for r in batch.reqs], dtype=torch.int64, device=self.device)
             self.attn_backend.prepare_metadata(batch)
             for layer in self.model.model.layers.op_list:
-                if hasattr(layer.attn, "rollback_carry"):
-                    layer.attn.rollback_carry(counts)
+                # only the HCA models name it .attn; qwen / inkling2 layers carry .self_attn
+                attn = getattr(layer, "attn", None)
+                if attn is not None and hasattr(attn, "rollback_carry"):
+                    attn.rollback_carry(counts)
         for req, n, tokens in zip(reqs, counts, out):
             if req.output_token_counts is not None:
                 req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
