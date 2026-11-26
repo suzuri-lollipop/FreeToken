@@ -50,9 +50,10 @@ class Fp8BlockConfig(QuantConfig):
         self.not_convert_substr = substr_set(not_convert)
         self.convert_tables = name_set(tuple(q.get("modules_to_convert") or ()))
         self.e8m0 = str(q.get("scale_fmt") or "").lower() == "ue8m0"
-        # ``expert_dtype`` sits at the config top level (V4) or inside quantization_config (V4.1)
+        # ``expert_dtype`` sits at the config top level (V4) or inside quantization_config (V4.1);
+        # ERNIE 5.5 spells the same OCP form "mxfp4"
         expert_dtype = q.get("expert_dtype") or cfg_get(hf_config, "expert_dtype")
-        self.expert_fp4 = str(expert_dtype or "").lower() == "fp4"
+        self.expert_fp4 = str(expert_dtype or "").lower() in ("fp4", "mxfp4")
         self.block_scheme = fp8_block_scheme("e8m0" if self.e8m0 else "float", self.block)
 
     def storage(self, scheme: QuantScheme) -> dict[str, Stored]:

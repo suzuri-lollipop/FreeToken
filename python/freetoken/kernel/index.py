@@ -65,5 +65,11 @@ def indexing(
 
     element_size = weights.shape[1] * weights.element_size()
     module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))
+    if vocab_range is not None:
+        # masked_index_kernel only writes the in-range rows (it skips pos >= length,
+        # and pos is unsigned so ids below start wrap past length); the out-of-range
+        # rows of the fresh output must be zeroed, not left as uninitialized garbage
+        # that the TP all-reduce would sum into the embedding.
+        output.zero_()
     module.launch(weights, indices, output, vocab_range)
     return output

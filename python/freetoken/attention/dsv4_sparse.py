@@ -87,7 +87,10 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         if self.full_snap is None:
             assert self.table_rows is not None, "snapshot is decode-only"
             pool = get_global_ctx().kv_cache
-            self.full_snap = pool.full_loc_map.index_select(0, self.table_rows).to(torch.int64)
+            snap = pool.full_loc_map.index_select(0, self.table_rows).to(torch.int64)
+            # a verify batch addresses rows_per_req query rows per request
+            rpr = get_global_ctx().batch.rows_per_req or 1
+            self.full_snap = snap.repeat_interleave(rpr, dim=0) if rpr > 1 else snap
         return self.full_snap
 
     def window_ctx(
@@ -170,7 +173,8 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         last = torch.tensor(
             [r.extend_len for r in batch.padded_reqs], dtype=torch.int32, device=self.device
         ).cumsum_(0) - 1
-        if not batch.is_decode:
+        # a verify batch (phase="verify") is a multi-row decode, not a prefill
+        if batch.is_prefill:
             # Segments tile the flat token stream per request: (offset, extend_len, table_idx,
             # start_pos). Built host-side here (the scheduler stream under overlap) from the
             # same Req counters every backend's prepare_metadata reads, so the model's forward
@@ -191,17 +195,19 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
-        if rows_per_req != 1:
-            raise NotImplementedError("dsv4_sparse captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
-        self.max_graph_bs = max(bs_list)
+        # a spec verify captures rows_per_req query rows per request (k+1); the snapshot
+        # buffer is sized in rows, the attend kernel is shape-generic over them
+        self.rows_per_req = rows_per_req
+        self.max_graph_bs = max(bs_list) * rows_per_req
         self.capture = DSV4CaptureData.create(self.max_graph_bs, max_seq_len, self.device)
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         # The capture batch is all dummy rows; stage them so the captured gather reads the
-        # reserved page-0 slots instead of the -1 fill.
-        bs = batch.size
+        # reserved page-0 slots instead of the -1 fill. padded_size is the REQUEST count; a
+        # spec verify captures rows_per_req query rows per request, so stage the row count.
+        bs = batch.padded_size * (batch.rows_per_req or 1)
         rows = torch.full(
             (bs,), batch.padded_reqs[0].table_idx, dtype=torch.int64, device=self.device
         )

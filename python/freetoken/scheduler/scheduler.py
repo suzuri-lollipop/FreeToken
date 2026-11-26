@@ -1008,7 +1008,7 @@ class Scheduler(SchedulerIOMixin):
             if msg.finished:
                 finished.append(req)
         # before any finish free: the hybrid finish donates the live GDN slot the commit writes
-        self.engine.commit_verify(batch.reqs, counts, output.next_tokens_gpu)
+        self.engine.commit_verify(batch, counts, output.next_tokens_gpu)
         # the last committed token is pending at cached_len, like a decode step's sampled token
         table, pos, last = torch.tensor(
             [(r.table_idx, r.cached_len, n - 1) for r, n in zip(batch.reqs, counts)],

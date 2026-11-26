@@ -57,6 +57,9 @@ class AotModel:
     expert_formats: tuple[str, ...] = ()
     embed_indexing: bool = True
     aliases: tuple[str, ...] = ()
+    # Expert-space hidden width when it differs from the model's (ERNIE 5.5's
+    # latent MoE runs its experts in moe_latent_size, not hidden_size).
+    expert_hidden_size: int | None = None
     # Further register.py keys this entry's checkpoints load under (text-only /
     # GGUF config variants of the same model); every registry key must be
     # claimed by some entry's architecture or arch_aliases.
@@ -350,6 +353,20 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=("ds_fp4",),
     ),
     AotModel(
+        # ERNIE 5.5 Flash Preview: HCA tiers write via torch scatter (like DSV4),
+        # DSA latent/index slabs via index_put_; the latent MoE's ds_fp4 banks
+        # live in moe_latent_size (2048), not hidden_size.
+        name="baidu/ERNIE-5.5-Flash-Preview",
+        architecture="Ernie5_5_MoeForCausalLM",
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=10,
+        moe_intermediate_size=2048,
+        expert_hidden_size=2048,
+        expert_formats=("ds_fp4",),
+        aliases=("baidu/ERNIE-5.5-Flash-Preview-FP8",),
+    ),
+    AotModel(
         name="RecursiveSI/flint",
         architecture="FlintForCausalLM",
         hidden_size=2048,
@@ -462,7 +479,9 @@ def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
     for fmt in model.expert_formats:
         assert model.moe_intermediate_size is not None
         sizes.update(
-            expert_bank_row_bytes(fmt, model.hidden_size, model.moe_intermediate_size).values()
+            expert_bank_row_bytes(
+                fmt, model.expert_hidden_size or model.hidden_size, model.moe_intermediate_size
+            ).values()
         )
     return sizes
 
