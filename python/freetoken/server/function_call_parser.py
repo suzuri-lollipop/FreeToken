@@ -461,6 +461,19 @@ class BaseFormatDetector(ABC):
         # Append new text to buffer
         self._buffer += new_text
         current_text = self._buffer
+        entered_with_name = self.current_tool_name_sent
+
+        # The serving drain loop re-feeds "" to probe for further calls. After an
+        # argument-streaming pass an unchanged buffer yields no new diff, so skip the
+        # full partial-JSON re-parse: it rescans the whole growing buffer and is O(n^2)
+        # over a large argument. The memo is set only after such a pass (see below), and
+        # completion clears current_tool_name_sent, so a pending next call is never skipped.
+        if (
+            not new_text
+            and self.current_tool_name_sent
+            and self._buffer is getattr(self, "_last_parse_buf", None)
+        ):
+            return StreamingParseResult()
 
         # The current_text has tool_call if it is the start of a new tool call sequence
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
@@ -660,6 +673,10 @@ class BaseFormatDetector(ABC):
                     self.prev_tool_call_arr.append({})
                 self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
 
+            # Memo only after an argument-streaming pass (name already sent on entry):
+            # the next empty re-feed then yields no new diff. After a name-only pass the
+            # arguments still owe a parse, so leave the memo unset and let the drain run.
+            self._last_parse_buf = self._buffer if entered_with_name else None
             return res
 
         except Exception as e:
@@ -1081,27 +1098,388 @@ class Inkling2Detector(Qwen25Detector):
         result.normal_text = text
         return result
 
+    # Incremental JSON streaming: a cursor walks the buffer once instead of re-parsing
+    # the whole growing call JSON every token (the base partial_json_parser path is
+    # O(n^2); a 20 KB argument stalled the stream past the engine watchdog). String
+    # values stream char-by-char as prefix-stable JSON-escaped fragments, typed values
+    # buffer until they close - the same shape as the invoke/parameter detectors. The
+    # buffer stays whole until the call completes so recover_truncated_call can re-parse.
+
+    def _ik_reset(self) -> None:
+        self._ik_mode = "idle"
+        self._ik_sp = 0
+        self._ik_outer_key = ""
+        self._ik_key = ""
+        self._ik_lead = "{"
+        self._ik_skip = False
+        self._ik_param_config: Dict = {}
+
+    @staticmethod
+    def _ik_ws(buf: str, i: int) -> int:
+        while i < len(buf) and buf[i] in " \t\r\n":
+            i += 1
+        return i
+
+    @staticmethod
+    def _ik_str_end(buf: str, i: int) -> int:
+        # i at the opening quote; index AFTER the closing quote, or -1 while incomplete
+        if i >= len(buf) or buf[i] != '"':
+            return -1
+        i += 1
+        while i < len(buf):
+            c = buf[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                return i + 1
+            i += 1
+        return -1
+
+    @staticmethod
+    def _ik_val_end(buf: str, i: int) -> int:
+        # end of a non-string JSON value at i (object/array balanced, scalar till a
+        # delimiter); -1 while incomplete
+        n = len(buf)
+        if i >= n:
+            return -1
+        if buf[i] in "{[":
+            depth = 0
+            in_str = esc = False
+            j = i
+            while j < n:
+                ch = buf[j]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                elif ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    depth += 1
+                elif ch in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        return j + 1
+                j += 1
+            return -1
+        j = i
+        while j < n and buf[j] not in ",}] \t\r\n":
+            j += 1
+        return j if j < n else -1
+
+    def _ik_start_call(self, name: str, tools: List[Tool], calls: List[ToolCallItem]) -> None:
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        if name in self._tool_indices or _should_forward_unknown_tool(name):
+            calls.append(ToolCallItem(tool_index=self.current_tool_id, name=name, parameters=""))
+            self.prev_tool_call_arr[self.current_tool_id] = {"name": name, "arguments": {}}
+            self.current_tool_name_sent = True
+            self._ik_skip = False
+            self._ik_param_config = self._get_param_config(name, tools)
+        else:
+            logger.warning(f"Model attempted to call undefined function: {name}")
+            self._ik_skip = True
+
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
-        result = self._strip_rendered_name(super().parse_streaming_increment(new_text, tools), tools)
-        # dropping a rendered name can empty a prefix-release increment; if a channel
-        # is now at the buffer head, parse it in this same increment so the serving
-        # drain loop still sees progress (otherwise it stops before the next call).
-        for _ in range(16):
-            if result.calls or result.normal_text or not self._buffer.startswith(self.bot_token):
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        if not hasattr(self, "_ik_mode"):
+            self._ik_reset()
+
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+
+        def _emit(fragment: str) -> None:
+            if fragment and not self._ik_skip:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                )
+
+        def _update_prev() -> None:
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            for probe in (ledger, ledger + "}"):
+                try:
+                    parsed = json.loads(probe)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
+
+        while True:
+            buf = self._buffer
+            mode = self._ik_mode
+            if mode == "idle":
+                if calls:
+                    break  # text after a call defers to the next increment (wire order)
+                pos = buf.find(self.bot_token)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self.bot_token)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        r = self._strip_rendered_name(StreamingParseResult(normal_text=release), tools)
+                        if r.normal_text:
+                            normal_parts.append(r.normal_text)
+                    self._buffer = buf[len(release):]
+                    break
+                self._buffer = buf[pos:]
+                r = self._strip_rendered_name(StreamingParseResult(normal_text=buf[:pos]), tools)
+                if r.normal_text:
+                    normal_parts.append(r.normal_text)
+                self._ik_sp = len(self.bot_token)
+                self._ik_mode = "o_open"
+                self._ik_lead = "{"
+                continue
+
+            i = self._ik_sp
+            if mode == "o_open":
+                i = self._ik_ws(buf, i)
+                self._ik_sp = i
+                if i < len(buf) and buf[i] == "{":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "o_key"
+                    continue
                 break
-            more = self._strip_rendered_name(super().parse_streaming_increment("", tools), tools)
-            result.normal_text += more.normal_text
-            result.calls = list(result.calls or []) + list(more.calls or [])
-            if more.calls or more.normal_text:
+
+            if mode == "o_key":
+                i = self._ik_ws(buf, i)
+                end = self._ik_str_end(buf, i)
+                if end == -1:
+                    self._ik_sp = i
+                    break
+                self._ik_outer_key = json.loads(buf[i:end])
+                self._ik_sp = end
+                self._ik_mode = "o_colon"
+                continue
+
+            if mode == "o_colon":
+                i = self._ik_ws(buf, i)
+                self._ik_sp = i
+                if i < len(buf) and buf[i] == ":":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "o_val"
+                    continue
                 break
-        return result
+
+            if mode == "o_val":
+                i = self._ik_ws(buf, i)
+                if i >= len(buf):
+                    self._ik_sp = i
+                    break
+                key = self._ik_outer_key
+                if key == "name":
+                    end = self._ik_str_end(buf, i)
+                    if end == -1:
+                        self._ik_sp = i
+                        break
+                    self._ik_start_call(json.loads(buf[i:end]), tools, calls)
+                    self._ik_sp = end
+                    self._ik_mode = "o_next"
+                    continue
+                if key == "args":
+                    if buf[i] == "{":
+                        self._ik_sp = i + 1
+                        self._ik_mode = "a_key"
+                        continue
+                    end = self._ik_val_end(buf, i)  # null / non-object args: skip
+                    if end == -1:
+                        self._ik_sp = i
+                        break
+                    self._ik_sp = end
+                    self._ik_mode = "o_next"
+                    continue
+                end = self._ik_val_end(buf, i)
+                if end == -1:
+                    self._ik_sp = i
+                    break
+                self._ik_sp = end
+                self._ik_mode = "o_next"
+                continue
+
+            if mode == "o_next":
+                i = self._ik_ws(buf, i)
+                self._ik_sp = i
+                if i >= len(buf):
+                    break
+                if buf[i] == ",":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "o_key"
+                    continue
+                if buf[i] == "}":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "end"
+                    continue
+                break
+
+            if mode == "a_key":
+                i = self._ik_ws(buf, i)
+                if i < len(buf) and buf[i] == "}":  # empty args object
+                    _emit("{}")
+                    _update_prev()
+                    self._ik_sp = i + 1
+                    self._ik_mode = "o_next"
+                    continue
+                end = self._ik_str_end(buf, i)
+                if end == -1:
+                    self._ik_sp = i
+                    break
+                self._ik_key = json.loads(buf[i:end])
+                _emit(self._ik_lead + json.dumps(self._ik_key, ensure_ascii=False) + ": ")
+                self._ik_lead = ", "
+                self._ik_sp = end
+                self._ik_mode = "a_colon"
+                continue
+
+            if mode == "a_colon":
+                i = self._ik_ws(buf, i)
+                self._ik_sp = i
+                if i < len(buf) and buf[i] == ":":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "a_val"
+                    continue
+                break
+
+            if mode == "a_val":
+                i = self._ik_ws(buf, i)
+                if i >= len(buf):
+                    self._ik_sp = i
+                    break
+                if buf[i] == '"':
+                    _emit('"')
+                    self._ik_sp = i + 1
+                    self._ik_mode = "a_str"
+                    continue
+                self._ik_sp = i
+                self._ik_mode = "a_buf"
+                continue
+
+            if mode == "a_str":
+                # walk only new text: emit complete chars, hold a trailing partial escape,
+                # stop at the unescaped closing quote. The wire is already JSON-escaped,
+                # so fragments concatenate verbatim into the value.
+                n = len(buf)
+                j = i
+                emit_end = i
+                closed = -1
+                while j < n:
+                    c = buf[j]
+                    if c == '"':
+                        closed = j
+                        break
+                    if c == "\\":
+                        if j + 1 >= n:
+                            break
+                        if buf[j + 1] == "u":
+                            if j + 6 > n:
+                                break
+                            j += 6
+                        else:
+                            j += 2
+                    else:
+                        j += 1
+                    emit_end = j
+                if closed >= 0:
+                    _emit(buf[i:closed])
+                    _emit('"')
+                    _update_prev()
+                    self._ik_sp = closed + 1
+                    self._ik_mode = "a_next"
+                    continue
+                if emit_end > i:
+                    _emit(buf[i:emit_end])
+                    self._ik_sp = emit_end
+                break
+
+            if mode == "a_buf":
+                end = self._ik_val_end(buf, i)
+                if end == -1:
+                    break
+                raw = buf[i:end].strip()
+                # the wire value is JSON, so its native type is authoritative (a schema
+                # conversion would stringify undeclared numbers/bools/objects)
+                try:
+                    converted = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    converted = raw
+                _emit(json.dumps(converted, ensure_ascii=False))
+                _update_prev()
+                self._ik_sp = end
+                self._ik_mode = "a_next"
+                continue
+
+            if mode == "a_next":
+                i = self._ik_ws(buf, i)
+                self._ik_sp = i
+                if i >= len(buf):
+                    break
+                if buf[i] == ",":
+                    self._ik_sp = i + 1
+                    self._ik_mode = "a_key"
+                    continue
+                if buf[i] == "}":
+                    _emit("}")
+                    _update_prev()
+                    self._ik_sp = i + 1
+                    self._ik_mode = "o_next"
+                    continue
+                break
+
+            if mode == "end":
+                i = self._ik_ws(buf, i)
+                rest = buf[i:]
+                if rest.startswith(self.eot_token):
+                    self._ik_sp = i + len(self.eot_token)
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self.current_tool_name_sent = False
+                    self._buffer = buf[self._ik_sp:]
+                    self._ik_reset()
+                    continue
+                if self.eot_token.startswith(rest):
+                    self._ik_sp = i
+                    break
+                # no closer yet (truncation): hold; finish_streaming decides
+                self._ik_sp = i
+                break
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finalize_streaming(self) -> List[ToolCallItem]:
+        # generation ended inside a call (truncation): complete the partial arguments
+        # ledger once so unstreamed_arguments serves the content streamed so far
+        idx = self.current_tool_id
+        if 0 <= idx < len(self.streamed_args_for_tool) and self.streamed_args_for_tool[idx]:
+            try:
+                parsed = partial_json_parser.loads(self.streamed_args_for_tool[idx], Allow.ALL)
+            except (MalformedJSON, JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and idx < len(self.prev_tool_call_arr):
+                self.prev_tool_call_arr[idx]["arguments"] = parsed
+        return []
 
     def finish_streaming(self) -> str:
         held, self._name_hold = self._name_hold, ""
         names = set(getattr(self, "_tool_indices", {}) or {})
         if held.strip() in names and self.prev_tool_call_arr:
             held = ""
-        return held + super().finish_streaming()
+        residual, self._buffer = self._buffer, ""
+        mode = getattr(self, "_ik_mode", "idle")
+        self._ik_reset()
+        self.current_tool_name_sent = False
+        if mode != "idle" or self.bot_token in residual:
+            return held  # unfinished call markup must not leak into content
+        return held + residual
 
 
 class RippleDetector(Qwen25Detector):

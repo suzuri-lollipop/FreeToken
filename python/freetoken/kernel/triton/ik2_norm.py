@@ -173,6 +173,46 @@ def _rel_table_kernel(
     tl.store(OUT + row * (E + 1) + E, 0.0)  # the padded zero bias column
 
 
+@triton.jit
+def _add_f32_kernel(OUT, A, B, N, BLOCK: tl.constexpr):
+    off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = off < N
+    a = tl.load(A + off, mask=m, other=0.0).to(tl.float32)
+    b = tl.load(B + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(OUT + off, a + b, mask=m)
+
+
+def residual_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a.float() + b.float()`` as fp32, one kernel (the non-boundary attention residual)."""
+    if not a.is_cuda:
+        return a.float() + b.float()
+    out = torch.empty(a.shape, dtype=torch.float32, device=a.device)
+    N = a.numel()
+    BLOCK = 1024
+    _add_f32_kernel[(triton.cdiv(N, BLOCK),)](out, a, b, N, BLOCK=BLOCK, num_warps=4, num_stages=1)
+    return out
+
+
+@triton.jit
+def _add_cast_kernel(OUT, RES, H, N, BLOCK: tl.constexpr):
+    off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = off < N
+    r = tl.load(RES + off, mask=m, other=0.0)
+    h = tl.load(H + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(OUT + off, (r + h).to(OUT.dtype.element_ty), mask=m)
+
+
+def residual_out(residual: torch.Tensor, h: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``(residual + h.float()).to(dtype)`` (residual fp32, h the conv output), one kernel."""
+    if not residual.is_cuda:
+        return (residual + h.float()).to(dtype)
+    out = torch.empty(residual.shape, dtype=dtype, device=residual.device)
+    N = residual.numel()
+    BLOCK = 1024
+    _add_cast_kernel[(triton.cdiv(N, BLOCK),)](out, residual, h, N, BLOCK=BLOCK, num_warps=4, num_stages=1)
+    return out
+
+
 def rel_table_fused(r: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """``r [T, nh, d_rel]`` bf16, ``bias [d_rel, extent]`` bf16 -> ``[T, nh, extent+1]`` fp32.
 
@@ -193,4 +233,4 @@ def rel_table_fused(r: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return out.view(T, nh, E + 1)
 
 
-__all__ = ["l2_clip", "rms_noweight", "rel_table_fused"]
+__all__ = ["l2_clip", "rms_noweight", "rel_table_fused", "residual_add", "residual_out"]

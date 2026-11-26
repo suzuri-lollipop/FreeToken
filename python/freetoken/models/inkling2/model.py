@@ -160,7 +160,9 @@ class Inkling2DecoderLayer(BaseOP):
             blocks.append(inpSA)
             residual = attn_out.float()
         else:
-            residual = inpSA.float() + attn_out.float()
+            from freetoken.kernel.triton.ik2_norm import residual_add
+
+            residual = residual_add(inpSA, attn_out)
 
         if _IK2_PROF:
             torch.cuda.synchronize()
@@ -183,7 +185,9 @@ class Inkling2DecoderLayer(BaseOP):
         _tp = 1 if _os.environ.get("FREETOKEN_LAYER_SPLIT") == "1" else get_tp_info().size
         _ffn_off = 2 * (args.kv_dim // _tp) + args.hidden_size
         h = self.ffn_post_conv.forward(h, conv_meta, conv_state_slab(visit, args.hidden_size, _ffn_off), verify_key=(visit, _ffn_off))
-        out = (residual + h.float()).to(x.dtype)
+        from freetoken.kernel.triton.ik2_norm import residual_out
+
+        out = residual_out(residual, h, x.dtype)
         if _IK2_PROF:
             torch.cuda.synchronize()
             _t3 = _time.perf_counter()

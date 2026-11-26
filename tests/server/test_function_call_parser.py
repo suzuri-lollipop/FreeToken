@@ -400,3 +400,41 @@ def test_inkling2_parser_reads_args_key_and_strips_name_prefix():
             slot["params"] += f.parameters
         assembled = [(s["name"], s["params"]) for _, s in sorted(by_index.items())]
         assert assembled == [("get_weather", '{"city": "Tokyo"}')]
+
+
+def test_inkling2_streaming_large_argument_does_not_rescan_per_token(monkeypatch):
+    # Regression: Inkling-2 once streamed through the base partial_json_parser path,
+    # re-parsing the whole growing call JSON every token (O(n^2)), plus a 16-iteration
+    # drain spin (~21x). A ~20 KB tool argument stalled the stream for minutes and the
+    # engine watchdog rebuilt the backend mid-turn. It now streams with an incremental
+    # cursor: feed char-by-char like the detokenizer and assert ZERO base full-buffer
+    # re-parses (any revert to the base path turns this red) and the call against input.
+    import freetoken.server.function_call_parser as fcp
+
+    args = {"content": "def handle(request):\n    return {'ok': True}\n" * 80}
+    tools = [{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"content": {"type": "string"}}}}}]
+    wire = 'write<|content_invoke_tool_json|>' + json.dumps({"name": "write", "args": args}, ensure_ascii=False) + '<|end_message|>'
+
+    base_calls = {"n": 0}
+    orig = fcp.BaseFormatDetector.parse_streaming_increment
+
+    def counting(self, new_text, tools):
+        base_calls["n"] += 1
+        return orig(self, new_text, tools)
+
+    monkeypatch.setattr(fcp.BaseFormatDetector, "parse_streaming_increment", counting)
+
+    parser = FunctionCallParser(tools, "inkling2")
+    texts, frags = _feed(parser, [wire[i : i + 1] for i in range(len(wire))])
+    texts.append(parser.finish_stream())
+    assert "".join(texts) == ""
+    by_index: dict = {}
+    for f in frags:
+        slot = by_index.setdefault(f.tool_index, {"name": None, "params": ""})
+        if f.name is not None:
+            slot["name"] = f.name
+        slot["params"] += f.parameters
+    assembled = [(s["name"], json.loads(s["params"])) for _, s in sorted(by_index.items())]
+    assert assembled == [("write", args)]
+    # Fully incremental: the cursor never falls back to the base whole-buffer re-parse.
+    assert base_calls["n"] == 0

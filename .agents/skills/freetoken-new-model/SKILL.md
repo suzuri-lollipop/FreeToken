@@ -73,11 +73,12 @@ for a phase before doing that phase.
    -> `references/model-and-kernels.md`, `references/weights-and-quant.md`
 7. **Delivery completeness - MANDATORY requirements (必須要件)** - parser
    registration in all four tables (class maps, auto cascade, explicit CLI
-   choices), TP >= 2 support, speculative draft support, GGUF support, and the
-   calibration tool's model_type map. These are REQUIRED, not optional: a
-   model that serves at TP1 but cannot shard, cannot draft, has no GGUF
-   reader, or cannot be selected explicitly is NOT delivered. Implement and
-   verify each on real hardware; a genuine blocker is an exception to raise
+   choices), an incremental streaming tool-call parser (cursor-based, not the
+   O(n^2) full-buffer re-parse), TP >= 2 support, speculative draft support,
+   GGUF support, and the calibration tool's model_type map. These are REQUIRED,
+   not optional: a model that serves at TP1 but cannot shard, cannot draft, has
+   no GGUF reader, or cannot be selected explicitly is NOT delivered. Implement
+   and verify each on real hardware; a genuine blocker is an exception to raise
    with the owner, never a silent "not required this time".
    -> `references/delivery-completeness.md`
 8. **Tests + verification + docs** - parity tests against independent

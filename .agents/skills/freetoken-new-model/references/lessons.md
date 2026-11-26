@@ -161,6 +161,18 @@ calling a new-model phase done.
   slice than the shard leaves, so the selector falls back to Triton.
   (docs/cli.md "What is TP-sharded today")
 
+- A streaming tool-call detector that re-parses the whole growing call JSON every
+  token (`BaseFormatDetector` + `partial_json_parser`) is O(n^2): a 20 KB argument
+  stalled the frontend for ~160 s, the stream went silent past the 90 s frozen
+  watchdog, and the supervisor rebuilt the backend mid-turn - a lost coding turn
+  that looks like a model crash, not a parser bug. A drain re-feed that loops on an
+  unchanged buffer (no progress guard) multiplies it ~21x. Rule: new families stream
+  with an incremental cursor (string values char-by-char, typed values buffered),
+  the `InvokeParamStreamMixin` / `Glm47Detector` / `Inkling2Detector` shape; an empty
+  re-feed with an unchanged buffer returns immediately. Guard the re-parse count in
+  a test. (inkling2 streaming migration, server/function_call_parser.py,
+  tests/server/test_function_call_parser.py)
+
 ## Delivery completeness / family registration
 
 - Parser registration is FOUR independent tables: the detector/parser class
