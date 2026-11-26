@@ -50,8 +50,18 @@ class TritonFp8BlockLinearKernel(LinearKernel):
         return None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear
+        from freetoken.kernel.triton.fp8_block_linear import block_fp8_gemv_rows, block_fp8_linear
 
+        # Single-request spec verify must reproduce the M=1 decode GEMV bit-for-bit:
+        # the W8A8 GEMM quantizes activations to fp8, decode (W8A16) does not, and the
+        # stored KV would drift from plain decode. Wider verify batches keep the GEMM:
+        # plain decode at bs>1 uses it too, and it is row-wise M-invariant.
+        from freetoken.core import try_get_global_ctx
+
+        ctx = try_get_global_ctx()
+        batch = ctx.maybe_batch if ctx is not None else None
+        if batch is not None and batch.phase == "verify" and batch.size == 1:
+            return block_fp8_gemv_rows(x, layer.weight, layer.weight_scale_inv, layer.bias)
         return block_fp8_linear(x, layer.weight, layer.weight_scale_inv, layer.bias)
 
 

@@ -23,6 +23,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, f32_to_e4m3, round_e4m3
@@ -63,6 +64,7 @@ def _decode_dsfp4_moe_kernel(
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    SKIP_W0: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     route_id = tl.program_id(0)
@@ -73,8 +75,16 @@ def _decode_dsfp4_moe_kernel(
     offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     n_mask = offs_n < N
 
-    slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    if SKIP_W0:
+        # fetch-overlap decode: a zero-weighted route belongs to the OTHER pass, whose
+        # slots the concurrent side-stream copy may be mid-write. Zero-store and exit
+        # without reading the slot (a torn scale byte decodes to NaN, and 0*NaN != 0).
+        w0 = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        if w0 == 0.0:
+            tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=compute_type), mask=(route_id < total_routes) & n_mask)
+            return
+    slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
     if slot < 0:
         # an inactive route (hybrid decode computes it on the CPU): zero contribution, and no read of
         # any slot -- a slot's storage may be uninitialized, and 0 * NaN is not 0
@@ -129,10 +139,11 @@ def _decode_dsfp4_moe_kernel(
 def _swiglu_kernel(
     gu_ptr,            # [R, 2I] gate_up (compute dtype)
     out_ptr,           # [R, I] activated (compute dtype)
-    R, I, limit,
+    R, I, limit, alpha,
     stride_gr, stride_gi, stride_or, stride_oi,
     BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, compute_type: tl.constexpr,
     ACT_BLOCK: tl.constexpr,  # > 0: fp8 (e4m3, ue8m0 per ACT_BLOCK) round-trip of the stored value, fused
+    IS_SITU: tl.constexpr,
 ):
     """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit)``.
 
@@ -140,17 +151,25 @@ def _swiglu_kernel(
     (6 elementwise launches over [R, I]) between the two FP4 GEMVs into one pass. With
     ``ACT_BLOCK`` the down projection's activation quant (``act_quant_fp8_inplace`` on the bf16
     value: ``s = 2**ceil(log2(max(|x|, 1e-4) / 448))``, e4m3 rounding, dequant) is applied to the
-    same tile before the store -- one launch and one memory pass fewer, bit-identical."""
+    same tile before the store -- one launch and one memory pass fewer, bit-identical.
+
+    ``IS_SITU`` (ERNIE 5.5 SituGLU): ``out = (alpha*tanh(gate/alpha)*sigmoid(gate)) *
+    (limit*tanh(up/limit))`` -- tanh softcaps instead of clamps, sigmoid on the RAW gate."""
     row = tl.program_id(0)
     cb = tl.program_id(1)
     offs = cb * BLOCK + tl.arange(0, BLOCK)
     mask = offs < I
     g = tl.load(gu_ptr + row * stride_gr + offs * stride_gi, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(gu_ptr + row * stride_gr + (I + offs) * stride_gi, mask=mask, other=0.0).to(tl.float32)
-    if HAS_LIMIT:
-        g = tl.minimum(g, limit)
-        u = tl.minimum(tl.maximum(u, -limit), limit)
-    act = (g * tl.sigmoid(g)) * u
+    if IS_SITU:
+        g = (alpha * libdevice.tanh(g / alpha)) * tl.sigmoid(g)
+        u = limit * libdevice.tanh(u / limit)
+        act = g * u
+    else:
+        if HAS_LIMIT:
+            g = tl.minimum(g, limit)
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+        act = (g * tl.sigmoid(g)) * u
     if ACT_BLOCK > 0:
         tl.static_assert(BLOCK % ACT_BLOCK == 0, "the tile holds whole quant blocks")
         xs = tl.reshape(act.to(compute_type).to(tl.float32), (BLOCK // ACT_BLOCK, ACT_BLOCK))  # the value the store would hold
@@ -297,9 +316,10 @@ def _compute_type(dtype: torch.dtype):
     return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[dtype]
 
 
-def fused_swiglu(gate_up: torch.Tensor, limit: float, *, act_block: int = 0) -> torch.Tensor:
+def fused_swiglu(gate_up: torch.Tensor, limit: float, *, act_block: int = 0, situ_alpha: float | None = None) -> torch.Tensor:
     """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``). ``act_block > 0``
-    also applies the down projection's fp8 activation round-trip (block ``act_block``) in the same pass."""
+    also applies the down projection's fp8 activation round-trip (block ``act_block``) in the same pass.
+    ``situ_alpha`` switches to ERNIE 5.5 SituGLU (``limit`` is then the up softcap)."""
     *lead, two_I = gate_up.shape
     I = two_I // 2
     gu = gate_up.reshape(-1, two_I)
@@ -309,10 +329,11 @@ def fused_swiglu(gate_up: torch.Tensor, limit: float, *, act_block: int = 0) -> 
     assert act_block == 0 or (I % act_block == 0 and BLOCK % act_block == 0), (I, act_block)
     grid = (R, triton.cdiv(I, BLOCK))
     _swiglu_kernel[grid](
-        gu, out, R, I, float(limit),
+        gu, out, R, I, float(limit), float(situ_alpha or 1.0),
         gu.stride(0), gu.stride(1), out.stride(0), out.stride(1),
         BLOCK=BLOCK, HAS_LIMIT=limit > 0,
-        compute_type=_compute_type(gate_up.dtype), ACT_BLOCK=act_block, num_warps=4,
+        compute_type=_compute_type(gate_up.dtype), ACT_BLOCK=act_block,
+        IS_SITU=situ_alpha is not None, num_warps=4,
     )
     return out.reshape(*lead, I)
 

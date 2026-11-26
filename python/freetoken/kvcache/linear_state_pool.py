@@ -375,6 +375,17 @@ def linear_state_bytes_per_req(
 __all__ = ["LinearStatePool", "linear_state_bytes_per_req"]
 
 
+def _spec_only_linear_group():
+    """A zero-layer GDN group for a target with no linear tower whose draft still keeps
+    per-request slot_states (ERNIE DSpark); its conv/recurrent tensors are empty."""
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    return LinearGatedDeltaGroupConfig(
+        name="spec_state", layer_ids=(), num_key_heads=1, num_value_heads=1,
+        key_head_dim=1, value_head_dim=1, conv_kernel_dim=2, output_gate="silu",
+    )
+
+
 def state_pool_bytes(config, num_slots: int | None = None) -> int:
     """Total GDN state-pool bytes at ``num_slots`` PHYSICAL slots (default: the startup
     slot count). The engine adds this to the KV family's fixed cost when budgeting --
@@ -382,9 +393,9 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     linear_group = config.model_config.linear_attention_group()
     slot_states = getattr(config, "slot_states", ())
     if linear_group is None:
-        if slot_states:
-            raise ValueError("slot_states ride the linear-state slots; model has no linear group")
-        return 0
+        if not slot_states:
+            return 0
+        linear_group = _spec_only_linear_group()
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
     per_req = linear_state_bytes_per_req(
         linear_group, config.tp_info.size, config.dtype, slot_states
@@ -395,7 +406,11 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
 def verify_scratch_bytes(config, rows_per_req: int) -> int:
     """Bytes of the LinearVerifyScratch the engine builds for verify batches of ``rows_per_req`` rows per request (0 when it is 1)."""
     group = config.model_config.linear_attention_group()
-    if group is None or rows_per_req <= 1:
+    if group is None:
+        if not getattr(config, "slot_states", ()):
+            return 0
+        group = _spec_only_linear_group()
+    if rows_per_req <= 1:
         return 0
     n_layers, conv_dim, hv, hk = _linear_local_dims(group, config.tp_info.size)
     rows = n_layers * config.max_running_req * rows_per_req

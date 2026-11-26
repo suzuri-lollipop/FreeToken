@@ -44,6 +44,22 @@ def ensure_tml_generation_prompt(tokenizer: Any) -> None:
     tokenizer.chat_template = template + "{%- if add_generation_prompt -%}<|message_model|>{%- endif -%}"
 
 
+def _ensure_family_hf_config(model_path: str) -> None:
+    """Register a family's transformers PretrainedConfig before AutoTokenizer runs.
+
+    A checkpoint with a custom tokenizer via ``auto_map`` (ERNIE's ErnieChatTokenizer)
+    makes AutoTokenizer resolve AutoConfig internally; transformers' RoPE standardization
+    then reads ``max_position_embeddings`` off the config class. The engine config path
+    sidesteps this with RawConfigShim, but the tokenizer worker needs the real class.
+    """
+    try:
+        model_type = _raw_config_json(model_path).get("model_type")
+    except Exception:
+        return
+    if model_type == "ernie5_5_moe":
+        import freetoken.models.ernie5_5_moe.config  # noqa: F401  (registers Ernie55HFConfig)
+
+
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     from freetoken.models.gguf.reader import gguf_config_source
 
@@ -51,7 +67,10 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
         from freetoken.models.gguf.tokenizer import load_gguf_tokenizer
 
         return load_gguf_tokenizer(gguf_src)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    _ensure_family_hf_config(model_path)
+    # trust_remote_code: families whose tokenizer ships in the checkpoint (ERNIE's
+    # ErnieChatTokenizer via auto_map) refuse to load without it.
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
         try:

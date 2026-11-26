@@ -23,6 +23,9 @@ class AttnType(str, Enum):
     # DSV41 (DeepSeek-V4.1): window + cross-layer-shared compressed KV in packed fp8/fp4
     # rows, Full/Reindex/Reuse layer modes -> DSV41PagedKVCache
     DSV41 = "dsv41"
+    # ERNIE 5.5: DSV4 window+compressed HCA layers + token-level MLA/DSA layers
+    # (full-history latent + index slabs) in one pool -> Ernie55PagedKVCache
+    ERNIE55 = "ernie55"
     LINEAR = "linear"  # GDN/mamba state layers -> LinearStatePool
     # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
     # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache

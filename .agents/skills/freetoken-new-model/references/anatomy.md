@@ -109,6 +109,22 @@ a shared layer op over a family-private copy when the math matches.
   `self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)`.
 - `python/freetoken/engine/config.py` - `ple_backend: str = "disk"`.
 - `python/freetoken/server/args.py` - `--ple-backend` flag.
+- `python/freetoken/server/function_call_parser.py` - the family's detector
+  class, its `FunctionCallParser` map entry, and the opener tag in
+  `TOOLS_TAG_LIST` (streaming tool-call detection).
+- `python/freetoken/server/reasoning_parser.py` - the family's parser class
+  and its `ReasoningParser` map entry (`force_reasoning` matches the chat
+  template's thinking default).
+- `python/freetoken/server/args.py` - the auto-resolution cascade
+  (`_infer_tool_call_parser` / `_infer_reasoning_parser`) AND the explicit
+  `choices` lists of `--tool-call-parser` / `--reasoning-parser`. These are
+  four independent tables; a name the cascade resolves but the choices list
+  lacks is rejected by argparse on explicit selection while `auto` works.
+  Checklist and CPU verification: `references/delivery-completeness.md`.
+- `python/freetoken/calibrate_multi.py` - `spec_backends_for`'s model_type
+  map: the family's speculative contract (own drafter -> swap the arm;
+  config-time refusal -> no arm). The generic fallback offers mtp + dflash
+  and excludes the doomed arm at server start - registration, not fallback.
 
 ## 6. Kernels: `python/freetoken/kernel/triton/`
 
@@ -140,9 +156,27 @@ int64 row addressing throughout. Later perf work added `nvfp4_linear.py`,
 
 ## 8. Docs
 
-- `docs/models.md` - checkpoint table row (HF / NVFP4 links), GGUF family
-  alias row (`qwen4exp`), image-token table, family notes (PLE backends,
-  KV-cache dtype guidance for long context).
+- `docs/models.md` - checkpoint table row (HF / NVFP4 links; siblings as
+  extra links in the same row), GGUF family alias row (`qwen4exp`),
+  image-token table, family notes (PLE backends, KV-cache dtype guidance
+  for long context). The Notes entry records the family's serving facts: MoE
+  strategy, TP, KV dtype support (the pool's `kv_formats`), draft support,
+  rope scaling bundled or not + the trained ceiling, KV bytes/token from the
+  cost model. TP / draft / GGUF are mandatory requirements, so a "limitation"
+  there is only a surfaced exception the owner agreed to solve next - never a
+  silent "not yet" shipped instead of the requirement
+  (`references/delivery-completeness.md`).
 - `docs/cli.md` - new flags (`--ple-backend`), speculative-draft options.
 - `docs/qwen38_flash_next_optimizations.md` - perf analysis + A/B numbers
   (pattern to copy for performance work).
+
+## 9. Delivery completeness - MANDATORY (TP / drafts / GGUF / parsers / calibration)
+
+`tp_supported` and `spec_drafts` in the ModelSpec are required deliverables,
+not defaults to leave unset: a family shipped TP1-only with an unserved
+bundled draft head, no GGUF reader, and auto-only parser selection is NOT
+delivered. TP >= 2, speculative draft, GGUF, the parser four-table
+registration and the calibration family map are MANDATORY requirements -
+implement and verify them on real hardware. The gates to clear (offload
+expert TP refusal, window-tier KV spec refusal) and the checklist are in
+`references/delivery-completeness.md`.

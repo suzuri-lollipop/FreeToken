@@ -67,6 +67,10 @@ def _model_config(kind):
     elif kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
         specs = (_spec("dsv4", AttnType.DSV4, sliding_window=128),)
+    elif kind == "ernie55":
+        mc.model_type = "ernie5_5_moe"
+        mc.dsv4_args = SimpleNamespace(window_size=128)
+        specs = (_spec("ernie55", AttnType.ERNIE55, sliding_window=128),)
     elif kind == "bsa":
         # MiniMax-M3 shape: one FULL-family group, mla=False + index dims -> BSA.
         specs = (_spec("full", AttnType.BSA, index_head_dim=128),)
@@ -116,6 +120,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
         ("mla", "dsa"),  # plain latent MLA
         ("dsa", "dsa"),  # MLA + DSA indexer (GLM-5.2 shape)
         ("dsv4", "dsv4_sparse"),
+        ("ernie55", "ernie55_sparse"),  # ERNIE 5.5 HCA+DSA hybrid
         ("bsa", "m3_sparse"),  # MiniMax-M3 block-sparse GQA
         ("qsa", "qsa_sparse"),  # Qwen3.8-Flash-Next compressed-block sparse
     ],
@@ -185,11 +190,12 @@ def test_qsa_rejects_float32_dtype(monkeypatch):
         _adjust_config(config)
 
 
-def test_auto_dsv4_sets_window_page_size(monkeypatch):
+@pytest.mark.parametrize("kind", ["dsv4", "ernie55"])
+def test_auto_dsv4_sets_window_page_size(monkeypatch, kind):
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch)
-    config = _config("dsv4", attention_backend="auto")
+    config = _config(kind, attention_backend="auto")
     _adjust_config(config)
     assert config.page_size == 128
 
@@ -221,6 +227,9 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
         ("dsv4", "fa"),
         ("dsv4", "triton"),
         ("dsv4", "trtllm"),
+        ("ernie55", "fi"),
+        ("ernie55", "dsv4_sparse"),  # the neighbouring DSV4 backend lacks the DSA tiers
+        ("full", "ernie55_sparse"),
         ("swa", "fa"),
         ("swa", "fi"),
         # comma pairs are validated per part
@@ -245,6 +254,7 @@ def test_illegal_combinations_rejected_at_config_time(monkeypatch, kind, backend
         ("mla", "dsa"),
         ("dsa", "dsa"),
         ("dsv4", "dsv4_sparse"),
+        ("ernie55", "ernie55_sparse"),
         ("qsa", "qsa_sparse"),
         ("swa", "triton"),
         ("full", "triton"),

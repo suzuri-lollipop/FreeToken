@@ -170,7 +170,8 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         P = dsv4_args.window_size
         floor = _dsv4_window_floor_pages(config, P)
         per_page, fixed, min_reserve_tokens = dsv4_auto_cost_model(
-            dsv4_args, _dsv4_swa_ratio(config), floor, P=P, n_scratch=config.max_running_req + 1
+            dsv4_args, _dsv4_swa_ratio(config), floor, P=P,
+            n_scratch=config.max_running_req * getattr(config, "decode_rows_per_req", 1) + 1,
         )
         return per_page, fixed, config.page_size, min_reserve_tokens
 
@@ -193,7 +194,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
             sizes = dsv4_solve_num_pages(
                 available_memory, dsv4_args, _dsv4_swa_ratio(config),
                 floor_win_pages=_dsv4_window_floor_pages(config, P), P=P,
-                n_scratch=config.max_running_req + 1,
+                n_scratch=config.max_running_req * getattr(config, "decode_rows_per_req", 1) + 1,
             )
             # The solver fits PHYSICAL pages to memory; one is the dummy page, so the
             # usable (advertised) count is one less.
@@ -316,7 +317,11 @@ class DSV4PagedKVCache(WindowTierPagedPool):
 
     # ----- specialized writes -----
     def store_window(self, k: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
-        self.window_pool[layer_id].index_copy_(0, window_slot, k.to(self._dtype))
+        # -1 (unmapped / slid-out-of-window, e.g. the warmup prefill's dummy row) routes to
+        # the reserved last dummy slot so the scatter stays graph-safe and in bounds
+        dummy = self.window_pool[layer_id].shape[0] - 1
+        slot = torch.where(window_slot >= 0, window_slot, torch.full_like(window_slot, dummy))
+        self.window_pool[layer_id].index_copy_(0, slot, k.to(self._dtype))
 
     def store_compressed(self, kv: torch.Tensor, layer_id: int, cmp_slot: torch.Tensor) -> None:
         pool = self.cmp_pool[layer_id]

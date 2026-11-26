@@ -219,7 +219,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     sliding_window: int  # the P-token window page
     # "v41": DeepSeek-V4.1's cross-layer-shared packed tiers (AttnType.DSV41, its own pool and backend)
-    variant: Literal["v4", "v41"] = "v4"
+    # "ernie55": ERNIE 5.5's HCA tiers + token-level DSA slabs (AttnType.ERNIE55)
+    variant: Literal["v4", "v41", "ernie55"] = "v4"
     # image token spans attend to each other in both directions, so prefill chunks end
     # before a block instead of splitting it (the scheduler's keep_images_whole gate)
     bidirectional_mm_blocks: bool = False
@@ -231,6 +232,14 @@ AttentionGroupConfig: TypeAlias = (
     | LinearGatedDeltaGroupConfig
     | DSV4AttentionGroupConfig
 )
+
+
+def _dsv4_group_attn_type(group: DSV4AttentionGroupConfig) -> AttnType:
+    if group.variant == "v41":
+        return AttnType.DSV41
+    if group.variant == "ernie55":
+        return AttnType.ERNIE55
+    return AttnType.DSV4
 
 
 def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
@@ -497,7 +506,7 @@ class ModelConfig:
         if isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
-            return AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4
+            return _dsv4_group_attn_type(group)
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -551,7 +560,7 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4,
+                        attn_type=_dsv4_group_attn_type(group),
                     )
                 )
         return tuple(specs)

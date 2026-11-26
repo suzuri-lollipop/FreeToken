@@ -43,6 +43,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
+    if AttnType.ERNIE55 in types:
+        from .dsv4.ernie55_pool import Ernie55PagedKVCache
+
+        return Ernie55PagedKVCache
     if AttnType.DSV4 in types:
         from .dsv4.v4_pool import DSV4PagedKVCache
 
@@ -101,6 +105,23 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
             n_scratch=config.max_running_req + 1,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
+    from .dsv4.ernie55_pool import Ernie55PagedKVCache, _ernie55_pool_sizes
+
+    if resolve_pool_class(model_config) is Ernie55PagedKVCache:
+        # ERNIE 5.5: the DSV4 window/compressed tiers + full-history DSA slabs,
+        # same generic-CacheManager route (the swa_pool plug-in).
+        pool = Ernie55PagedKVCache(
+            sizes=_ernie55_pool_sizes(config, num_pages + 1),  # +1 for dummy page
+            args=model_config.dsv4_args,
+            device=device,
+            dtype=dtype,
+            P=model_config.dsv4_args.window_size,
+            # a spec verify scatters rows_per_req query rows per request to scratch
+            n_scratch=config.max_running_req * getattr(config, "decode_rows_per_req", 1) + 1,
+            kv_format=getattr(config, "kv_format", NONE),
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool

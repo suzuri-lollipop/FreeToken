@@ -263,7 +263,8 @@ def spec_backends_for(requested: str, draft_path: str | None, *,
                       model_type: str | None = None, tp: int = 1) -> list[tuple[str, str]]:
     """Resolve --spec into (algo, skip_reason) pairs. 'auto' offers the backends the
     target can serve: Inkling-2-Mini (model_type inkling2_loop, HF config or GGUF
-    architecture) drafts with dspark, other checkpoints get mtp + dflash; an
+    architecture) drafts with dspark, ERNIE 5.5 (ernie5_5_moe) refuses speculation
+    at config time so it gets no arm, other checkpoints get mtp + dflash; an
     unreadable model type keeps mtp + dflash and leaves dspark to an explicit
     --spec. dflash is skipped without a draft checkpoint, dspark outside
     inkling2_loop or above tp 1, rather than failing the run."""
@@ -272,6 +273,8 @@ def spec_backends_for(requested: str, draft_path: str | None, *,
     if requested.strip().lower() == "auto":
         if model_type == "inkling2_loop":
             algos = ["dspark", "mtp", "dflash"]
+        elif model_type == "ernie5_5_moe":
+            algos = []  # window-tier KV + unserved DSpark head: spec refused at config time
         else:
             algos = ["mtp", "dflash"]
     else:
@@ -281,7 +284,10 @@ def spec_backends_for(requested: str, draft_path: str | None, *,
                 raise ValueError(f"--spec: unknown backend {a!r} (have: {', '.join(SPEC_ALGOS)})")
     out = []
     for a in algos:
-        if a == "dflash" and not draft_path:
+        if model_type == "ernie5_5_moe":
+            out.append((a, "ERNIE 5.5 refuses speculative decoding at config time "
+                           "(window-tier KV; bundled DSpark head unserved)"))
+        elif a == "dflash" and not draft_path:
             out.append((a, "no DFlash 2 draft checkpoint (--spec-draft-path)"))
         elif a == "dspark" and model_type not in (None, "inkling2_loop"):
             out.append((a, "dspark drafts Inkling-2-Mini (inkling2_loop) only"))

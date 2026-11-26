@@ -117,6 +117,22 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "ernie55_sparse",
+    # TP via REPLICATED attention: ERNIE is MQA (one shared latent KV head, K==V) with a
+    # VHA cross-head post-mix, so the query heads are not sharded -- every rank attends the
+    # full heads against the replicated KV pool (the geometry gate replicates the single KV
+    # head). The MLPs and routed experts shard instead. supports_tp here means "correct at
+    # TP>1 with replicated attention/KV", not "shards heads".
+    BackendInfo(supported_types=frozenset({AttnType.ERNIE55}), supports_tp=True,
+                uniform_extend_graph="host_plan", kv_formats=ROW_SCALE_FORMATS),
+)
+def create_ernie55_sparse_backend(config: ModelConfig):
+    from .ernie55_sparse import Ernie55SparseAttnBackend
+
+    return Ernie55SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv41_sparse",
     BackendInfo(supported_types=frozenset({AttnType.DSV41})),
 )

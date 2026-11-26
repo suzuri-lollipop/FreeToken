@@ -12,7 +12,9 @@ Structure follows ``dsv4/sparse_attn.py``'s prefill kernel, with three deltas:
   part and the 64-dim rope tail separately (``tl.arange`` needs pow-2 spans) and the
   score is the sum of the two partial dots. The accumulator only carries the 512
   value dims -- the rope tail contributes to scores, never to the output.
-* one pool, no window half (``n_window == 0`` always), no attention sink.
+* one pool, no window half (``n_window == 0`` always); an OPTIONAL per-head
+  attention sink (``sink=``, ERNIE 5.5) joins the softmax denominator as a null
+  key with zero value -- None keeps the historical no-sink math bit-identical.
 * ``counts`` (device ``[b, m]`` int32) bounds the columns a CUDA-graph replay
   visits, exactly like DSV4's ``cmp_counts``; ``-1`` indices are masked, so the
   kernel is exact for ``kv_len < topk`` (short contexts select every live row and
@@ -39,7 +41,7 @@ MIN_TILES_PER_SPLIT = 4
 
 @triton.jit
 def _glm_dsa_sparse_kernel(
-    q_ptr, pool_ptr, scale_ptr, o_ptr, idx_ptr, cnt_ptr,
+    q_ptr, pool_ptr, scale_ptr, o_ptr, idx_ptr, cnt_ptr, sink_ptr,
     scale,
     H, TOPK,
     stride_qb, stride_qm, stride_qh, stride_qd,
@@ -53,6 +55,7 @@ def _glm_dsa_sparse_kernel(
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
     HAS_ROPE: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     KV_FMT: tl.constexpr,
     KV_OFFSET_DTYPE: tl.constexpr,
 ):
@@ -105,6 +108,15 @@ def _glm_dsa_sparse_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(kv_v.dtype), kv_v)
         m_i = m_new
+
+    if HAS_SINK:
+        # Attention sink (ERNIE 5.5): a null key with logit sink[h] and zero value joins
+        # the denominator once, at the end (dsv4/sparse_attn.py precedent).
+        sink = tl.load(sink_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+        m_final = tl.maximum(m_i, sink)
+        alpha = tl.where(m_final == -float("inf"), 1.0, tl.exp(m_i - m_final))
+        l_i = l_i * alpha + tl.where(m_final == -float("inf"), 0.0, tl.exp(sink - m_final))
+        acc = acc * alpha[:, None]
 
     o = acc / l_i[:, None]
     o_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + offs_h[:, None] * stride_oh + offs_v[None, :] * stride_od
@@ -300,22 +312,28 @@ def _glm_dsa_splitk_kernel(
 
 @triton.jit
 def _glm_dsa_merge_kernel(
-    mid_o_ptr, mid_lse_ptr, o_ptr,
+    mid_o_ptr, mid_lse_ptr, o_ptr, sink_ptr,
     stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
     stride_lb, stride_lm, stride_lh, stride_ls,
     stride_ob, stride_om, stride_oh, stride_od,
     D_V: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
-    """Stage 2: log-sum-exp merge over the splits (no attention sink -- GLM DSA has none,
-    so the running max/denominator start empty instead of seeded by a null key)."""
+    """Stage 2: log-sum-exp merge over the splits. Without a sink the running
+    max/denominator start empty; with one (ERNIE 5.5) the sink seeds them as a null
+    key with logit sink[h] and zero value (dsv4/sparse_attn.py precedent)."""
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
     offs_v = tl.arange(0, D_V)
 
-    m_i = -float("inf")
-    l_i = 0.0
+    if HAS_SINK:
+        m_i = tl.load(sink_ptr + pid_h).to(tl.float32)
+        l_i = 1.0  # the sink's own exp(sink - m_i) == 1
+    else:
+        m_i = -float("inf")
+        l_i = 0.0
     acc = tl.zeros((D_V,), dtype=tl.float32)
 
     mid_base = (
@@ -366,6 +384,7 @@ def glm_dsa_sparse_attn(
     out: torch.Tensor | None = None,     # [b, m, h, d_v] to write into, any strides
     kv_format: KVFormat = NONE,
     scale: torch.Tensor | None = None,   # [rows, 2] fp32 (ckv, kpe) when the pool is quantized
+    sink: torch.Tensor | None = None,    # [h] fp32 attention sink (ERNIE 5.5); None = no sink
 ) -> torch.Tensor:
     """Sparse MLA attention over gathered latent rows; returns ``[b, m, h, d_v]``.
 
@@ -412,6 +431,12 @@ def glm_dsa_sparse_attn(
         stride_nb, stride_nm = cnt.stride()
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0
+    has_sink = sink is not None
+    if has_sink:
+        assert sink.shape == (h,) and sink.dtype == torch.float32
+        sink_arg = sink.contiguous()
+    else:
+        sink_arg = q
 
     n_splits = _split_count(b, m, h, topk, q.device) if force_splits is None else force_splits
     if n_splits:
@@ -435,18 +460,18 @@ def glm_dsa_sparse_attn(
         )
         grid2 = (m, b, h)
         _glm_dsa_merge_kernel[grid2](
-            mid_o, mid_lse, o,
+            mid_o, mid_lse, o, sink_arg,
             mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
             mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            D_V=d_v, NUM_SPLITS=n_splits,
+            D_V=d_v, NUM_SPLITS=n_splits, HAS_SINK=has_sink,
             num_warps=4,
         )
         return o
 
     grid = (m, b, triton.cdiv(h, BLOCK_H))
     _glm_dsa_sparse_kernel[grid](
-        q, pool_2d, scale_arg, o, idx, cnt,
+        q, pool_2d, scale_arg, o, idx, cnt, sink_arg,
         float(softmax_scale),
         h, topk,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -456,7 +481,7 @@ def glm_dsa_sparse_attn(
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=block_t,
-        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, KV_FMT=kv_format.name, KV_OFFSET_DTYPE=offset_dtype,
+        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, HAS_SINK=has_sink, KV_FMT=kv_format.name, KV_OFFSET_DTYPE=offset_dtype,
         num_warps=num_warps, num_stages=2,
     )
     return o

@@ -345,6 +345,34 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
             "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
         ),
     ),
+    # ERNIE 5.5 Flash Preview (model_type ernie5_5_moe): HCA layers ride the DSV4
+    # window+compressed machinery (dsv4_args carries Ernie55Args); DSA layers add
+    # token-level latent/index slabs to the same pool. The checkpoint's dense fp8
+    # scales are F32 weight_scale_inv despite scale_fmt ue8m0 (that field describes
+    # the MXFP4 expert scales), so the dialect reads float scales.
+    "Ernie5_5_MoeForCausalLM": ModelSpec(
+        "freetoken.models.ernie5_5_moe",
+        "Ernie55ForCausalLM",
+        checkpoint_roots=(("model.embed", "model.embed_tokens"), ("model.head", "lm_head")),
+        checkpoint_segments=(("attn", "self_attn"),),
+        packed_modules_mapping=_EXPERTS_W123_PACKED,
+        unquantized_modules=("model.embed_tokens", "lm_head", "*.self_attn.kv_b_proj"),
+        quant_overrides=(("scale_fmt", ""),),
+        # TP: MLPs (col/row parallel) + vocab shard in the reader, routed MXFP4 experts shard
+        # in the bank pack; attention/KV stay replicated (MQA + VHA cross-head).
+        tp_supported=True,
+        spec_drafts=(("dspark", "freetoken.spec.dspark.ernie55:Ernie55DSparkProposer"),),
+    ),
+    # Strata-convention GGUF (HF-name-preserving, no llama.cpp converter transforms):
+    # the same model class, dense weights read by HF name from the GGUF index.
+    "Ernie5_5_MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.ernie5_5_moe",
+        "Ernie55ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_EXPERTS_W123_PACKED,
+        tp_supported=True,
+    ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5MoeForConditionalGeneration",

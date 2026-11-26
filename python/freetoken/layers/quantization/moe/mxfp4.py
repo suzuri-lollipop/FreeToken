@@ -6,7 +6,7 @@ import torch
 
 from ..registry import LayerKind, register_method
 from ..scheme import MX_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod, tp_piece, tp_rows
 
 E8M0 = torch.float8_e8m0fnu
 
@@ -18,21 +18,32 @@ class TritonMxfp4MoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "ds_fp4"
     supports_inactive_slots = True
+    supports_skip_w0 = True  # _decode_dsfp4_moe_kernel zero-stores w==0 routes unread
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.interleaved:
             return "standard MXFP4 kernel reads the concatenated gate|up row order"
-        if (cfg.alpha, cfg.beta) != (1.0, 0.0):
+        if cfg.activation == "situ":
+            # ERNIE 5.5 SituGLU: alpha is the gate tanh softcap, limit the up softcap.
+            if cfg.beta != 0.0 or cfg.limit is None:
+                return "situ experts need beta=0 and an up softcap (limit)"
+        elif (cfg.alpha, cfg.beta) != (1.0, 0.0):
             return "standard MXFP4 kernel has no alpha / beta in its swiglu"
         if cfg.act_block is None:
             return "W4A8 ds_fp4 experts need the fp8 activation quant block"
-        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        # TP: the banks hold this rank's intermediate slice (layout/pack above), the down
+        # GEMM sums only that slice, and the MoE layer all-reduces the partials. The decode
+        # GEMV needs K//2 % 128 == 0 (local intermediate a multiple of 256); the prefill
+        # grouped GEMM has no such floor.
+        return self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False)
 
     def cpu_options(self, cfg: MoEConfig) -> dict[str, int]:
         return {"act_block": int(cfg.act_block)}
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # banks hold this rank's slice of the expert intermediate (local == full at TP1,
+        # so the resident/offload TP1 layout is byte-identical); pack() cuts the matching slice
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), E8M0),
@@ -41,10 +52,26 @@ class TritonMxfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        out["gate_up"].copy_(fused_piece(pieces, "gate_up").view(torch.uint8))
-        out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale").view(E8M0))
-        out["down"].copy_(pieces["down"].view(torch.uint8))
-        out["down_scale"].copy_(pieces["down_scale"].view(E8M0))
+        gu = fused_piece(pieces, "gate_up").view(torch.uint8)
+        gus = fused_piece(pieces, "gate_up_scale").view(E8M0)
+        down = pieces["down"].view(torch.uint8)
+        downs = pieces["down_scale"].view(E8M0)
+        if cfg.tp_size > 1:
+            # the reader hands over full experts; this rank banks its own intermediate slice
+            # (gate|up rows, down columns). tp_piece takes the cut in each piece's own grain
+            # (packed e2m1 pairs /2, e8m0 scale groups /GROUP), so the scales stay aligned.
+            lo, hi = cfg.local_intermediate_range
+            total = cfg.intermediate
+            # pieces carry the expert axis first: the intermediate is dim 1 of the fused
+            # gate|up (2*total rows) and dim 2 of down (packed columns) -- the NVFP4 axes
+            gu = tp_rows(gu, 1, lo, hi, total)
+            gus = tp_rows(gus, 1, lo, hi, total)
+            down = tp_piece(down, 2, lo, hi, total)
+            downs = tp_piece(downs, 2, lo, hi, total)
+        out["gate_up"].copy_(gu)
+        out["gate_up_scale"].copy_(gus)
+        out["down"].copy_(down)
+        out["down_scale"].copy_(downs)
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
@@ -52,13 +79,17 @@ class TritonMxfp4MoEKernel(MoEKernel):
         banks = (t["gate_up"], t["gate_up_scale"], t["down"], t["down_scale"])
         limit = limit_or_inf(layer)
         act_block = layer.quant_method.cfg.act_block
+        situ_alpha = float(layer.alpha) if layer.activation == "situ" else None
         if is_prefill and view.n is not None:
             from freetoken.moe.fused_ds_fp4 import routed_experts_fp4_prefill
 
-            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n, act_block=act_block)
+            return routed_experts_fp4_prefill(x, topk_ids, topk_weights, *banks, limit, view.n, act_block=act_block, situ_alpha=situ_alpha)
         from freetoken.moe.fused_ds_fp4 import routed_experts_fp4
 
-        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block)
+        # _moe_skip_w0 is a capture-time transient set by the fetch-overlap decode
+        # (layers/moe.py): each pass zero-stores the other half's routes unread.
+        return routed_experts_fp4(x, topk_ids, topk_weights, *banks, limit, act_block=act_block, situ_alpha=situ_alpha,
+                                  skip_w0=getattr(layer, "_moe_skip_w0", False))
 
 
 class TritonGptossMxfp4MoEKernel(MoEKernel):
