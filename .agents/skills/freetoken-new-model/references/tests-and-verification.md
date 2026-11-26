@@ -10,7 +10,8 @@ name the future change that would turn it red. If the only answer is
   a number, a wrong cache slot, a crash only one interleaving/checkpoint hits);
 - properties that took reasoning to get right, checked against something
   INDEPENDENT (torch reference, round-trip, CPU mirror, live registry);
-- bookkeeping that is easy to forget (registry exports, arch -> parser maps).
+- bookkeeping that is easy to forget (registry exports, arch -> parser maps,
+  CLI choices lists, calibration tool family maps).
 
 Not admitted: happy-path restatements, config tests echoing fixture values,
 `assert_called*` / "no exception" checks. Extend an existing parametrize /
@@ -81,6 +82,11 @@ ft serve --model <checkpoint> --ple-backend disk|pinned|gpu
 - Verify a fix by re-running what failed (the command/request/checkpoint
   from the issue) and report the result; if you cannot run it, say so and
   say what you ran instead. Verification alone does not call for a new test.
+- Parser registration and the calibration family map are CPU-verifiable
+  (explicit-choices parse, `spec_backends_for`) - run them. The streaming
+  matrix tests the parser classes, not the CLI choices; auto resolution
+  working is not evidence the choices list was extended. See
+  `references/delivery-completeness.md`.
 - Check both prefill and decode, chunked prefill + prefix reuse, CUDA-graph
   decode, and (if supported) speculative verify with rejected rows.
 - Performance changes: A/B end-to-end numbers against `main` - same model,
@@ -92,10 +98,22 @@ ft serve --model <checkpoint> --ple-backend disk|pinned|gpu
 ## Docs to update with a new family
 
 - `docs/models.md`: supported-checkpoint table row (HF / FP8 / NVFP4 / GGUF
-  links), GGUF family alias table, image-token table (if multimodal),
-  family notes (host tables, KV dtype guidance, TP limits, draft options).
+  links; siblings as extra links in the same row), GGUF family alias table,
+  image-token table (if multimodal), family notes (host tables, KV dtype
+  guidance, TP, draft). The Notes entry records the serving facts: MoE
+  strategy, TP, KV dtype support, draft support, bundled rope scaling +
+  trained ceiling, KV bytes/token. TP / draft / GGUF are mandatory, so a
+  "limitation" there is only a surfaced exception the owner agreed to solve
+  next - see `references/delivery-completeness.md`.
 - `docs/cli.md`: new flags and speculative-draft sources.
 - `docs/quickstart.md` when the serve example changes.
+- Delivery completeness (TP >= 2, speculative draft, GGUF, parser four-table
+  registration, calibration family map) is a set of MANDATORY requirements,
+  not a follow-up: checklist in `references/delivery-completeness.md`. Each
+  must be verified on real hardware - a TP=2 forward, a speculative verify
+  with rejected rows, a GGUF load - not just the TP1 path. The synthetic-
+  checkpoint harness (`tests/models/<family>/`) runs these on GPU without the
+  full-size weights.
 
 ## Commits / PRs
 

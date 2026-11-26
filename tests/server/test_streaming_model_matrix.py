@@ -86,6 +86,10 @@ CALL_BLOCKS = {
         '<minimax:tool_call><invoke name="read"><parameter name="filePath">'
         "/tmp/test_calc.py</parameter></invoke></minimax:tool_call>"
     ),
+    "ernie55": (
+        '<ernie:tool_call><invoke name="read"><parameter name="filePath">'
+        "/tmp/test_calc.py</parameter></invoke></ernie:tool_call>"
+    ),
     "minimax_m3": (
         "]<]minimax[>[<tool_call>\n"
         ']<]minimax[>[<invoke name="read">'
@@ -117,6 +121,7 @@ MARKUP_MARKERS = {
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
     "minimax": ["<minimax:tool_call>", "<invoke"],
+    "ernie55": ["<ernie:tool_call>", "<invoke"],
     "minimax_m3": ["]<]minimax[>[", "<invoke"],
     "mistral": ["[TOOL_CALLS]"],
     "llama3": ["<|python_tag|>"],
@@ -136,6 +141,7 @@ REASONING_FAMILIES = {
     "qwen": ("qwen25", "qwen3", "", "</think>"),
     "glm4.7": ("glm47", "glm", "", "</think>"),
     "minimax-m2": ("minimax", "minimax", "", "</think>"),
+    "ernie5.5": ("ernie55", "ernie55", "", "</ernie:think>"),
     # M3 adaptive mode: the model opens <mm:think> itself (enabled mode pre-opens it
     # in the template; the parser then runs with force_reasoning=True instead).
     "minimax-m3": ("minimax_m3", "minimax_m3", "<mm:think>", "</mm:think>"),

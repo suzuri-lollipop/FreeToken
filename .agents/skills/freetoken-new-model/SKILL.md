@@ -1,6 +1,6 @@
 ---
 name: freetoken-new-model
-description: FreeToken (this repository) に新しいモデルアーキテクチャを実装・追加するときに使う。Qwen3.8-Flash-Next (model_type qwen4_exp, NVFP4 / block-fp8 / GGUF) の実装全体から抽出した手順・凍結契約・チェックリスト・既知の落とし穴。Use when implementing or adding a new model / architecture / checkpoint family to FreeToken - model package, registry, weight readers, quantization dialects, attention backends, KV pools, slot states, Triton kernels, MoE expert banks, host tables, MTP drafts, GGUF support, TP sharding, tests and hardware verification. Triggers - 新モデル実装, モデル追加, 新アーキテクチャ対応, new model support, add model, model loader.
+description: FreeToken (this repository) に新しいモデルアーキテクチャを実装・追加するときに使う。Qwen3.8-Flash-Next (model_type qwen4_exp, NVFP4 / block-fp8 / GGUF) の実装全体から抽出した手順・凍結契約・チェックリスト・既知の落とし穴。Use when implementing or adding a new model / architecture / checkpoint family to FreeToken - model package, registry, weight readers, quantization dialects, attention backends, KV pools, slot states, Triton kernels, MoE expert banks, host tables, MTP drafts, GGUF support, TP sharding, server parser registration, TP and speculative-draft completeness, calibration tool family map, tests and hardware verification. Triggers - 新モデル実装, モデル追加, 新アーキテクチャ対応, パーサ登録, TP対応, ドラフト対応, GGUF対応, 必須要件, new model support, add model, model loader, parser choices, delivery completeness, mandatory requirements.
 ---
 
 # FreeToken new-model implementation
@@ -67,11 +67,20 @@ for a phase before doing that phase.
    attention backend, KV pool family, `SlotStateSpec` + verify handlers,
    scheduler chunk alignment, engine `load_host_tables` / pin-budget hook.
    -> `references/config-and-state.md`
-6. **Optional surfaces** - GGUF reader (undo the converter's transforms),
-   TP support, MTP / DFlash drafts, disk / pinned / GPU table backends,
-   dual-microbatch decode, feature-sink exports.
+6. **Architecture-specific surfaces** (required when the architecture has the
+   feature) - disk / pinned / GPU host-table backends, dual-microbatch decode,
+   feature-sink exports.
    -> `references/model-and-kernels.md`, `references/weights-and-quant.md`
-7. **Tests + verification + docs** - parity tests against independent
+7. **Delivery completeness - MANDATORY requirements (必須要件)** - parser
+   registration in all four tables (class maps, auto cascade, explicit CLI
+   choices), TP >= 2 support, speculative draft support, GGUF support, and the
+   calibration tool's model_type map. These are REQUIRED, not optional: a
+   model that serves at TP1 but cannot shard, cannot draft, has no GGUF
+   reader, or cannot be selected explicitly is NOT delivered. Implement and
+   verify each on real hardware; a genuine blocker is an exception to raise
+   with the owner, never a silent "not required this time".
+   -> `references/delivery-completeness.md`
+8. **Tests + verification + docs** - parity tests against independent
    references, subsystem tests for new pools/backends, real serve run,
    `docs/models.md` + `docs/cli.md` entries, A/B numbers for perf changes.
    -> `references/tests-and-verification.md`
@@ -79,7 +88,9 @@ for a phase before doing that phase.
 Before calling any phase done, sweep `references/lessons.md`: it lists the
 concrete bugs the qwen4_exp follow-up history fixed (TP fusion order, quant
 dialect names, GGUF converter transforms, disk-PLE staging sizes, MTP source
-checks, pin-budget ordering). Most new-model bugs are repeats of these.
+checks, pin-budget ordering) and the delivery gaps the ERNIE 5.5 addition
+exposed (parser choices, TP1-only, unserved draft head, calibration family
+map). Most new-model bugs are repeats of these.
 
 ## Frozen contracts (do not rename or reshape)
 
@@ -111,5 +122,6 @@ Read the file for the phase you are in; the table is the complete list.
 | Config parsing, ModelConfig payload, attention groups, slot states, KV pool, attention backend, scheduler / engine hooks | `references/config-and-state.md` |
 | Weight reader, QuantConfig dialects, fusions, TP slicing, PLE table, NVFP4 expert spec, GGUF transforms, FTW side files | `references/weights-and-quant.md` |
 | Model skeleton, HC / GDN / QSA / MoE / PLE modules, kernel vendoring, MTP draft, dual decode, feature sink | `references/model-and-kernels.md` |
+| Delivery completeness - MANDATORY requirements: parser registration (four tables), TP >= 2, speculative draft, GGUF, calibration tool family map | `references/delivery-completeness.md` |
 | Test layout and parity oracles, the test bar, run commands, hardware verification, docs, commits | `references/tests-and-verification.md` |
-| Silent-failure lessons from the qwen4_exp fix history, grouped by subsystem | `references/lessons.md` |
+| Silent-failure lessons from the qwen4_exp fix history and the ERNIE 5.5 registration gaps, grouped by subsystem | `references/lessons.md` |

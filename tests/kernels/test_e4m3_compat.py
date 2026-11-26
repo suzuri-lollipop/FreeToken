@@ -201,6 +201,8 @@ def _emit_all(path: str) -> None:
     out["blk_aq_y"], out["blk_aq_s"] = f32(aq_y), aq_s.cpu()
     out["blk_gemv"] = f32(block_fp8_linear(x1, w, bs))
     out["blk_gemm"] = f32(block_fp8_linear(xm, w, bs))
+    from freetoken.kernel.triton.fp8_block_linear import block_fp8_gemv_rows
+    out["blk_gemv_rows"] = f32(block_fp8_gemv_rows(xm[:8], w, bs))
 
     # block-fp8 offload experts
     E, H, inter = 4, 256, 128
@@ -266,6 +268,26 @@ def _child_env(tmp_path, **extra) -> dict:
     env["TRITON_CACHE_DIR"] = str(tmp_path / "triton-cache")
     env.update(extra)
     return env
+
+
+# ======================================================================================
+# 1b. Multi-row decode GEMV: spec-verify rows must be bit-identical to M=1 decode.
+# ======================================================================================
+@pytest.mark.parametrize("n,k", [(512, 1024), (384, 1152), (4096, 4096)])
+def test_block_fp8_gemv_rows_bitmatch_decode(n, k):
+    """Single-request spec verify reproduces decode bit-for-bit: the W8A8 GEMM
+    quantizes activations to fp8 while the decode GEMV keeps bf16, so verify rows
+    ride the M=1 GEMV one row at a time. A fused multi-row kernel re-layouts the
+    128-K reduction and loses this identity (the stored KV would drift)."""
+    from freetoken.kernel.triton.fp8_block_linear import block_fp8_gemv_rows, block_fp8_linear
+
+    torch.manual_seed(0)
+    w = (torch.randn(n, k, device="cuda") * 0.05).to(FP8)
+    bs = torch.rand(n // 128, k // 128, dtype=torch.bfloat16, device="cuda") + 0.5
+    x = torch.randn(16, k, dtype=torch.bfloat16, device="cuda")
+    ref = torch.stack([block_fp8_linear(x[i:i + 1], w, bs)[0] for i in range(16)])
+    for m in (2, 3, 8, 9, 16):
+        assert torch.equal(block_fp8_gemv_rows(x[:m], w, bs), ref[:m]), f"M={m}"
 
 
 # ======================================================================================

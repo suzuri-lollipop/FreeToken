@@ -324,6 +324,11 @@ class Context:
         assert cur is not None, "No active batch in context"
         return cur
 
+    @property
+    def maybe_batch(self) -> "Batch | None":
+        """The active batch, or None outside a forward (weight load, unit tests)."""
+        return self._active
+
     @contextmanager
     def override(
         self,
@@ -384,4 +389,9 @@ def set_global_ctx(ctx: Context):
 
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
+    return _GLOBAL_CTX
+
+
+def try_get_global_ctx() -> "Context | None":
+    """The global context if one is installed (None in unit tests and tooling)."""
     return _GLOBAL_CTX

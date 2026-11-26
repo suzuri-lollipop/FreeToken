@@ -72,6 +72,7 @@ TOOLS_TAG_LIST = [
     "<function=",
     "<tool_call>",
     "<minimax:tool_call>",
+    "<ernie:tool_call>",
     "]<]minimax[>[<tool_call>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
@@ -2549,6 +2550,20 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
 
 
+class Ernie55Detector(MiniMaxDetector):
+    """ERNIE 5.5: the MiniMax-M2 invoke/parameter grammar inside ``<ernie:tool_call>``
+    wrapper tags (vLLM-ERNIE's parser reuses the M2 parameter regex and converter)."""
+
+    toolcall_opener = "<ernie:tool_call>"
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<ernie:tool_call>"
+        self.eot_token = "</ernie:tool_call>"
+        self._ps_outer_open = "<ernie:tool_call>"
+        self._ps_outer_close = "</ernie:tool_call>"
+
+
 class MiniMaxM3Detector(BaseFormatDetector):
     """FreeToken serving adapter for MiniMax-M3 namespace-delimited XML tool calls.
 
@@ -3687,6 +3702,7 @@ class FunctionCallParser:
         "inkling2": Inkling2Detector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
+        "ernie55": Ernie55Detector,
         "minimax_m3": MiniMaxM3Detector,
         "mistral": MistralDetector,
         "muse_glimmer": MuseGlimmerDetector,

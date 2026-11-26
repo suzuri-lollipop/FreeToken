@@ -231,6 +231,8 @@ def parse_args(
             return "ricursive"
         if "inkling" in marker:
             return "inkling2"
+        if "ernie" in marker:
+            return "ernie55"
         if "flint" in marker:
             return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -288,6 +290,8 @@ def parse_args(
             return "ricursive"
         if "inkling" in marker:
             return "inkling2"
+        if "ernie" in marker:
+            return "ernie55"
         if "flint" in marker:
             return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -394,6 +398,18 @@ def parse_args(
             "Fraction of the GPU's total VRAM the engine's whole per-rank footprint may "
             "use for weights + MoE cache + KV cache combined; the remainder is reserved "
             "runtime headroom."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=float,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Window/full token ratio sizing the SWA / DSV4 window-tier pool: the default "
+            "window pool is max(working-set floor, ratio x full-pool tokens). Lower it to "
+            "trade retained window-prefix capacity for VRAM (a single long-context request "
+            "only needs its live window, so a small ratio fits a much larger full KV pool)."
         ),
     )
 
@@ -725,6 +741,7 @@ def parse_args(
             "gpt_oss",
             "gpt-oss",
             "inkling2",
+            "ernie55",
         ],
         help="Tool-call parser format for OpenAI-compatible tool responses.",
     )
@@ -736,6 +753,7 @@ def parse_args(
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
             "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive", "inkling2",
+            "ernie55",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "

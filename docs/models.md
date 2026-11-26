@@ -5,6 +5,7 @@ for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
+| ERNIE-5.5-Flash-Preview | [baidu/ERNIE-5.5-Flash-Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) ([-FP8](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview-FP8)) |
 | DeepSeek-V4.1-Flash | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) |
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731), [deepseek-ai/DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) |
 | GLM-5.3-Flash | [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) |
@@ -162,6 +163,24 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- ERNIE-5.5-Flash-Preview (`ernie5_5_moe`, 280B total / 14B active) serves from the HF
+  checkpoint as shipped: block-fp8 dense projections, MXFP4 routed experts (W4A8,
+  SituGLU) on the offload cache (`--moe-strategy offload`, TP=1 only), 512 experts
+  top-10 + 1 shared in a 2048-wide latent space. 37 HCA layers keep a 128-token
+  window plus one learned compressed KV entry per 128 tokens (the DeepSeek-V4
+  window+compressed machinery); 6 MLA-DSA layers keep full-history latent KV and a
+  lightning indexer that selects the top-2048 tokens older than the trailing
+  128-window (the window is always attended). mHC residual streams, VHA head
+  post-mix and the learned multimax lm_head correction run as in the reference.
+  KV is bf16 with the reference's fp8 activation round-trips baked in; the DSA
+  latent/index slabs cost ~8.4 KB/token, so long context needs `--num-tokens`
+  budgeting (1M tokens ~ 8.4 GiB of DSA slabs alone). The `-FP8` sibling (fp8
+  experts) loads through the same reader. The bundled DSpark draft head
+  (`model.mtp.*`) is not served yet; speculative decoding is refused at config
+  time. The optional FlashIndexer head-routing gates ship in the checkpoint's
+  `flashindexer/` subfolder; set `"enable_flashindexer": true` via `--hf-overrides`
+  to score with the top-8 of 64 indexer heads (a speed path; the default scores
+  all heads).
 - A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.

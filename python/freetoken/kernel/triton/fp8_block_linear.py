@@ -240,6 +240,32 @@ def _block_fp8_gemv(a, weight, weight_scale, out_dtype, a_scale=None):
     return out
 
 
+# ======================================================================================
+# Multi-row W8A16 GEMV for single-request spec verify: the M=1 decode GEMV run per row.
+# Verify must reproduce decode bit-for-bit -- the W8A8 GEMM quantizes the activation to
+# fp8, which decode (W8A16) never does, and the stored KV would drift from plain decode.
+# A fused multi-row kernel re-layouts the 128-K tl.sum and loses that identity at large
+# N/K, so each row rides the exact decode kernel. Weight traffic matches plain decode
+# (one stream per token either way); the verify win is the batched attention / MoE / head.
+# ======================================================================================
+def block_fp8_gemv_rows(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x [..., K]`` with M >= 2 rows through the M=1 decode GEMV, one row at a time:
+    bit-identical per row to decode by construction (same kernel, split, and reduce)."""
+    *lead, K = x.shape
+    N = weight.shape[0]
+    x2d = x.reshape(-1, K)
+    M = x2d.shape[0]
+    assert M >= 2 and K % 128 == 0, (M, K)
+    out = torch.stack([_block_fp8_gemv(x2d[i], weight, weight_scale, x.dtype) for i in range(M)])
+    out = out.reshape(*lead, N)
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out
+
+
 def block_fp8_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -274,6 +300,7 @@ def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = _B
 __all__ = [
     "FP8",
     "block_fp8_linear",
+    "block_fp8_gemv_rows",
     "block_fp8_matmul",
     "per_token_group_quant_fp8",
     "dequant_block_fp8",
